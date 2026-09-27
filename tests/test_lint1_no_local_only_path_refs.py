@@ -195,7 +195,6 @@ def scan_bare_words(text: str) -> list:
 #: to inherit.
 _BAREWORD_BUDGET = {
     "tex_runtime/pacing.py": 10,
-    "tests/test_pace462_bounded_lookahead.py": 2,
     "tools/gate.py": 1,
     "tex_runtime/stdlib_core.py": 1,
     "tex_runtime/graphed.py": 1,
@@ -206,12 +205,9 @@ _BAREWORD_BUDGET = {
     "tests/test_simp3_consumer_registries.py": 1,
     "tests/test_seam45_embedding_host_seam.py": 1,
     "tests/test_pace45_pacing.py": 1,
-    "tests/test_ovh47_device_parse_memo.py": 1,
-    "tests/test_gate47_wallclock_ratchet.py": 1,
     "tests/test_bench2_counts.py": 1,
     "benchmarks/preempt_drain_bench.py": 1,
     "benchmarks/host_path_counts.py": 1,
-    "benchmarks/artist_loops_bench.py": 1,
 }
 
 

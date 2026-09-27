@@ -5,6 +5,150 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] - 2026-09-27 — "A cost knob, not a safety knob"
+
+A minor release, author-approved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze
+is owed; no default moved, no ComfyUI pixel change. Adds resolution scale as a v1, engine-
+integration feature (opt-in, off by default) and closes out the bounded look-ahead pacing
+mechanism `v0.46.2` shipped. This entry states no whole-release speedup figure: a single-
+reviewer, CPU-only reading exists from this cycle but has not been reproduced elsewhere, so it
+is left out rather than repeated as a claim.
+
+### Added
+
+- **Resolution scale (`scale=`), a v1 engine-integration feature for an embedding host that
+  cooks a smaller canvas and wants pixel-unit builtins to shrink with it.** A host passes
+  `scale=` to `tex_engine.prepare()`/`cook()` and to the stage-list family
+  (`cook_stage_list`/`cook_fused_cached`/`cook_checkpointed`/`materialize`, and the two
+  lineage/checkpoint-key functions); it multiplies the pixel-unit argument of every
+  registry-tagged builtin (`gauss_blur`'s sigma, `erode`/`dilate`'s radius,
+  `bilateral_filter`'s spatial_sigma — never its colour-similarity `range_sigma`) and the halo
+  margin derived from it, ceiling up. `scale=None` (the default; no host has to opt in) is
+  byte-identical and cost-free — no multiply is emitted, no key changes. `scale=1.0` is the
+  exact, bit-identical degenerate case. `tex_api.scale_verdict(source, param_values=None)` is
+  a cheap, memoized, pre-cook query answering whether a non-trivial scale would be refused for
+  a given program, reading the same memoized answer a cook's own refusal does, so the two can
+  never disagree; `tex_api.check_proxy_scale(bindings, full_hw, scale)` is an offered, never
+  enforced sanity check that a bound proxy image's shape actually agrees with the claimed
+  scale. A program the classifier cannot prove safe (anything touching `ix`/`iy`/`img_width`/
+  `img_height` outside a whitelisted coordinate position) refuses a non-1.0/non-None scale
+  request with a structured, stable reason code, never a silently wrong picture; an author can
+  override the verdict either direction with a leading `//!tex scale: safe`/`never` comment
+  pragma (`never` wins on conflict), which reads past a leading block comment unlike the
+  language pragma. A coarse cook (`scale` neither `None` nor `1.0`) whose caller leaves
+  `precision` unset promotes to `"auto"`; an explicit `precision=` is honoured unchanged.
+  **Envelope, measured, not a claim of equality:** a `scale=s` cook (upsampled) is compared
+  against a `scale=None` cook of the same program (downsampled to the same size) — maxdiff, on
+  both an adversarial 8-pixel-period checker and a realistic smooth-plus-hard-edges image,
+  pinned per builtin family at `scale=½` (`gauss_blur` 0.10, `bilateral_filter` 0.08, `erode`/
+  `dilate` 0.05) with worse, informational bands measured at `¼`/`⅛`. **`erode`/`dilate` are
+  not recommended below `scale=¼`**: at `⅛` their scaled radius truncates to a zero-radius
+  no-op on the tested inputs (maxdiff 0.25-0.75, more than half the value range) — investigated
+  switching the truncation to a ceiling to match `gauss_blur`'s own convention, measured that
+  it does not reliably help (worse for one family, better for the other, at the same rung), and
+  left unchanged rather than trade one silently-worse case for another. **Only the interpreter
+  tier honours `scale`**: a scale-active cook is routed to the plain interpreter ahead of tier
+  selection, ahead of `torch_compile`/`auto`/`cuda_graph` and the default tier's own codegen/
+  stencil/tiling shortcuts, reported via the normal tier-decline trace — none of those tiers
+  thread a runtime scale multiplier through emitted or captured code yet, so extending them was
+  deferred rather than risk a wrong replay. ROI narrowing and a non-None `scale` are not yet
+  reconciled: a cook naming both declines the ROI window and cooks whole-frame at scale. Full
+  detail: `docs/resolution-scale.md`.
+
+### Fixed
+
+- **The bounded look-ahead pacing mechanism `v0.46.2` shipped is now confirmed stride-
+  independent on every measured shape, and its default stride is a pure cost knob rather than
+  a partial safety knob.** Two gaps closed: a completed-tail blind spot that let a
+  fast-host/slow-device pairing under-count real outstanding device work regardless of how
+  little host time had elapsed, and a resolution-blind classification that treated a cheap,
+  large-canvas statement the same as a small one even though its own device time scales with
+  pixel count, not footprint — a large cook now resolves a `large_resolution` flag once per
+  cook (at the existing per-cook grid seam) and forces every poll past the stride window
+  regardless of per-statement classification. With both fixed, every tested shape (cheap,
+  medium and heavy chains, at 256/1024/2048-pixel canvases, both tested pacing depths) reads a
+  flat drained-p95 bound across the whole tested stride range (0-4ms) instead of growing with
+  stride, and the module default stride moves `0.5ms -> 4ms`. Headline cost, the cheapest and
+  most poll-dense shape tested (`cheap256`, pacing depth 2, the new 4ms default stride,
+  measured on a Turing-class discrete GPU): **+3.15%** versus unpaced — falling, not growing,
+  as stride widens, with diminishing returns toward the measured per-poll overhead floor.
+  Heaviness classification is now registry-derived (a builtin's own halo/halo_arg footprint
+  tag), covering octave noise and a warm mip-pyramid hit that previously polled every
+  statement unconditionally; a paced cook's heavy-statement classification, previously
+  computed and discarded on every cook including an unpaced ComfyUI default, is now gated
+  behind a cheap `is_paced()` check resolved once per cook.
+- **The toolchain-capability probe that gates the `"auto"` tier's background compiles can no
+  longer stall the cook thread, and a probe failure or a probe pool exhausted by a crash can no
+  longer permanently strand a key.** The probe now runs through a non-blocking, memoized async
+  read that returns nothing-yet rather than blocking until the (potentially slow) toolchain
+  search finishes; a probe exception now resolves to capability-False for that key with one
+  logged warning and one later retry, instead of leaving the future failed forever; the probe
+  pool is a daemon pool reusing the existing warm pool rather than a second, non-daemon one
+  that could stall process exit for up to 30 seconds.
+- **A cold `"auto"` first cook's measured cost is codegen emission, not the toolchain probe or
+  a compile attempt.** Confirmed no compile attempt fires in this scenario at all — the
+  MEASURING/COMPILING path always executes through codegen emission (parse the source, compile
+  the emitted Python, then run it), memoized in-process and to disk once per distinct program
+  fingerprint; this is
+  architectural, not a defect this release fixes, and is carried to the backlog below rather
+  than attempted here.
+- **A cross-file rebase drift left a dead `docs/roadmap.md` citation; re-pointed to the symbol
+  it already names.**
+
+### Changed
+
+- **`tex_runtime/interpreter.py` and `tex_runtime/compiled.py`, both at the module-size hard
+  budget, are split by pure moves of plain module-level functions into two new sibling leaf
+  modules each** (`interpreter_analysis.py`/`interpreter_values.py`,
+  `compiled_capability.py`/`compiled_exec_support.py`), all four re-exported at their parent's
+  own top level — no call path, import path or default changes anywhere.
+- **One memoized device-string parse replaces up to three redundant ones per default-path
+  cook.** `tex_memory.py` had seven call sites independently re-parsing the same raw `device`
+  value into a `torch.device`; a single default cook's own body reached three of them. Now
+  memoized by the raw value, bounded by the small number of distinct device values a process
+  ever sees. Measured recovery: **~4.3 µs/cook** (profiled) — real, and reported honestly as
+  a small piece of a larger, still only partly attributed per-cook overhead question, not the
+  whole of it.
+- **Structural-count benchmark coverage extends from two dirty-fraction points to four**
+  (`whole_frame_chain_d1`/`d3`/`d5`/`d10`), and a new artist-loops benchmark times six
+  representative artist-workflow shapes (cheap per-pixel grades and blur-heavy comp-shaped
+  chains) through public entry points, reusing existing bench fixtures rather than re-deriving
+  them. Measurement tooling only — no product-code change, nothing gated.
+
+### Tooling (`benchmarks/`, `tests/`, `tools/` only — no `tex_*` production module touched)
+
+- **A ratchet now catches a new wall-clock comparison entering an assertion without a
+  `timing`/`slow` marker or a reviewed allowlist entry**, the structural gap behind more than
+  one CI-only red this project has hit: CI runs the whole suite with coverage tracing always
+  on and does not deselect `timing`, so a comparison against a bound that is fine untraced can
+  invert once coverage's line tracer taxes an extra Python-level call far more than the
+  bytecode either side of it. A new `--ci-exact` gate leg runs the CI workflow's own command
+  verbatim, coverage on, against a designated interpreter, so this class of gap can be
+  reproduced locally instead of only in CI (an environment variable forces the toolchain-probe
+  answer this leg needs to stay deterministic there).
+- **A hashed-bare-word lint now catches a local-process-artifact word or a configured machine
+  name leaking into a tracked source file** even when it is not a path and names no host — the
+  class the existing local-only-path lint cannot see. Ships with a down-only budget for the
+  pre-existing occurrences it inherited, and a companion tool that scans a commit-message range
+  for the same class at landing time.
+- Two bench-thread hygiene fixes: a background benchmark thread that hangs past its join
+  timeout now hard-fails naming the depth/stride/trial that triggered it instead of silently
+  continuing (this project's own benches; not a product-code change), and an exception raised
+  inside a background bench thread is now propagated to the caller instead of swallowed.
+- A cross-test isolation hazard (a global `os.listdir` patch left an un-checked background
+  thread join) is fixed; a documentation-drift test investigated as possibly related was
+  investigated and NOT CONFIRMED against this release's own repeated reproduction attempts —
+  recorded as such rather than closed on a guess.
+
+### Not in this release (backlog)
+
+- Resolution scale threaded through the codegen/compiled/CUDA-graph tiers (today interpreter-
+  only) — changes the persisted codegen-cache key format, deferred rather than risked here.
+- A general measured-device-time pacing bound (as opposed to the fixed-depth bound this
+  release confirms) — needs its own design.
+- The `"auto"` tier's cold-codegen-emission cost on a first cook — architectural, named above,
+  not attempted this release.
+
 ## [0.46.2] - 2026-09-26 — "Bounded, not blocking"
 
 A patch release, answering an embedding host's own re-pin findings against `v0.46.1` — a
@@ -1056,7 +1200,7 @@ freeze is owed.
 - **TRK-109 — the CHANGELOG's own dangling citation named its covering symbol.** The `roi=`/
   fused-chain sentence's citation named no enclosing symbol, so `tools/check_citations.py` had
   carried it as a standing warning since the citation tool shipped. Now reads
-  "`tex_engine.py:1037`, inside `run`"; the citation-warning budget re-pins 22→21.
+  "`run` in `tex_engine.py`"; the citation-warning budget re-pins 22→21.
 
 ### Tooling (`benchmarks/`, `tests/` only — no `tex_*` production module touched)
 
@@ -3815,7 +3959,7 @@ is unlikely to get right:
   `frame_version` is a constant 0 for every frozen entry, and `put` always freezes.
 
 **Scope, decided in §1 of the note rather than deferred:** `roi=` is refused on a fused chain
-(`tex_engine.py:1037`, inside `run`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
+(`run` in `tex_engine.py`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
 the fused one. They are complements, not layers.
 
 ### GOV-1 — memory/effort profiles on the governor (`tex_memory.py`)

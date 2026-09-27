@@ -9,7 +9,7 @@ because GitHub Actions runs the whole suite with `--cov=TEX_Wrangle` always on a
 Python-level function call far more than it taxes one `IMPORT_NAME` bytecode, so a "not
 slower than X" claim can invert under tracing even though the code changed nothing. That
 fix replaced the one test; nothing stopped a NEW instance of the same class from shipping.
-This is the ratchet CI-461's hand-back asked for.
+This is the ratchet an embedding host asked for.
 
 WHAT COUNTS AS THE DEFECT SHAPE
 --------------------------------

@@ -36,7 +36,7 @@ a reader needs to relate the timing to the pinned counts.
 GPU timing is `torch.cuda.synchronize()`-wrapped throughout (invariant #6). This file makes NO
 product-code change and asserts nothing; it is a measurement tool, run under a bench lease
 (`docs/brief-conventions.md`'s three measurement rules — fresh cache dir, discard the first
-leg, name the box beside every figure) and read by a human or folded into a hand-back table.
+leg, name the box beside every figure) and read by a human or folded into a results table.
 
     python benchmarks/artist_loops_bench.py --device cpu --scenarios whole_frame_tick,param_drag
     python benchmarks/artist_loops_bench.py --device cuda --save results/artist_loops_<box>.json

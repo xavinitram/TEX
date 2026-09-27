@@ -13,7 +13,7 @@ comparison (`cache_budget_bytes`/`enforce_cache_budget`/`trim_reserved_pool` all
 small but consistent per-call tottime growth with an UNCHANGED call count -- the
 "invisible to a call-count diff" bucket TRK-211 asks this lane to find); the redundant
 re-parse was already present at the pin, so this closes a pre-existing inefficiency
-rather than a new regression, and is reported honestly as such in the hand-back.
+rather than a new regression, and is reported honestly as such here.
 
 THE FIX: `_as_device(device)`, memoized by the raw `device` value in `_device_obj_cache`
 (mirroring the existing `_total_mem_cache` pattern just below it in this file) -- bounded

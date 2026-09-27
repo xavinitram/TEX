@@ -513,8 +513,8 @@ def test_stride_zero_disables_the_gate(r):
 
 # ── PACE-47: the stride skip is honoured only while the device keeps up ──────────
 #
-# A finding measured on a box whose host dispatch is fast relative to its device (see the
-# hand-back): a fast host paired with a slower device can dispatch several statements
+# A finding measured on a box whose host dispatch is fast relative to its device: a fast
+# host paired with a slower device can dispatch several statements
 # inside one stride window, and the
 # pre-PACE-47 gate skipped recording on host-elapsed time ALONE -- so the pool's outstanding
 # count silently under-counted a real, growing backlog. These rows drive the FakeCudaEvent
@@ -613,7 +613,7 @@ def test_pace47_stride_skip_still_fires_once_device_catches_up(r):
 #
 # PACE-47's own fix made every economizing poll pay for a real `event.query()` call --
 # measured to cost real cheap-chain overhead (cheap256's own cost regressed after the
-# PACE-47 fix landed, see the hand-back). Once a poll's peek confirms the tail event
+# PACE-47 fix landed). Once a poll's peek confirms the tail event
 # complete, that answer cannot change until the event is `record()`ed again -- so a run of
 # further polls against the SAME unchanged tail (nothing recorded in between: precisely the
 # shape a long chain of cheap, fast-finishing statements produces) should pay for exactly
