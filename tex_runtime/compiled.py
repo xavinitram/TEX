@@ -1467,6 +1467,9 @@ def _build_codegen_env(
 
     if sp:
         B, H, W = sp
+        # Coordinate builtins are fp32 whatever the image precision (as in the interpreter):
+        # fp16 `u` cannot address every row of a tall frame.
+        cdt = torch.float32
         # The cook-region grid is H×W; coordinates are offset by the window origin and
         # normalized against the full image. Absent an ROI this collapses to the old
         # behaviour exactly (x0=y0=0, W_full=W, H_full=H), so the default path is untouched.
@@ -1475,39 +1478,39 @@ def _build_codegen_env(
         # ROI components join every cache key they affect, or a panning viewport would be
         # served the previous window's coordinates out of _ENV_TENSOR_CACHE.
         if "ix" in used or "u" in used:
-            ix = _env_cached(("ix", W, x0, dev_key, dtype),
-                             lambda: torch.arange(x0, x0 + W, dtype=dtype, device=device).view(1, 1, W))
+            ix = _env_cached(("ix", W, x0, dev_key, cdt),
+                             lambda: torch.arange(x0, x0 + W, dtype=cdt, device=device).view(1, 1, W))
             if "ix" in used:
                 env["ix"] = ix
             if "u" in used:
-                env["u"] = _env_cached(("u", B, H, W, x0, W_full, dev_key, dtype),
+                env["u"] = _env_cached(("u", B, H, W, x0, W_full, dev_key, cdt),
                                        lambda: (ix / max(W_full - 1, 1)).expand(B, H, W))
         if "iy" in used or "v" in used:
-            iy = _env_cached(("iy", H, y0, dev_key, dtype),
-                             lambda: torch.arange(y0, y0 + H, dtype=dtype, device=device).view(1, H, 1))
+            iy = _env_cached(("iy", H, y0, dev_key, cdt),
+                             lambda: torch.arange(y0, y0 + H, dtype=cdt, device=device).view(1, H, 1))
             if "iy" in used:
                 env["iy"] = iy
             if "v" in used:
-                env["v"] = _env_cached(("v", B, H, W, y0, H_full, dev_key, dtype),
+                env["v"] = _env_cached(("v", B, H, W, y0, H_full, dev_key, cdt),
                                        lambda: (iy / max(H_full - 1, 1)).expand(B, H, W))
         if "iw" in used:
-            env["iw"] = _env_cached(("iw", W_full, dev_key, dtype),
-                                    lambda: torch.tensor(float(W_full), dtype=dtype, device=device))
+            env["iw"] = _env_cached(("iw", W_full, dev_key, cdt),
+                                    lambda: torch.tensor(float(W_full), dtype=cdt, device=device))
         if "ih" in used:
-            env["ih"] = _env_cached(("ih", H_full, dev_key, dtype),
-                                    lambda: torch.tensor(float(H_full), dtype=dtype, device=device))
+            env["ih"] = _env_cached(("ih", H_full, dev_key, cdt),
+                                    lambda: torch.tensor(float(H_full), dtype=cdt, device=device))
         if "px" in used:
-            env["px"] = _env_cached(("px", W_full, dev_key, dtype),
-                                    lambda: torch.tensor(1.0 / max(W_full, 1), dtype=dtype, device=device))
+            env["px"] = _env_cached(("px", W_full, dev_key, cdt),
+                                    lambda: torch.tensor(1.0 / max(W_full, 1), dtype=cdt, device=device))
         if "py" in used:
-            env["py"] = _env_cached(("py", H_full, dev_key, dtype),
-                                    lambda: torch.tensor(1.0 / max(H_full, 1), dtype=dtype, device=device))
+            env["py"] = _env_cached(("py", H_full, dev_key, cdt),
+                                    lambda: torch.tensor(1.0 / max(H_full, 1), dtype=cdt, device=device))
         if "fi" in used:
-            env["fi"] = _env_cached(("fi", B, dev_key, dtype),
-                                    lambda: torch.arange(B, dtype=dtype, device=device).view(B, 1, 1))
+            env["fi"] = _env_cached(("fi", B, dev_key, cdt),
+                                    lambda: torch.arange(B, dtype=cdt, device=device).view(B, 1, 1))
         if "fn" in used:
-            env["fn"] = _env_cached(("fn", B, dev_key, dtype),
-                                    lambda: torch.tensor(float(B), dtype=dtype, device=device))
+            env["fn"] = _env_cached(("fn", B, dev_key, cdt),
+                                    lambda: torch.tensor(float(B), dtype=cdt, device=device))
     else:
         for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
             if name in used:
