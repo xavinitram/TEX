@@ -47,8 +47,12 @@ from typing import Any
 # not TEX's own code (see the COMPILE-51 finding writeup). Scoped OFF, in-memory
 # only, for the `_has_fn_calls` class `fncalls_compile` tracks; every other
 # compiled program keeps disk-persisted `caching_precompile` (PC-2) unchanged.
-# The flag is process-global while `_COMPILE_POOL`/`_WARM_POOL` (both defined in
-# `compiled.py`) run concurrently, so `_precompile_flag_lock` serializes EVERY
+# `_COMPILE_POOL`/`_WARM_POOL` (both defined in `compiled.py`) run concurrently.
+# On torch 2.12 a dynamo config patch is a per-thread override (a ContextVar), so
+# a patch on one pool's thread is invisible to the other (measured: a second
+# thread never saw the patched value); TEX sets no torch floor, though, and on a
+# build where the patch writes a shared module global the two pools' windows race.
+# `_precompile_flag_lock` keeps both correct by serializing EVERY
 # scoped window against every other one, whichever value it sets -- FIX-COMPILE51
 # C1 (B3#1): the pre-fix code took this lock ONLY for the `disable=True` branch
 # (`_precompile_off_ctx`); the `disable=False` (default) branch called
