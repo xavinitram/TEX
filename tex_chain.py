@@ -379,7 +379,7 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                    roi: tuple | None = None, roi_exec: bool | None = None,
                    dirty_from: int = 0, valid=None, declined=(),
                    known_outputs: dict | None = None,
-                   result_cache=None, upstream=()) -> dict:
+                   result_cache=None, upstream=(), store: set | None = None) -> dict:
     """JOINWIRE-50 (host item 1): cook a DAG-shaped stage list — a join such as a Merge
     reading two upstream stages, below an edit — node-by-node, windowed end-to-end via
     `tex_roi.chain_windows_dag`, when the sink (the last stage) is asked for a sub-window.
@@ -463,13 +463,43 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
     actually fed as another stage's `chain_inputs` binding (see `_materialize_input` below) —
     it is never what `stage_outputs` reports back. `windows` is `None` when nothing was
     planned (no `roi=`, or `chain_windows_dag` refused the whole plan) or a
-    `chain_windows_dag`-shaped list (unchanged)."""
+    `chain_windows_dag`-shaped list (unchanged).
+
+    STORE-51: `store` (optional set of stage indices) lets the host NARROW which clean
+    whole-frame stages actually get `put` into `result_cache`, without touching where a
+    boundary is served from or how one is keyed. The host owns cut placement (which stage
+    indices are worth caching, given its own cost model); TEX owns the one safety rule this
+    whole mechanism exists to enforce (a windowed output is never storable as a whole-frame
+    boundary) and does not hand that rule to the host to re-implement. Concretely: `store=
+    None` (every caller before this ask, and the default) keeps today's behaviour exactly —
+    every stage that reaches the `put` line above (clean, `result_cache is not None`,
+    `windows is not None`, not the sink, and `served_roi is None`) is stored, as before.
+    `store={i, j, ...}` intersects with that same eligibility test — a stage index in `store`
+    is stored only if it was ALREADY eligible, and a stage NOT in `store` is never stored even
+    if it is eligible. `store` can therefore only narrow what gets stored, never widen it: a
+    windowed stage's index named in `store` still does not get a `put` (`served_roi is None`
+    is checked first, exactly as it always was), and `store` has no effect at all on reading a
+    boundary back (`_clean_lookup` above is unconditional on `store`) or on the never-serve-a-
+    window-as-whole-frame contract this section documents. `store=set()` stores nothing this
+    tick, but still SERVES any boundary a previous tick already put — narrowing what is
+    written is not the same as forgetting what was read. An index in `store` outside
+    `range(len(stages))` is a host wiring mistake (not a shape this cook can act on) and is
+    rejected up front, before any stage cooks, with a `ValueError` naming the bad index, how
+    many stages there are, and what a valid index looks like."""
     with _cook_observer.scope("cook_stage_dag"):
         from . import tex_roi as _tex_roi
         from .tex_runtime import tier_trace as _tier_trace_mod
         n = len(stages)
         known_outputs = known_outputs or {}
         eff_precision = "fp32" if latent_channel_count else precision
+        if store is not None:
+            for _idx in store:
+                if not (0 <= _idx < n):
+                    raise ValueError(
+                        f"cook_stage_dag: store names stage index {_idx}, but this stage "
+                        f"list only has {n} stage(s) — I need an index between 0 and "
+                        f"{n - 1} inclusive. Check the index against the `stages` list you "
+                        f"passed.")
 
         # 1. One StageSpec per stage, resolved from EACH stage's own source alone (no
         #    cross-stage knowledge needed for this step — `stage_dag_arg_halos` reads one
@@ -652,9 +682,13 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 # `prefix_fingerprint`'s own `1 <= k < len(stages)` range contract (a
                 # boundary is always "AFTER stage k-1", which needs a stage AT k to exist)
                 # has no valid key for it — there is nothing downstream of the sink for a
-                # cached boundary to ever serve anyway.
+                # cached boundary to ever serve anyway. STORE-51: `store is None or i in
+                # store` is the ONLY new condition ANDed onto this already-computed
+                # eligibility — a narrowing, never a widening, so a stage that reaches this
+                # line with `served_roi is None` (this section's one load-bearing fact) is
+                # unaffected by `store` unless the host explicitly leaves its index out.
                 if (result_cache is not None and windows is not None and i != n - 1
-                        and "OUT" in out):
+                        and "OUT" in out and (store is None or i in store)):
                     result_cache.put(_checkpoint_key(i), out["OUT"],
                                      canvas={"shape": list(out["OUT"].shape)})
             stage_outputs[i] = out

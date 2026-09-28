@@ -539,3 +539,22 @@ stage's own cook actually served). Neither row needed a code change: `boundary_l
 generic topology walk and the `served_roi is None` cache-population gate (both above) already
 covered a join-shaped cut and an approximation-forced whole-frame serve without a
 join-specific or approximation-specific case.
+
+**STORE-51 (v0.51) added ONE additive parameter: `cook_stage_dag(..., store=None)`.** Once a
+host has its own cut planner (choosing checkpoint placement by an effort model, an artist's
+manual pin, or a ban) it needs a way to say WHICH
+clean whole-frame stages are actually worth the memory a `result_cache.put` costs — without
+re-implementing the one safety rule this whole mechanism exists to enforce. The division of
+labour is exact: **the host owns cut placement; TEX owns the safety rule.** `store` (an
+optional `set[int]` of stage indices) is ANDed onto the existing `put` eligibility test
+(clean, `result_cache is not None`, `windows is not None`, not the sink, `served_roi is
+None`) — naming a stage in `store` can only make that test's own verdict count; it cannot
+override `served_roi is None`, so a stage `cook_stage_dag` itself decided was genuinely
+windowed this tick is never stored no matter what `store` says. `store=None` (the default,
+and every call shape before this ask) keeps today's behaviour: every eligible stage is
+stored. `store=set()` stores nothing new this tick, but reading a boundary back
+(`_clean_lookup`) is entirely unconditional on `store` — a prior tick's already-`put` entries
+are still served. An index outside `range(len(stages))` is rejected up front, before any
+stage cooks, with a `ValueError` naming the bad index. Proof: `tests/test_store51_store_
+narrowing.py` (5 rows: named-stores-exactly-that-stage, empty-store-still-serves,
+windowed-stage-named-in-store-still-not-stored, default-unchanged, out-of-range diagnostic).
