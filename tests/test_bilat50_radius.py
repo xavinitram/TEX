@@ -42,7 +42,7 @@ def _old_clamped_bilateral(image, sigma_s, sigma_r):
     patches = padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
     center = bchw.unsqueeze(-1).unsqueeze(-1)
     inv_2ss = -0.5 / max(ss * ss, 1e-10)
-    dy = torch.arange(ksize, dtype=torch.float32) - radius
+    dy = torch.arange(ksize, dtype=torch.float32, device=img.device) - radius
     dx = dy.clone()
     d2 = dy.view(-1, 1) ** 2 + dx.view(1, -1) ** 2
     w_spatial = torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize)
