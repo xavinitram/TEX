@@ -115,8 +115,8 @@ _BOUND_ROWS = [
      "float acc = 0.0;\nfor (float t = -1.0; t < 0.0; t += 0.25) { acc = acc + 1.0; if (acc > 500.0) { break; } }\n"
      "@OUT = vec3(acc) + @A.rgb * 0.0;", 4.0),
     ("fractional literal bound x < 2.5",
-     "float acc = 0.0;\nfor (float x = 0.5; x < 2.5; x += 1.0) { acc = acc + 1.0; if (acc > 500.0) { break; } }\n"
-     "@OUT = vec3(acc) + @A.rgb * 0.0;", 2.0),
+     "float acc = 0.0;\nfor (float x = 0.0; x < 2.5; x += 1.0) { acc = acc + 1.0; if (acc > 500.0) { break; } }\n"
+     "@OUT = vec3(acc) + @A.rgb * 0.0;", 3.0),
     ("y from -0.5 below 0.5",
      "float acc = 0.0;\nfor (float y = -0.5; y < 0.5; y += 0.25) { acc = acc + 1.0; if (acc > 500.0) { break; } }\n"
      "@OUT = vec3(acc) + @A.rgb * 0.0;", 4.0),
