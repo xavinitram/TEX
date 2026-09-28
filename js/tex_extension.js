@@ -549,6 +549,10 @@ function _showManageSnippetsDialog() {
                     const newName = prompt("New name for snippet:", key);
                     if (newName && newName.trim() && newName.trim() !== key) {
                         const snips = _loadUserSnippets();
+                        if (Object.prototype.hasOwnProperty.call(snips, newName.trim())) {
+                            alert(`A snippet named "${newName.trim()}" already exists. Delete it first or pick another name.`);
+                            return;
+                        }
                         snips[newName.trim()] = snips[key];
                         delete snips[key];
                         _saveUserSnippets(snips, [newName.trim(), key]);
@@ -627,17 +631,73 @@ function _parseParamMetadata(block) {
 // everything else — img/v/v2/v3/v4/f/i/c/b/s/none — wires as IMAGE). Mirrors the prefix
 // legend in TEX_HELP_DATA ("m@ MASK, l@ LATENT") and tex_marshalling's socket families, so a
 // published tool records the true socket type instead of flattening mask/latent to IMAGE.
+// A promoted param's default in the shape the tool manifest carries: strings and hex/vector
+// text stay text (comma-separated numbers for vectors), a bool is 0/1, numbers are numbers.
+function _texPublishDefault(t, raw) {
+    const unq = (v) => String(v).trim().replace(/^["']|["']$/g, "");
+    if (t === "s") return raw == null ? "" : unq(raw);
+    if (t === "c") {
+        const v = raw == null ? "" : unq(raw);
+        return v.startsWith("#") ? v : "#000000";
+    }
+    if (t === "v2" || t === "v3" || t === "v4") {
+        const n = Number(t[1]);
+        if (raw == null) return Array(n).fill("0.0").join(", ");
+        const m = String(raw).match(new RegExp(`vec${n}\\s*\\(\\s*([^)]+)\\)`));
+        return (m ? m[1] : unq(raw)).trim() || Array(n).fill("0.0").join(", ");
+    }
+    if (t === "b") {
+        const v = raw == null ? "0" : unq(raw);
+        return (v === "true" || (Number.isFinite(Number(v)) && Number(v) !== 0)) ? 1 : 0;
+    }
+    return raw == null ? 0 : (Number(raw) || 0);
+}
+
 function _socketTypeForPrefix(prefix) {
     if (prefix === "m") return "MASK";
     if (prefix === "l") return "LATENT";
     return "IMAGE";
 }
 
+// One pass over the source, length-preserving: comments become spaces (newlines kept) and
+// string contents become spaces (quotes kept). `noComments` keeps strings intact, so an
+// index found in `stripped` reads the same span of the raw text (string/hex param defaults),
+// and a `//` inside a string is not mistaken for a comment.
+function _texMaskSource(code) {
+    let noComments = "", stripped = "";
+    const n = code.length;
+    let i = 0;
+    const blank = (s) => s.replace(/[^\n]/g, " ");
+    while (i < n) {
+        const c = code[i];
+        if (c === "/" && code[i + 1] === "/") {
+            let j = code.indexOf("\n", i);
+            if (j < 0) j = n;
+            noComments += blank(code.slice(i, j)); stripped += blank(code.slice(i, j));
+            i = j;
+        } else if (c === "/" && code[i + 1] === "*" && code.indexOf("*/", i + 2) >= 0) {
+            const j = code.indexOf("*/", i + 2) + 2;
+            noComments += blank(code.slice(i, j)); stripped += blank(code.slice(i, j));
+            i = j;
+        } else if (c === '"') {
+            let j = i + 1;
+            while (j < n && code[j] !== '"') j += (code[j] === "\\" && code[j + 1] !== "\n" ? 2 : 1);
+            if (j >= n) {   // unterminated: leave the quote as ordinary text
+                noComments += c; stripped += c; i++;
+            } else {
+                noComments += code.slice(i, j + 1);
+                stripped += '"' + blank(code.slice(i + 1, j)) + '"';
+                i = j + 1;
+            }
+        } else {
+            noComments += c; stripped += c; i++;
+        }
+    }
+    return { noComments, stripped };
+}
+
 function parseCode(code) {
-    const stripped = code
-        .replace(/\/\/[^\n]*/g, "")
-        .replace(/\/\*[\s\S]*?\*\//g, "")
-        .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    const { noComments, stripped } = _texMaskSource(code);
 
     // 1) Count ALL @name occurrences (including typed prefixes like f@name)
     const refCounts = new Map();
@@ -656,7 +716,9 @@ function parseCode(code) {
 
     // 2) Count simple assignment targets (@name = ..., not ==)
     const simpleAssignCounts = new Map();
-    const SIMPLE_RE = /(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)(?:\.[a-zA-Z]+)?\s*=(?!=)/g;
+    // A target may carry swizzles and scatter subscripts: `@OUT[x, y].rgb = v`.
+    const TARGET = String.raw`(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)(?:\.[a-zA-Z]+|\[(?:[^\[\]]|\[[^\]]*\])*\])*`;
+    const SIMPLE_RE = new RegExp(TARGET + String.raw`\s*=(?!=)`, "g");
     while ((m = SIMPLE_RE.exec(stripped)) !== null) {
         if (!RESERVED_NAMES.has(m[1])) {
             simpleAssignCounts.set(m[1], (simpleAssignCounts.get(m[1]) || 0) + 1);
@@ -665,7 +727,7 @@ function parseCode(code) {
 
     // 3) Find compound assignment targets (+=, -=, *=, /=) — always both read+write
     const compoundTargets = new Set();
-    const COMPOUND_RE = /(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)(?:\.[a-zA-Z]+)?\s*[+\-*/]=/g;
+    const COMPOUND_RE = new RegExp(TARGET + String.raw`\s*(?:[+\-*/]=|\+\+|--)`, "g");
     while ((m = COMPOUND_RE.exec(stripped)) !== null) {
         if (!RESERVED_NAMES.has(m[1])) {
             compoundTargets.add(m[1]);
@@ -679,11 +741,14 @@ function parseCode(code) {
     // Lookbehind requires statement boundary (^, ;, {, }) to avoid matching
     // $name inside expressions like for-loop headers: for (int dy = -$radius; ...)
     // Group 3 = default (stops before `[` or `;`); group 4 = the `[…]` metadata block.
-    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v[234]|[fismvlcb]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;\[]*?))?\s*(\[[^\]]*\])?\s*;/gm;
+    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v[234]|[fismvlcb]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;\[]*?))?\s*(\[[^\]]*\])?\s*;/gmd;
     while ((m = PARAM_DECL_RE.exec(stripped)) !== null) {
+        // The default is read from the comment-free RAW text (same indices), so a string or
+        // hex default survives; the masked text only decides where the declaration ends.
+        const rawDefault = m.indices[3] ? noComments.slice(m.indices[3][0], m.indices[3][1]) : null;
         params.set(m[2], {
             typeHint: m[1] || "f",
-            defaultValue: m[3]?.trim() || null,
+            defaultValue: rawDefault?.trim() || null,
             metadata: _parseParamMetadata(m[4]),
         });
     }
@@ -792,6 +857,22 @@ function syncInputs(node, usedBindings, paramNames) {
 
 // ─── Dynamic Output Sockets ─────────────────────────────────────────
 
+// A prompt key is a plain integer for a top-level node and "12:3" for a node inside a
+// subgraph; parseInt("12:3") is 12, a different node. Composite keys resolve to null.
+function _texNodeByPromptId(id) {
+    const key = String(id);
+    if (!/^\d+$/.test(key)) return null;
+    return app.graph?.getNodeById(parseInt(key, 10)) ?? null;
+}
+
+// LiteGraph's graph.links is a Map (older builds: a plain object). Bracket-indexing a Map
+// silently yields undefined, so every lookup goes through here.
+function _texLinkIn(graph, id) {
+    const links = graph?.links;
+    if (!links) return null;
+    return (typeof links.get === "function") ? links.get(id) : links[id];
+}
+
 function syncOutputs(node, outputNames) {
     if (!node.graph) return;
     const ANY_TYPE = "*";
@@ -813,7 +894,7 @@ function syncOutputs(node, outputNames) {
             if (out.links && out.links.length > 0) {
                 const conns = [];
                 for (const linkId of out.links) {
-                    const link = node.graph.links?.[linkId];
+                    const link = _texLinkIn(node.graph, linkId);
                     if (link) {
                         conns.push({
                             targetNodeId: link.target_id,
@@ -877,6 +958,7 @@ function _texParamSchemaEntry(typeHint) {
     if (typeHint === "c") return ["STRING", { default: "#000000" }];
     if (typeHint === "v2") return ["STRING", { default: "0.0, 0.0" }];
     if (typeHint === "v3") return ["STRING", { default: "0.0, 0.0, 0.0" }];
+    if (typeHint === "v4") return ["STRING", { default: "0.0, 0.0, 0.0, 0.0" }];
     return ["FLOAT", { default: 0.0, min: -9999, max: 9999, step: 0.1, round: 0.001 }];
 }
 
@@ -947,6 +1029,19 @@ function syncParams(node, params) {
     // Desired param names
     const desiredNames = new Set(params.keys());
 
+    // A reloaded workflow restores the param sockets from the saved graph without the
+    // runtime-only `_texParam` flag; adopt them so a wired $param is never read as an image
+    // input (fusion would fold its producer and bake the widget value). Adoption precedes
+    // the removal passes so a stale or retyped socket is dropped like a fresh one.
+    if (node.inputs) {
+        for (const inp of node.inputs) {
+            if (!inp._texParam && desiredNames.has(inp.name)) {
+                inp._texParam = true;
+                if (!inp.widget) inp.widget = { name: inp.name };
+            }
+        }
+    }
+
     // Identify widgets to remove: stale names OR type changed
     const toRemove = new Set();
     for (const [name, cur] of currentParams) {
@@ -991,6 +1086,7 @@ function syncParams(node, params) {
         if (typeHint === "c") return "STRING";   // hex color string
         if (typeHint === "v2") return "STRING";   // comma-separated floats
         if (typeHint === "v3") return "STRING";   // comma-separated floats
+        if (typeHint === "v4") return "STRING";   // comma-separated floats
         return "FLOAT";
     }
 
@@ -1014,9 +1110,9 @@ function syncParams(node, params) {
                 if (raw.startsWith("#")) def = raw;
             }
             widget = node.addWidget("text", name, def, () => {});
-        } else if (typeHint === "v2" || typeHint === "v3") {
-            // Vec2/Vec3 → text input with comma-separated defaults
-            const n = typeHint === "v2" ? 2 : 3;
+        } else if (typeHint === "v2" || typeHint === "v3" || typeHint === "v4") {
+            // Vec2/Vec3/Vec4 → text input with comma-separated defaults
+            const n = Number(typeHint[1]);
             let def = Array(n).fill("0.0").join(", ");
             if (info.defaultValue != null) {
                 const raw = String(info.defaultValue).trim();
@@ -1055,7 +1151,7 @@ function syncParams(node, params) {
             widget._texTypeHint = typeHint;
             // LANG-1: a `label: "…"` overrides the widget's displayed name (value unchanged).
             if (info.metadata && info.metadata.label) widget.label = info.metadata.label;
-            const prefixMap = { i: "i", s: "s", b: "b", c: "c", v2: "v2", v3: "v3" };
+            const prefixMap = { i: "i", s: "s", b: "b", c: "c", v2: "v2", v3: "v3", v4: "v4" };
             const prefixChar = prefixMap[typeHint] || "f";
             const defaultStr = info.defaultValue != null ? String(info.defaultValue) : (typeHint === "s" ? '""' : typeHint === "b" ? "0" : typeHint === "c" ? '"#000000"' : "0");
             widget.tooltip = `TEX parameter: $${name} (${typeName})\nDeclare in code: ${prefixChar}$${name} = ${defaultStr};\nUse in expressions: $${name}\nConnect a wire or adjust the widget value.`;
@@ -1068,7 +1164,7 @@ function syncParams(node, params) {
         const existingInput = node.inputs?.find(inp => inp.name === name);
         if (!existingInput) {
             // Vec/color params accept any wire type (IMAGE, MASK, etc.) to override widget
-            const socketType = (typeHint === "c" || typeHint === "v2" || typeHint === "v3") ? "*" : typeName;
+            const socketType = (typeHint === "c" || typeHint === "v2" || typeHint === "v3" || typeHint === "v4") ? "*" : typeName;
             node.addInput(name, socketType);
             const newInput = node.inputs[node.inputs.length - 1];
             newInput._texParam = true;
@@ -1190,9 +1286,14 @@ function showDOMErrorBanner(node, errMsg) {
                     const wrongText = diag.source_line.substring(wrongStart, wrongEnd);
                     const editor = texEditors.get(node);
                     if (editor && wrongText) {
-                        const line = editor.state.doc.line(diag.line);
+                        // The banner reports the code as it was when it was compiled; apply the
+                        // fix only if that exact text is still at that position.
+                        const doc = editor.state.doc;
+                        if (!(diag.line >= 1 && diag.line <= doc.lines)) return;
+                        const line = doc.line(diag.line);
                         const from = line.from + wrongStart;
                         const to = from + wrongText.length;
+                        if (line.text.substring(wrongStart, wrongStart + wrongText.length) !== wrongText) return;
                         editor.dispatch({ changes: { from, to, insert: sug } });
                         clearDOMErrorBanner(node);
                     }
@@ -2536,9 +2637,7 @@ let _texHullShape     = true;    // TEX.Fusion.bubbleHull (convex hull vs rectan
 // Litegraph's app.graph.links is a Map — ALWAYS use .get(), never bracket-index
 // (bracket-index silently returns undefined → empty adjacency → silent no-fuse).
 function _texGetLink(id) {
-    const links = app.graph?.links;
-    if (!links) return null;
-    return (typeof links.get === "function") ? links.get(id) : links[id];
+    return _texLinkIn(app.graph, id);
 }
 
 // {name: value} for this node's $param widgets (used for both fusion payload + injection).
@@ -3121,7 +3220,7 @@ app.registerExtension({
             if (!app.ui.settings.getSettingValue("TEX.Lazy.enabled", true)) return;
             for (const [nodeId, nodeData] of Object.entries(result.output)) {
                 if (nodeData.class_type !== TEX_NODE_TYPE) continue;
-                const node = app.graph.getNodeById(parseInt(nodeId));
+                const node = _texNodeByPromptId(nodeId);
                 if (!node) continue;
                 // Collision guard: a user input literally named like a pool
                 // slot would collide after renaming — leave the node eager.
@@ -3142,7 +3241,7 @@ app.registerExtension({
                     delete nodeData.inputs[name];
                     let t = input.type || "*";
                     if (input.link != null) {
-                        const link = app.graph.links[input.link];
+                        const link = _texLinkIn(app.graph, input.link);
                         if (link?.type) t = link.type;
                     }
                     map.push({ name, slot, type: String(t) });
@@ -3159,7 +3258,7 @@ app.registerExtension({
             if (result?.output) {
                 for (const [nodeId, nodeData] of Object.entries(result.output)) {
                     if (nodeData.class_type === TEX_NODE_TYPE) {
-                        const node = app.graph.getNodeById(parseInt(nodeId));
+                        const node = _texNodeByPromptId(nodeId);
                         if (node?.widgets) {
                             for (const w of node.widgets) {
                                 if (w._texParam && !(w.name in nodeData.inputs)) {
@@ -3412,8 +3511,7 @@ app.registerExtension({
                         const promoted = [];
                         for (const [pname, info] of params) {
                             const t = VALID.has(info.typeHint) ? info.typeHint : "f";
-                            let def = info.defaultValue;
-                            def = (t === "s") ? (def || "") : (def == null ? 0 : (Number(def) || 0));
+                            const def = _texPublishDefault(t, info.defaultValue);
                             // Forward only metadata keys the tool validator accepts (the editor's
                             // parser is more permissive), so an extra key can't 422 the publish.
                             const meta = {};
