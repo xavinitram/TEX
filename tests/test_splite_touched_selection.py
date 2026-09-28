@@ -79,7 +79,8 @@ def test_splite_test_module_refs_both_import_shapes(r: SubTestResult):
         "import os\n"          # a plain stdlib import must NOT show up
         "from helpers import *\n"   # a non-TEX_Wrangle from-import must NOT show up
     )
-    want = {"tex_engine", "tex_chain", "tex_runtime", "tex_runtime.compiled", "tex_memory"}
+    want = {"tex_engine", "tex_chain", "tex_runtime", "tex_runtime.compiled", "tex_memory",
+            "tex_runtime.tier_trace"}
     try:
         with tempfile.TemporaryDirectory(prefix="tex-splite-") as d:
             path = os.path.join(d, "test_sample.py")

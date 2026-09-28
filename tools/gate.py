@@ -238,8 +238,16 @@ def _touched_module(path: str) -> str | None:
 #: -- a string literal's content is not valid Python at that position, so nothing here asks
 #: `ast` to look inside it).
 _STR_FROM_BARE_RE = re.compile(r"from\s+TEX_Wrangle\s+import\s+([\w\s,]+)")
-_STR_FROM_DOTTED_RE = re.compile(r"from\s+TEX_Wrangle\.([\w.]+)\s+import\s+\w+")
+_STR_FROM_DOTTED_RE = re.compile(r"from\s+TEX_Wrangle\.([\w.]+)\s+import\s+(\w+)")
 _STR_IMPORT_DOTTED_RE = re.compile(r"import\s+TEX_Wrangle\.([\w.]+)")
+
+
+def _submodule_refs(pkg: str, names) -> set:
+    """`pkg.name` for each imported name that is a module file (or package) under `pkg`."""
+    base = os.path.join(_PKG, *pkg.split("."))
+    return {pkg + "." + n for n in names
+            if os.path.isfile(os.path.join(base, n + ".py"))
+            or os.path.isdir(os.path.join(base, n))}
 
 
 def _string_module_refs(text: str) -> set:
@@ -250,6 +258,7 @@ def _string_module_refs(text: str) -> set:
         refs.update(n.strip() for n in m.group(1).split(",") if n.strip())
     for m in _STR_FROM_DOTTED_RE.finditer(text):
         refs.add(m.group(1))
+        refs.update(_submodule_refs(m.group(1), [m.group(2)]))
     for m in _STR_IMPORT_DOTTED_RE.finditer(text):
         refs.add(m.group(1))
     return refs
@@ -279,7 +288,11 @@ def _test_module_refs(path: str) -> set:
             if node.module == "TEX_Wrangle":
                 refs.update(alias.name for alias in node.names)
             elif node.module.startswith("TEX_Wrangle."):
-                refs.add(node.module[len("TEX_Wrangle."):])
+                pkg = node.module[len("TEX_Wrangle."):]
+                refs.add(pkg)
+                # `from TEX_Wrangle.tex_runtime import compiled` imports the submodule
+                # `tex_runtime.compiled`; a name that is not a module file is an attribute.
+                refs.update(_submodule_refs(pkg, [a.name for a in node.names]))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.startswith("TEX_Wrangle."):
@@ -1153,7 +1166,7 @@ def main(argv=None) -> int:
     if not _importable_as_tex_wrangle():
         print("the package must be importable as TEX_Wrangle: run from a directory where it "
               "resolves (e.g. a worktree whose package dir is named TEX_Wrangle)")
-        return 2
+        return 1   # a refusal is not a verdict: never the GREEN+STALE code
 
     head, th = head_label(), tree_hash()
     ci_python, ci_source = resolve_ci_python(a.ci_python)
