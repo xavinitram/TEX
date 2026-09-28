@@ -603,6 +603,13 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                              value=A.Identifier(name=wire_map[name]))
                 for name in sorted(wire_map) if name in passthrough
             ]
+            # The same holds for a NON-chain external the terminal also assigns: it stays bare
+            # (passthrough) yet the value lives under the stage-prefixed key, so seed from that.
+            rmw_seeds += [
+                A.Assignment(op="=", target=A.BindingRef(kind="wire", name=name),
+                             value=A.BindingRef(kind="wire", name=_user_prefix(prefix) + name))
+                for name in sorted(ext) if name in passthrough and name not in wire_map
+            ]
             prog.statements[:0] = rmw_seeds
         if seedless_idx is not None:
             # _transform rewrote `@OUT = expr` to `Assignment(Identifier(out_local) = expr)`;
