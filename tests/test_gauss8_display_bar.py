@@ -143,6 +143,25 @@ def test_gauss8_bright_plate_holds_the_bar(r: SubTestResult):
         r.ok(f"night x16 sigma={int(sigma)}: max code diff {stats['max']} <= 1")
 
 
+def test_gauss8_non_multiple_frame_size_stays_registered(r: SubTestResult):
+    print("\n--- GAUSS8-51: a frame side that is not a multiple of the downscale factor "
+          "must not stretch the reduced grid (830 = 8*103.75 read 4 codes before) ---")
+    big = _d8.plate_night(832, 832, torch.device("cpu"), seed=3) * 16.0
+    for side in (826, 830, 832):
+        p = big[:, :, :side, :side].contiguous()
+        exact = _gauss_blur_bchw(p, 260.0)
+        approx = _gauss_blur_pyramid_approx(p, 260.0)
+        if approx.shape != p.shape:
+            r.fail(f"gauss8 registration side={side}", f"shape {tuple(approx.shape)} != {tuple(p.shape)}")
+            continue
+        stats = _d8.code_diff_stats(_d8.aces_srgb8(approx), _d8.aces_srgb8(exact))
+        if stats["max"] > 1:
+            r.fail(f"gauss8 registration side={side}",
+                   f"worst-channel code diff {stats['max']} exceeds the 1-code bar (stats={stats})")
+            continue
+        r.ok(f"side={side}: max code diff {stats['max']} <= 1")
+
+
 def test_gauss8_below_threshold_still_bitexact(r: SubTestResult):
     print("\n--- GAUSS8-51: invariant 7 — the exact path below the threshold is untouched "
           "by the edge-pad fix or the raised cap ---")

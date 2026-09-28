@@ -480,7 +480,18 @@ generated on the GPU, both paths run on an RTX 5070 Ti Laptop. Cell = max codes 
 81 codes (night x16, sigma=1024, +46 mean). After: max 1 code and 0% of pixels at >= 2 on every
 one of the 16 cells (sigma 260/512/1024/2048 x day/night x4/x16); SSIMULACRA2 88.9-94.2 at x16.
 
-**The bar (<=1 code) is met on every row measured.** The edge fix is what closes most of it;
+**Frame sizes that are not a multiple of the downscale factor.** The tables above use square
+1080 frames, which divide evenly by the factor at every sigma measured (8 or less). A real
+828-wide plate does not (828 / 8 = 103.5): the reduced grid used to round to 104, stretching the
+blur by up to half a coarse pixel, and the bilinear upsample back then misregistered the whole
+result — up to 4 codes on 75% of pixels at 830x830 (night x16, sigma=260) while 824 and 832 read
+1. The path now replicate-pads the right/bottom up to the next multiple of the factor and crops
+the result; this changes nothing about what is approximated, since the exact blur already
+treats everything past the border as the replicated edge. A sweep over odd sizes (826, 828,
+830, 827x1031, 1084, 1099x1097, 17x23, 3x5 and more), day/night at x1 and x16, sigma 260-8192,
+leaves one cell above 1 code: 1084x1084, night x16, sigma=260, 2 codes on 0.001% of pixels.
+
+**The bar (<=1 code) is met on every row of the tables above.** The edge fix is what closes most of it;
 raising the cap alone does not (cap=32 without the fix still left a +3 code bias on the night
 plate at sigma=1024), and cap=64 closes the bright-plate residual. The fast-row regression
 tests (the mechanism proof, the scaled-down bar check, the bright-plate row) live in

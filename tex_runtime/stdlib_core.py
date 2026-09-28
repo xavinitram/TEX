@@ -1082,7 +1082,24 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     factor = 1
     while sigma / factor > GAUSS_BLUR_PYRAMID_QUALITY_CAP:
         factor *= 2
-    reduced_h, reduced_w = max(1, round(out_h / factor)), max(1, round(out_w / factor))
+    # The reduced grid must be an EXACT `factor` subsampling of the frame: when a side
+    # is not a multiple of `factor`, rounding `side / factor` stretches the reduced
+    # image by up to half a coarse pixel, and the bilinear upsample back to full size
+    # then misregisters the whole blur (measured: up to 4 codes on 75% of pixels after
+    # ACES sRGB 8-bit at 830x830, sigma=260, while 824 and 832 read 1). Replicate-pad
+    # the right/bottom up to the next multiple first and crop at the end. This does not
+    # change what is being approximated: the exact blur already treats everything past
+    # the border as the replicated edge, and replicating a replicated edge yields the
+    # same values, so the exact blur of the padded frame, cropped, IS the exact blur of
+    # the frame. A side no longer than `factor` reduces to ONE coarse pixel (a flat
+    # field, which cannot misregister) and is never padded: padding it up to `factor`
+    # would allocate without bound as sigma grows.
+    pad_h = (-out_h) % factor if out_h > factor else 0
+    pad_w = (-out_w) % factor if out_w > factor else 0
+    if pad_h or pad_w:
+        img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), mode='replicate')
+    reduced_h = img.shape[-2] // factor if out_h > factor else 1
+    reduced_w = img.shape[-1] // factor if out_w > factor else 1
     poll_cook_cancel(heavy=True)
     reduced = torch.nn.functional.interpolate(img, size=(reduced_h, reduced_w), mode='area')
     residual = sigma / factor
@@ -1111,8 +1128,8 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     blurred = _gauss_blur_bchw_edge_pad(reduced, residual, left_edge, right_edge, top_edge, bottom_edge, corners)
     poll_cook_cancel(heavy=True)
     return torch.nn.functional.interpolate(
-        blurred, size=(out_h, out_w), mode='bilinear', align_corners=False,
-    )
+        blurred, size=(img.shape[-2], img.shape[-1]), mode='bilinear', align_corners=False,
+    )[:, :, :out_h, :out_w]
 
 
 def _gauss_blur_auto(img: torch.Tensor, sigma: float) -> torch.Tensor:
