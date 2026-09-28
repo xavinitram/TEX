@@ -403,6 +403,26 @@ def load_counts_harness():
     return mod
 
 
+def load_display8_harness():
+    """Load `tools/display8.py` by path, once per process (v0.51) --
+    the same shape as `load_counts_harness` above, for the same reason: GAUSS8-51/
+    BILAT8-51's shared display-8 harness was hand-spelled with the identical
+    `importlib.util.spec_from_file_location` + `module_from_spec` + `sys.modules[...] =`
+    + `exec_module` incantation in three separate test files, none of them memoizing, so
+    calling any of them twice re-executed the tool module. One implementation, loaded
+    once, cannot drift from itself and cannot double-exec."""
+    import importlib.util
+    mod = sys.modules.get("_display8_bar_harness")
+    if mod is not None:
+        return mod
+    path = os.path.join(_pkg_dir, "tools", "display8.py")
+    spec = importlib.util.spec_from_file_location("_display8_bar_harness", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_display8_bar_harness"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def run_python_kv(code: str, *, timeout: int = 60, python: str | None = None) -> dict:
     """Run `<python> -X utf8 -c code` (default: this interpreter) in a FRESH subprocess and
     parse its stdout as `KEY value` lines into a dict.

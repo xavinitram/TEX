@@ -8,28 +8,12 @@ builtin's accuracy band (that belongs to each builtin's own test file).
 """
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import torch
 
 from helpers import *
+from helpers import load_display8_harness
 
-_PKG = Path(__file__).resolve().parent.parent  # TEX_Wrangle/
-_TOOL = _PKG / "tools" / "display8.py"
-
-
-def _load_display8():
-    """Import `tools/display8.py` by path — `tools/` is not a package."""
-    spec = importlib.util.spec_from_file_location("_display8_harness", _TOOL)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_d8 = _load_display8()
+_d8 = load_display8_harness()
 aces_srgb8, code_diff_stats, plate_day, plate_night = (
     _d8.aces_srgb8, _d8.code_diff_stats, _d8.plate_day, _d8.plate_night,
 )
