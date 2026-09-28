@@ -527,7 +527,7 @@ tests (the mechanism proof, the scaled-down bar check, the bright-plate row) liv
 `tests/test_gauss8_display_bar.py`.
 
 **A v0.51 review evaluated replacing the three-layer boundary fix above with one
-pad-before-reduce mechanism — NOT ADOPTED.** The proposal: replicate-pad the full-resolution image
+pad-before-reduce mechanism â€” NOT ADOPTED.** The proposal: replicate-pad the full-resolution image
 by `pad_to_multiple + factor` on each side BEFORE the single `area` reduction, then blur with the
 ordinary, unmodified `_gauss_blur_bchw` (averaging N replicated copies of the true border value
 returns that value, so the reduced grid's own border would already equal the true edge). That
@@ -540,7 +540,7 @@ and x16; sigma 260/300/512/1024/2048/8192 = 240 cells, CPU, vs the exact `_gauss
 the candidate read 24 of 240 cells above 1 code (worst 53: 17x23 day at sigma 2048/8192; 3x5 day
 at every sigma; 100x1097 at sigma 8192), so it was not adopted. The shipped mechanism, run on the
 same sweep, reads 238 of 240 cells at <=1 code; the two exceptions are 100x1097 night x16 at
-sigma 260 and 300, both 2 codes — a pre-existing residual of the shipped path (the refactor
+sigma 260 and 300, both 2 codes â€” a pre-existing residual of the shipped path (the refactor
 below is bit-identical), not covered by the "every one of 360 cells" reading above, which also
 used a four-border-highlight plate this sweep did not include. Kept as shipped; the unrelated
 simplification of collapsing `_replicate_pad_h_conv`/`_replicate_pad_v_conv` into one
