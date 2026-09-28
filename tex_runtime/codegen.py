@@ -2711,6 +2711,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         saved_scalar = self._scalar_loop
         self._scalar_loop = use_scalar
 
+        self._forget_loop_carried_initializers(stmt)
         self._emit(f"for _i_idx in range({n}):")
         self._indent += 1
         if use_scalar:
@@ -2756,6 +2757,23 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             else:
                 self._local_vars[vname] = prev
 
+    def _forget_loop_carried_initializers(self, stmt: ForLoop | WhileLoop):
+        """Drop the VarDecl initializer of every name the loop reassigns.
+
+        Emission is textual, but a loop runs its body again: a read that precedes the
+        reassignment in the body sees the reassigned value from the second pass on. The
+        per-assignment pop in `_emit_assignment` comes too late for such a read, which
+        would otherwise resolve `x` to its pre-loop initializer (`sample(@A, x, v)` with
+        `float x = u;` folded to a direct fetch of the pixel's own texel). A name declared
+        inside the body re-records its initializer when that declaration is emitted,
+        which is right: the declaration re-runs every pass."""
+        names, _ = collect_assigned_vars(stmt.body)
+        upd = getattr(stmt, "update", None)
+        if isinstance(upd, Assignment) and isinstance(upd.target, Identifier):
+            names.add(upd.target.name)
+        for name in names:
+            self._var_initializers.pop(name, None)
+
     def _setup_scalar_loop(
         self, all_vars: set[str], loop_var: str,
     ):
@@ -2787,6 +2805,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # Hoist sample/fetch BCHW setup outside loop to avoid per-call overhead
         self._hoist_sample_setup(stmt.body)
         self._emit_stmt(stmt.init)
+        self._forget_loop_carried_initializers(stmt)
 
         static = self._try_static_bound(stmt)
         iter_var = self._tmp()
@@ -2871,6 +2890,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         """
         # Hoist sample/fetch BCHW setup outside loop
         self._hoist_sample_setup(stmt.body)
+        self._forget_loop_carried_initializers(stmt)
         iter_var = self._tmp()
         self._emit(f"{iter_var} = 0")
         self._emit(f"while {iter_var} < _MAX_ITER:")

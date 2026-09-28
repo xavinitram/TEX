@@ -205,3 +205,51 @@ def test_if_else_channel_write_never_aliases(label, code, extra):
     a = _img()
     ref, got = assert_parity(code, {"A": a, **extra})
     assert "OUT" in ref
+
+
+# ── a loop-carried variable is not its declaration's initializer ─────────────────────
+#
+# `sample(@A, x, v)` with `x` declared `= u` folds to a direct pixel fetch. Inside a loop
+# that advances `x` after the read, the second pass reads a shifted coordinate, so the
+# fold is wrong from the first reassignment on, whatever the textual order.
+
+_LOOP_INIT_ROWS = [
+    ("while loop advancing x after the sample",
+     "float x = u;\nvec3 acc = vec3(0.0);\n"
+     "for (int k = 0; k < 2; k++) {\n"
+     "  float pin = ix + iy;\n"
+     "  int i = 0;\n"
+     "  while (i < 3) { acc = acc + sample(@A, x, v).rgb; x = x + 0.25; i = i + 1; }\n"
+     "  if (pin < -1.0) { break; }\n"
+     "}\n@OUT = acc;"),
+    ("general for loop advancing x after the sample",
+     "float x = u;\nvec3 acc = vec3(0.0);\n"
+     "for (int k = 0; k < 2; k++) {\n"
+     "  float pin = ix + iy;\n"
+     "  for (float t = 0.5; t < 3.0; t += 1.0) { acc = acc + sample(@A, x, v).rgb; x = x + 0.25; }\n"
+     "  if (pin < -1.0) { break; }\n"
+     "}\n@OUT = acc;"),
+]
+
+
+@pytest.mark.parametrize("label,code", _LOOP_INIT_ROWS, ids=[r[0] for r in _LOOP_INIT_ROWS])
+def test_loop_carried_var_is_not_folded_to_its_initializer(label, code):
+    assert_parity(code, {"A": _img(H=6, W=6)})
+
+
+def test_loop_invariant_initializer_keeps_the_direct_fetch():
+    """Control: a name the loop never reassigns still folds (the fast path is kept)."""
+    code = ("float x = u;\nvec3 acc = vec3(0.0);\n"
+            "for (int k = 0; k < 2; k++) {\n"
+            "  float pin = ix + iy;\n"
+            "  int i = 0;\n"
+            "  while (i < 3) { acc = acc + sample(@A, x, v).rgb; i = i + 1; }\n"
+            "  if (pin < -1.0) { break; }\n"
+            "}\n@OUT = acc;")
+    bindings = {"A": _img(H=6, W=6)}
+    assert_parity(code, bindings)
+    bt = {"A": infer_binding_type(bindings["A"])}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+    src = try_compile(program, tm)._tex_src
+    assert "shape[2] - 1).long()" in src, "the zero-offset direct fetch was not emitted"
