@@ -10,6 +10,7 @@ here, CACHE-2 — ResultCache, the engine frame cache — still in tex_results.p
 
 import hashlib
 import json
+from pathlib import Path
 
 
 # ── CACHE-1: lineage keys ─────────────────────────────────────────────────────
@@ -20,6 +21,26 @@ import json
 _ENV_EPOCH_CACHE: dict = {}
 
 
+# The cook pipeline around the compiler: a fix to any of these (ROI windows, tiling, marshalling,
+# the tier router) changes what a cook returns without moving a compiler epoch, so a spilled
+# frame from before the fix must not be served after it.
+_RESULT_FILES = tuple(
+    Path(__file__).parent / n for n in (
+        "tex_engine.py", "tex_engine_tiers.py", "tex_roi.py", "tex_roi_dag.py", "tex_tiling.py",
+        "tex_marshalling.py", "tex_lazy.py", "tex_chain.py", "tex_packing.py"))
+_RESULT_EPOCH: list = []
+
+
+def _result_epoch() -> str:
+    if not _RESULT_EPOCH:
+        try:
+            from .tex_cache import _hash_files
+            _RESULT_EPOCH.append(_hash_files(list(_RESULT_FILES)))
+        except Exception:
+            return "0"
+    return _RESULT_EPOCH[0]
+
+
 def _code_epoch() -> str:
     """The compiler/codegen code identity a cached RESULT is only reproducible under: the CACHE-4
     CODEGEN_EPOCH (which nests AST_EPOCH, so ANY parse/typecheck/optimize OR codegen change bumps
@@ -28,7 +49,7 @@ def _code_epoch() -> str:
     result key mints a fresh key on every such change."""
     try:
         from .tex_cache import codegen_epoch
-        return codegen_epoch()
+        return codegen_epoch() + "." + _result_epoch()
     except Exception:
         return "0"
 
@@ -56,7 +77,7 @@ def env_epoch() -> str:
         return cached
     try:
         import torch
-        parts.append(torch.__version__.split("+")[0])
+        parts.append(torch.__version__)
         if dev >= 0:
             parts.append(torch.cuda.get_device_name(dev))
             cc = torch.cuda.get_device_capability(dev)
