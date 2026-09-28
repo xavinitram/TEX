@@ -105,11 +105,21 @@ _package_relpath = _counts.package_relpath
 #: its frame or every `Class.method` row in this file counts zero (see `frame_qualname`).
 _frame_qualname = _counts.frame_qualname
 
-#: Two programs that reach the compiled tier on CPU and take the codegen-only adapter
-#: (they call stdlib functions, so `_has_fn_calls` is set and `torch.compile` is never
-#: entered — see `compiled._try_compile`). One of them calls `gauss_blur`, which is the
-#: only class of program whose emitted preamble carries PERF-2's host-scalar stores, so
-#: the `_tag_host_scalar` row below is measured where it could actually fire.
+#: Two programs that reach the compiled tier on CPU (they call stdlib functions, so
+#: `_has_fn_calls` is set). One of them calls `gauss_blur`, which is the only class of
+#: program whose emitted preamble carries PERF-2's host-scalar stores, so the
+#: `_tag_host_scalar` row below is measured where it could actually fire.
+#:
+#: R3 (v0.50 Phase C, FIX-REL50): this comment used to read "and `torch.compile` is
+#: never entered — see `compiled._try_compile`", true before COMPILETRY-50 (v0.50.0):
+#: `_has_fn_calls` used to be a BLANKET bail straight to the codegen-only eager adapter,
+#: no exceptions. COMPILETRY-50 replaced that with "each fingerprint gets ONE real
+#: `torch.compile()` fall-through attempt, remembered" (`fncalls_compile.verdict`/
+#: `begin_attempt`, persisted via `warm_state`) — on a box with a working CPU inductor
+#: toolchain (the PORTABILITY note below still holds: a box WITHOUT one degrades to the
+#: codegen-only path exactly as before, `r.skip` where the sidecar can't be read back),
+#: this real attempt now runs, and can succeed. See the `_FRAME_CEILING` note for what
+#: that does to the total-frame ceiling.
 _PROGRAMS = {
     "blur_chain": """
 vec3 base = @A.rgb;
@@ -160,13 +170,55 @@ _EXACTLY_ONCE = (
 #: docstring. The margin (~23 %) is generous enough to absorb a CPython frame-model
 #: difference and far too small to absorb a re-emit, which the mutation guard below
 #: measures at roughly five times the pinned reading.
-_FRAME_CEILING = {"blur_chain": 340, "fetch_stencil": 400}
+#:
+#: R3 (v0.50 Phase C, FIX-REL50): `fetch_stencil`'s reading is no longer a fixed TEX
+#: property, and 400 stopped covering it — the full-tier canonical run (this same box,
+#: CUDA present, `tools/gate.py --tier full` at `c780fe9`) read **525**. Investigated with
+#: a frame profile (this file's own `_cold_counts_only`) rather than guessed: it is NOT a
+#: fixed amount of new bookkeeping any single K-item added (FIX-COMPILE's K0-K6 account for
+#: well under twenty new frames total — one `codegen_persist` module-registration call
+#: chain, a widened `fncalls_compile._key` composite). It is COMPILETRY-50 (the v0.50.0
+#: lane before FIX-COMPILE): before it, `_has_fn_calls` was a BLANKET bail — a program
+#: calling a stdlib builtin (both `_PROGRAMS` here do) NEVER reached a real
+#: `torch.compile()`, ever, on any box. COMPILETRY-50 changed that to "each
+#: (fingerprint, device, precision) gets ONE real fall-through attempt, remembered" — a
+#: correctness-neutral, wanted improvement (three of four gated builtins trace clean), but
+#: it means this file's `fetch_stencil` case (previously always codegen-only, 0 real-Dynamo
+#: frames) now runs a REAL `torch.compile()`/Dynamo trace on this box (confirmed directly:
+#: `_cold_counts` reports `status="compiled", backend="inductor"` here, where the module
+#: docstring's own "no compiler" portability note assumed it never would). A real Dynamo
+#: trace's own frame count is Dynamo's property, not TEX's — it depends on how many
+#: guard/graph-break/resume segments Dynamo needs for a given call, which is sensitive to
+#: Dynamo's own accumulated, process-wide trace state (repeated in-process re-derivations
+#: on this same box, isolated — `python -m pytest tests/test_perf7_compiled_cold.py -q -s`,
+#: three separate runs — all read a stable 348, comfortably under the OLD ceiling; only the
+#: full, ~2000-test canonical process, which necessarily accumulates far more Dynamo/
+#: `torch.compile` state before ever reaching this file, read 525). This is the same class
+#: of variability the docstring already names for the total ("partly a property of the
+#: CPython that runs it"), now extended by COMPILETRY-50 to "partly a property of Dynamo's
+#: own trace state" — a real, inherent, and NEWLY-introduced cost class on this path, not
+#: an avoidable regression in any single line changed this release. Re-pinned to 650 (525
+#: measured + ~24% margin, the same proportion the original 400/321 ceiling used) rather
+#: than raised to bare-cover 525, and rather than left at 400 to silently rot the gate red
+#: on every future canonical run. `blur_chain`'s ceiling is untouched — the full-tier log
+#: did not red it, and this file's own SKIP/PASS behaviour for it did not change.
+_FRAME_CEILING = {"blur_chain": 340, "fetch_stencil": 650}
 #: v0.37.0 (`dfe7c38`) read 276 / 321; head reads 280 / 324 (RTX 5070 Ti Laptop, this box,
 #: `python tests/test_perf7_compiled_cold.py -q -s`, each row prints its own). One extra
 #: frame on `blur_chain` is PERF-2's `_host_scalar` call inside `fn_gauss_blur` — one Python
 #: frame in place of a device readback, which is the trade that lane recorded; the rest of
 #: the drift is later, unrelated frame growth the ceiling (340/400) already has room for.
+#: `fetch_stencil`'s v0.37.0 reading of 321 no longer describes the SAME code path this box
+#: takes at head (see the `_FRAME_CEILING` note above: v0.37.0 could never reach a real
+#: Dynamo trace here at all) — kept for its historical value, not as a tight comparison.
 _MEASURED_AT_V0370 = {"blur_chain": 276, "fetch_stencil": 321}
+#: v0.50.0 Phase C (FIX-REL50, R3): the readings that motivated the re-pin above.
+#: `fetch_stencil`'s canonical-run reading (525) is the evidence for its new ceiling (650);
+#: this file's own solo, in-process reading (348) is included to show the same fingerprint
+#: reads far lower outside the full suite's accumulated Dynamo state — both are "cold
+#: cook", neither is wrong, and the gap is exactly the variability documented above.
+_MEASURED_AT_V0500_PHASEC = {"fetch_stencil_canonical_fulltier": 525,
+                             "fetch_stencil_solo_in_process": 348}
 
 REDERIVE = ("python -m pytest tests/test_perf7_compiled_cold.py -q  "
             "(each row prints its reading; the ceilings are in _FRAME_CEILING)")
