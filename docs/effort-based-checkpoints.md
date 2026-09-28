@@ -526,3 +526,16 @@ in a purely linear prefix, and `cook_stage_dag` degrades to the linear case exac
 `StageSpec` with one input per stage, `inputs=(i - 1,)`, is `chain_windows_dag`'s own
 documented degenerate case). Picking the wrong one for a join-shaped graph is not silent:
 `cook_checkpointed` raises `REFUSE_NOT_LINEAR` rather than serve a wrong boundary.
+
+**CKPT-51 (v0.51) extended this section's proof, not its mechanism.** Two shapes the
+JOINWIRE-50b suite exercised only implicitly are now covered by name in
+`tests/test_ckpt51_join_checkpoint.py`: a checkpoint boundary keyed AT a join stage's own
+output (not only at a stage feeding one), and an approximate builtin's window decline
+(`gauss_blur` past `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`, `bilateral_filter` past its
+exact-radius threshold) surfacing correctly through the checkpointed `cook_stage_dag` route —
+both proved by `torch.equal` against a fresh whole-frame cook, with the served-vs-planned
+distinction read off `stage_windows` (never off `windows`, which is the plan, not what a
+stage's own cook actually served). Neither row needed a code change: `boundary_lineage_key`'s
+generic topology walk and the `served_roi is None` cache-population gate (both above) already
+covered a join-shaped cut and an approximation-forced whole-frame serve without a
+join-specific or approximation-specific case.
