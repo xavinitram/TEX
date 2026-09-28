@@ -261,6 +261,13 @@ band pins whichever measures WORSE, since neither input is reliably the worse on
 every family (erode's `scale=0.125` divergence is worse on the smooth+edges image, 0.43–0.48,
 than on the checker, 0.25).
 
+**Scope: these bands are maxdiff on display-range input (channel values in [0,1]).** They are not
+a promise for scene-linear HDR plates. On an 828² scene-linear plate pushed x16, a `scale=½`
+`bilateral_filter` (spatial_sigma 10, range_sigma 1.0) measured up to 0.76 linear maxdiff
+against the exact cook area-downsampled, on 0.04-3.9% of pixels at 2 or more codes after ACES
+sRGB 8-bit (SSIMULACRA2 88.7-97.5): the hard-edge effect described below, magnified by bright
+values. Treat a scaled cook of an HDR plate as a coarse preview.
+
 | family | scale=½ (pinned, `test_scale47b_r1_envelope_*`) | scale=¼ | scale=⅛ |
 |---|---:|---:|---:|
 | `gauss_blur` | 0.10 | 0.20 | 0.40 |
