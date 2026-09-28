@@ -2785,7 +2785,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"if not _torch.is_tensor({cv}) or {cv}.dim() == 0:")
             self._indent += 1
             ci = self._tmp()
-            self._emit(f"{ci} = int({cv})")
+            # The real value, never int(): truncation moves a fractional counter across
+            # the bound. Against an integer-valued bound the compare is exact for an fp32
+            # counter, so it agrees with the interpreter's tensor compare.
+            self._emit(f"{ci} = float({cv})")
             if is_le:
                 self._emit(f"if {ci} > {bound}: break")
             else:
@@ -2822,7 +2825,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit_iter_limit(iter_var, "For")
 
     def _try_static_bound(self, stmt: ForLoop) -> tuple[str, int, bool] | None:
-        """Try to extract static loop bounds."""
+        """Try to extract static loop bounds.
+
+        Only an integer-valued literal qualifies: a fractional one (`x < 2.5`, `t <= 0.3`)
+        must be compared as the interpreter does, in fp32, so it takes the general
+        condition test instead."""
         cond = stmt.condition
         if not isinstance(cond, BinOp):
             return None
@@ -2831,6 +2838,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if not isinstance(cond.left, Identifier):
             return None
         if not isinstance(cond.right, NumberLiteral):
+            return None
+        if not float(cond.right.value).is_integer():
             return None
         return (cond.left.name, int(cond.right.value), cond.op == "<=")
 
@@ -2850,8 +2859,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit(f"while {iter_var} < _MAX_ITER:")
         self._indent += 1
         # Increment first: immune to a native `continue` skipping it. With the
-        # bound at `< _MAX_ITER` this runs exactly _MAX_ITER bodies before the
-        # post-loop limit check fires — matching the interpreter's cap.
+        # bound at `< _MAX_ITER` the loop runs at most _MAX_ITER bodies.
         self._emit(f"{iter_var} += 1")
 
         self._emit_cond_break(stmt.condition)
@@ -2865,7 +2873,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         self._indent -= 1
 
-        self._emit_iter_limit(iter_var, "While")
+        # The interpreter raises only when the budget ran out, never when the loop ended
+        # by its condition or a break — even on the last allowed pass. `while ... else`
+        # runs exactly then; a post-loop `iter >= _MAX_ITER` test would also fire for a
+        # loop that ended on its 1024th condition check or broke in its 1024th body,
+        # because the counter is bumped before either can happen.
+        self._emit("else:")
+        self._indent += 1
+        self._emit("raise RuntimeError('While loop exceeded maximum iteration limit (' + "
+                   "str(_MAX_ITER) + '). Check your loop condition.')")
+        self._indent -= 1
 
     # ── Expression emission ─────────────────────────────────────────────
 
