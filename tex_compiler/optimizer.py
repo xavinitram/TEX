@@ -201,6 +201,11 @@ def _subst_stmt_literals(stmt: ASTNode, subs: dict) -> ASTNode:
     return stmt
 
 
+# Only scalar locals can stand for a bare literal: `vec3 c = 0.5;` is a vec3, and a literal
+# in its place changes what length()/dot()/vec4(c, ...) and the type checker see.
+_SCALAR_LOCAL_TYPES = frozenset({"float", "int"})
+
+
 def _propagate_literal_locals(statements: list[ASTNode]) -> list[ASTNode]:
     """Substitute top-level float/int locals that are (a) initialized to a
     NumberLiteral, (b) never reassigned, (c) declared exactly once and never a
@@ -240,10 +245,13 @@ def _propagate_literal_locals(statements: list[ASTNode]) -> list[ASTNode]:
     subs: dict[str, tuple] = {}
     for stmt in statements:  # top level only
         if (stmt.__class__ is VarDecl
+                and stmt.type_name in _SCALAR_LOCAL_TYPES
                 and stmt.name not in reassigned and stmt.name not in params
                 and stmt.name not in loopvars and decl_count.get(stmt.name, 0) == 1):
             lit = _const_literal_value(stmt.initializer)
-            if lit is not None:
+            # An int local only takes an int literal; a float local takes either (an int
+            # literal in a float local has always been propagated).
+            if lit is not None and (stmt.type_name == "float" or lit[1]):
                 subs[stmt.name] = lit
     if not subs:
         return statements
@@ -526,10 +534,8 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         # while fn_pow preserves NaN for negative bases with fractional exponents
         # (pow(-2, 0.5) is NaN). Rewriting to sqrt would silently turn NaN into 0
         # for signed inputs — not semantics-preserving — so leave pow(x, 0.5) as is.
-        # pow(x, -1) -> 1 / x
-        if exp == -1.0:
-            return BinOp(loc=node.loc, op="/",
-                         left=_make_num(1.0, node.loc), right=args[0])
+        # pow(x, -1) -> 1 / x is NOT applied: division goes through the zero guard
+        # (finite ~1e8 at x == 0) while pow(0, -1) is inf.
 
     # lerp(a, b, 0) -> a, lerp(a, b, 1) -> b
     if name in ("lerp", "mix") and len(args) == 3 and _is_num_lit(args[2]):
