@@ -146,6 +146,37 @@ def test_bilatx51_dispatch_boundary_96_and_97_unchanged(r: SubTestResult):
 # ── 2. Accuracy: r<=3 torch.equal; 3<r<=24 within 1e-5 of the OLD tiled exact (kept as a
 #    test-local reference, never product code); 25<=r<=40 within 1e-5 of a brute reference ─
 
+def _sum_kernel_taps_fixed_order(t):
+    """Test-local copy of FIX-501 F3's fixed, sequential row-major accumulator over a
+    tensor's trailing (kH, kW) axes -- kept ONLY so `_old_tiled_exact_reference` below
+    can still reproduce the exact pre-BILATX-51 `_bilateral_exact_bchw` behaviour
+    (`deterministic=True` for radius>3) now that A4 (v0.51 Phase C) removed this helper
+    and the `deterministic` flag from product code, since no product caller can reach
+    that regime any more. Never imported by product code."""
+    kH, kW = t.shape[-2], t.shape[-1]
+    acc = t[..., 0, 0]
+    for j in range(1, kW):
+        acc = acc + t[..., 0, j]
+    for i in range(1, kH):
+        for j in range(kW):
+            acc = acc + t[..., i, j]
+    return acc
+
+
+def _old_weighted_avg_deterministic(patches, center, w_spatial, sr):
+    """Test-local copy of `_bilateral_weighted_avg`'s pre-A4 `deterministic=True`
+    branch (fixed-order accumulation instead of `torch.sum(dim=(-2,-1))`), paired with
+    `_sum_kernel_taps_fixed_order` above -- see that helper's own docstring."""
+    diff = patches - center
+    inv_2sr = -0.5 / max(sr * sr, 1e-10)
+    cd2 = (diff * diff).sum(dim=1, keepdim=True)
+    w_range = torch.exp(cd2 * inv_2sr)
+    w = w_spatial * w_range
+    numerator = _sum_kernel_taps_fixed_order(patches * w)
+    denominator = _sum_kernel_taps_fixed_order(w)
+    return numerator / denominator.clamp(min=1e-10)
+
+
 def _old_tiled_exact_reference(bchw, ss, sr, radius):
     """A byte-for-byte copy of the pre-BILATX-51 `_bilateral_exact_bchw` row-tiling loop,
     kept here ONLY as this test's own before/after reference -- never called by product
@@ -167,8 +198,8 @@ def _old_tiled_exact_reference(bchw, ss, sr, radius):
         center_rows = bchw[:, :, y0:y1, :]
         patches = padded_rows.unfold(2, ksize, 1).unfold(3, ksize, 1)
         center = center_rows.unsqueeze(-1).unsqueeze(-1)
-        outputs.append(TEXStdlib._bilateral_weighted_avg(
-            patches, center, w_spatial, sr, deterministic=deterministic))
+        avg_fn = _old_weighted_avg_deterministic if deterministic else TEXStdlib._bilateral_weighted_avg
+        outputs.append(avg_fn(patches, center, w_spatial, sr))
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
 
 

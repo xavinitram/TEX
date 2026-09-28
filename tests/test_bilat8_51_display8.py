@@ -78,12 +78,16 @@ def test_bilat8_51_display8_fast_rows_do_not_regress(r: SubTestResult):
 
 
 def test_bilat8_51_display8_fast_rows_exact_tier_untouched(r: SubTestResult):
-    print("\n--- BILAT8-51 fast tier: the exact MATH (radius<=24) is bit-identical on the "
+    print("\n--- BILAT8-51 fast tier: the exact MATH (radius<=24) is unchanged on the "
           "shared harness's plates -- BILAT8-51 touched only the separable path, never this "
           "regime. BILATX-51 later gave 3<radius<=40 a different IMPLEMENTATION of the same "
           "math (`_bilateral_exact_taploop_bchw`, dispatched by `fn_bilateral_filter`), so this "
-          "row now checks the MATH (both functions) rather than assuming a specific one is "
-          "still wired -- see test_bilatx51_taploop.py for the dispatch-level pin ---")
+          "row checks the MATH (both functions) rather than assuming a specific one is still "
+          "wired -- see test_bilatx51_taploop.py for the dispatch-level pin. A4 (v0.51 Phase C) "
+          "then removed `_bilateral_exact_bchw`'s fixed-order accumulator for radius>3 (no "
+          "product caller could reach it any more), so the two functions now reduce the same "
+          "per-tap terms in a different ORDER -- a tight numeric tolerance replaces torch.equal "
+          "here, not a claim that the two remain bit-identical ---")
     H = W = 32
     device = torch.device("cpu")
     p = plate_day(H, W, device)
@@ -92,11 +96,15 @@ def test_bilat8_51_display8_fast_rows_exact_tier_untouched(r: SubTestResult):
     img = bchw.permute(0, 2, 3, 1)
     via_fn = TEXStdlib.fn_bilateral_filter(img.clone(), ss, sr)
     direct = TEXStdlib._bilateral_exact_bchw(bchw.clone(), ss, sr, 18).permute(0, 2, 3, 1)
-    if not torch.equal(via_fn, direct):
-        r.fail("exact tier", "fn_bilateral_filter's radius=18 output is not torch.equal to "
-               "_bilateral_exact_bchw's own math -- BILAT8-51 must not have touched this "
-               "regime's math (BILATX-51 may have changed which function implements it)")
+    md = (via_fn.float() - direct.float()).abs().max().item()
+    tol = 1e-5
+    if md > tol:
+        r.fail("exact tier", f"fn_bilateral_filter's radius=18 output diverges from "
+               f"_bilateral_exact_bchw's own math by {md:.3e} (tolerance {tol:.0e}) -- "
+               "BILAT8-51 must not have touched this regime's math (BILATX-51 may have "
+               "changed which function implements it)")
         return
-    r.ok("radius=18 (inside the exact-math tier) stays bit-identical to _bilateral_exact_bchw's "
-         "own math on the shared harness's own plate -- BILAT8-51's fix is confined to the "
+    r.ok(f"radius=18 (inside the exact-math tier) stays within {tol:.0e} of "
+         f"_bilateral_exact_bchw's own math (maxdiff {md:.3e}) on the shared harness's own "
+         "plate -- BILAT8-51's fix is confined to the "
          "separable path")

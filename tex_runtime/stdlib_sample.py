@@ -701,50 +701,49 @@ class _StdlibSample:
         return torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize), ksize
 
     @staticmethod
-    def _sum_kernel_taps_fixed_order(t):
-        """FIX-501 F3: sum a tensor's trailing (kH, kW) axes via a FIXED, sequential
-        row-major accumulation -- one elementwise add per tap -- instead of
-        `torch.sum(dim=(-2,-1))`. `torch.sum` over these axes is free to pick a
-        different CUDA reduction algorithm depending on the tensor's OVERALL shape
-        (the leading batch/spatial dims), even though every output element's own
-        kH*kW taps are unchanged -- this is exactly what made a windowed cook and the
-        matching crop of a whole-frame cook of `bilateral_filter`'s exact tier diverge
-        by a few ULPs on CUDA (an embedding host's own finding): `_bilateral_exact_bchw`'s row
-        tiling picks its tile height from the input's OWN width, so a narrower window
-        and the wider whole frame hand this reduction differently-shaped tensors for
-        the SAME output pixels. Elementwise add has no such size dependence -- every
-        tap is combined in the same order regardless of what surrounds it."""
-        kH, kW = t.shape[-2], t.shape[-1]
-        acc = t[..., 0, 0]
-        for j in range(1, kW):
-            acc = acc + t[..., 0, j]
-        for i in range(1, kH):
-            for j in range(kW):
-                acc = acc + t[..., i, j]
-        return acc
+    def _bilateral_range_weight(diff, inv_2sr, cd2_out=None, w_out=None):
+        """A3 (v0.51 Phase C, R1#2): the range-weight half of the exact bilateral
+        formula -- `exp(-0.5/sr^2 * sum(diff**2, dim=1, keepdim=True))` -- shared by
+        the tiled exact pass (`_bilateral_weighted_avg`) and the tap-loop pass
+        (`_bilateral_exact_taploop_bchw`) instead of each restating it. Mutates
+        `diff` in place (squares it) -- safe because every caller passes a `diff` it
+        owns and never reads again afterward. When `cd2_out`/`w_out` (pre-allocated
+        buffers, the same broadcast shape as this call's output) are given, the
+        squared-difference sum and the exponential are written into them in place --
+        the tap-loop's own buffer reuse (A2) -- otherwise a fresh tensor is allocated,
+        matching this formula's original (pre-A2) shape for the tiled pass."""
+        diff.mul_(diff)  # diff now holds the squared difference
+        if cd2_out is not None:
+            torch.sum(diff, dim=1, keepdim=True, out=cd2_out)
+            torch.mul(cd2_out, inv_2sr, out=w_out)
+            torch.exp(w_out, out=w_out)
+            return w_out
+        cd2 = diff.sum(dim=1, keepdim=True)
+        return torch.exp(cd2 * inv_2sr)
 
     @staticmethod
-    def _bilateral_weighted_avg(patches, center, w_spatial, sr, deterministic=False):
+    def _bilateral_weighted_avg(patches, center, w_spatial, sr):
         """The exact bilateral core (today's own weighted-average formula, shared by the
         tiled exact pass and the detail-transfer path's reduced-scale call): `patches`
         [B,C,h,w,kH,kW] already unfolded, `center` [B,C,h,w,1,1] the un-unfolded pixel.
-        `deterministic` (FIX-501 F3, default off): route the two kernel-window sums
-        through `_sum_kernel_taps_fixed_order` instead of `torch.sum(dim=(-2,-1))`, so
-        the result cannot depend on the surrounding tile's shape. Off by default so
-        `radius<=3`'s existing bit-identity pin (`test_bilat50_radius.py`) and its
-        untiled default-path perf stay untouched; `_bilateral_exact_bchw` turns it on
-        only for `radius>3`, the row-tiled regime the bug lives in."""
+
+        A4 (v0.51 Phase C, R2#1/R3#2/B2#2/B4#4): this used to take a `deterministic`
+        flag (FIX-501 F3) that routed the two kernel-window sums through a fixed,
+        sequential row-major accumulator instead of `torch.sum(dim=(-2,-1))`, so a
+        windowed cook and a whole-frame cook of `bilateral_filter`'s exact tier agreed
+        bit-for-bit on CUDA regardless of how each one's row-tiling shaped the
+        reduction. `_bilateral_exact_bchw` (the only caller that ever passed
+        `deterministic=True`) now only runs for `radius<=3`, where its row-tiling loop
+        always degenerates to a single untiled tile (A5, v0.50 Phase C) -- so there is
+        no longer any product call whose tiling can vary the shape `torch.sum` sees for
+        the same output pixels, and the flag has no caller left to protect. Dropped
+        along with the now-fully-dead `_sum_kernel_taps_fixed_order` helper it drove."""
         diff = patches - center
         inv_2sr = -0.5 / max(sr * sr, 1e-10)
-        cd2 = (diff * diff).sum(dim=1, keepdim=True)
-        w_range = torch.exp(cd2 * inv_2sr)
+        w_range = TEXStdlib._bilateral_range_weight(diff, inv_2sr)
         w = w_spatial * w_range
-        if deterministic:
-            numerator = TEXStdlib._sum_kernel_taps_fixed_order(patches * w)
-            denominator = TEXStdlib._sum_kernel_taps_fixed_order(w)
-        else:
-            numerator = (patches * w).sum(dim=(-2, -1))
-            denominator = w.sum(dim=(-2, -1))
+        numerator = (patches * w).sum(dim=(-2, -1))
+        denominator = w.sum(dim=(-2, -1))
         return numerator / denominator.clamp(min=1e-10)
 
     @staticmethod
@@ -770,16 +769,19 @@ class _StdlibSample:
         tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, B * C * W * ksize * ksize))
         if tile_h >= H:
             tile_h = H
-        # FIX-501 F3: `tile_h` above is derived from THIS call's own `W` -- a windowed
-        # crop and the whole frame it is drawn from generally have different widths, so
-        # they tile at different heights for the SAME output pixels. Past radius 3 (the
-        # only regime this row-tiling loop actually exercises with more than one
-        # possible tile shape), route the kernel-window sum through the shape-
-        # independent fixed-order accumulator instead of `torch.sum`, so the windowed
-        # and whole-frame cooks agree on CUDA regardless of how each one tiled.
-        # `radius<=3` keeps `deterministic=False` -- untouched, still bit-identical to
-        # v0.50.0 (test_bilat50_radius.py).
-        deterministic = radius > 3
+        # A4 (v0.51 Phase C, R2#1/R3#2/B2#2/B4#4): this loop used to pick a
+        # `deterministic` flag (`radius > 3`) here, routing the kernel-window sum
+        # through a fixed-order accumulator so a windowed crop and the whole frame it
+        # is drawn from (generally different widths, hence different `tile_h`) agreed
+        # bit-for-bit on CUDA (FIX-501 F3). The only caller left that can ever reach
+        # `radius > 3` in this function is a future one -- today's dispatch
+        # (`fn_bilateral_filter`) sends every `radius > 3` call to
+        # `_bilateral_exact_taploop_bchw` instead, whose own per-tap accumulation is
+        # already shape-independent by construction (see its docstring) -- so this
+        # function's row-tiling loop only ever runs with `tile_h == H` (a single tile,
+        # A5's own proof), and `torch.sum`'s reduction never sees two different shapes
+        # for the same output pixels. Flag and helper dropped; still bit-identical to
+        # v0.50.0 at `radius<=3` (`test_bilat50_radius.py`).
         outputs = []
         for y0 in range(0, H, tile_h):
             # CANCEL-44/PACE-47c idiom: a poll between tiles -- the multi-pass boundary
@@ -792,7 +794,7 @@ class _StdlibSample:
             patches = padded_rows.unfold(2, ksize, 1).unfold(3, ksize, 1)
             center = center_rows.unsqueeze(-1).unsqueeze(-1)
             outputs.append(TEXStdlib._bilateral_weighted_avg(
-                patches, center, w_spatial, sr, deterministic=deterministic))
+                patches, center, w_spatial, sr))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
 
     @staticmethod

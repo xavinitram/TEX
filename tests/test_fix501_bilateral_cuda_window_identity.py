@@ -1,18 +1,28 @@
-"""FIX-501 F3 -- `bilateral_filter`'s exact tier (radius<=24) used to differ, by a few
-ULPs, between a windowed cook and the corresponding crop of a whole-frame cook, on CUDA
-only (CPU read 0.0 in every reproduction). Root cause (an embedding host's own finding,
-confirmed by reading `_bilateral_exact_bchw`): its row-tiling divides work into tiles
-sized from the INPUT'S OWN WIDTH (`_BILATERAL_TILE_BUDGET_ELEMS // (W * ksize * ksize)`),
-so a narrower windowed crop and the wider whole frame tile at different row heights for
-the SAME output pixels -- and a CUDA reduction over the kernel window (`.sum(dim=(-2,
--1))`) is not guaranteed bit-identical across differently shaped surrounding tensors,
-even though every output pixel's own math is unchanged.
+"""FIX-501 F3 -- `bilateral_filter`'s exact tier (radius<=24, at the time) used to
+differ, by a few ULPs, between a windowed cook and the corresponding crop of a
+whole-frame cook, on CUDA only (CPU read 0.0 in every reproduction). Root cause (an
+embedding host's own finding, confirmed by reading `_bilateral_exact_bchw`): its
+row-tiling divides work into tiles sized from the INPUT'S OWN WIDTH
+(`_BILATERAL_TILE_BUDGET_ELEMS // (W * ksize * ksize)`), so a narrower windowed crop and
+the wider whole frame tile at different row heights for the SAME output pixels -- and a
+CUDA reduction over the kernel window (`.sum(dim=(-2, -1))`) is not guaranteed
+bit-identical across differently shaped surrounding tensors, even though every output
+pixel's own math is unchanged.
 
-The fix confines the reduction inside `_bilateral_exact_bchw` to a shape-independent,
-strictly sequential accumulation (one elementwise add per kernel tap, in a fixed
-row-major order) whenever `radius > 3` -- i.e. only in the row-tiled regime this bug
-lives in. `radius<=3` keeps calling the ORIGINAL `_bilateral_weighted_avg` unchanged, so
-today's bit-identity pin (`test_bilat50_radius.py`) is untouched.
+The original fix confined the reduction inside `_bilateral_exact_bchw` to a
+shape-independent, strictly sequential accumulation (one elementwise add per kernel
+tap, in a fixed row-major order) whenever `radius > 3` -- i.e. only in the row-tiled
+regime this bug lived in. `radius<=3` kept calling the ORIGINAL `_bilateral_weighted_
+avg` unchanged, so the bit-identity pin (`test_bilat50_radius.py`) stayed untouched.
+
+BILATX-51 later moved every `radius > 3` call off `_bilateral_exact_bchw` onto the new
+`_bilateral_exact_taploop_bchw` (whose per-tap accumulation is already shape-independent
+by construction -- see its own docstring), so the repro radii below (6 and 9, this
+test's own original shape) now exercise the TAP-LOOP tier, not the row-tiled path this
+file was originally written against; the fixed-order accumulator FIX-501 F3 added is no
+longer reachable from any product call at all (A4, v0.51 Phase C -- removed from
+`stdlib_sample.py`). The function/test names below reflect that, so a reader is not
+told they are exercising code that no longer runs.
 """
 from __future__ import annotations
 
@@ -63,19 +73,25 @@ def _repro_roi(r: SubTestResult, ss: float, seed: int, device: str):
                f"windowed cook diverges from whole-frame crop, maxdiff={md:.4e}")
 
 
-def test_fix501_bilateral_exact_tier_window_identity_cpu(r: SubTestResult):
-    print("\n--- FIX-501 F3: bilateral_filter exact tier, windowed vs whole-frame, CPU "
-          "(control -- always read 0.0 in every reproduction) ---")
+def test_fix501_bilateral_taploop_tier_window_identity_low_radius_cpu(r: SubTestResult):
+    print("\n--- FIX-501 F3's original repro shape (radius 6 and 9), CPU (control -- "
+          "always read 0.0 in every reproduction). BILATX-51 moved this radius range "
+          "onto the tap-loop tier (_bilateral_exact_taploop_bchw), not the row-tiled "
+          "_bilateral_exact_bchw this file was originally written against ---")
     _repro_roi(r, 2.0, seed=201, device="cpu")   # radius=6
     _repro_roi(r, 3.0, seed=202, device="cpu")   # radius=9
 
 
-def test_fix501_bilateral_exact_tier_window_identity_cuda(r: SubTestResult):
+def test_fix501_bilateral_taploop_tier_window_identity_low_radius_cuda(r: SubTestResult):
     if not _CUDA:
-        r.skip("FIX-501 F3 CUDA window identity", "no CUDA device present on this box")
+        r.skip("FIX-501 F3 CUDA window identity (low radius)", "no CUDA device present on this box")
         return
-    print("\n--- FIX-501 F3: bilateral_filter exact tier, windowed vs whole-frame, CUDA "
-          "(an embedding host's own repro shape: radius 6 and 9) ---")
+    print("\n--- An embedding host's own original repro shape (radius 6 and 9), CUDA. "
+          "BILATX-51 moved this radius range onto the tap-loop tier "
+          "(_bilateral_exact_taploop_bchw) -- its per-tap accumulation is already "
+          "shape-independent by construction, so it keeps windowed cook == whole-frame "
+          "crop without needing FIX-501 F3's own fixed-order accumulator, which A4 "
+          "(v0.51 Phase C) removed since no product caller can reach it any more ---")
     _repro_roi(r, 2.0, seed=201, device="cuda")   # radius=6
     _repro_roi(r, 3.0, seed=202, device="cuda")   # radius=9
 
@@ -96,8 +112,9 @@ def test_fix501_bilateral_taploop_tier_window_identity_cuda(r: SubTestResult):
     print("\n--- BILATX-51: the tap-loop exact tier's per-tap accumulation is already "
           "shape-independent (each add combines two full-frame-shaped tensors, never a "
           "tensor shaped by how the caller tiled) -- windowed cook == whole-frame crop on "
-          "CUDA at radius 24, 30 and 40 (the new ceiling), without needing FIX-501 F3's own "
-          "`_sum_kernel_taps_fixed_order` helper ---")
+          "CUDA at radius 24, 30 and 40 (the new ceiling). FIX-501 F3's own fixed-order "
+          "accumulator is not needed here and (A4, v0.51 Phase C) no longer exists in "
+          "product code at all ---")
     _repro_roi(r, 8.0, seed=204, device="cuda")           # radius=24
     _repro_roi(r, 10.0, seed=205, device="cuda")          # radius=30
     _repro_roi(r, 40.0 / 3.0, seed=207, device="cuda")    # radius=40, the new ceiling
