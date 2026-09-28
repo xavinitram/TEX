@@ -106,6 +106,19 @@ def _walk(node):
         stack.extend(_children(n))
 
 
+def _target_base(t):
+    """The node an assignment ultimately writes into: `c.r = ..` and `a[i] = ..` write
+    into `c` / `a`, so unwrap swizzle and index wrappers down to the base."""
+    while True:
+        c = t.__class__.__name__
+        if c == "ChannelAccess":
+            t = t.object
+        elif c == "ArrayIndexAccess":
+            t = t.array
+        else:
+            return t
+
+
 def _output_names(program) -> set:
     """Names of @-bindings written by the program (so they aren't treated as image
     *inputs* for taint)."""
@@ -139,20 +152,24 @@ def _image_tainted_vars(program, out_names) -> set:
     """Variables whose value derives from an input image, via a fixed-point forward
     scan (handles chains like `col=@A; lum=luma(col); thr=lum;`). Fixed-point (not a
     single pass) so out-of-order/looped assignments can't under-taint (which would be
-    the unsafe direction — accepting an inaccurate program)."""
+    the unsafe direction — accepting an inaccurate program). Runs until nothing grows (the
+    variable set is finite, so it terminates): `_walk` visits siblings in reverse source
+    order, so a chain can move only one hop per pass and a fixed pass cap under-taints it.
+    A swizzle / element store (`c.r = @A.r`) taints its base variable."""
     tainted: set = set()
-    for _ in range(8):  # converges in <=depth passes; 8 is a generous cap
+    grew = True
+    while grew:
         grew = False
         for n in _walk(program):
             cls = n.__class__.__name__
             if cls == "VarDecl" and n.initializer is not None:
                 if n.name not in tainted and _reads_image(n.initializer, tainted, out_names):
                     tainted.add(n.name); grew = True
-            elif cls == "Assignment" and n.target.__class__.__name__ == "Identifier":
-                if n.target.name not in tainted and _reads_image(n.value, tainted, out_names):
-                    tainted.add(n.target.name); grew = True
-        if not grew:
-            break
+            elif cls == "Assignment":
+                base = _target_base(n.target)
+                if (base.__class__.__name__ == "Identifier" and base.name not in tainted
+                        and _reads_image(n.value, tainted, out_names)):
+                    tainted.add(base.name); grew = True
     return tainted
 
 
@@ -427,12 +444,14 @@ def _amplification_hazard(program, out_names) -> bool:
                         consts.pop(t.name, None)
                     else:
                         _bind(t.name, s.value)
-                elif tcls == "ArrayIndexAccess" and t.array.__class__.__name__ == "Identifier":
-                    # a[i] = expr — carry the element's gain/mag onto the array name so an
-                    # arr_*/reduction over it inherits image lineage (doc 32: the analysis
-                    # doesn't see inside arrays otherwise). Compound array stores accumulate.
+                elif (tcls in ("ArrayIndexAccess", "ChannelAccess")
+                        and _target_base(t).__class__.__name__ == "Identifier"):
+                    # a[i] = expr / c.r = expr — carry the element's gain/mag onto the
+                    # base variable so an arr_*/reduction/later read inherits image lineage
+                    # (doc 32: the analysis doesn't see inside arrays otherwise). Compound
+                    # stores accumulate.
                     g, m = _gm(s.value, vg, vm, out_names, hz, consts)
-                    an = t.array.name
+                    an = _target_base(t).name
                     if s.op:
                         g += vg.get(an, 0.0)
                         m += vm.get(an, 1.0)
@@ -459,6 +478,15 @@ def _amplification_hazard(program, out_names) -> bool:
                 merged = {k: v for k, v in tc.items() if consts.get(k) == v}  # const iff both agree
                 consts.clear(); consts.update(merged)
             elif cls in ("ForLoop", "WhileLoop"):
+                # The body is analysed once, but a name it assigns is carried into the next
+                # iteration: it is no longer a folded constant and its magnitude is unbounded
+                # (`s = s*2.0` reaches 1024, a counter reaches N-1).
+                for n in _walk(s):
+                    if n.__class__.__name__ == "Assignment":
+                        b = _target_base(n.target)
+                        if b.__class__.__name__ == "Identifier":
+                            consts.pop(b.name, None)
+                            vm[b.name] = float("inf")
                 if process(s.body):
                     return True
             if hz[0]:
@@ -493,8 +521,8 @@ def _for_accumulates_image(loop, tainted) -> bool:
     for stmt in loop.body:
         for m in _walk(stmt):
             if (m.__class__.__name__ == "Assignment"
-                    and m.target.__class__.__name__ == "Identifier"
-                    and m.target.name in tainted):
+                    and _target_base(m.target).__class__.__name__ == "Identifier"
+                    and _target_base(m.target).name in tainted):
                 return True
     return False
 

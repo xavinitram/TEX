@@ -167,3 +167,48 @@ def test_hash_int_with_max_is_a_modulo():
     assert 0 <= S.fn_hash_int("abc", 100).item() < 100
 
 
+# -- fp16 gate --------------------------------------------------------------------------
+
+def _resolve(code):
+    return resolve_auto_precision(parse_and_split(code, {}), 2048 * 2048, "cuda")[0]
+
+
+def test_gate_long_taint_chain_is_followed_to_the_end():
+    lines = ["float v0 = @A.r;"] + [f"float v{i} = v{i-1} * 1.0;" for i in range(1, 13)]
+    code = "\n".join(lines) + "\nfloat o = v12 > 0.5;\n@OUT = vec4(o, o, o, 1.0);"
+    assert _resolve(code) == "fp32"
+
+
+def test_gate_swizzle_store_of_image_taints_the_local():
+    code = ("vec3 c = vec3(0.0);\nc.r = @A.r;\nfloat o = c.r > 0.5;\n"
+            "@OUT = vec4(o, o, o, 1.0);")
+    assert _resolve(code) == "fp32"
+
+
+def test_gate_swizzle_store_carries_gain():
+    code = "vec3 c = vec3(0.0);\nc.r = @A.r * 3.0;\n@OUT = vec4(sin(c * 3.0), 1.0);"
+    assert _resolve(code) == "fp32"
+
+
+def test_gate_swizzle_accumulation_in_a_loop_is_declined():
+    code = ("vec3 acc = vec3(0.0);\nfor (int i = 0; i < 4; i++) { acc.r += @A.r; }\n"
+            "@OUT = vec4(acc, 1.0);")
+    assert _resolve(code) == "fp32"
+
+
+def test_gate_loop_carried_constant_is_not_folded():
+    code = ("float s = 1.0;\nfor (int i = 0; i < 10; i++) { s = s * 2.0; }\n"
+            "@OUT = vec4(sin(@A.rgb * s), 1.0);")
+    assert _resolve(code) == "fp32"
+
+
+def test_gate_loop_counter_magnitude_is_unbounded():
+    code = ("vec3 c = vec3(0.0);\nfor (int i = 0; i < 40; i++) { c = sin(@A.rgb * i); }\n"
+            "@OUT = vec4(c, 1.0);")
+    assert _resolve(code) == "fp32"
+
+
+def test_gate_still_accepts_a_smooth_pointwise_program():
+    assert _resolve("@OUT = vec4(@A.rgb * 1.1, 1.0);") == "fp16"
+
+
