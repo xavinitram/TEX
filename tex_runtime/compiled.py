@@ -110,6 +110,17 @@ def _setup_msvc_env():
             _msvc_env_initialized = True
 
 
+def _parse_env_dump(text: str) -> dict[str, str]:
+    """Parse `set` output into {NAME: value}. Names are upper-cased: Windows prints `Path`,
+    and the PATH/INCLUDE/LIB lookups must not depend on that spelling."""
+    env: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k.upper()] = v
+    return env
+
+
 def _do_setup_msvc_env() -> None:
     """The actual search/subprocess/env-injection body, run under `_msvc_env_lock` by
     `_setup_msvc_env` with the initialised flag set only after this returns (C6)."""
@@ -152,11 +163,7 @@ def _do_setup_msvc_env() -> None:
             return
 
         # Parse and inject relevant environment variables
-        new_env: dict[str, str] = {}
-        for line in result.stdout.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                new_env[k] = v
+        new_env = _parse_env_dump(result.stdout)
 
         # Merge INCLUDE, LIB, LIBPATH, and extend PATH
         for var in ("INCLUDE", "LIB", "LIBPATH"):
