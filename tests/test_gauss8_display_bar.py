@@ -22,10 +22,11 @@ THE FIX (`_gauss_blur_bchw_edge_pad`, `tex_runtime/stdlib_core.py`): downsample 
 border strip ONLY along the axis parallel to it (never mixing in the perpendicular,
 into-the-image direction the 2-D `area` reduction does), and pad the residual blur with
 THAT instead of the reduced image's own edge. `GAUSS_BLUR_PYRAMID_QUALITY_CAP` was also
-raised 8.0 -> 64.0 (author-approved) — at cap=8.0 the reduced level shrinks fast enough
+raised 8.0 -> 96.0 (author-approved) — at cap=8.0 the reduced level shrinks fast enough
 that even a correctly-seeded pad still lets a several-pixel-wide reduced image's border
 dominate at high sigma; cap=32.0 still missed on a bright plate (night x16, sigma=260),
-which `test_gauss8_bright_plate_holds_the_bar` pins; cap=64.0 holds the bar across the
+which `test_gauss8_bright_plate_holds_the_bar` pins; cap=64.0 still missed on a thin strip
+(`test_gauss8_thin_strip_holds_the_bar`); cap=96.0 holds the bar across the
 sigmas and exposures this file (and `docs/resolution-scale.md`'s table) cover.
 
 The v0.51 pyramid review evaluated replacing this caller-supplied-edge-pad
@@ -168,6 +169,21 @@ def test_gauss8_border_interpolates_not_clamps(r: SubTestResult):
                f"worst-channel code diff {stats['max']} exceeds the 1-code bar (stats={stats})")
         return
     r.ok(f"1084 night x16 sigma=260: max code diff {stats['max']} <= 1")
+
+
+def test_gauss8_thin_strip_holds_the_bar(r: SubTestResult):
+    print("\n--- GAUSS8-51: a thin strip (100 rows) keeps a light's blurred peak concentrated; "
+          "a cap of 64 read 2 codes here ---")
+    p = _d8.plate_night(100, 1097, torch.device("cpu"), seed=2) * 16.0
+    for sigma in (260.0, 300.0):
+        exact = _gauss_blur_bchw(p, sigma)
+        approx = _gauss_blur_pyramid_approx(p, sigma)
+        diff = (_d8.aces_srgb8(approx).double() - _d8.aces_srgb8(exact).double()).abs().amax(dim=-1)
+        maxcode = int(diff.max())
+        if maxcode > 1:
+            r.fail(f"gauss8 thin strip sigma={sigma}", f"worst-channel code diff {maxcode} exceeds the 1-code bar")
+            continue
+        r.ok(f"100x1097 night x16 sigma={int(sigma)}: max code diff {maxcode} <= 1")
 
 
 def test_gauss8_below_threshold_still_bitexact(r: SubTestResult):

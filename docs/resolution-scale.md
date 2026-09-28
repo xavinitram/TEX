@@ -469,7 +469,7 @@ horizontally-blurred image) — skipping this made the day plate's corners visib
 after the boundary-dominated night-plate case was fixed. Cost is O(H)+O(W) extra, not O(sigma)
 or O(image area), so the flat-cost promise holds.
 
-**`GAUSS_BLUR_PYRAMID_QUALITY_CAP` raised 8.0 -> 64.0 (author-approved).** At cap=8.0 the
+**`GAUSS_BLUR_PYRAMID_QUALITY_CAP` raised 8.0 -> 96.0 (author-approved; 64 in the tables below, 96 after the thin-strip finding at the end of this section).** At cap=8.0 the
 reduced level shrinks fast enough, relative to the residual blur's own kernel radius
 (`3 * min(sigma, cap)`), that even a correctly-seeded pad still lets the border dominate a
 reduced image only a few pixels wide once sigma runs into the thousands. cap=32.0 held the bar
@@ -525,6 +525,19 @@ raising the cap alone does not (cap=32 without the fix still left a +3 code bias
 plate at sigma=1024), and cap=64 closes the bright-plate residual. The fast-row regression
 tests (the mechanism proof, the scaled-down bar check, the bright-plate row) live in
 `tests/test_gauss8_display_bar.py`.
+
+**Thin strips: cap 64 -> 96.** A pre-release check found one shape family the square sweep
+missed: a 100x1097 night plate x16 generated at that size (not cropped from a larger plate) read
+2 codes in thin column bands next to lights at sigma 260 and 300 (up to 94 pixels, about 0.09%),
+with cap=64. A frame only 100 rows tall keeps a light's blurred peak concentrated, and at
+factor 8 the coarse grid no longer represents it to within one code. A bicubic upsample did not
+help (the miss is in the reduction, not the interpolation); cap=128 closed it at 4-6x the cost
+across sigma 256-1024; cap=96 closes it by halving the factor only for sigma up to 384. With
+cap=96: the thin strips (two seeds, x1 and x16, both orientations) and the odd-size sweep
+extended to sigma 400 (420 cells, sigma 260-8192) all read max 1 code. Cost for sigma 256-384
+rises to about 85-95ms at 4K on the CPU (Threadripper 3970X; 22ms at cap=64) and about 6ms on
+CUDA (1.7ms); sigma >= 385 is unchanged. The tables above were measured at cap=64 and are not
+re-run; at sigma 512 and above the factor, and so the result, is identical at either cap.
 
 **A v0.51 review evaluated replacing the three-layer boundary fix above with one
 pad-before-reduce mechanism — NOT ADOPTED.** The proposal: replicate-pad the full-resolution image

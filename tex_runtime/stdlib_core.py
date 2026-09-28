@@ -961,7 +961,7 @@ GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA = 256.0
 # The pyramid path's own accuracy/speed knob (not source-visible — an internal detail
 # of the approximation, never a `gauss_blur(...)` argument).
 #
-# GAUSS8-51: raised 8.0 -> 64.0 (author-approved) as part of closing the display-8 bar
+# GAUSS8-51: raised 8.0 -> 96.0 (author-approved) as part of closing the display-8 bar
 # (an approximate path must not change any 8-bit code after ACES RRT + sRGB ODT — see
 # docs/resolution-scale.md's "gauss_blur past the exact threshold" section). At cap=8.0
 # the reduced level shrinks fast enough, relative to the residual blur's own kernel
@@ -971,12 +971,17 @@ GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA = 256.0
 # not on a bright one: a night plate of small practical lights pushed x16 (sigma=260,
 # factor 16) still read 2-3 codes, the residual being the bilinear upsample of a field
 # curved by point-like highlights. cap=64.0 halves the factor there and holds the bar
-# at x1/x4/x16 on both plates, sigma 260-2048, at the same flat cost (4k, CUDA
-# ~1.4-1.7ms, CPU ~10ms at either cap) — see docs/resolution-scale.md. The one real blur
+# at x1/x4/x16 on both plates, sigma 260-2048. cap=64.0 still read 2 codes on a thin
+# strip (a 100x1097 night plate x16, sigma 260-300, factor 8), where a light's blurred
+# peak stays concentrated; cap=96.0 halves the factor again for sigma up to 384 only
+# (factor 4) and holds the bar there. That band costs more (4k CPU ~85-95ms vs ~22ms at
+# cap=64 on a Threadripper 3970X; CUDA ~6ms vs ~1.7ms); sigma >= 385 is unchanged, and
+# every sigma past the threshold stays far below the exact blur's own cost at sigma 256
+# — see docs/resolution-scale.md. The one real blur
 # still runs at a bounded `sigma / factor <= quality_cap`, so cost stays flat regardless
 # of sigma; the extra edge-strip work the fix adds is O(H)+O(W), not O(sigma) —
 # measured flat at 4k, see docs/resolution-scale.md.
-GAUSS_BLUR_PYRAMID_QUALITY_CAP = 64.0
+GAUSS_BLUR_PYRAMID_QUALITY_CAP = 96.0
 
 
 def _replicate_pad_conv(x: torch.Tensor, low_val: torch.Tensor, high_val: torch.Tensor,
