@@ -731,7 +731,7 @@
         {
           "name": "bilateral_filter",
           "sig": "bilateral_filter(img, spatial_sigma, range_sigma) → vec",
-          "desc": "Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.",
+          "desc": "Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost approximation runs past it.",
           "example": "@OUT = bilateral_filter(@A, 1.5, 0.2);",
           "tags": [
             "spatial",

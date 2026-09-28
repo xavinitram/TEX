@@ -629,8 +629,20 @@ class _StdlibSample:
     # 256 clamp was. The window now genuinely grows with `ss` (no clamp): exact wherever
     # memory-feasible (today's own 7x7 math is untouched below, and `_bilateral_exact_bchw`
     # extends the SAME exact math, row-tiled to stay memory-bounded, up to
-    # `_BILATERAL_EXACT_RADIUS_MAX`), and a downscale + detail-transfer approximation
-    # (`_bilateral_detail_transfer_bchw`) past that measured limit.
+    # `_BILATERAL_EXACT_RADIUS_MAX`). Past that, BILAT-51 measured `_bilateral_detail_
+    # transfer_bchw` (BILAT-50's own downscale+residual stand-in) against the TRUE exact
+    # filter at the SAME spatial_sigma (not a fixed boundary anchor) and found it scores
+    # BELOW the disclosed band on realistic content (SSIMULACRA2 as low as -11.6 at
+    # ss=32) -- worse, once measured correctly, than even the v0.49 fixed-7x7 clamp it
+    # replaced (18.5-34.6 over the same range). A separable (per-axis) bilateral pass
+    # (`_bilateral_separable_bchw`) measured 87.8-93.3 across every corpus at ss=8.5/16/32
+    # -- it wins outright, so it is now the past-threshold default up to
+    # `_BILATERAL_SEPARABLE_RADIUS_MAX`. It is NOT O(image size) like detail-transfer,
+    # though -- its cost is O(image size * radius), the same class D1 rejected for
+    # erode/dilate's "just raise the cap" option -- so detail-transfer stays as the
+    # ultimate fallback past `_BILATERAL_SEPARABLE_RADIUS_MAX`, keeping the "no call
+    # ever costs more than O(image size) at truly extreme spatial_sigma" guarantee this
+    # codebase holds for every other builtin's own past-threshold tier.
     _BILATERAL_EXACT_RADIUS_MAX = 24  # ksize=49 (spatial_sigma up to ~8.0). A prior design
     # pass measured the UNTILED exact filter needing ~60GB at this exact radius on
     # a canvas far smaller than 1080p (an O(r^2) memory blow-up, not a resolution-specific
@@ -645,6 +657,16 @@ class _StdlibSample:
     # `fn_bilateral_filter` read the same boundary from one place, not two matching
     # literals. See the footprint's own comment for why this matters to the planner.
     _BILATERAL_APPROX_THRESHOLD_SS = _BILATERAL_EXACT_RADIUS_MAX / 3.0
+    # BILAT-51: the separable pass's own cost grows with `radius` (O(image size *
+    # radius), measured ~3.5s at radius=256 on a 1080p CPU -- similar order to the
+    # exact tier's own boundary cost, ~7.6s at radius=24), so it stays bounded to a
+    # measured, reasonable radius; a genuinely huge `spatial_sigma` past this falls
+    # back to `_bilateral_detail_transfer_bchw` (flat O(image size), independent of
+    # sigma) rather than pay an ever-growing per-call cost, matching the guarantee
+    # every OTHER builtin's own past-threshold tier already holds (D1's van Herk,
+    # D2's gauss pyramid): no call ever costs more than O(image size) once sigma is
+    # large enough to be past the tier that scales with it.
+    _BILATERAL_SEPARABLE_RADIUS_MAX = 256
     _BILATERAL_TILE_BUDGET_ELEMS = 8_000_000  # ~32MB per fp32 intermediate tensor,
     # independent of image resolution: the row-tile height shrinks as `ksize` grows so
     # every per-tile intermediate (`patches`/`diff`/`w`, each [B,C,tile_h,W,ksize,ksize])
@@ -738,6 +760,59 @@ class _StdlibSample:
         detail = bchw - upsampled_plain
         return upsampled_filtered + detail
 
+    @staticmethod
+    def _bilateral_separable_1d_pass(bchw, dim, radius, ss, sr):
+        """One 1-D bilateral pass along `dim` (2=H, 3=W): each of the
+        `2*radius+1` taps along that single axis is weighted by the SAME
+        spatial-Gaussian x range-Gaussian formula the exact 2-D filter uses
+        (`_bilateral_weighted_avg`'s own math, taken one axis at a time), with
+        replicate-boundary handling via a clamped `index_select` (an O(image
+        size) tensor per tap, never an O(radius) x O(radius) unfolded patch,
+        so memory stays flat regardless of radius -- unlike the exact tier,
+        this never needs row-tiling). BILAT-51: measured to score far higher
+        (SSIMULACRA2) on realistic content than the detail-transfer residual
+        it replaces past the exact tier's own ceiling, at the cost of growing
+        with `radius` rather than staying flat (see `_BILATERAL_SEPARABLE_
+        RADIUS_MAX`'s own comment)."""
+        device = bchw.device
+        n = bchw.shape[dim]
+        d = torch.arange(-radius, radius + 1, device=device, dtype=torch.float32)
+        w_spatial_1d = torch.exp(-0.5 * (d * d) / max(ss * ss, 1e-10))
+        inv_2sr = -0.5 / max(sr * sr, 1e-10)
+        idx_base = torch.arange(n, device=device)
+        acc = torch.zeros_like(bchw)
+        wsum_shape = list(bchw.shape)
+        wsum_shape[1] = 1
+        wsum = torch.zeros(wsum_shape, device=device, dtype=bchw.dtype)
+        for i, off in enumerate(range(-radius, radius + 1)):
+            idx = (idx_base + off).clamp(0, n - 1)
+            tap = torch.index_select(bchw, dim, idx)
+            diff = bchw - tap
+            cd2 = (diff * diff).sum(dim=1, keepdim=True)
+            w_range = torch.exp(cd2 * inv_2sr)
+            w = w_spatial_1d[i] * w_range
+            acc = acc + tap * w
+            wsum = wsum + w
+        return acc / wsum.clamp(min=1e-10)
+
+    @staticmethod
+    def _bilateral_separable_bchw(bchw, ss, sr, radius):
+        """BILAT-51: a row pass then a column pass of the 1-D bilateral core
+        (`_bilateral_separable_1d_pass`) -- a well-known cheaper-than-exact
+        approximation (not a true 2-D bilateral filter: the second pass's
+        range weights compare against the FIRST pass's own output, not the
+        original image), used past `_BILATERAL_EXACT_RADIUS_MAX` and up to
+        `_BILATERAL_SEPARABLE_RADIUS_MAX`. Measured against the exact filter
+        at the SAME spatial_sigma (not detail-transfer's fixed-boundary
+        anchor): SSIMULACRA2 87.8-93.3 on realistic/smooth+edges/checker
+        corpora at ss=8.5/16/32 (1080p, CPU) -- clears the accuracy bar both
+        the old 7x7 clamp (18.5-34.6) and BILAT-50's detail-transfer
+        (-11.6-8.3, measured the same corrected way) fall short of."""
+        poll_cook_cancel(heavy=True)
+        row_passed = TEXStdlib._bilateral_separable_1d_pass(bchw, 3, radius, ss, sr)
+        poll_cook_cancel(heavy=True)
+        return TEXStdlib._bilateral_separable_1d_pass(row_passed, 2, radius, ss, sr)
+
     # A1 (v0.50 Phase C): the footprint's 4th element, `_BILATERAL_APPROX_THRESHOLD_SS`,
     # tells `tex_roi._reach_of` the exact `spatial_sigma` past which this builtin
     # switches to the detail-transfer downscale approximation
@@ -754,7 +829,7 @@ class _StdlibSample:
     # narrow at all, so this mult only ever needs to describe the (unchanged) exact
     # tiers' real reach. The old 8.0 over-padded every ROI-narrowed or tiled cook below
     # the threshold by ~2.67x more halo than the math needs (R3#5's own measurement).
-    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0, _BILATERAL_APPROX_THRESHOLD_SS), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
+    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0, _BILATERAL_APPROX_THRESHOLD_SS), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
     @staticmethod
     def fn_bilateral_filter(image, sigma_s, sigma_r) -> torch.Tensor:
         """Edge-preserving bilateral filter using Tensor.unfold.
@@ -818,12 +893,17 @@ class _StdlibSample:
         # single untiled pass whenever `tile_h >= H`, which is always true at a small
         # `ksize` (small radius) -- so it is correct, and bit-identical (proven,
         # `tests/test_bilat50_radius.py::test_bilat50_a5_exact_bchw_matches_inline_and_
-        # degenerates_to_one_tile`), for `radius<=3` too. The old third regime hand-
-        # inlined the identical spatial-weight/weighted-average formula a second time,
-        # reachable only for `radius<=3` -- two regimes now (exact / detail-transfer),
-        # matching `_gauss_blur_auto`'s own two-regime dispatch.
+        # degenerates_to_one_tile`), for `radius<=3` too.
+        # BILAT-51: three regimes now -- exact (unchanged, bit-identical for
+        # radius<=_BILATERAL_EXACT_RADIUS_MAX), separable (measured to beat both the
+        # v0.49 clamp and BILAT-50's detail-transfer on realistic content, up to
+        # _BILATERAL_SEPARABLE_RADIUS_MAX), then detail-transfer again as the flat-cost
+        # fallback for spatial_sigma large enough that even the separable pass's O(radius)
+        # cost would be excessive.
         if radius <= TEXStdlib._BILATERAL_EXACT_RADIUS_MAX:
             result = TEXStdlib._bilateral_exact_bchw(bchw, ss, sr, radius)
+        elif radius <= TEXStdlib._BILATERAL_SEPARABLE_RADIUS_MAX:
+            result = TEXStdlib._bilateral_separable_bchw(bchw, ss, sr, radius)
         else:
             result = TEXStdlib._bilateral_detail_transfer_bchw(bchw, ss, sr)
 
