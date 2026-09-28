@@ -175,6 +175,7 @@ def test_precompile_flag_lock_serializes_two_off_scoped_callers():
     assert dynamo_config.caching_precompile is True
 
 
+@pytest.mark.timing
 def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock():
     """FIX-COMPILE51 C1 (B3#1): RED at `365fdb4` -- `_precompile_flag_lock` was taken only
     by the `disable=True` (OFF-scoped) branch (`_precompile_off_ctx`); the `disable=False`
