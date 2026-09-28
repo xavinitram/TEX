@@ -49,6 +49,9 @@ from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
                      _stage_codegen_param,  # TRK-236: seeded as `_THS`, `build()` below
                      _scale_pixel_arg,   # SCALE-CG-48: seeded as `_SCM`, `build()` below
+                     _is_vec_param_list as is_vec_param_list,  # v0.51:
+                     # one definition (`stdlib_core.py`, a leaf `codegen_persist.py` also
+                     # imports without a cycle), re-exported here under the pre-existing name
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx,  # P0-D: cook grid
                      poll_cook_cancel as _stdlib_poll_cancel)  # CANCEL-44: Gap 2 in-body poll
@@ -242,19 +245,6 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
         return None
 
 
-def is_vec_param_list(value: Any) -> bool:
-    """True for a vec/color `$param` value — a list/tuple of 2-4 plain numbers.
-
-    Deliberately narrow: a ComfyUI batch list holds TENSORS (graphed `_list_to_static`
-    unwraps element 0) and an array param holds 5+ entries, and neither is the vecN
-    channel-last class. `bool` is excluded because it is an `int` subclass.
-    """
-    if not isinstance(value, (list, tuple)) or len(value) not in (2, 3, 4):
-        return False
-    for c in value:
-        if isinstance(c, bool) or not isinstance(c, (int, float)):
-            return False
-    return True
 
 
 _host_scalar_readers_memo: frozenset | None = None
