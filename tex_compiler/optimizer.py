@@ -842,6 +842,30 @@ def _expr_info(expr: ASTNode, memo: dict[int, tuple],
     return info
 
 
+# The expression fields each CSE walker (collect / find-first / replace) descends into, in one
+# place so no walker can skip a child the others visit.
+_CSE_CHILD_ATTRS = {
+    BinOp: ("left", "right"),
+    UnaryOp: ("operand",),
+    FunctionCall: ("args",),
+    VecConstructor: ("args",),
+    ChannelAccess: ("object",),
+    CastExpr: ("expr",),
+    TernaryOp: ("condition", "true_expr", "false_expr"),
+    BindingIndexAccess: ("args",),
+    BindingSampleAccess: ("args",),
+}
+
+
+def _cse_children(expr: ASTNode):
+    for attr in _CSE_CHILD_ATTRS.get(expr.__class__, ()):
+        v = getattr(expr, attr)
+        if isinstance(v, list):
+            yield from v
+        else:
+            yield v
+
+
 def _collect_subexprs(expr: ASTNode, seen: dict[int, int],
                       memo: dict[int, tuple], intern: dict[tuple, int],
                       depth_threshold: int = _CSE_MIN_DEPTH):
@@ -857,29 +881,8 @@ def _collect_subexprs(expr: ASTNode, seen: dict[int, int],
         else:
             seen[h] += 1
 
-    # Recurse into children
-    if isinstance(expr, BinOp):
-        _collect_subexprs(expr.left, seen, memo, intern, depth_threshold)
-        _collect_subexprs(expr.right, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, UnaryOp):
-        _collect_subexprs(expr.operand, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, FunctionCall):
-        for a in expr.args:
-            _collect_subexprs(a, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, VecConstructor):
-        for a in expr.args:
-            _collect_subexprs(a, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, ChannelAccess):
-        _collect_subexprs(expr.object, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, CastExpr):
-        _collect_subexprs(expr.expr, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, TernaryOp):
-        _collect_subexprs(expr.condition, seen, memo, intern, depth_threshold)
-        _collect_subexprs(expr.true_expr, seen, memo, intern, depth_threshold)
-        _collect_subexprs(expr.false_expr, seen, memo, intern, depth_threshold)
-    elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        for a in expr.args:
-            _collect_subexprs(a, seen, memo, intern, depth_threshold)
+    for child in _cse_children(expr):
+        _collect_subexprs(child, seen, memo, intern, depth_threshold)
 
 
 def _collect_subexprs_in_stmt(stmt: ASTNode, seen: dict[int, int],
@@ -913,25 +916,13 @@ def _replace_expr(expr: ASTNode, replacements: dict[int, str],
             _register_type(type_map, ident, hash_to_type[h])
         return ident
 
-    if isinstance(expr, BinOp):
-        expr.left = _replace_expr(expr.left, replacements, memo, intern, type_map, hash_to_type)
-        expr.right = _replace_expr(expr.right, replacements, memo, intern, type_map, hash_to_type)
-    elif isinstance(expr, UnaryOp):
-        expr.operand = _replace_expr(expr.operand, replacements, memo, intern, type_map, hash_to_type)
-    elif isinstance(expr, FunctionCall):
-        expr.args = [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type) for a in expr.args]
-    elif isinstance(expr, VecConstructor):
-        expr.args = [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type) for a in expr.args]
-    elif isinstance(expr, ChannelAccess):
-        expr.object = _replace_expr(expr.object, replacements, memo, intern, type_map, hash_to_type)
-    elif isinstance(expr, CastExpr):
-        expr.expr = _replace_expr(expr.expr, replacements, memo, intern, type_map, hash_to_type)
-    elif isinstance(expr, TernaryOp):
-        expr.condition = _replace_expr(expr.condition, replacements, memo, intern, type_map, hash_to_type)
-        expr.true_expr = _replace_expr(expr.true_expr, replacements, memo, intern, type_map, hash_to_type)
-        expr.false_expr = _replace_expr(expr.false_expr, replacements, memo, intern, type_map, hash_to_type)
-    elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        expr.args = [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type) for a in expr.args]
+    for attr in _CSE_CHILD_ATTRS.get(expr.__class__, ()):
+        v = getattr(expr, attr)
+        if isinstance(v, list):
+            setattr(expr, attr, [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type)
+                                 for a in v])
+        else:
+            setattr(expr, attr, _replace_expr(v, replacements, memo, intern, type_map, hash_to_type))
     return expr
 
 
@@ -950,7 +941,8 @@ def _replace_in_stmt(stmt: ASTNode, replacements: dict[int, str],
 
 
 def _eliminate_common_subexpressions(stmts: list[ASTNode],
-                                     type_map: dict | None = None) -> list[ASTNode]:
+                                     type_map: dict | None = None,
+                                     counter: list[int] | None = None) -> list[ASTNode]:
     """CSE within a basic block (list of sequential statements).
 
     Scans for sub-expressions that appear 2+ times, hoists the first
@@ -962,17 +954,21 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
     Conservative: does not CSE across control flow boundaries where
     variable reassignment could invalidate the cached value.
     """
+    # Temp names come from one counter shared by every nested block: the runtime env is flat,
+    # so an inner block's temp must not reuse an outer block's name.
+    if counter is None:
+        counter = [0]
     # First recurse into compound statement bodies
     for stmt in stmts:
         if isinstance(stmt, IfElse):
-            stmt.then_body = _eliminate_common_subexpressions(stmt.then_body, type_map)
-            stmt.else_body = _eliminate_common_subexpressions(stmt.else_body, type_map)
+            stmt.then_body = _eliminate_common_subexpressions(stmt.then_body, type_map, counter)
+            stmt.else_body = _eliminate_common_subexpressions(stmt.else_body, type_map, counter)
         elif isinstance(stmt, ForLoop):
-            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
+            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map, counter)
         elif isinstance(stmt, WhileLoop):
-            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
+            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map, counter)
         elif isinstance(stmt, FunctionDef):
-            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
+            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map, counter)
 
     # Per-invocation scratch tables for _expr_info: valid across the whole
     # collect -> find -> replace sequence because each phase visits parents
@@ -1013,25 +1009,8 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
             # Don't recurse into children of a found duplicate —
             # we want the outermost match
             return
-        if isinstance(expr, BinOp):
-            _find_first(expr.left, stmt_idx)
-            _find_first(expr.right, stmt_idx)
-        elif isinstance(expr, UnaryOp):
-            _find_first(expr.operand, stmt_idx)
-        elif isinstance(expr, FunctionCall):
-            for a in expr.args:
-                _find_first(a, stmt_idx)
-        elif isinstance(expr, VecConstructor):
-            for a in expr.args:
-                _find_first(a, stmt_idx)
-        elif isinstance(expr, ChannelAccess):
-            _find_first(expr.object, stmt_idx)
-        elif isinstance(expr, CastExpr):
-            _find_first(expr.expr, stmt_idx)
-        elif isinstance(expr, TernaryOp):
-            _find_first(expr.condition, stmt_idx)
-            _find_first(expr.true_expr, stmt_idx)
-            _find_first(expr.false_expr, stmt_idx)
+        for child in _cse_children(expr):
+            _find_first(child, stmt_idx)
 
     for idx, stmt in enumerate(stmts):
         if isinstance(stmt, VarDecl) and stmt.initializer:
@@ -1049,7 +1028,7 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
     hash_to_type: dict[int, TEXType] = {}  # hash -> hoisted expr's type (if known)
     # Group CSE decls by the statement index they should be inserted before
     insert_before: dict[int, list[VarDecl]] = {}  # stmt_index -> [VarDecl, ...]
-    for i, (h, (expr_node, stmt_idx)) in enumerate(first_occurrence.items()):
+    for h, (expr_node, stmt_idx) in first_occurrence.items():
         # The hoisted node is usually an original AST node, so its type is in
         # type_map. Carry it onto the temp (declared type + register the
         # synthesized refs) so the post-optimization AST stays type-consistent —
@@ -1064,7 +1043,8 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
         # caller has opted out of type tracking; preserve the old float default.)
         if type_map is not None and t is None:
             continue
-        temp_name = f"_cse{i}"
+        temp_name = f"_cse{counter[0]}"
+        counter[0] += 1
         replacements[h] = temp_name
         decl = VarDecl(
             loc=expr_node.loc,
@@ -1164,8 +1144,8 @@ def _collect_written_vars(stmts: list[ASTNode]) -> set[str]:
 class _ReassignedVarsVisitor(NodeVisitor):
     """STR-4: names REASSIGNED (an Assignment target) — NOT merely declared once. The
     deliberate asymmetry vs the written-collector: a ForLoop/WhileLoop recurses into
-    its *body only* (a loop-var's init/update reassignment is not a block-level
-    reassignment for the CSE guard), and declarations (VarDecl/ArrayDecl) are ignored."""
+    its body plus any header write to a variable declared OUTSIDE the loop (a
+    loop-scoped counter's own init/update is not a block-level reassignment), and declarations (VarDecl/ArrayDecl) are ignored."""
 
     def __init__(self):
         self.out: set[str] = set()
@@ -1182,7 +1162,16 @@ class _ReassignedVarsVisitor(NodeVisitor):
             self.visit(s)
 
     def visit_ForLoop(self, node):
-        for s in node.body:  # body ONLY — do not visit init/update/condition
+        # A header that ASSIGNS (`for (k = 0; ...; k += 1)`) writes a variable that outlives
+        # the loop. A header that DECLARES its counter scopes it to the loop, so writes to
+        # that name are not block-level reassignments.
+        scoped = node.init.name if isinstance(node.init, VarDecl) else None
+        if isinstance(node.init, Assignment):
+            self.visit(node.init)
+        upd = node.update
+        if isinstance(upd, Assignment) and _write_target_name(upd.target) != scoped:
+            self.visit(upd)
+        for s in node.body:
             self.visit(s)
 
     def visit_WhileLoop(self, node):
