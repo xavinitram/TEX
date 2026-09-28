@@ -55,3 +55,39 @@ def test_mask_blur_program_matches_across_tiers():
             assert (cg["OUT"].float() - o.float()).abs().max() < 1e-5, call
 
 
+# -- sample_mip identity-UV detection ---------------------------------------------------
+
+def _uv(H=8, W=8, B=1):
+    u = (torch.arange(W).float() / (W - 1)).view(1, 1, W).expand(B, H, W).contiguous()
+    v = (torch.arange(H).float() / (H - 1)).view(1, H, 1).expand(B, H, W).contiguous()
+    return u, v
+
+
+def test_sample_mip_honours_a_warp_that_fixes_the_corners():
+    img = _img(H=16, W=16)
+    u, v = _uv(16, 16)
+    warp = u + 0.08 * torch.sin(v * math.pi)
+    assert (S.fn_sample_mip(img, warp, v, 1.0) - S.fn_sample_mip(img, u, v, 1.0)).abs().max() > 1e-3
+    assert (S.fn_sample_mip_gauss(img, warp, v, 1.0)
+            - S.fn_sample_mip_gauss(img, u, v, 1.0)).abs().max() > 1e-3
+
+
+def test_sample_mip_identity_uv_still_takes_the_plain_level():
+    img = _img(H=16, W=16)
+    u, v = _uv(16, 16)
+    out = S.fn_sample_mip(img, u, v, 1.0)
+    assert out.shape == img.shape
+
+
+def test_sample_mip_mixed_rank_uv_broadcasts():
+    img = _img(H=8, W=8)
+    u, v = _uv(8, 8)
+    a = S.fn_sample_mip(img, u, torch.tensor(0.5), 0.0)
+    b = S.fn_sample_mip(img, u, torch.full_like(v, 0.5), 0.0)
+    assert a.shape == b.shape
+    assert (a - b).abs().max() < 1e-6
+    c = S.fn_sample_mip(img, torch.tensor(0.25), v, 0.0)
+    d = S.fn_sample_mip(img, torch.full_like(u, 0.25), v, 0.0)
+    assert (c - d).abs().max() < 1e-6
+
+

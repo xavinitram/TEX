@@ -1356,19 +1356,21 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
 
     B, H, W, C = img.shape
 
-    # Detect identity UV (standard pixel grid) by checking corner values.
-    # When identity, use F.interpolate instead of grid_sample (avoids grid read).
+    # u and v may differ in rank (a per-pixel u with a scalar v): give both the joint shape.
+    if u.shape != v.shape:
+        joint = torch.broadcast_shapes(u.shape, v.shape)
+        u, v = u.expand(joint), v.expand(joint)
+
+    # Detect identity UV (standard pixel grid): EVERY texel of u and v must match the
+    # pixel ramp. When identity, use F.interpolate instead of grid_sample (avoids the grid
+    # read). A corner probe is not enough -- a warp that fixes the corners is still a warp.
+    # One max-abs reduction and ONE GPU->CPU sync (this runs inside sampling loops).
     identity_uv = False
     if u.dim() == 3 and u.shape == (B, H, W) and H > 1 and W > 1:
-        # Identity UV: u[0,0,0]=0, u[0,0,W-1]=1, v[0,0,0]=0, v[0,H-1,0]=1.
-        # Batch the four corner probes into ONE GPU->CPU sync instead of four
-        # (each .item() forces a sync; this runs inside sampling loops).
-        c0u, c1u, c0v, c1v = torch.stack(
-            [u[0, 0, 0], u[0, 0, -1], v[0, 0, 0], v[0, -1, 0]]
-        ).tolist()
-        if (abs(c0u) < 1e-5 and abs(c1u - 1.0) < 1e-5
-                and abs(c0v) < 1e-5 and abs(c1v - 1.0) < 1e-5):
-            identity_uv = True
+        ramp_u = torch.arange(W, dtype=torch.float32, device=u.device).div_(W - 1).view(1, 1, W)
+        ramp_v = torch.arange(H, dtype=torch.float32, device=v.device).div_(H - 1).view(1, H, 1)
+        dev = torch.maximum((u - ramp_u).abs().amax(), (v - ramp_v).abs().amax())
+        identity_uv = dev.item() < 1e-5
 
     if identity_uv:
         out_size = (H, W)
