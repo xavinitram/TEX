@@ -751,6 +751,9 @@ class MaskedFlowMixin:
         if not m_any(self._live):
             return torch.scalar_tensor(0.0, dtype=self._dtype, device=self.device)
 
+        # Arguments first: a raising argument must not leave a depth level held.
+        args = [self._eval(arg) for arg in call_node.args]
+
         self._call_depth += 1
         if self._call_depth > MAX_CALL_DEPTH:
             self._call_depth -= 1
@@ -760,8 +763,6 @@ class MaskedFlowMixin:
                 call_node.loc, source=self._source, code="E6060",
                 hint="Check for functions that call themselves without a base case.",
             )
-
-        args = [self._eval(arg) for arg in call_node.args]
 
         saved_env = self.env
         saved_ready = self._inplace_ready

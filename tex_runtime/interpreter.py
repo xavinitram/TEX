@@ -387,6 +387,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         # the interpreter is a per-thread REUSED singleton, so a value left on `self` from a
         # PRIOR cook would silently leak into this one.
         self._scale = scale
+        self._call_depth = 0   # per-thread singleton: a prior cook's abort must not carry depth over
         # SCHED-3: bind the cook's cancel token + progress callback for THIS execute. Set
         # unconditionally every run (the interpreter is a per-thread REUSED singleton — a
         # token left on self would abort a later, unrelated cook). Pure values, never keyed.
@@ -1088,6 +1089,9 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         # live. One attribute test per user-function call on the default path.
         if self._masked:
             return self._mf_call_user_function(func_def, call_node)
+        # Arguments first: a raising argument must not leave a depth level held.
+        args = [self._eval(arg) for arg in call_node.args]
+
         self._call_depth += 1
         if self._call_depth > MAX_CALL_DEPTH:
             self._call_depth -= 1
@@ -1097,8 +1101,6 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 call_node.loc, source=self._source, code="E6060",
                 hint="Check for functions that call themselves without a base case.",
             )
-
-        args = [self._eval(arg) for arg in call_node.args]
 
         # Save and replace environment. The in-place ready set is scoped per
         # call: params are bound by reference to caller tensors, so readiness
