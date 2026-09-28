@@ -1179,6 +1179,9 @@ _FETCH_COORD_ARGS = {
 }
 _PIXEL_COORD_NAMES = ("ix", "iy")
 _PIXEL_DIM_NAMES = ("img_width", "img_height")
+# The bare-identifier spellings of the canvas grid: image size in pixels and one pixel's size in
+# u / v. Arithmetic on any of them means a different answer at a different resolution.
+_PIXEL_GRID_IDENTS = ("iw", "ih", "px", "py")
 
 
 def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
@@ -1214,7 +1217,7 @@ def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
     workaround for an author who knows the cast is harmless."""
     cls = node.__class__
     if cls is Identifier:
-        if node.name in _PIXEL_DIM_NAMES:
+        if node.name in _PIXEL_DIM_NAMES or node.name in _PIXEL_GRID_IDENTS:
             return True
         return node.name in _PIXEL_COORD_NAMES and not in_coord_arg
     if cls is BindingIndexAccess or cls is BindingSampleAccess:
