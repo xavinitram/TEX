@@ -370,8 +370,8 @@ class _ControlFlowMixin:
         if start is None or end is None or step_mag is None:
             return None  # fractional or non-scalar bound → general path
         step = step_sign * step_mag
-        if step == 0:
-            return None
+        if step <= 0:
+            return None  # `<`/`<=` never reaches the bound counting down: general path
         if cond_op == "<=":
             end += 1
         try:

@@ -566,7 +566,10 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     else:
         return None
 
-    if step == 0:
+    # The condition only accepts `<`/`<=`, so a step that does not count UP can never reach
+    # the bound: the general loop runs to the iteration cap (or not at all when start is
+    # already past the bound), and a static range would say something else.
+    if step <= 0:
         return None
     return (loop_var, start, end, step)
 
