@@ -34,6 +34,10 @@ perceptual-band figures that measured it.
   continue to decline narrowing any of `bilateral_filter`'s approximate paths, unchanged from
   `0.50.0`.
 
+- **bilateral_filter's exact tier (radius 4–24) is now bit-identical between a windowed or tiled cook and the
+  whole-frame cook on CUDA** (it differed by up to ~4.8e-7): its per-tap sum now runs in a fixed order independent
+  of the cooked region's size. Radius ≤ 3 is unchanged; CPU was already identical.
+
 ### Correction
 
 - **`0.50.0`'s own perceptual-band figures for `bilateral_filter` (this file's `[0.50.0]` entry
