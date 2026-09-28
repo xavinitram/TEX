@@ -393,9 +393,13 @@ class MaskedEmitMixin:
 
     def _mf_emit_static_for(self, stmt: ForLoop, static_range: tuple, entry: str):
         loop_var, start, stop, step = static_range
-        n = abs(stop - start) // max(abs(step), 1)
+        # range(start, stop, step), exactly as the interpreter iterates it.
+        n = len(range(start, stop, step))
         if n > 1024:
             self._emit("raise RuntimeError('For loop would exceed 1024 iterations')")
+            return
+        if n == 0:
+            self._emit("pass")  # the body never runs; the prologue's `try:` needs a statement
             return
 
         modified_vars, _ = self._collect_modified_vars(stmt.body)

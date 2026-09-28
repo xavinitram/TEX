@@ -2641,9 +2641,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
     ):
         """Emit a for loop with a fully static range (zero per-iteration overhead)."""
         loop_var, start, stop, step = static_range
-        n = abs(stop - start) // max(abs(step), 1)
+        # The interpreter iterates range(start, stop, step): a partial last stride still
+        # runs, and a range whose step points away from the bound is empty.
+        n = len(range(start, stop, step))
         if n > 1024:
             self._emit(f"raise RuntimeError('For loop would exceed {1024} iterations')")
+            return
+        if n == 0:
+            self._emit("pass")  # the body never runs; keep an enclosing block non-empty
             return
 
         has_flow_control = _body_has_break_continue(stmt.body)
