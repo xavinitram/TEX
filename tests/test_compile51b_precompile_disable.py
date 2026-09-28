@@ -64,14 +64,13 @@ from TEX_Wrangle.tex_runtime import compiled as C
 from test_compiletry50_fncalls_gate import _fake_cg_fn  # noqa: F401 (re-used below)
 
 dynamo_config = pytest.importorskip("torch._dynamo.config")
-if not hasattr(dynamo_config, "caching_precompile"):
-    # C2 (B4#5): three tests below set `dynamo_config.caching_precompile` directly with no
-    # check that the attribute exists on the installed torch -- on a build without this
-    # flag, a validated `ConfigModule` raises `AttributeError` for an unrecognized key
-    # rather than silently creating one, so those tests would ERROR rather than SKIP.
-    # Guard once, at module level, instead of repeating the check in every test.
-    pytest.skip("this torch build has no caching_precompile flag to scope",
-                allow_module_level=True)
+# C2 (B4#5): three tests below set `dynamo_config.caching_precompile` directly with no
+# check that the attribute exists on the installed torch -- on a build without this
+# flag, a validated `ConfigModule` raises `AttributeError` for an unrecognized key
+# rather than silently creating one, so those tests would ERROR rather than SKIP.
+# Guard once, at module level, instead of repeating the check in every test.
+pytestmark = pytest.mark.skipif(not hasattr(dynamo_config, "caching_precompile"),
+                                reason="this torch build has no caching_precompile flag to scope")
 
 
 @pytest.fixture(autouse=True)
