@@ -557,8 +557,10 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
     array_collects: list[tuple[str, str | None, str, bool]] = []
     inner_count_var = None
     has_unknown = False
+    collect_index_names: set = set()   # what each arr[...] collect is indexed by
+    last_collect_pos = count_pos = -1  # body positions of the last collect / the counter bump
 
-    for stmt in inner_loop.body:
+    for pos, stmt in enumerate(inner_loop.body):
         if isinstance(stmt, Assignment):
             info = _is_sum_accum(stmt, inner_var, outer_var, local_defs)
             if info is not None:
@@ -578,6 +580,9 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
 
             ac = _is_array_collect_assign(stmt, inner_var, outer_var, local_defs)
             if ac is not None:
+                idx = stmt.target.index
+                collect_index_names.add(idx.name if isinstance(idx, Identifier) else None)
+                last_collect_pos = pos
                 array_collects.append(ac)
                 continue
 
@@ -589,6 +594,7 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
                 if inner_count_var is not None:
                     has_unknown = True
                 inner_count_var = cv
+                count_pos = pos
                 continue
             # Allow intermediate definitions (su/sv for the sample pattern) — but only
             # for names DECLARED inside the nest. `local_defs` would accept every
@@ -660,6 +666,17 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
     # this pass could not account for would simply stop running. Without it, a
     # body that collects taps AND does anything else — accumulate, branch, call —
     # silently loses that other work.
+    # The unfold stores tap t at slot t, which is what the loop does only when every
+    # collect is indexed by the inner counter, bumped once per pass AFTER the collects,
+    # and each array is collected once per pass. (That the counter starts at 0 is an
+    # emit-time fact: `_emit_median_stencil` checks the seed.) A constant index, a bump
+    # before the collect or a different index writes other slots.
+    if array_collects and (
+            inner_count_var is None
+            or collect_index_names != {inner_count_var}
+            or count_pos < last_collect_pos
+            or len({ac[0] for ac in array_collects}) != len(array_collects)):
+        has_unknown = True
     if array_collects and not accum_info and not minmax_info and not has_unknown:
         # Validate: all from same binding
         bindings = set(ac[2] for ac in array_collects)

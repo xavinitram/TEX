@@ -692,6 +692,11 @@ def _body_has_break_continue(stmts: list[ASTNode], kinds=(BreakStmt, ContinueStm
 
 
 
+def _is_zero_literal(node: ASTNode | None) -> bool:
+    """True iff `node` is the literal 0 (a counter provably entering a nest at zero)."""
+    return isinstance(node, NumberLiteral) and node.value == 0
+
+
 def _resolve_through_locals(expr: ASTNode, local_defs: dict[str, ASTNode]) -> ASTNode:
     """Resolve an expression by substituting known local variable definitions.
 
@@ -2506,7 +2511,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # better than the old overwrite, which dropped the seed outright.
         self._emit(f"{accum_local} = {accum_local} + {result_tmp}")
         if count_local and n_expr:
-            self._emit(f"{count_local} = _torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)")
+            n_t = f"_torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)"
+            if _is_zero_literal(self._var_initializers.get(stencil.count_var)):
+                self._emit(f"{count_local} = {n_t}")
+            else:
+                # The loop counts up from the counter's entry value, not from 0.
+                self._emit(f"{count_local} = {count_local} + {n_t}")
         return True
 
     def _emit_minmax_stencil(self, stencil: _StencilInfo) -> bool:
@@ -2595,6 +2605,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         """
         if not stencil.array_vars:
             return False
+        # Detection proved each collect writes arr[counter] before the counter's one bump
+        # per pass; tap t lands in slot t only if the counter enters the nest at 0.
+        # Decline before emitting anything so the loop itself runs otherwise.
+        if not _is_zero_literal(self._var_initializers.get(stencil.count_var)):
+            return False
 
         sel_tmp, _ = self._stencil_to_bchw(stencil)
         pad_tmp, kh, kw, n_expr = self._stencil_pad_and_kernel_size(stencil, sel_tmp)
@@ -2618,7 +2633,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 arr_tmp = self._tmp()
                 self._emit(f"{arr_tmp} = {flat_tmp}[:, {ch_idx}, :, :, :]")
                 tgt = self._local_vars.get(arr_name, f"_env[{arr_name!r}]")
-                self._emit(f"{tgt} = {arr_tmp}")
+                self._emit_collect_into(tgt, arr_tmp, "")
         else:
             # Single vec array (e.g. samples[idx] = fetch(...))
             # flat_tmp is [B, C, H, W, N] → [B, H, W, N, C] for vec array
@@ -2626,7 +2641,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             result_tmp = self._tmp()
             self._emit(f"{result_tmp} = {flat_tmp}.permute(0, 2, 3, 4, 1)")
             tgt = self._local_vars.get(arr_name, f"_env[{arr_name!r}]")
-            self._emit(f"{tgt} = {result_tmp}")
+            self._emit_collect_into(tgt, result_tmp, ", :")
 
         # Update counter variable to total number of elements
         if stencil.count_var:
@@ -2634,6 +2649,31 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"{ct} = _torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)")
 
         return True
+
+    def _emit_collect_into(self, tgt: str, taps: str, tail: str):
+        """Leave the array the collect loop would: tap t in slot t, clamped into the
+        DECLARED size, every other slot as it was.
+
+        `taps` holds the N taps along the slot axis (the last axis, or the one before
+        the channels: `tail` is "" or ", :"). When the declared size S equals N the
+        taps ARE the array. Otherwise the loop writes slots 0..min(N,S)-1 and, when
+        N > S, keeps overwriting the clamped last slot, which ends as the last tap."""
+        n, sz, a, m = self._tmp(), self._tmp(), self._tmp(), self._tmp()
+        axis = "-2" if tail else "-1"
+        self._emit(f"{n} = {taps}.shape[{axis}]")
+        self._emit(f"{sz} = {tgt}.shape[{axis}]")
+        self._emit(f"if {sz} == {n}:")
+        self._indent += 1
+        self._emit(f"{tgt} = {taps}")
+        self._indent -= 1
+        self._emit("else:")
+        self._indent += 1
+        self._emit(f"{a} = {tgt}.clone()")
+        self._emit(f"{m} = min({n}, {sz})")
+        self._emit(f"{a}[..., :{m}{tail}] = {taps}[..., :{m}{tail}]")
+        self._emit(f"if {n} > {sz}: {a}[..., {sz} - 1{tail}] = {taps}[..., {n} - 1{tail}]")
+        self._emit(f"{tgt} = {a}")
+        self._indent -= 1
 
     def _try_emit_stencil(self, stmt: ForLoop) -> bool:
         """Try to detect and emit a stencil pattern. Returns True if handled."""

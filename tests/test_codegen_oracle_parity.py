@@ -349,3 +349,71 @@ _STENCIL_ROWS = [
 @pytest.mark.parametrize("label,code", _STENCIL_ROWS, ids=[r[0] for r in _STENCIL_ROWS])
 def test_stencil_lowering_matches_interpreter(label, code):
     assert_parity(code, {"A": _img(H=12, W=12)})
+
+
+# ── the median/array-collect lowering fills the array exactly as the loop would ────────
+#
+# The loop writes arr[k] with k counting from its seed, clamped into the DECLARED array;
+# the unfold must leave the same array behind, whatever the declared size.
+
+_MEDIAN_ROWS = [
+    ("runtime radius smaller than the declared array",
+     "i$r = 1;\nfloat m[25];\nint k = 0;\n"
+     "for (int dy = -$r; dy <= $r; dy++) {\n  for (int dx = -$r; dx <= $r; dx++) {\n"
+     "    vec3 s = fetch(@A, ix + dx, iy + dy);\n    m[k] = s.r;\n    k++;\n  }\n}\n"
+     "@OUT = vec3(median(m), arr_sum(m), float(k));", {"r": 1}),
+    ("literal radius, declared array larger than the tap count",
+     "float m[130];\nint k = 0;\n" + _NEST.format(
+         body="    vec3 s = fetch(@A, ix + dx, iy + dy);\n    m[k] = s.r;\n    k++;\n")
+     + "@OUT = vec3(median(m), m[125], float(k));", {}),
+    ("literal radius, declared array smaller than the tap count",
+     "float m[100];\nint k = 0;\n" + _NEST.format(
+         body="    vec3 s = fetch(@A, ix + dx, iy + dy);\n    m[k] = s.r;\n    k++;\n")
+     + "@OUT = vec3(median(m), m[99], float(k));", {}),
+    ("vec array smaller than the tap count",
+     "vec4 m[100];\nint k = 0;\n" + _NEST.format(
+         body="    m[k] = fetch(@A, ix + dx, iy + dy);\n    k++;\n")
+     + "@OUT = m[99] + m[3];", {}),
+    ("a constant index",
+     "float m[121];\nint k = 0;\n" + _NEST.format(
+         body="    vec3 s = fetch(@A, ix + dx, iy + dy);\n    m[0] = s.r;\n    k++;\n")
+     + "@OUT = vec3(m[0], m[1], float(k));", {}),
+    ("the counter bumped before the collect",
+     "float m[121];\nint k = 0;\n" + _NEST.format(
+         body="    vec3 s = fetch(@A, ix + dx, iy + dy);\n    k++;\n    m[k] = s.r;\n")
+     + "@OUT = vec3(m[0], m[120], float(k));", {}),
+    ("a counter seeded at one",
+     "float m[121];\nint k = 1;\n" + _NEST.format(
+         body="    vec3 s = fetch(@A, ix + dx, iy + dy);\n    m[k] = s.r;\n    k++;\n")
+     + "@OUT = vec3(m[0], m[120], float(k));", {}),
+    ("a box-sum counter seeded at one",
+     "vec3 acc = vec3(0.0);\nfloat n = 1.0;\n" + _NEST.format(
+         body="    acc = acc + fetch(@A, ix + dx, iy + dy).rgb;\n    n = n + 1.0;\n")
+     + "@OUT = acc / n;", {}),
+]
+
+
+@pytest.mark.parametrize("label,code,extra", _MEDIAN_ROWS, ids=[r[0] for r in _MEDIAN_ROWS])
+def test_array_collect_lowering_matches_interpreter(label, code, extra):
+    assert_parity(code, {"A": _img(H=12, W=12), **extra})
+
+
+def test_array_collect_lowering_is_kept_where_exact():
+    """The first four rows still take the unfold (now filling the declared array); the
+    three whose slots the unfold cannot place run the loop."""
+    def src(code, extra):
+        bindings = {"A": _img(H=12, W=12), **extra}
+        bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+        program = Parser(Lexer(code).tokenize(), source=code).parse()
+        program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+        return try_compile(program, tm)._tex_src
+    lowered = {label: ".unfold(" in src(code, extra) for label, code, extra in _MEDIAN_ROWS[:7]}
+    assert lowered == {
+        "runtime radius smaller than the declared array": True,
+        "literal radius, declared array larger than the tap count": True,
+        "literal radius, declared array smaller than the tap count": True,
+        "vec array smaller than the tap count": True,
+        "a constant index": False,
+        "the counter bumped before the collect": False,
+        "a counter seeded at one": False,
+    }
