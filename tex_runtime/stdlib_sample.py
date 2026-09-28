@@ -807,27 +807,55 @@ class _StdlibSample:
         which is what let the author's own prototype measure ~138 MiB flat at radius=30
         on a 1920x1080 frame where the old tiled path needed 196s (tiling itself was
         cheap; the per-tile `unfold` allocation was not). Measured within 2e-6 of the
-        shipped tiled exact tier it replaces (author's own comparison), and the fixed
-        `dy`-then-`dx` (row-major) tap order below matches `_sum_kernel_taps_fixed_
-        order`'s own accumulation order exactly -- so a windowed cook and a whole-frame
-        cook agree bit-for-bit on CUDA the same way FIX-501 F3 already made the tiled
-        path do, without needing that helper: this loop's per-tap add is already
-        shape-independent (each add combines two `[B,C,H,W]`-shaped tensors, never a
-        tensor whose shape depends on how the caller tiled).
+        shipped tiled exact tier it replaces (author's own comparison). The fixed
+        `dy`-then-`dx` (row-major) tap order below is unchanged and load-bearing: it is
+        what makes a windowed cook and a whole-frame cook agree bit-for-bit on CUDA the
+        same way FIX-501 F3 made the tiled path do, without needing that fix's own
+        helper -- this loop's per-tap add is already shape-independent (each add
+        combines two `[B,C,H,W]`-shaped tensors, never a tensor whose shape depends on
+        how the caller tiled).
 
         The spatial weight is read from `_bilateral_spatial_weights`'s own precomputed
         tensor (same `exp(d2*inv_2ss)` form, same float32 dtype and argument order the
         tiled path already uses) rather than recomputed inline, so this tier's spatial
-        term is identical -- not merely close -- to today's.
+        term is identical -- not merely close -- to today's. The range weight goes
+        through the shared `_bilateral_range_weight` (A3, v0.51 Phase C, R1#2) instead
+        of restating the formula inline.
+
+        A1 (v0.51 Phase C, B2#1): every tap and both accumulators (`acc`/`wsum`) are
+        held in fp32 regardless of `bchw`'s own dtype -- a naive sequential sum over up
+        to 6561 taps compounds fp16 rounding error far faster than the shipped tiled
+        path's `torch.sum` (pairwise/tree) reduction did (measured: 36x worse at
+        radius=40). Only the fixed tap ORDER is load-bearing for the CUDA
+        windowed/whole-frame guarantee above; accumulating in fp32 changes the
+        PRECISION of each add, never the order, so that guarantee is untouched. The
+        final result is cast back to `bchw`'s own dtype.
+
+        A2 (v0.51 Phase C, R3#1): every per-tap intermediate (`tap32`/`diff`/`cd2`/`w`/
+        `tapw`) is a fixed-shape buffer allocated ONCE before the loop and reused via
+        in-place ops (`.copy_()`/`torch.sub(..., out=)`/`_bilateral_range_weight`'s own
+        `out=` path/`torch.mul(..., out=)`/`.add_()`) every tap, instead of allocating
+        7 fresh tensors per tap -- measured bit-identical (maxdiff 0.0) in fp32 against
+        the allocate-per-tap version it replaces, 15-34% faster on CPU.
         """
         B, C, H, W = bchw.shape
         w_spatial, ksize = TEXStdlib._bilateral_spatial_weights(ss, radius, bchw.device)
         padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
         inv_2sr = -0.5 / max(sr * sr, 1e-10)
-        acc = torch.zeros_like(bchw)
+
+        acc_dtype = torch.float32
+        bchw32 = bchw if bchw.dtype == acc_dtype else bchw.to(acc_dtype)
         wsum_shape = list(bchw.shape)
         wsum_shape[1] = 1
-        wsum = torch.zeros(wsum_shape, device=bchw.device, dtype=bchw.dtype)
+
+        acc = torch.zeros_like(bchw32)
+        wsum = torch.zeros(wsum_shape, device=bchw.device, dtype=acc_dtype)
+        tap32 = torch.empty_like(bchw32)
+        diff = torch.empty_like(bchw32)
+        cd2 = torch.empty(wsum_shape, device=bchw.device, dtype=acc_dtype)
+        w = torch.empty(wsum_shape, device=bchw.device, dtype=acc_dtype)
+        tapw = torch.empty_like(bchw32)
+
         for ky in range(ksize):
             # CANCEL-44/PACE-47c idiom: one poll per `dy` row of taps, per BILATX-51's
             # own ask -- this tier no longer tiles by rows of the IMAGE (there is only
@@ -836,13 +864,16 @@ class _StdlibSample:
             poll_cook_cancel(heavy=True)
             for kx in range(ksize):
                 tap = padded[:, :, ky:ky + H, kx:kx + W]
-                diff = tap - bchw
-                cd2 = (diff * diff).sum(dim=1, keepdim=True)
-                w_range = torch.exp(cd2 * inv_2sr)
-                w = w_spatial[0, 0, 0, 0, ky, kx] * w_range
-                acc = acc + tap * w
-                wsum = wsum + w
-        return acc / wsum.clamp(min=1e-10)
+                tap32.copy_(tap)  # upcasts to fp32 when `bchw` is fp16; a no-op value
+                                   # copy (still in fp32) otherwise -- one code path.
+                torch.sub(tap32, bchw32, out=diff)
+                w_tap = TEXStdlib._bilateral_range_weight(diff, inv_2sr, cd2_out=cd2, w_out=w)
+                w_tap.mul_(w_spatial[0, 0, 0, 0, ky, kx])
+                torch.mul(tap32, w_tap, out=tapw)
+                acc.add_(tapw)
+                wsum.add_(w_tap)
+        result = acc / wsum.clamp(min=1e-10)
+        return result if result.dtype == bchw.dtype else result.to(bchw.dtype)
 
     @staticmethod
     def _bilateral_detail_transfer_bchw(bchw, ss, sr):
