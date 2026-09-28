@@ -614,15 +614,18 @@ class _StdlibSample:
             sigma_val = sigma_t.item()
         _require_finite_arg("gauss_blur", "sigma", sigma_val)  # A7: friendly diagnostic, not a raw int() crash
         sigma_val = max(sigma_val, 0.0)
-        if sigma_val < 0.3 or img.dim() < 4:
+        if sigma_val < 0.3 or img.dim() < 3:
             return img
+        mask = img.dim() == 3  # [B,H,W] mask / scalar field: one channel, blurred like an image
+        if mask:
+            img = img.unsqueeze(-1)
         bchw = _get_bchw(img)
         # GAUSSPYR-50: `_gauss_blur_auto` dispatches on sigma alone (an engine policy,
         # not a new argument) — exact and bit-identical at/below
         # GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA, an O(image size) downscale-pyramid
         # approximation above it. See stdlib_core.py's own comment on the constant.
-        result = _gauss_blur_auto(bchw, sigma_val)
-        return result.permute(0, 2, 3, 1)
+        result = _gauss_blur_auto(bchw, sigma_val).permute(0, 2, 3, 1)
+        return result.squeeze(-1) if mask else result
 
     # BILAT-50: the old `min(ceil(3*ss), 3)` silently clamped every spatial_sigma past
     # ~1.0 to whatever a 7x7 window gives -- the same silent-wrong class the erode/dilate
@@ -1059,8 +1062,11 @@ class _StdlibSample:
                 sr = raw if rounded is None else rounded
 
         _require_finite_arg("bilateral_filter", "spatial_sigma", ss)  # A7: friendly diagnostic
-        if img.dim() < 4 or ss < 0.3:
+        if img.dim() < 3 or ss < 0.3:
             return img
+        mask = img.dim() == 3  # [B,H,W] mask / scalar field: one channel
+        if mask:
+            img = img.unsqueeze(-1)
 
         B, H, W, C = img.shape
         radius = int(math.ceil(3.0 * ss))  # BILAT-50: no clamp -- the true window
@@ -1088,7 +1094,8 @@ class _StdlibSample:
         else:
             result = TEXStdlib._bilateral_detail_transfer_bchw(bchw, ss, sr)
 
-        return result.permute(0, 2, 3, 1)  # back to BHWC
+        result = result.permute(0, 2, 3, 1)  # back to BHWC
+        return result.squeeze(-1) if mask else result
 
     # ASK-1: native convolution. `kernel` is a second IMAGE/MASK BINDING, read whole —
     # not an ARRAY literal (an array is expanded to one full frame per tap by the
