@@ -306,3 +306,46 @@ def test_scalar_loop_branch_local_that_never_ran():
             "@OUT = vec3(acc) + @A.rgb * 0.0;")
     ref, got = assert_parity(code, {"A": _img()})
     assert ref["OUT"][..., 0].unique().tolist() == [12.0]
+
+
+# ── stencil lowering claims only the nests and clusters it computes exactly ─────────────
+#
+# A lowering replaces a whole loop nest (or an inline tap cluster) with one pool, unfold
+# or conv2d, so anything in it the pattern does not account for simply stops happening.
+# Radius 5 keeps each nest past the optimizer's unroller.
+
+_NEST = ("for (int dy = -5; dy <= 5; dy++) {{\n  for (int dx = -5; dx <= 5; dx++) {{\n{body}  }}\n}}\n")
+
+_STENCIL_ROWS = [
+    ("a tap temporary updated in the body (min/max)",
+     "vec3 m = vec3(-10.0);\n" + _NEST.format(
+         body="    vec3 s = fetch(@A, ix + dx, iy + dy).rgb;\n    s = s + vec3(0.1);\n    m = max(m, s);\n")
+     + "@OUT = m;"),
+    ("a tap temporary updated in the body (array collect)",
+     "vec4 r[121];\nint k = 0;\n" + _NEST.format(
+         body="    vec4 s = fetch(@A, ix + dx, iy + dy);\n    s = s + vec4(0.1);\n    r[k] = s;\n    k++;\n")
+     + "@OUT = r[0] + r[60] + r[120];"),
+    ("a counter beside a min/max accumulator",
+     "vec3 m = vec3(-10.0);\nfloat n = 0.0;\n" + _NEST.format(
+         body="    m = max(m, fetch(@A, ix + dx, iy + dy).rgb);\n    n = n + 1.0;\n")
+     + "@OUT = m + vec3(n);"),
+    ("two counters beside a box sum",
+     "vec3 acc = vec3(0.0);\nfloat n = 0.0;\nfloat c = 0.0;\n" + _NEST.format(
+         body="    acc = acc + fetch(@A, ix + dx, iy + dy).rgb;\n    n = n + 1.0;\n    c = c + 1.0;\n")
+     + "@OUT = acc / n + vec3(c);"),
+    ("a fractional literal radius on a float counter",
+     "vec3 acc = vec3(0.0);\n"
+     "for (float dy = -1.5; dy <= 1.5; dy += 1.0) {\n  for (float dx = -1.5; dx <= 1.5; dx += 1.0) {\n"
+     "    acc = acc + fetch(@A, ix + dx, iy + dy).rgb;\n  }\n}\n@OUT = acc;"),
+    ("an inline cluster with a fractional fetch offset",
+     "vec4 a = fetch(@A, ix - 1.5, iy);\nvec4 b = fetch(@A, ix, iy);\nvec4 c = fetch(@A, ix + 1, iy);\n"
+     "vec4 o = a * 0.25 + b * 0.5 + c * 0.25;\n@OUT = o;"),
+    ("an inline cluster mixing a pixel read with sample() taps",
+     "vec4 c = @A;\nvec4 l = sample(@A, u - px, v);\nvec4 r = sample(@A, u + px, v);\n"
+     "vec4 o = c * 0.5 + l * 0.25 + r * 0.25;\n@OUT = o;"),
+]
+
+
+@pytest.mark.parametrize("label,code", _STENCIL_ROWS, ids=[r[0] for r in _STENCIL_ROWS])
+def test_stencil_lowering_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img(H=12, W=12)})

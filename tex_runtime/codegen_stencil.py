@@ -122,8 +122,11 @@ def _try_extract_symmetric_range(loop: ForLoop) -> tuple[str, ASTNode | int] | N
     else:
         return None
 
-    # Return radius as int or ASTNode
+    # Return radius as int or ASTNode. A fractional literal radius on a float counter
+    # visits fractional offsets (-1.5, -0.5, ...), which no integer kernel reproduces.
     if isinstance(radius_expr, NumberLiteral):
+        if not float(radius_expr.value).is_integer():
+            return None
         return (loop_var, int(radius_expr.value))
     return (loop_var, radius_expr)
 
@@ -392,15 +395,36 @@ def _is_minmax_accum(stmt: Assignment, inner_var: str, outer_var: str,
     return None
 
 
+def _reads_name(node: ASTNode, name: str) -> bool:
+    """True if `name` is read anywhere in the expression `node`."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, Identifier) and n.name == name:
+            return True
+        stack.extend(_iter_child_nodes(n))
+    return False
+
+
 def _collect_local_defs(stmts: list[ASTNode], local_defs: dict[str, ASTNode]) -> None:
-    """Collect variable definitions from a statement list into local_defs."""
+    """Collect variable definitions from a statement list into local_defs.
+
+    Only a name with exactly ONE definition, not computed from itself, resolves. A
+    second definition or a self-update (`s = s + vec3(0.1)`, `acc = acc + tap`) leaves no
+    single expression the name stands for, and resolving it to its first definition
+    would lower a tap that ignores the update. Such a name is poisoned: mapped to
+    itself, so `_resolve_coord` stops at the bare name and no tap matches it."""
     for stmt in stmts:
         if isinstance(stmt, VarDecl) and stmt.initializer is not None:
-            local_defs[stmt.name] = stmt.initializer
+            name, value = stmt.name, stmt.initializer
         elif isinstance(stmt, Assignment) and isinstance(stmt.target, Identifier):
-            if not (isinstance(stmt.value, BinOp) and stmt.value.op == "+"
-                    and _is_ident(stmt.value.left, stmt.target.name)):
-                local_defs[stmt.target.name] = stmt.value
+            name, value = stmt.target.name, stmt.value
+        else:
+            continue
+        if name in local_defs or _reads_name(value, name):
+            local_defs[name] = Identifier(name=name)
+        else:
+            local_defs[name] = value
 
 
 def _collect_local_decls(stmts: list[ASTNode], out: set) -> None:
@@ -559,6 +583,11 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
 
             cv = _is_count_increment(stmt)
             if cv is not None:
+                # One counter, bumped once per tap: the emitters materialize exactly
+                # one count. A second increment (of it or of another name) would be
+                # dropped with the nest.
+                if inner_count_var is not None:
+                    has_unknown = True
                 inner_count_var = cv
                 continue
             # Allow intermediate definitions (su/sv for the sample pattern) — but only
@@ -584,6 +613,9 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
 
     # (count_var: the outer-counter route is declined in the outer-body scan above, where the
     # decision is made — an outer counter never survives the nest replacement.)
+    # The min/max lowering has no count to write, so a counter beside it would stop counting.
+    if minmax_info is not None and inner_count_var is not None:
+        has_unknown = True
 
     # Return the detected stencil kind (prefer box, then minmax, then median)
     if accum_info is not None and not has_unknown:
@@ -741,18 +773,28 @@ def _extract_fetch_offset(node: ASTNode) -> tuple[str, int, int, str | None] | N
     return None
 
 
+def _int_literal(node: ASTNode | None) -> int | None:
+    """The value of an integer-valued NumberLiteral, else None. A fractional tap offset
+    is not a kernel position: `ix - 1.5` truncates per pixel in fetch() and lands
+    sub-pixel in sample(), and int() would silently move it to a neighbouring tap."""
+    if isinstance(node, NumberLiteral) and float(node.value).is_integer():
+        return int(node.value)
+    return None
+
+
 def _extract_pixel_offset(expr: ASTNode, base: str) -> int | None:
     """Extract integer pixel offset from `base + CONST` or `base - CONST` or `base`."""
     if _is_ident(expr, base):
         return 0
     if not isinstance(expr, BinOp):
         return None
-    if expr.op == "+" and _is_ident(expr.left, base) and isinstance(expr.right, NumberLiteral):
-        return int(expr.right.value)
-    if expr.op == "+" and isinstance(expr.left, NumberLiteral) and _is_ident(expr.right, base):
-        return int(expr.left.value)
-    if expr.op == "-" and _is_ident(expr.left, base) and isinstance(expr.right, NumberLiteral):
-        return -int(expr.right.value)
+    if expr.op == "+" and _is_ident(expr.left, base):
+        return _int_literal(expr.right)
+    if expr.op == "+" and _is_ident(expr.right, base):
+        return _int_literal(expr.left)
+    if expr.op == "-" and _is_ident(expr.left, base):
+        k = _int_literal(expr.right)
+        return None if k is None else -k
     return None
 
 
@@ -775,27 +817,21 @@ def _extract_uv_offset(expr: ASTNode, base: str) -> int | None:
             return sign
 
         if isinstance(rhs, BinOp):
-            # u + CONST * px  or  u + px * CONST
+            k = None
+            # u + CONST * px  or  u + px * CONST  (CONST may be wrapped in float(...))
             if rhs.op == "*":
-                if isinstance(rhs.left, NumberLiteral) and _is_ident(rhs.right, px_var):
-                    return sign * int(rhs.left.value)
-                if _is_ident(rhs.left, px_var) and isinstance(rhs.right, NumberLiteral):
-                    return sign * int(rhs.right.value)
-                # float(CONST) * px — CastExpr wrapping
-                if isinstance(rhs.left, CastExpr) and _is_ident(rhs.right, px_var):
-                    if isinstance(rhs.left.expr, NumberLiteral):
-                        return sign * int(rhs.left.expr.value)
-                if _is_ident(rhs.left, px_var) and isinstance(rhs.right, CastExpr):
-                    if isinstance(rhs.right.expr, NumberLiteral):
-                        return sign * int(rhs.right.expr.value)
-            # u + float(CONST) / iw
-            dim_var = "iw" if base == "u" else "ih"
-            if rhs.op == "/":
-                if isinstance(rhs.left, NumberLiteral) and _is_ident(rhs.right, dim_var):
-                    return sign * int(rhs.left.value)
-                if isinstance(rhs.left, CastExpr) and isinstance(rhs.left.expr, NumberLiteral):
-                    if _is_ident(rhs.right, dim_var):
-                        return sign * int(rhs.left.expr.value)
+                if _is_ident(rhs.right, px_var):
+                    k = rhs.left
+                elif _is_ident(rhs.left, px_var):
+                    k = rhs.right
+            # u + CONST / iw  (or float(CONST) / iw)
+            elif rhs.op == "/" and _is_ident(rhs.right, "iw" if base == "u" else "ih"):
+                k = rhs.left
+            if isinstance(k, CastExpr):
+                k = k.expr
+            k = _int_literal(k)
+            if k is not None:
+                return sign * k
     return None
 
 
@@ -909,20 +945,19 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
                 break
 
         b_name, dx, dy, ch = info
+        # Whether THIS tap is pixel-exact (fetch, @img[...], a bare @img read). The
+        # cluster is fetch-based only if every tap is: a sample() tap lands sub-pixel
+        # (UV step 1/(W-1)), which the integer kernel cannot reproduce, so a mixed
+        # cluster must be neither lowered nor default-routed.
+        inner = init_expr
+        if isinstance(inner, ChannelAccess):
+            inner = inner.object
+        tap_is_fetch = not ((isinstance(inner, FunctionCall) and inner.name == "sample")
+                            or isinstance(inner, BindingSampleAccess))
         if binding_name is None:
             binding_name = b_name
             all_channels = ch
-            # Determine if fetch or sample based on first tap.
-            # Unwrap ChannelAccess to find the underlying fetch/sample call.
-            inner = init_expr
-            if isinstance(inner, ChannelAccess):
-                inner = inner.object
-            if isinstance(inner, FunctionCall):
-                is_fetch = inner.name != "sample"
-            elif isinstance(inner, BindingSampleAccess):
-                is_fetch = False
-            else:
-                is_fetch = True  # BindingRef, BindingIndexAccess → fetch-like
+            is_fetch = tap_is_fetch
         elif b_name != binding_name or ch != all_channels:
             # Different binding — stop. And likewise a different SWIZZLE: `all_channels` is
             # recorded from the FIRST tap and then applied to the whole lowered kernel, so
@@ -932,6 +967,7 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
             # collecting and let the interpreter read each tap as written.
             break
 
+        is_fetch = is_fetch and tap_is_fetch
         taps.append((var_name, b_name, dx, dy, ch))
         tap_indices.append(i)
         i += 1
