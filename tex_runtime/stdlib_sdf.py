@@ -14,6 +14,7 @@ from .stdlib_registry import stdlib
 from .stdlib_core import (
     SAFE_EPSILON,
     _lerp_f32,
+    _require_finite_arg,
     _to_float,
     _to_tensor,
 )
@@ -70,15 +71,21 @@ class _StdlibSdf:
         """Signed distance to a regular polygon centered at origin."""
         px_t = _to_tensor(px)
         py_t = _to_tensor(py)
-        r = _to_float(radius)
-        n = max(int(_to_float(sides)), 3)
+        sides_v = _to_float(sides)
+        _require_finite_arg("sdf_polygon", "sides", sides_v)
+        n = max(int(sides_v), 3)
         an = math.pi / n  # half-angle of one segment
         cos_an = math.cos(an)
+        # Only `sides` needs a host number (it sizes the fold); a per-pixel radius stays a tensor.
+        if isinstance(radius, torch.Tensor) and radius.numel() > 1:
+            r_cos = _to_tensor(radius) * cos_an
+        else:
+            r_cos = _to_float(radius) * cos_an
         full_an = 2.0 * an
         angle = torch.atan2(py_t, px_t)
         # Fold angle into one segment: [-an, an]
         sector = angle - full_an * torch.floor((angle + an) / full_an)
-        dist = torch.sqrt(px_t * px_t + py_t * py_t) * torch.cos(sector) - r * cos_an
+        dist = torch.sqrt(px_t * px_t + py_t * py_t) * torch.cos(sector) - r_cos
         return dist
 
     # -- Smooth min/max -------------------------------------------------

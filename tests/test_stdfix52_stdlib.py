@@ -280,3 +280,23 @@ def test_string_and_int_egress_non_finite():
     assert prepare_output(torch.tensor(7.0), "INT") == 7
 
 
+# -- sdf_polygon ------------------------------------------------------------------------
+
+def test_sdf_polygon_per_pixel_radius():
+    g = torch.Generator().manual_seed(5)
+    px, py = torch.rand(1, 4, 4, generator=g) - 0.5, torch.rand(1, 4, 4, generator=g) - 0.5
+    rad = 0.1 + 0.3 * torch.rand(1, 4, 4, generator=g)
+    out = S.fn_sdf_polygon(px, py, rad, 6)
+    for i in range(4):
+        for j in range(4):
+            one = S.fn_sdf_polygon(px[:, i:i + 1, j:j + 1], py[:, i:i + 1, j:j + 1],
+                                   rad[0, i, j].item(), 6)
+            assert abs(one.item() - out[0, i, j].item()) < 1e-5
+
+
+def test_sdf_polygon_non_finite_sides_is_a_diagnostic():
+    with pytest.raises(Exception) as ei:
+        S.fn_sdf_polygon(torch.zeros(1, 2, 2), torch.zeros(1, 2, 2), 0.3, NAN)
+    assert "finite" in str(ei.value)
+
+
