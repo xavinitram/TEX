@@ -61,6 +61,7 @@ from .compiled_exec_support import (_show_once, _maybe_triton_hint, _ensure_indu
 # AUTOSAFE-50 promotion-TRIAL state and its two functions are a self-contained domain
 # (mirrors `_bg_futures`/`_submit_bg_compile`'s own shape); re-exported the same way.
 from .compiled_promotion import (_trial_futures, _promotion_stats, promotion_stats,
+                                 _note_failure, _durable_failure,
                                  _reset_promotion_stats_for_test, _TRIAL_WAIT_BUDGET_S,
                                  _TRIAL_POLL_SLICE_S, _submit_trial, _await_trial)
 # FIX-COMPILE51 C0: compiled.py's precompile-scoping domain (COMPILE-51b) -- the
@@ -997,7 +998,8 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
                     # worker — never on the cook thread's TRIAL invocation.
                     warm_call()
             return "ok"
-        except Exception:
+        except Exception as _exc:
+            _note_failure(cache_key, _exc)
             _compiled_cache.pop(cache_key, None)   # never hand a proven-broken artifact on
             fnc_backend = None   # a warm_call crash after a successful wrap is still a fail
             return "failed"
@@ -1082,9 +1084,10 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
 
     try:
         return _COMPILE_POOL.submit(_worker).result()
-    except Exception:
+    except Exception as _exc:
         # Crash — demote (do not blacklist forever). Reset dynamo on the calling
         # thread; the caller routes to codegen-only.
+        _note_failure(cache_key, _exc)
         _compiled_cache.pop(cache_key, None)
         try:
             torch._dynamo.reset()
@@ -1160,14 +1163,14 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                                       output_names, device_type, timed=False,
                                       scale=scale)
         if res is None:
-            autotier.record_trial(key, None)  # demote to rejected
+            autotier.record_trial(key, None, persist=_durable_failure(cache_key))  # demote
             return _codegen(bindings)
         return res
     # Committed but artifact gone (restart w/o PC-2 persistence, or evicted):
-    # re-establish by trialling again this cook.
+    # measure and compile it again (mark_ready cannot: the state is not COMPILING).
     if state == autotier.COMMITTED:
-        autotier.mark_ready(key)
-        state = autotier.TRIAL
+        autotier.reopen(key)
+        state = autotier.verdict(key)
 
     if state == autotier.TRIAL and cache_key in _compiled_cache:
         # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation used to run
@@ -1180,9 +1183,10 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         # duration, and a later cook's near-free poll picks up the result once it lands —
         # the cook keeps running on the safe (codegen) tier meanwhile, never idle and never
         # stalled waiting for the promotion.
+        own_job = cache_key not in _trial_futures    # a job already in flight ran an earlier cook
         if not _submit_trial(cache_key, program, bindings, type_map, device,
                              latent_channel_count, output_names, device_type, scale=scale):
-            autotier.record_trial(key, None)
+            autotier.record_trial(key, None, persist=False)   # a dead pool is not the program
             _promotion_stats["failed"] += 1
             tier_trace.record("codegen", fallback_from="torch_compile",
                               reason="promotion trial could not be submitted")
@@ -1195,7 +1199,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                               reason="promotion trial pending (bounded off the cook thread)")
             return res
         if status == "failed" or status == "absent":
-            autotier.record_trial(key, None)
+            autotier.record_trial(key, None,
+                                  persist=status == "failed" and _durable_failure(cache_key))
             _promotion_stats["failed"] += 1
             res = _codegen(bindings)
             tier_trace.record("codegen", fallback_from="torch_compile",
@@ -1203,7 +1208,9 @@ def run_auto(program, bindings, type_map, device, fingerprint,
             return res
         res, ms = payload
         autotier.record_trial(key, ms)
-        return res
+        # The job's output belongs to the cook that submitted it (its bindings, its size):
+        # a later cook may take the timing but must be served from its OWN inputs.
+        return res if own_job else _codegen(bindings)
 
     # CC-6: bounded trial convergence. A key that has been ELIGIBLE to compile (enough
     # interpreter samples — should_submit_compile's own bar) for too long without reaching
@@ -1296,7 +1303,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         if st == "ready":
             autotier.mark_ready(key)
         elif st in ("failed", "absent"):
-            autotier.record_trial(key, None)  # compile failed → reject, stay on codegen
+            autotier.record_trial(key, None, persist=_durable_failure(cache_key))  # reject, stay on codegen
             # AUTOSAFE-50 (TRK-231): a failed background compile must always be
             # VISIBLE, not just silently rejected — `res` above already served this cook
             # from codegen (the `_timed_deferred` call earlier in this branch), so this

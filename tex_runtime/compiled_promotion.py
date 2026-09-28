@@ -48,6 +48,30 @@ _trial_futures: dict = {}
 _promotion_stats = {"bounded": 0, "failed": 0}
 
 
+# Cache keys whose LAST failure looked transient (out of memory, a dead or abandoned worker) as
+# opposed to a fact about the program. A verdict recorded from such a failure applies to this
+# process only: persisting it would pin the program to the safe tier for every later session.
+_transient_failed: set = set()
+
+
+def _note_failure(cache_key, exc) -> None:
+    """Remember that the failure just seen under `cache_key` is not a property of the program."""
+    if (isinstance(exc, (MemoryError, concurrent.futures.CancelledError,
+                         concurrent.futures.BrokenExecutor))
+            or type(exc).__name__ == "OutOfMemoryError"
+            or "out of memory" in str(exc).lower()):
+        _transient_failed.add(cache_key)
+
+
+def _durable_failure(cache_key) -> bool:
+    """True when a failure under `cache_key` may be persisted as a REJECTED verdict; False
+    (consuming the note) when it was transient."""
+    if cache_key in _transient_failed:
+        _transient_failed.discard(cache_key)
+        return False
+    return True
+
+
 def promotion_stats() -> dict:
     """AUTOSAFE-50: a copy of the cumulative promotion counters -- how many cooks
     deferred an in-flight TRIAL invocation past the bounded wait ("bounded"), and how
@@ -156,8 +180,9 @@ def _await_trial(cache_key, cancel=None):
             result = fut.result(timeout=min(_TRIAL_POLL_SLICE_S, remaining))
         except concurrent.futures.TimeoutError:
             continue
-        except Exception:
+        except Exception as exc:
             _trial_futures.pop(cache_key, None)
+            _note_failure(cache_key, exc)
             # Mirrors _run_cached_compiled's own crash handling: demote, reset dynamo on
             # THIS (the calling) thread -- dynamo state is process-global (DO-NOT-TOUCH).
             from .compiled import _compiled_cache
