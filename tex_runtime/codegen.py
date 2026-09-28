@@ -1854,6 +1854,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # (const/range/vec/kernel/fn/param) already dominate the whole function
         # and need no such scoping.
         hoist_snap = dict(self._hoisted_bchw)
+        # Ownership is emit-time state and every body below is emitted more than once
+        # (then/else, and again on the per-pixel path). A write that claimed a name in one
+        # emission never ran on the path of the next, so each starts from the pre-if set;
+        # otherwise a later emission writes in place through an alias (`vec4 d = c;`) or
+        # into an input binding.
+        owned_snap = set(self._owned)
 
         if self._scalar_loop:
             # Scalar-mode loops (_is_scalar_body) guarantee every value in the
@@ -1864,6 +1870,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"if float({cond_tmp}) > 0.5:")
             self._indent += 1
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             if stmt.then_body:
                 for s in stmt.then_body:
                     self._emit_stmt(s)
@@ -1874,6 +1881,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 self._emit(f"else:")
                 self._indent += 1
                 self._hoisted_bchw = dict(hoist_snap)
+                self._owned = set(owned_snap)
                 for s in stmt.else_body:
                     self._emit_stmt(s)
                 self._indent -= 1
@@ -1895,6 +1903,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit(f"if float({cond_tmp}) > 0.5:")
         self._indent += 1
         self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
         if stmt.then_body:
             for s in stmt.then_body:
                 self._emit_stmt(s)
@@ -1905,6 +1914,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"else:")
             self._indent += 1
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             for s in stmt.else_body:
                 self._emit_stmt(s)
             self._indent -= 1
@@ -1921,7 +1931,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # it must start from the same pre-if hoist snapshot (the scalar path's
         # branch-local hoists are unbound on this path).
         lines_before = len(self._lines)
-        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial, hoist_snap)
+        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial, hoist_snap, owned_snap)
         if len(self._lines) == lines_before:
             self._emit("pass")  # guard against empty else block
 
@@ -1932,7 +1942,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._hoisted_bchw = hoist_snap
 
     def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str, cond_spatial: bool,
-                              hoist_snap: dict[str, tuple[str, str]]):
+                              hoist_snap: dict[str, tuple[str, str]],
+                              owned_snap: set[str]):
         """Emit spatial if/else with selective cloning and torch.where merge.
 
         Uses local variables for env vars when available (program-level locals),
@@ -1945,9 +1956,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         whole if/else. This method (and the scalar path in _emit_if_else) re-emit
         the same branch bodies, so a hoist from a sibling emission is unbound here;
         reset to this snapshot before each branch so every branch re-hoists what it
-        samples (its allocation then dominates its own uses).
+        samples (its allocation then dominates its own uses). ``owned_snap`` is the
+        copy-on-write ownership that holds before the if; each branch starts from it.
         """
         self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
         # Collect modified variables (same analysis as interpreter)
         then_mods = self._collect_modified_vars(stmt.then_body)
         else_mods = self._collect_modified_vars(stmt.else_body) if stmt.else_body else (set(), set())
@@ -1960,10 +1973,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if not all_env_mods and not all_bind_mods:
             # Nothing modified — just execute both branches for side effects
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             for s in stmt.then_body:
                 self._emit_stmt(s)
             if stmt.else_body:
                 self._hoisted_bchw = dict(hoist_snap)
+                self._owned = set(owned_snap)
                 for s in stmt.else_body:
                     self._emit_stmt(s)
             return
@@ -1983,6 +1998,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         # Execute then-branch
         self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
         for s in stmt.then_body:
             self._emit_stmt(s)
         # Which modified vars the then-branch left holding a spatial value. Read
@@ -2008,6 +2024,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         if stmt.else_body:
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             for s in stmt.else_body:
                 self._emit_stmt(s)
         # Which modified vars are spatial on the else path (with no else body this

@@ -178,3 +178,30 @@ def test_while_runaway_still_raises_in_codegen():
     with pytest.raises(RuntimeError, match="maximum iteration limit"):
         _invoke_cg(fn, {"__tex_scale": 1.0}, {"A": _img()}, TEXStdlib.get_functions(),
                    torch.device("cpu"), (1, 4, 4), program=program)
+
+
+# ── copy-on-write across the re-emitted bodies of an if/else ──────────────────────────
+#
+# Each branch body is emitted more than once (the uniform path, the per-pixel path, and
+# then/else in each). Ownership a write claimed in one emission does not hold in the next,
+# so a channel write there must still clone rather than write through an alias.
+
+_COW_ROWS = [
+    ("per-pixel if writes a channel of an aliased vec4",
+     "vec4 c = @A;\nvec4 d = c;\nif (u > 0.5) { c.r = 0.9; }\n@OUT = d + c * 0.0;", {}),
+    ("uniform if/else writes different channels of an aliased vec4",
+     "f$f = 0.0;\nvec4 p = @A;\nvec4 q = p;\nif ($f > 0.5) { p.r = 1.0; } else { p.g = 2.0; }\n"
+     "@OUT = q + p * 0.0;", {"f": 0.0}),
+    ("per-pixel if/else writes different channels of an aliased vec4",
+     "vec4 p = @A;\nvec4 q = p;\nif (u > 0.5) { p.r = 1.0; } else { p.g = 2.0; }\n"
+     "@OUT = vec4(q.r, q.g, p.r, p.g);", {}),
+    ("the input binding itself is not written through",
+     "vec4 c = @A;\nif (u > 0.5) { c.b = 0.25; } else { c.a = 0.5; }\n@OUT = @A + c * 0.0;", {}),
+]
+
+
+@pytest.mark.parametrize("label,code,extra", _COW_ROWS, ids=[r[0] for r in _COW_ROWS])
+def test_if_else_channel_write_never_aliases(label, code, extra):
+    a = _img()
+    ref, got = assert_parity(code, {"A": a, **extra})
+    assert "OUT" in ref
