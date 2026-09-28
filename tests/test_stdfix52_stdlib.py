@@ -147,3 +147,23 @@ def test_nan_coordinate_program_runs_on_both_tiers(code):
         assert (torch.nan_to_num(a) - torch.nan_to_num(b)).abs().max() < 1e-5
 
 
+# -- hash_int ---------------------------------------------------------------------------
+
+def test_hash_int_without_max_varies_per_string():
+    vals = {S.fn_hash_int(s).item() for s in ("a", "b", "c", "frame_001", "frame_002")}
+    assert len(vals) >= 4
+    for v in vals:
+        assert 0 <= v < 2 ** 24 and v == int(v)
+
+
+@pytest.mark.parametrize("mx", [0, -5, 2 ** 25])
+def test_hash_int_unusable_max_still_varies(mx):
+    vals = {S.fn_hash_int(s, mx).item() for s in ("a", "b", "c", "d")}
+    assert len(vals) >= 3
+    assert all(0 <= v < 2 ** 24 for v in vals)
+
+
+def test_hash_int_with_max_is_a_modulo():
+    assert 0 <= S.fn_hash_int("abc", 100).item() < 100
+
+

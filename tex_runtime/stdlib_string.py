@@ -319,17 +319,14 @@ class _StdlibString:
             raise ValueError("hash_int() expects a string first argument")
         h = hashlib.sha256(s.encode("utf-8")).digest()
         value = int.from_bytes(h[:8], "big")
-        if max_val is not None:
-            m = _host_int(max_val)
-            if m > 0:
-                value = value % m
-                if m <= 2**24:
-                    # Modulo already bounds the value within float32's exact-int
-                    # range — don't clamp it down and break the [0, max_val) contract.
-                    return torch.scalar_tensor(float(value), dtype=torch.float32)
-        # No max_val (or a range beyond float32's exact-int range): clamp so the
-        # value stays exactly representable as float32.
-        value = min(value, 2**24 - 1)
+        m = _host_int(max_val) if max_val is not None else 0
+        if 0 < m <= 2**24:
+            value = value % m
+        else:
+            # No usable max_val (absent, <= 0, or beyond float32's exact-int range): fold
+            # the hash into [0, 2**24) so it stays exactly representable AND still varies
+            # per string (a min() clamp would return one constant for nearly every input).
+            value = value % 2**24
         return torch.scalar_tensor(float(value), dtype=torch.float32)
 
     @stdlib("char_at", sig='char_at(s, idx) \\u2192 string', category='Strings', doc='Character at index (0-based).', ex='string c = char_at(s, 0);')
