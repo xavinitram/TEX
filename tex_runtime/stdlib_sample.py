@@ -811,7 +811,7 @@ class _StdlibSample:
         return upsampled_filtered + detail
 
     @staticmethod
-    def _bilateral_separable_1d_pass(bchw, dim, radius, ss, sr):
+    def _bilateral_separable_1d_pass(bchw, dim, radius, ss, sr, range_ref=None):
         """One 1-D bilateral pass along `dim` (2=H, 3=W): each of the
         `2*radius+1` taps along that single axis is weighted by the SAME
         spatial-Gaussian x range-Gaussian formula the exact 2-D filter uses
@@ -823,8 +823,22 @@ class _StdlibSample:
         (SSIMULACRA2) on realistic content than the detail-transfer residual
         it replaces past the exact tier's own ceiling, at the cost of growing
         with `radius` rather than staying flat (see `_BILATERAL_SEPARABLE_
-        RADIUS_MAX`'s own comment)."""
+        RADIUS_MAX`'s own comment).
+
+        BILAT8-51: `range_ref` (default `bchw`, i.e. unchanged behaviour) is the
+        tensor the RANGE weight's difference is measured against -- the tap is
+        still read from `bchw` (the pass's own input; this is what gets
+        averaged), only the similarity test can be redirected. The composing
+        pass (`_bilateral_separable_bchw`) points this at the ORIGINAL image
+        for both the row and the column pass, fixing the diagnosed defect: the
+        column pass's range weight used to compare the row-passed (already
+        smoothed) values against each other, which is a weaker edge test than
+        the true 2-D filter's (both axes' difference measured against the same
+        real pixel) and is what let the two-pass filter bleed across a hard
+        edge into a many-code spike at 1080p (day-plate corners)."""
         device = bchw.device
+        if range_ref is None:
+            range_ref = bchw
         n = bchw.shape[dim]
         d = torch.arange(-radius, radius + 1, device=device, dtype=torch.float32)
         w_spatial_1d = torch.exp(-0.5 * (d * d) / max(ss * ss, 1e-10))
@@ -837,7 +851,8 @@ class _StdlibSample:
         for i, off in enumerate(range(-radius, radius + 1)):
             idx = (idx_base + off).clamp(0, n - 1)
             tap = torch.index_select(bchw, dim, idx)
-            diff = bchw - tap
+            tap_ref = torch.index_select(range_ref, dim, idx)
+            diff = range_ref - tap_ref
             cd2 = (diff * diff).sum(dim=1, keepdim=True)
             w_range = torch.exp(cd2 * inv_2sr)
             w = w_spatial_1d[i] * w_range
@@ -847,21 +862,33 @@ class _StdlibSample:
 
     @staticmethod
     def _bilateral_separable_bchw(bchw, ss, sr, radius):
-        """BILAT-51: a row pass then a column pass of the 1-D bilateral core
-        (`_bilateral_separable_1d_pass`) -- a well-known cheaper-than-exact
-        approximation (not a true 2-D bilateral filter: the second pass's
-        range weights compare against the FIRST pass's own output, not the
-        original image), used past `_BILATERAL_EXACT_RADIUS_MAX` and up to
-        `_BILATERAL_SEPARABLE_RADIUS_MAX`. Measured against the exact filter
-        at the SAME spatial_sigma (not detail-transfer's fixed-boundary
-        anchor): SSIMULACRA2 87.8-93.3 on realistic/smooth+edges/checker
-        corpora at ss=8.5/16/32 (1080p, CPU) -- clears the accuracy bar both
-        the old 7x7 clamp (18.5-34.6) and BILAT-50's detail-transfer
-        (-11.6-8.3, measured the same corrected way) fall short of."""
+        """BILAT-51/BILAT8-51: a row pass then a column pass of the 1-D
+        bilateral core (`_bilateral_separable_1d_pass`) -- a well-known
+        cheaper-than-exact approximation (still not a true 2-D bilateral
+        filter: a genuine corner where two differently-coloured hard edges
+        cross is invisible to any single row-then-column or column-then-row
+        decomposition, since neither 1-D pass ever tests a diagonal
+        neighbour's colour). BILAT8-51 measured the diagnosed defect (the
+        second pass's range weight compared against the first pass's OWN
+        smoothed output) against several candidate fixes -- pointing BOTH
+        passes' range weight at the original image, symmetrizing row/col
+        order, and a 4-direction (row+col+2 diagonals) variant -- on a
+        purpose-built hard-edge plate at spatial_sigma 8.5-10 (the host's own
+        priority range) and range_sigma 0.05/0.2/0.5/1.0. Only pointing the
+        range weight at the original image never regressed any measured cell
+        (fewer >=1-code pixels at every combination, same or lower max code);
+        the order-symmetrized and 4-direction variants scored WORSE at
+        range_sigma>=0.5 near a hard bright edge, so they were dropped.
+        Adopted here. This does NOT clear the <=1-code bar near a hard bright
+        edge/corner at range_sigma>=0.5 -- max code there is unchanged (up to
+        ~20-30 at 1080p) because the residual is the corner effect above, a
+        structural limit of any O(image size * radius) separable/directional-
+        sum scheme, not a pass-order or range-reference choice. See
+        `docs/resolution-scale.md`'s bilateral section for the frontier."""
         poll_cook_cancel(heavy=True)
-        row_passed = TEXStdlib._bilateral_separable_1d_pass(bchw, 3, radius, ss, sr)
+        row_passed = TEXStdlib._bilateral_separable_1d_pass(bchw, 3, radius, ss, sr, range_ref=bchw)
         poll_cook_cancel(heavy=True)
-        return TEXStdlib._bilateral_separable_1d_pass(row_passed, 2, radius, ss, sr)
+        return TEXStdlib._bilateral_separable_1d_pass(row_passed, 2, radius, ss, sr, range_ref=bchw)
 
     # A1 (v0.50 Phase C): the footprint's 4th element, `_BILATERAL_APPROX_THRESHOLD_SS`,
     # tells `tex_roi._reach_of` the exact `spatial_sigma` past which this builtin

@@ -557,3 +557,41 @@ def test_bilat51_separable_ceiling_matches_measured_evidence(r: SubTestResult):
     r.ok("radius=96 (the last measured-good radius) still runs separable; radius=99 (just "
          "past it) already falls back to detail-transfer -- the crossover is exactly where "
          "this ask's own quality evidence ends, not past it")
+
+
+# ── BILAT8-51: the second pass's range weight now compares against the ORIGINAL image ──────
+# in both passes, not the first pass's own (already-smoothed) output. Diagnosed cause of the
+# day-plate hard-edge/corner spikes (up to 38 codes at ss=32): a column pass whose range test
+# only sees row-blurred values is a weaker edge discriminator than the true 2-D filter's,
+# where both axes' difference is measured against the same real pixel. Kept here as a copy of
+# the PRE-fix math (column pass's range_ref = row-passed output) so the comparison below is
+# characterizing an actual regression risk, not a hypothetical.
+def _old_separable_bchw(bchw, ss, sr, radius):
+    row_passed = TEXStdlib._bilateral_separable_1d_pass(bchw, 3, radius, ss, sr, range_ref=bchw)
+    return TEXStdlib._bilateral_separable_1d_pass(row_passed, 2, radius, ss, sr, range_ref=row_passed)
+
+
+def test_bilat8_51_original_range_ref_never_regresses_hard_edge(r: SubTestResult):
+    print("\n--- BILAT8-51: routing both separable passes' range weight through the "
+          "ORIGINAL image (not the first pass's own output) never scores worse than the "
+          "pre-fix math on a hard-edge plate, at the host's own priority spatial_sigma "
+          "range (8.5-10) across several range_sigma values ---")
+    H = W = 48
+    bchw = torch.zeros(1, 3, H, W)
+    bchw[:, :, :H // 3, :] = torch.tensor([8.0, 6.0, 3.0]).view(1, 3, 1, 1)  # hard bright band
+    bchw[:, :, :, W // 2:] += 0.05  # a second, weaker edge so the pass sees two directions
+    for ss in (8.5, 10.0):
+        radius = int(math.ceil(3.0 * ss))
+        for sr in (0.05, 0.2, 0.5, 1.0):
+            exact = TEXStdlib._bilateral_exact_bchw(bchw, ss, sr, radius)
+            fixed = TEXStdlib._bilateral_separable_bchw(bchw.clone(), ss, sr, radius)
+            old = _old_separable_bchw(bchw.clone(), ss, sr, radius)
+            d_fixed = (fixed - exact).abs().max().item()
+            d_old = (old - exact).abs().max().item()
+            if d_fixed > d_old + 1e-6:
+                r.fail(f"ss={ss} sr={sr}", f"fixed max-abs-diff {d_fixed:.4f} regresses past "
+                       f"the pre-fix path's {d_old:.4f} -- BILAT8-51 must never make this worse")
+                return
+    r.ok("_bilateral_separable_bchw with range weights pinned to the original image is never "
+         "worse (max-abs-diff vs the exact filter) than the pre-fix row-then-column path, "
+         "across ss=8.5/10 and sr=0.05/0.2/0.5/1.0 on a two-direction hard-edge plate")
