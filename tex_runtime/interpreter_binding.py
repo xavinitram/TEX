@@ -334,7 +334,15 @@ class _BindingExecMixin:
             indices = [CHANNEL_MAP[ch] for ch in channels]
             result = base if inplace else base.clone()
             val = _ensure_spatial(value, result.shape[:-1]) if self.spatial_shape else value
-            val_is_multi = isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[-1] > 1
+            # Multi-channel is decided from the RHS's STATIC type: after `_ensure_spatial` a
+            # scalar field is `[B,H,W]`, whose last axis is W, not a channel axis. The rank test
+            # is only the fallback for a node the type map does not know.
+            rhs_t = self.type_map.get(id(rhs_node)) if rhs_node is not None else None
+            if rhs_t is not None:
+                val_is_multi = rhs_t.is_vector and isinstance(val, torch.Tensor) and val.dim() >= 1
+            else:
+                val_is_multi = (isinstance(val, torch.Tensor) and val.dim() >= 1
+                                and val.shape[-1] > 1 and val.dim() >= result.dim())
             for i, idx in enumerate(indices):
                 if result.dim() >= 1 and result.shape[-1] > idx:
                     result[..., idx] = val[..., i] if val_is_multi else val

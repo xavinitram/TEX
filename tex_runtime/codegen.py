@@ -1763,7 +1763,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 # scatter must clone again (mirrors interpreter disown-on-rebind).
                 self._emit(f"_scat_owned.discard({target.name!r})")
         elif isinstance(target, ChannelAccess):
-            self._emit_channel_assign(target, value_expr)
+            self._emit_channel_assign(target, value_expr, stmt.value)
         elif isinstance(target, ArrayIndexAccess):
             self._emit_array_index_assign(target, value_expr)
         elif isinstance(target, BindingIndexAccess):
@@ -1771,7 +1771,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         else:
             raise _Unsupported(f"Unsupported assignment target: {type(target).__name__}")
 
-    def _emit_channel_assign(self, target: ChannelAccess, value_expr: str):
+    def _emit_channel_assign(self, target: ChannelAccess, value_expr: str, rhs_node=None):
         channels = target.channels
         # Spatial-scalar disambiguation is the interpreter's job: `m.r = v` on a channel-less
         # [B,H,W] base means `m = v`, not a `[..., 0]` column write. Bail for a single-channel
@@ -1805,8 +1805,15 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 raise _Unsupported(f"Invalid swizzle: {channels}")
             val_tmp = self._tmp()
             self._emit(f"{val_tmp} = _es({value_expr}, {tmp}.shape[:-1])")
-            multi_flag = self._tmp()
-            self._emit(f"{multi_flag} = {val_tmp}.dim() >= 1 and {val_tmp}.shape[-1] > 1")
+            # Same rule as the interpreter: the RHS's static type decides, never shape[-1]
+            # (a scalar field is `[B,H,W]`, so its last axis is W).
+            rhs_t = self.type_map.get(id(rhs_node)) if rhs_node is not None else None
+            if rhs_t is not None:
+                multi_flag = f"({val_tmp}.dim() >= 1)" if rhs_t.is_vector else "False"
+            else:
+                multi_flag = self._tmp()
+                self._emit(f"{multi_flag} = {val_tmp}.dim() >= 1 and {val_tmp}.shape[-1] > 1 "
+                           f"and {val_tmp}.dim() >= {tmp}.dim()")
             for i, idx in enumerate(indices):
                 self._emit(f"{tmp}[..., {idx}] = {val_tmp}[..., {i}] if {multi_flag} else {val_tmp}")
 
