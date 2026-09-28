@@ -615,11 +615,11 @@ _iter_child_nodes = _ast_iter_child_nodes
 
 
 def _collect_reassigned_bindings(program: Program) -> set[str]:
-    """Binding names REBOUND via `@name = ...` or `@name.ch = ...` anywhere in
-    the program (loop/if/function bodies included). Rebinding replaces the
-    _bind entry with a new tensor, so a hoisted BCHW permute view of it goes
-    stale. In-place scatter writes (`@name[x, y] = ...`) mutate through shared
-    storage and stay coherent with the view, so they are not collected.
+    """Binding names REBOUND via `@name = ...`, `@name.ch = ...` or a scatter
+    write `@name[x, y] = ...` anywhere in the program (loop/if/function bodies
+    included). Each replaces the _bind entry with a new tensor — a scatter does
+    so on its first write, by the copy-on-write clone (or the fresh buffer for a
+    binding it widens) — so a hoisted BCHW permute view of it goes stale.
     """
     names: set[str] = set()
     stack: list[ASTNode] = list(program.statements)
@@ -631,6 +631,8 @@ def _collect_reassigned_bindings(program: Program) -> set[str]:
                 names.add(t.name)
             elif isinstance(t, ChannelAccess) and isinstance(t.object, BindingRef):
                 names.add(t.object.name)
+            elif isinstance(t, BindingIndexAccess) and isinstance(t.binding, BindingRef):
+                names.add(t.binding.name)
         stack.extend(_iter_child_nodes(node))
     return names
 
@@ -826,9 +828,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._var_vec_type: dict[str, TEXType] = {}
         # Hoisted BCHW images for inline sample(): binding_name → (bchw_var, grid_var).
         # Cross-loop reuse is only safe for bindings that are never REBOUND:
-        # `@A = ...` / `@A.ch = ...` emit `_bind[name] = ...`, which stales the
-        # hoisted permute view. _hoist_sample_setup skips _reassigned_bindings;
-        # in-place scatter writes share storage with the view and stay coherent.
+        # `@A = ...` / `@A.ch = ...` / `@A[x, y] = ...` all replace `_bind[name]`
+        # (a scatter by its copy-on-write clone), which stales the hoisted permute
+        # view. _hoist_sample_setup skips _reassigned_bindings.
         self._hoisted_bchw: dict[str, tuple[str, str]] = {}
         # Bindings rebound anywhere in the program (set by emit_program).
         self._reassigned_bindings: set[str] = set()

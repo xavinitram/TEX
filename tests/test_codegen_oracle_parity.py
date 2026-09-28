@@ -253,3 +253,25 @@ def test_loop_invariant_initializer_keeps_the_direct_fetch():
     program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
     src = try_compile(program, tm)._tex_src
     assert "shape[2] - 1).long()" in src, "the zero-offset direct fetch was not emitted"
+
+
+# ── a scatter write replaces the binding the loop's hoisted sample view was taken from ─
+#
+# The first scatter into a binding this cook does not own clones it (copy-on-write), so a
+# BCHW view hoisted above the loop keeps reading the original data and misses every write.
+
+_SCATTER_SAMPLE_ROWS = [
+    ("while loop scatters then samples the same input",
+     "vec3 acc = vec3(0.0);\nint i = 0;\n"
+     "while (i < 4) { @A[i, 1] = vec4(1.0); acc = acc + sample(@A, u, v).rgb; i = i + 1; }\n"
+     "@OUT = acc;"),
+    ("general for loop scatters then samples the same input",
+     "vec3 acc = vec3(0.0);\n"
+     "for (float t = 0.5; t < 4.0; t += 1.0) { @A[t, 2] = vec4(0.0); acc = acc + sample(@A, u, v).rgb; }\n"
+     "@OUT = acc;"),
+]
+
+
+@pytest.mark.parametrize("label,code", _SCATTER_SAMPLE_ROWS, ids=[r[0] for r in _SCATTER_SAMPLE_ROWS])
+def test_sample_sees_scatter_writes_in_the_same_loop(label, code):
+    assert_parity(code, {"A": _img(H=5, W=5)})
