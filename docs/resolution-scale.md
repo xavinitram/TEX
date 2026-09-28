@@ -526,6 +526,36 @@ plate at sigma=1024), and cap=64 closes the bright-plate residual. The fast-row 
 tests (the mechanism proof, the scaled-down bar check, the bright-plate row) live in
 `tests/test_gauss8_display_bar.py`.
 
+**A v0.51 review evaluated replacing the three-layer boundary fix above with one
+pad-before-reduce mechanism — NOT ADOPTED.** The proposal: replicate-pad the full-resolution image
+by `pad_to_multiple + factor` on each side BEFORE the single `area` reduction, then blur with the
+ordinary, unmodified `_gauss_blur_bchw` (averaging N replicated copies of the true border value
+returns that value, so the reduced grid's own border would already equal the true edge). That
+holds only while the reduced grid keeps more than one coarse pixel. On a side no longer than
+`factor` (the "flat field" branch above, unchanged) the reduced grid collapses to ONE coarse
+pixel, and a plain replicate pad of that single value discards the edge-vs-interior distinction
+the exact convolution still carries at that size. Measured on the odd-size sweep (10 sizes: 826,
+828, 830, 1084, 1080, 827x1031, 1099x1097, 17x23, 3x5, 100x1097; `plate_day`/`plate_night` at x1
+and x16; sigma 260/300/512/1024/2048/8192 = 240 cells, CPU, vs the exact `_gauss_blur_bchw`):
+the candidate read 24 of 240 cells above 1 code (worst 53: 17x23 day at sigma 2048/8192; 3x5 day
+at every sigma; 100x1097 at sigma 8192), so it was not adopted. The shipped mechanism, run on the
+same sweep, reads 238 of 240 cells at <=1 code; the two exceptions are 100x1097 night x16 at
+sigma 260 and 300, both 2 codes — a pre-existing residual of the shipped path (the refactor
+below is bit-identical), not covered by the "every one of 360 cells" reading above, which also
+used a four-border-highlight plate this sweep did not include. Kept as shipped; the unrelated
+simplification of collapsing `_replicate_pad_h_conv`/`_replicate_pad_v_conv` into one
+dim-parametrized `_replicate_pad_conv` helper was applied instead (`torch.equal` to the previous
+output on 21 size/sigma pairs).
+
+**Fast rows now also cover batch>1, 1/4 channels, fp16 and tiny frames**, shape families the
+tables above (and the original display-8 bar) never exercised: a probe showed no crash, but no
+accuracy check existed for any of them. `tests/test_gauss8_display_bar.py::test_gauss8_fast_rows_batch_gt1`/
+`_channel_counts`/`_fp16`/`_tiny_frames` close it: batch>1 and tiny frames are held to the same
+<=1-code bar (the ACES transform is RGB-only, so 1/4-channel rows compare directly against the
+exact reference in linear space, against the same 0.05-0.10 max-abs band this document's R1
+promise already accepts for this builtin family); fp16 gets its own STATED bound of <=2 codes,
+since the reduce/blur/upsample chain and the kernel cast (M-3) both round to fp16.
+
 **This changes results for an existing program that already called `gauss_blur` with
 sigma > 256** (the pyramid path was always documented as an approximation past the threshold,
 never exact â€” see above â€” so this is not a new invariant violation, but a program's own past
