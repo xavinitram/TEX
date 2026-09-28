@@ -117,7 +117,14 @@ _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
                   # `warm_state.json` under this same epoch. It was never added here, so an
                   # edit to its gating logic (what counts as `ok=True`) moved no epoch, and
                   # a stale on-disk verdict from before the edit could be adopted after it.
-                  _R_DIR / "fncalls_compile.py"]
+                  _R_DIR / "fncalls_compile.py",
+                  # FIX-COMPILE51 C0: `compiled.py`'s precompile-scoping domain
+                  # (`compiled_precompile.py`) is a fourth pure move out of `compiled.py`,
+                  # so an edit to it can move a measured win/lose verdict (the
+                  # `caching_precompile` blacklist-vs-attach-recovery outcome) exactly as
+                  # the three SPLIT-47/K0 siblings above already can (TRK-189 derives and
+                  # enforces this from disk).
+                  _R_DIR / "compiled_precompile.py"]
 
 
 # ── DATA-6: the plane seam ────────────────────────────────────────────────────
