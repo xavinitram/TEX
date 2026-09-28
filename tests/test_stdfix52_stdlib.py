@@ -212,3 +212,46 @@ def test_gate_still_accepts_a_smooth_pointwise_program():
     assert _resolve("@OUT = vec4(@A.rgb * 1.1, 1.0);") == "fp16"
 
 
+# -- colour -----------------------------------------------------------------------------
+
+def _px(*c):
+    return torch.tensor(c, dtype=torch.float32).view(1, 1, 1, len(c))
+
+
+@pytest.mark.parametrize("h", [-0.1, -0.2, -0.5, -0.9, -1.3])
+def test_hsv2rgb_negative_hue_wraps(h):
+    a = S.fn_hsv2rgb(_px(h, 1.0, 1.0))
+    b = S.fn_hsv2rgb(_px(h % 1.0, 1.0, 1.0))
+    assert (a - b).abs().max() < 1e-5
+
+
+def test_rgb2hsv_gray_is_finite_in_fp16():
+    gray = torch.full((1, 2, 2, 3), 0.5, dtype=torch.float16)
+    out = S.fn_rgb2hsv(gray)
+    assert torch.isfinite(out).all()
+    assert (out[..., 0] == 0).all() and (out[..., 1] < 1e-3).all()
+    black = S.fn_rgb2hsv(torch.zeros(1, 1, 1, 3, dtype=torch.float16))
+    assert torch.isfinite(black).all()
+
+
+def test_rgb2hsv_fp32_unchanged():
+    out = S.fn_rgb2hsv(_px(1.0, 0.0, 0.0))
+    assert abs(out[0, 0, 0, 0].item()) < 1e-6 and abs(out[0, 0, 0, 1].item() - 1.0) < 1e-6
+
+
+def test_dodge_burn_hdr_ranges():
+    assert S.fn_color_dodge(_px(0.5, 0.5, 0.5), _px(2.0, 2.0, 2.0)).min() == 1.0
+    assert S.fn_color_dodge(_px(0.5, 0.5, 0.5), _px(1.0, 1.0, 1.0)).min() == 1.0
+    assert S.fn_color_dodge(_px(0.0, 0.0, 0.0), _px(2.0, 2.0, 2.0)).max() == 0.0
+    assert S.fn_color_burn(_px(0.5, 0.5, 0.5), _px(-1.0, -1.0, -1.0)).max() == 0.0
+    assert S.fn_color_burn(_px(1.0, 1.0, 1.0), _px(-1.0, -1.0, -1.0)).min() == 1.0
+    for b in (3.0, -3.0):
+        v = S.fn_vivid_light(_px(0.5, 0.5, 0.5), _px(b, b, b))
+        assert v.max() <= 1.0 and v.min() >= 0.0
+
+
+def test_dodge_burn_in_range_values_unchanged():
+    assert abs(S.fn_color_dodge(_px(0.25, 0.25, 0.25), _px(0.5, 0.5, 0.5))[0, 0, 0, 0].item() - 0.5) < 1e-6
+    assert abs(S.fn_color_burn(_px(0.75, 0.75, 0.75), _px(0.5, 0.5, 0.5))[0, 0, 0, 0].item() - 0.5) < 1e-6
+
+
