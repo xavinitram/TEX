@@ -1,10 +1,10 @@
 """GAUSS8-51/BILAT8-51 common brief: `tools/display8.py`, the shared display-8
-harness both display-8 lanes measure against (an approximate path vs. an exact
+harness the display-8 approximation work measures against (an approximate path vs. an exact
 reference, mapped through the ACES RRT + sRGB ODT and rounded to 8 bits).
 
 Fast rows only: small plates, no blur/host call — this file pins the harness
 functions themselves (shapes, determinism, the diff-stats contract), not a
-builtin's accuracy band (that belongs to each lane's own test file).
+builtin's accuracy band (that belongs to each builtin's own test file).
 """
 from __future__ import annotations
 

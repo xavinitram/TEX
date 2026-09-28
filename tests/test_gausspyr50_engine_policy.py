@@ -171,12 +171,17 @@ def test_gausspyr50_huge_sigma_bounded_levels(r: SubTestResult):
     print("\n--- GAUSSPYR-50/A2: huge sigma stays bounded (final kernel sigma), never "
           "reverting to O(sigma) ---")
     final_sigma_seen = {"v": None}
-    real_gauss_blur_bchw = _sc._gauss_blur_bchw
+    real_get_gauss_kernels = _sc._get_gauss_kernels
 
-    def _capturing_gauss_blur_bchw(img, sigma, downsample_2x=False):
-        if not downsample_2x:
-            final_sigma_seen["v"] = sigma
-        return real_gauss_blur_bchw(img, sigma, downsample_2x=downsample_2x)
+    # GAUSS8-51: the residual blur inside the pyramid path no longer calls
+    # `_gauss_blur_bchw` (it needs a caller-supplied edge pad, `_gauss_blur_bchw_edge_pad`,
+    # to fix the boundary bias -- see that function's own docstring), but every shape of
+    # the real convolution -- old and new -- still resolves its kernel through
+    # `_get_gauss_kernels`, so THAT is the stable chokepoint to capture the one real
+    # blur's sigma from.
+    def _capturing_get_gauss_kernels(sigma, device):
+        final_sigma_seen["v"] = sigma
+        return real_get_gauss_kernels(sigma, device)
 
     h = w = 4096
     img = torch.rand(1, 1, h, w)  # single channel: this is a structural/counts probe, not accuracy
@@ -184,11 +189,11 @@ def test_gausspyr50_huge_sigma_bounded_levels(r: SubTestResult):
 
     for sigma in (2000.0, 8192.0, 1_000_000.0, 1e8, 1e9):
         final_sigma_seen["v"] = None
-        _sc._gauss_blur_bchw = _capturing_gauss_blur_bchw
+        _sc._get_gauss_kernels = _capturing_get_gauss_kernels
         try:
             out = _gauss_blur_pyramid_approx(img, sigma)
         finally:
-            _sc._gauss_blur_bchw = real_gauss_blur_bchw
+            _sc._get_gauss_kernels = real_get_gauss_kernels
 
         if final_sigma_seen["v"] is None or final_sigma_seen["v"] > allowed:
             r.fail(f"gausspyr50 final kernel bound sigma={sigma}",

@@ -954,17 +954,83 @@ def _gauss_blur_bchw(
 GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA = 256.0
 
 # The pyramid path's own accuracy/speed knob (not source-visible — an internal detail
-# of the approximation, never a `gauss_blur(...)` argument). Picked by measurement:
-# quality_cap=8.0 keeps the worst-measured maxdiff on a realistic (smooth-gradient +
-# hard-edged rectangles) corpus image at <=0.09 across sigma=16..512 — inside the same
-# 0.05-0.10 band `docs/resolution-scale.md`'s own `scale=` R1 envelope already accepts
-# for this same builtin family — at no measured speed cost over a more aggressive cap
-# (both stay flat, ~20-40ms at 4k regardless of sigma). A pure-checker corpus (8px
-# period) saturates to ~0.12-0.13 maxdiff regardless of quality_cap once sigma exceeds
-# roughly its own period — the same "checker isn't reliably the worse case" effect
-# `docs/resolution-scale.md` already documents for `scale=`; the realistic-image number
-# is the one this constant was tuned against.
-GAUSS_BLUR_PYRAMID_QUALITY_CAP = 8.0
+# of the approximation, never a `gauss_blur(...)` argument).
+#
+# GAUSS8-51: raised 8.0 -> 32.0 (author-approved) as part of closing the display-8 bar
+# (an approximate path must not change any 8-bit code after ACES RRT + sRGB ODT — see
+# docs/resolution-scale.md's "gauss_blur past the exact threshold" section). At cap=8.0
+# the reduced level shrinks fast enough, relative to the residual blur's own kernel
+# radius (`3 * min(sigma, cap)`), that even a CORRECTLY-seeded replicate pad (below)
+# still lets the border dominate a reduced image only a few pixels wide once sigma runs
+# into the thousands. cap=32.0 keeps the reduced level wide enough, at the sigmas this
+# document's own table covers, that the display-8 bar holds with the edge-pad fix
+# below; cost stays flat regardless (the one real blur still runs at a bounded
+# `sigma / factor <= quality_cap`, and the extra edge-strip work the fix adds is
+# O(H)+O(W), not O(sigma) — measured flat at 4k, see docs/resolution-scale.md).
+GAUSS_BLUR_PYRAMID_QUALITY_CAP = 32.0
+
+
+def _replicate_pad_h_conv(x: torch.Tensor, left_val: torch.Tensor, right_val: torch.Tensor,
+                           kh: torch.Tensor, radius: int, C: int) -> torch.Tensor:
+    """Pad `x` in W with `radius` copies of `left_val`/`right_val` (each broadcastable
+    to `[B, C, H, 1]`) instead of `x`'s own border column, then convolve horizontally.
+    Shared by `_gauss_blur_bchw_edge_pad`'s main pass and its own edge-strip pre-pass
+    (GAUSS8-51) so both use the identical padding mechanics."""
+    if radius == 0:
+        return x
+    left = left_val.to(x.dtype).expand(x.shape[0], C, x.shape[2], radius)
+    right = right_val.to(x.dtype).expand(x.shape[0], C, x.shape[2], radius)
+    return torch.nn.functional.conv2d(torch.cat([left, x, right], dim=-1), kh, groups=C)
+
+
+def _replicate_pad_v_conv(x: torch.Tensor, top_val: torch.Tensor, bottom_val: torch.Tensor,
+                           kv: torch.Tensor, radius: int, C: int) -> torch.Tensor:
+    """The vertical counterpart of `_replicate_pad_h_conv` (`top_val`/`bottom_val`
+    broadcastable to `[B, C, 1, W]`)."""
+    if radius == 0:
+        return x
+    top = top_val.to(x.dtype).expand(x.shape[0], C, radius, x.shape[3])
+    bottom = bottom_val.to(x.dtype).expand(x.shape[0], C, radius, x.shape[3])
+    return torch.nn.functional.conv2d(torch.cat([top, x, bottom], dim=-2), kv, groups=C)
+
+
+def _gauss_blur_bchw_edge_pad(
+    img: torch.Tensor, sigma: float,
+    left_edge: torch.Tensor, right_edge: torch.Tensor,
+    top_edge: torch.Tensor, bottom_edge: torch.Tensor,
+    corners: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """GAUSS8-51: the same separable blur as `_gauss_blur_bchw`, except the
+    replicate padding on each side is seeded from caller-supplied edge values
+    (`left_edge`/`right_edge`: broadcastable to `[1, C, H, 1]`; `top_edge`/
+    `bottom_edge`: broadcastable to `[1, C, 1, W]`; `corners` = (tl, tr, bl, br),
+    each a single pixel) instead of `img`'s own border pixel/row/column. Exists so
+    `_gauss_blur_pyramid_approx` can pad with the true, un-mixed border row/column
+    (see its own comment) rather than `img`'s already block-averaged edge. Only
+    ever called from that path; `_gauss_blur_bchw` itself is untouched (invariant 7:
+    nothing below `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` is reachable through here).
+
+    The vertical pass's own pad must be the horizontally-blurred top/bottom edge
+    (matching `_gauss_blur_bchw`'s own pad-then-conv order: its vertical pad reads
+    `result`, the ALREADY horizontally-blurred image, never the pre-blur input) --
+    so `top_edge`/`bottom_edge` are run through the identical horizontal pass first,
+    padded at their own two ends by the corner pixels, before they seed the vertical
+    pad. Skipping this step left the day-plate corners visibly worse (measured) even
+    though it fixed the boundary-dominated case (night plate, large sigma) outright."""
+    if sigma < 0.3:
+        return img
+    C = img.shape[1]
+    kernel_h, kernel_v = _get_gauss_kernels(sigma, img.device)
+    radius = kernel_h.shape[-1] // 2
+    kh = kernel_h.to(img.dtype).expand(C, 1, 1, -1)
+    kv = kernel_v.to(img.dtype).expand(C, 1, -1, 1)
+    tl, tr, bl, br = corners
+    result = _replicate_pad_h_conv(img, left_edge, right_edge, kh, radius, C)
+    poll_cook_cancel(heavy=True)
+    top_edge_blurred = _replicate_pad_h_conv(top_edge, tl, tr, kh, radius, C)
+    bottom_edge_blurred = _replicate_pad_h_conv(bottom_edge, bl, br, kh, radius, C)
+    result = _replicate_pad_v_conv(result, top_edge_blurred, bottom_edge_blurred, kv, radius, C)
+    return result
 
 
 def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -1017,7 +1083,29 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     poll_cook_cancel(heavy=True)
     reduced = torch.nn.functional.interpolate(img, size=(reduced_h, reduced_w), mode='area')
     residual = sigma / factor
-    blurred = _gauss_blur_bchw(reduced, residual)
+    # GAUSS8-51: the residual blur's own replicate padding must repeat the TRUE
+    # border row/column, not `reduced`'s own edge pixel. `reduced`'s edge pixel is a
+    # 2-D `factor`x`factor` block average taken INWARD from the border in both axes at
+    # once, so it has already mixed interior content into what a replicate pad treats
+    # as a constant boundary value. The exact conv never does this: its replicate pad
+    # always repeats the single, un-mixed border row (or column), so for a sigma large
+    # relative to the image (the common case here -- this path only runs past
+    # `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`, and the kernel's 3-sigma reach routinely
+    # exceeds the whole frame) the exact result is itself dominated by that one
+    # replicated row, and any mismatch in what value gets replicated becomes a
+    # systematic, image-wide bias after a highlight-compressing tone curve amplifies
+    # it (measured: a mean signed shift up to +12 codes on a scattered-highlight
+    # plate at sigma=1024, cap=8 -- see docs/resolution-scale.md). `_edge_strip`
+    # downsamples the border ONLY along the axis parallel to it (never mixing in the
+    # perpendicular, into-the-image direction `reduced`'s own 2-D downsample does),
+    # giving the true edge value at the coarse resolution -- cost is O(H)+O(W), not
+    # O(sigma) or O(image area), so this stays on the flat-cost budget.
+    left_edge = torch.nn.functional.interpolate(img[:, :, :, 0:1], size=(reduced_h, 1), mode='area')
+    right_edge = torch.nn.functional.interpolate(img[:, :, :, -1:], size=(reduced_h, 1), mode='area')
+    top_edge = torch.nn.functional.interpolate(img[:, :, 0:1, :], size=(1, reduced_w), mode='area')
+    bottom_edge = torch.nn.functional.interpolate(img[:, :, -1:, :], size=(1, reduced_w), mode='area')
+    corners = (img[:, :, 0:1, 0:1], img[:, :, 0:1, -1:], img[:, :, -1:, 0:1], img[:, :, -1:, -1:])
+    blurred = _gauss_blur_bchw_edge_pad(reduced, residual, left_edge, right_edge, top_edge, bottom_edge, corners)
     poll_cook_cancel(heavy=True)
     return torch.nn.functional.interpolate(
         blurred, size=(out_h, out_w), mode='bilinear', align_corners=False,

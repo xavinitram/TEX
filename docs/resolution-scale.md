@@ -395,17 +395,102 @@ computable there at all (§ above). 1080p (1080×1080), CPU (an RTX 5070 Ti Lapt
 |---|---|---:|---:|---:|
 | `gauss_blur` | checker | sigma=260 (just past) | 0.128 | 77.6 |
 | `gauss_blur` | checker | sigma=1024 (well past) | 0.209 | 39.0 |
-| `gauss_blur` | smooth+edges | sigma=260 | 0.034 | 87.2 |
-| `gauss_blur` | smooth+edges | sigma=1024 | 0.049 | 84.9 |
-| `gauss_blur` | realistic | sigma=260 | 0.036 | 85.6 |
-| `gauss_blur` | realistic | sigma=1024 | 0.041 | 84.9 |
 
 **`bilateral_filter`'s row is corrected below (BILAT-51), not repeated here** — its original
 reading in this table compared every past-threshold `spatial_sigma` against ONE fixed anchor
 (the exact filter at `ss=8.0`/`radius=24`), which understated the detail-transfer path's own
-error once `ss` grew large (see "Correcting the method" below). `gauss_blur`'s reading above is
-unaffected (out of scope for this correction) and still holds up well on both realistic corpora,
-degrading only on the adversarial checker at a very large sigma.
+error once `ss` grew large (see "Correcting the method" below). The checker rows above are
+unaffected by GAUSS-51 (out of scope — an 8-pixel-period adversarial corpus was never the
+gauss_blur worst case; see GAUSS8-51 immediately below for the corpus and metric this wave's
+work is measured against).
+
+## The display-8 bar for `gauss_blur` past sigma 256 (GAUSS8-51)
+
+**GAUSS8-51's own criterion (the smooth+edges/realistic max-abs rows above are STALE and
+replaced by this section): does the approximation change what the artist sees at all**, not
+how far apart two floats are in scene-linear space. The plate is blurred with the shipped
+pyramid path and with the exact reference, both mapped through the ACES 1.x RRT + sRGB ODT
+(Hill's fitted form) and rounded to 8 bits — every pixel within 1 code (worst channel) is the
+bar. Two plates (`tools/display8.py`'s `plate_day`/`plate_night` — a daylight exterior with
+hard highlights, and a near-black interior with forty small, very bright practical lights, the
+harder case for a highlight-compressing tone curve under a large blur), 1080×1080, CPU (an RTX
+5070 Ti Laptop workstation); a 3840×3840 spot check at sigma=1024 confirmed the same bound
+holds at 4K.
+
+**The first reading found the bar badly missed, and not by noise — by a bias.** At the
+original `GAUSS_BLUR_PYRAMID_QUALITY_CAP` (8.0), the night plate showed a mean SIGNED shift up
+to +12 codes at sigma=1024 (worst pixel +23 in the centre half of the frame alone), the day
+plate up to +4.6 at sigma=2048 — most of the error a shift, not lost detail.
+
+**The mechanism, proved red-first.** `_gauss_blur_pyramid_approx` downsamples with one 2-D
+`interpolate(mode='area')` call, then blurs the reduced image with `_gauss_blur_bchw`'s own
+replicate padding — which repeats the REDUCED image's own edge pixel. That edge pixel is a
+`factor`x`factor` 2-D block average taken INWARD from the border in both axes at once, so it
+has already mixed interior content into what a replicate pad should treat as a pure boundary
+constant. The exact convolution never does this: its pad always repeats the single, un-mixed
+border row/column. Once sigma is large relative to the image — routine here, since this path
+only runs past the threshold, and the kernel's 3-sigma reach often exceeds the whole frame —
+the exact result is ITSELF dominated by that one replicated row, so any mismatch in what gets
+replicated becomes a systematic, image-wide bias, not a local edge artifact (matching the
+measured shift showing up in the CENTRE half of the frame too, not only near the border). The
+area-down/bilinear-up resample pair was also checked for a half-pixel phase shift and cleared:
+`tests/test_gauss8_display_bar.py::test_gauss8_mechanism_red_first_naive_pad_is_worse`
+reproduces the pre-fix mechanism inline and proves it is measurably worse than the fix against
+the same exact reference, isolating the border-mixing mechanism as the cause.
+
+**The fix (`_gauss_blur_bchw_edge_pad`, `tex_runtime/stdlib_core.py`).** Downsample the border
+strip ONLY along the axis parallel to it (`interpolate` on a 1-pixel-thick slice, never mixing
+in the perpendicular, into-the-image direction the 2-D reduction does) to get the true edge
+value at the coarse resolution, and pad the residual blur with THAT instead of the reduced
+image's own edge. The vertical pass's pad is the HORIZONTALLY-BLURRED top/bottom edge (matching
+`_gauss_blur_bchw`'s own pad-then-conv order, where the vertical pad reads the already
+horizontally-blurred image) — skipping this made the day plate's corners visibly worse even
+after the boundary-dominated night-plate case was fixed. Cost is O(H)+O(W) extra, not O(sigma)
+or O(image area), so the flat-cost promise holds.
+
+**`GAUSS_BLUR_PYRAMID_QUALITY_CAP` raised 8.0 -> 32.0 (author-approved).** At cap=8.0 the
+reduced level shrinks fast enough, relative to the residual blur's own kernel radius
+(`3 * min(sigma, cap)`), that even a correctly-seeded pad still lets the border dominate a
+reduced image only a few pixels wide once sigma runs into the thousands. cap=32.0 keeps the
+reduced level wide enough, at the sigmas below, that the bar holds; the one real blur still
+runs at a bounded `sigma / factor <= quality_cap`, so cost stays flat regardless of sigma
+(measured 4K, this box: ~2-10ms at both cap=8 and cap=32, sigma=260..4096, CPU and CUDA;
+CUDA warm-call timings at sigma=260/1024/4096 were 1.9-2.8ms at cap=32 vs. 2.7-9.8ms at
+cap=8 — no regression from the higher cap).
+
+**The bar, before and after, at 1080x1080.** Both columns come from ONE run of the same script
+(plates generated on the GPU, both paths run on an RTX 5070 Ti Laptop); "before" is the previous
+release's shipped path (cap=8, no edge fix), "after" is cap=32 plus the edge fix. Cell = max
+codes (worst channel) / mean signed codes / % of pixels off by >= 2 codes. SSIMULACRA2 is the
+after path's, measured separately on CPU.
+
+| sigma | plate | before | after | after SSIMULACRA2 |
+|---:|---|---|---|---:|
+| 260 | day | 6 / +0.34 / 25.3% | 2 / +0.08 / 0.01% | 92.6 |
+| 260 | night | 18 / +3.42 / 82.1% | 1 / -0.04 / 0% | 92.5 |
+| 512 | day | 6 / +1.00 / 43.8% | 1 / +0.17 / 0% | 90.9 |
+| 512 | night | 13 / +5.21 / 100% | 1 / -0.00 / 0% | 94.5 |
+| 1024 | day | 9 / +3.19 / 96.4% | 1 / +0.10 / 0% | 91.6 |
+| 1024 | night | 27 / +11.45 / 100% | 1 / +0.02 / 0% | 95.4 |
+| 2048 | day | 43 / +26.30 / 100% | 1 / +0.03 / 0% | 92.8 |
+| 2048 | night | 20 / +11.89 / 100% | 1 / +0.01 / 0% | 95.9 |
+| 1024 (3840x3840) | day | — | 1 / -0.00 / 0% | — |
+| 1024 (3840x3840) | night | — | 1 / -0.00 / 0% | — |
+
+**The bar (<=1 code) is met on every row but one:** sigma=260 on the day plate leaves 0.01% of
+pixels at 2 codes, all near the frame border (the centre half stays within 1). Before the fix the
+previous release missed it everywhere, by up to 43 codes, almost all of it a brightness bias. The
+edge fix is what closes it; raising the cap alone does not (cap=32 without the fix still left a
++3 code bias on the night plate at sigma=1024). Cost stays flat in sigma. The fast-row regression
+tests (the mechanism proof and the scaled-down bar check) live in
+`tests/test_gauss8_display_bar.py`.
+
+**This changes results for an existing program that already called `gauss_blur` with
+sigma > 256** (the pyramid path was always documented as an approximation past the threshold,
+never exact — see above — so this is not a new invariant violation, but a program's own past
+sigma>256 output is not bit-identical to what it was before this fix; every below-threshold
+call is untouched, proven by `torch.equal` in
+`tests/test_gauss8_display_bar.py::test_gauss8_below_threshold_still_bitexact`).
 
 ## `bilateral_filter` past radius 24 (BILAT-50/BILAT-51): measured against the SAME-σ exact reference
 
