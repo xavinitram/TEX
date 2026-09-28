@@ -517,3 +517,43 @@ def test_bilat50_a5_exact_bchw_matches_inline_and_degenerates_to_one_tile(r: Sub
             return
     r.ok("_bilateral_exact_bchw is bit-identical to the inline radius<=3 math and runs as a "
          "single untiled pass there -- the two regimes are provably one regime under two names")
+
+
+# ── BILAT-51 round 3: the separable/detail-transfer crossover is bounded by MEASURED  ──────
+# quality evidence, not just cost. Round 2 (this ask's own SSIMULACRA2 sweep) measured
+# separable beating both the v0.49 clamp and BILAT-50's detail-transfer only up to
+# spatial_sigma=32 (radius=96) -- the shipped ceiling of 256 extended the separable regime
+# past that into an untested range. Round 3's timing sweep also found separable's own cost at
+# radius=256 reaches ~106s on a 4K CPU cook (this box) -- both the untested-quality concern and
+# the measured worst-case cost point the same way: down, to the last radius this ask actually
+# has quality evidence for.
+def test_bilat51_separable_ceiling_matches_measured_evidence(r: SubTestResult):
+    print("\n--- BILAT-51 round 3: _BILATERAL_SEPARABLE_RADIUS_MAX is 96 (radius=96, "
+          "spatial_sigma=32) -- the largest radius this ask measured SSIMULACRA2 for, not a "
+          "larger number chosen for its cost alone ---")
+    if TEXStdlib._BILATERAL_SEPARABLE_RADIUS_MAX != 96:
+        r.fail("separable ceiling", f"expected 96 (the last radius with measured quality "
+               f"evidence), got {TEXStdlib._BILATERAL_SEPARABLE_RADIUS_MAX}")
+        return
+    img = make_img(1, 16, 16, 3, seed=51)
+    bchw = _get_bchw(img)
+    sr = 0.2
+    # radius=96 (ss=32): still separable -- the last measured-good radius.
+    ss_in = 96 / 3.0
+    via_fn = TEXStdlib.fn_bilateral_filter(img.clone(), ss_in, sr)
+    direct = TEXStdlib._bilateral_separable_bchw(bchw.clone(), ss_in, sr, 96).permute(0, 2, 3, 1)
+    if not torch.equal(via_fn, direct):
+        r.fail("radius=96 still separable", "fn_bilateral_filter's output at radius=96 is not "
+               "torch.equal to _bilateral_separable_bchw -- the dispatch boundary moved")
+        return
+    # radius=99 (ss=33, just past 96): now detail-transfer, not separable.
+    ss_out = 99 / 3.0
+    via_fn2 = TEXStdlib.fn_bilateral_filter(img.clone(), ss_out, sr)
+    direct_dt = TEXStdlib._bilateral_detail_transfer_bchw(bchw.clone(), ss_out, sr).permute(0, 2, 3, 1)
+    if not torch.equal(via_fn2, direct_dt):
+        r.fail("radius=99 falls back to detail-transfer", "fn_bilateral_filter's output past "
+               "the new ceiling is not torch.equal to _bilateral_detail_transfer_bchw")
+        return
+    r.ok("radius=96 (the last measured-good radius) still runs separable; radius=99 (just "
+         "past it) already falls back to detail-transfer -- the crossover is exactly where "
+         "this ask's own quality evidence ends, not past it")

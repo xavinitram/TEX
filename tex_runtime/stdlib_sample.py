@@ -657,16 +657,22 @@ class _StdlibSample:
     # `fn_bilateral_filter` read the same boundary from one place, not two matching
     # literals. See the footprint's own comment for why this matters to the planner.
     _BILATERAL_APPROX_THRESHOLD_SS = _BILATERAL_EXACT_RADIUS_MAX / 3.0
-    # BILAT-51: the separable pass's own cost grows with `radius` (O(image size *
-    # radius), measured ~3.5s at radius=256 on a 1080p CPU -- similar order to the
-    # exact tier's own boundary cost, ~7.6s at radius=24), so it stays bounded to a
-    # measured, reasonable radius; a genuinely huge `spatial_sigma` past this falls
-    # back to `_bilateral_detail_transfer_bchw` (flat O(image size), independent of
-    # sigma) rather than pay an ever-growing per-call cost, matching the guarantee
-    # every OTHER builtin's own past-threshold tier already holds (D1's van Herk,
-    # D2's gauss pyramid): no call ever costs more than O(image size) once sigma is
-    # large enough to be past the tier that scales with it.
-    _BILATERAL_SEPARABLE_RADIUS_MAX = 256
+    # BILAT-51 round 3: bounded by MEASURED evidence on BOTH axes, not cost alone.
+    # This ask's own SSIMULACRA2 sweep (docs/resolution-scale.md) only measured separable
+    # beating both the v0.49 clamp and BILAT-50's detail-transfer through spatial_sigma=32
+    # (radius=96) -- the first-shipped ceiling of 256 extended the regime past that into a
+    # radius this ask never scored for accuracy. Round 3's own timing sweep then found the
+    # cost at radius=256 reaches ~106s on a 4K CPU cook (this box, "best of 5") -- both the
+    # untested-quality concern and the measured worst-case cost point the same way: down, to
+    # the last radius this ask actually measured. At radius=96 the worst observed cost is a
+    # few tens of seconds (4K CPU) / a few seconds (4K CUDA, RTX 2080 SUPER) -- see
+    # docs/resolution-scale.md's own time/memory table for the full sweep. A genuinely huge
+    # `spatial_sigma` past this falls back to `_bilateral_detail_transfer_bchw` (flat
+    # O(image size), independent of sigma) rather than pay an ever-growing per-call cost,
+    # matching the guarantee every OTHER builtin's own past-threshold tier already holds
+    # (D1's van Herk, D2's gauss pyramid): no call ever costs more than O(image size) once
+    # sigma is large enough to be past the tier that scales with it.
+    _BILATERAL_SEPARABLE_RADIUS_MAX = 96
     _BILATERAL_TILE_BUDGET_ELEMS = 8_000_000  # ~32MB per fp32 intermediate tensor,
     # independent of image resolution: the row-tile height shrinks as `ksize` grows so
     # every per-tile intermediate (`patches`/`diff`/`w`, each [B,C,tile_h,W,ksize,ksize])
