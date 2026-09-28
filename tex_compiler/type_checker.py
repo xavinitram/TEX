@@ -1216,6 +1216,11 @@ class TypeChecker:
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
+        bad = self._reject_aggregate_operand(node.op, node.loc, lt, rt)
+        if bad is not None:
+            self._set_type(node, bad)
+            return bad
+
         # Matrix-specific rules
         if lt.is_matrix or rt.is_matrix:
             result = self._check_matrix_binop(lt, rt, node.op, node.loc)
@@ -1236,6 +1241,21 @@ class TypeChecker:
         self._set_type(node, result)
         return result
 
+    def _reject_aggregate_operand(self, what: str, loc, *types: TEXType) -> TEXType | None:
+        """An array or planes value is not a pixel value: as an operand it would fall through
+        `_promote` as a FLOAT while the runtime holds an N-wide tensor. After reporting, returns
+        the type to give the expression (the other operand's, so the error does not cascade
+        into an assignment mismatch), else None."""
+        for t in types:
+            if t.is_array or t.is_planes:
+                noun = "an array" if t.is_array else "a planes wire"
+                self._error(f"Operator '{what}' doesn't work on {noun}.",
+                            loc, code="E3401",
+                            hint="Index the array first (arr[i]) to get a value to compute with."
+                            if t.is_array else "Name a plane first (@beauty.diffuse).")
+                return next((o for o in types if not (o.is_array or o.is_planes)), TEXType.FLOAT)
+        return None
+
     def _check_unary(self, node: UnaryOp) -> TEXType:
         """Type-check a unary operation (-/!): the operand must be numeric/scalar."""
         t = self._check_expr(node.operand)
@@ -1243,6 +1263,9 @@ class TypeChecker:
             self._error(f"Unary operator '{node.op}' is not supported for strings.",
                         node.loc, code="E3401",
                         hint="Unary operators only work on numeric types (int, float, vec, mat).")
+            self._set_type(node, TEXType.FLOAT)
+            return TEXType.FLOAT
+        if self._reject_aggregate_operand(node.op, node.loc, t) is not None:
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
         if node.op == "!":
@@ -1410,6 +1433,10 @@ class TypeChecker:
         """Type-check an explicit cast to a numeric/vector target type."""
         expr_type = self._check_expr(node.expr)
         t = TYPE_NAME_MAP.get(node.target_type, TEXType.FLOAT)
+        if expr_type.is_array or expr_type.is_planes:
+            self._error(f"Casting {'an array' if expr_type.is_array else 'a planes wire'} to {t.value} isn't supported.",
+                        node.loc, code="E3700",
+                        hint="Index the array first (arr[i]) to cast one element.")
         # string(vec3/vec4/mat3/mat4) is not allowed — the str conversion code
         # is written for scalars only.
         if t.is_string and (expr_type.is_vector or expr_type.is_matrix):
