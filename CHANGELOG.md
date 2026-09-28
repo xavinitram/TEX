@@ -5,6 +5,44 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.1] - 2026-09-28 — "The same sigma, not a stand-in"
+
+A patch release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
+name. Fixes a regression in `0.50.0`'s own `bilateral_filter` approximation and corrects the
+perceptual-band figures that measured it.
+
+### Fixed (regression in 0.50.0)
+
+- **`bilateral_filter` past radius 24 used a downscale + detail-transfer approximation that,
+  once measured against the exact filter at the SAME `spatial_sigma` (rather than `0.50.0`'s own
+  fixed `ss=8.0` anchor, reused for every larger `spatial_sigma`), scored SSIMULACRA2 8.3 / 3.3 /
+  -11.6 on realistic images at `spatial_sigma` 8.5/16/32 — worse than the `v0.49` fixed 7x7-window
+  clamp it replaced (34.6 / 23.9 / 18.5 at the same points), a genuine perceptual regression the
+  original fixed-anchor measurement had hidden.** Radii 25-96 (`spatial_sigma` up to ~32) now run
+  a separable (row-then-column) bilateral pass instead: 91.9 / 91.4 / 89.1 on realistic images,
+  87.8-93.3 on smooth+edges, at the same three `spatial_sigma` points — clearing SSIMULACRA2 >= 80
+  on every corpus at every measured radius, CPU and CUDA agreeing within tolerance (max-abs <=
+  8.3e-7). `radius <= 24` is unaffected (bit-identical to every prior release). Past radius 96 the
+  flat-cost detail-transfer path remains — its measured band is the same 8.3 / 3.3 / -11.6 figure
+  above, disclosed, not improved this release: the separable pass's own accuracy sweep only covers
+  through `spatial_sigma=32`, and its own cost grows with radius (`O(image size x radius)`; the
+  worst measured cell, radius=256 at 4K on CPU, is 106 s), so extending it past what this release
+  measured would trade a disclosed quality gap for an undisclosed cost one. Full cost table
+  (1080p and 4K, CPU and a second CUDA workstation) is in `docs/resolution-scale.md`; large radii
+  are not interactive on CPU under any of the three mechanisms measured there (exact, separable,
+  or the exact-tiled reference used only to take this measurement). Windowed and tiled cooks
+  continue to decline narrowing any of `bilateral_filter`'s approximate paths, unchanged from
+  `0.50.0`.
+
+### Correction
+
+- **`0.50.0`'s own perceptual-band figures for `bilateral_filter` (this file's `[0.50.0]` entry
+  and `docs/resolution-scale.md`, "~43-56" on realistic images) were measured against a fixed
+  `spatial_sigma=8.0` anchor reused for every larger `spatial_sigma`, which understated the
+  approximation's own error as `spatial_sigma` grew.** The same-`spatial_sigma` figures above
+  replace it. `gauss_blur`'s own perceptual band is unaffected — out of scope for this correction,
+  and not re-measured.
+
 ## [0.50.0] - 2026-09-28 — "The stage, not the splice"
 
 A minor release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
