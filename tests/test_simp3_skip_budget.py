@@ -259,7 +259,12 @@ _SKIP_VOCAB = re.compile(
 #: `test_lint1_no_local_only_path_refs.py::test_lint1_i1_no_tracked_file_names_a_review_note`,
 #: skips for the identical reason and under the identical guard as its four siblings in the
 #: same file, each with its own row already counted in this pin.
-_SKIP_BUDGET = 131
+#: Re-pinned from 131 to 133 (FIX-501 F3): two new rows in
+#: `test_fix501_bilateral_cuda_window_identity.py` (`test_fix501_bilateral_exact_tier_
+#: window_identity_cuda`, `test_fix501_bilateral_radius_le_3_unchanged_on_cuda`) skip only
+#: when the box has no CUDA device -- the same named environment every other CUDA-only row
+#: in this pin already needs; both run for real on this ask's own box (CUDA present here).
+_SKIP_BUDGET = 133
 
 
 def _literal(node) -> str:
