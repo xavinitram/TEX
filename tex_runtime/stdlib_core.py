@@ -956,18 +956,21 @@ GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA = 256.0
 # The pyramid path's own accuracy/speed knob (not source-visible — an internal detail
 # of the approximation, never a `gauss_blur(...)` argument).
 #
-# GAUSS8-51: raised 8.0 -> 32.0 (author-approved) as part of closing the display-8 bar
+# GAUSS8-51: raised 8.0 -> 64.0 (author-approved) as part of closing the display-8 bar
 # (an approximate path must not change any 8-bit code after ACES RRT + sRGB ODT — see
 # docs/resolution-scale.md's "gauss_blur past the exact threshold" section). At cap=8.0
 # the reduced level shrinks fast enough, relative to the residual blur's own kernel
 # radius (`3 * min(sigma, cap)`), that even a CORRECTLY-seeded replicate pad (below)
 # still lets the border dominate a reduced image only a few pixels wide once sigma runs
-# into the thousands. cap=32.0 keeps the reduced level wide enough, at the sigmas this
-# document's own table covers, that the display-8 bar holds with the edge-pad fix
-# below; cost stays flat regardless (the one real blur still runs at a bounded
+# into the thousands. cap=32.0 held the bar on the display-8 plates at their base
+# exposure but not on a bright one: a night plate of small practical lights pushed x16
+# (sigma=260, factor 16) still read 2-3 codes, the residual being the bilinear upsample
+# of a field curved by point-like highlights. cap=64.0 halves the factor there and holds
+# the bar at x1/x4/x16 on both plates, sigma 260-2048, at the same flat cost (4k, CUDA
+# ~1.4-1.7ms, CPU ~10ms at either cap) — see docs/resolution-scale.md; cost stays flat regardless (the one real blur still runs at a bounded
 # `sigma / factor <= quality_cap`, and the extra edge-strip work the fix adds is
 # O(H)+O(W), not O(sigma) — measured flat at 4k, see docs/resolution-scale.md).
-GAUSS_BLUR_PYRAMID_QUALITY_CAP = 32.0
+GAUSS_BLUR_PYRAMID_QUALITY_CAP = 64.0
 
 
 def _replicate_pad_h_conv(x: torch.Tensor, left_val: torch.Tensor, right_val: torch.Tensor,

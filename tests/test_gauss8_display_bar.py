@@ -22,10 +22,11 @@ THE FIX (`_gauss_blur_bchw_edge_pad`, `tex_runtime/stdlib_core.py`): downsample 
 border strip ONLY along the axis parallel to it (never mixing in the perpendicular,
 into-the-image direction the 2-D `area` reduction does), and pad the residual blur with
 THAT instead of the reduced image's own edge. `GAUSS_BLUR_PYRAMID_QUALITY_CAP` was also
-raised 8.0 -> 32.0 (author-approved) — at cap=8.0 the reduced level shrinks fast enough
+raised 8.0 -> 64.0 (author-approved) — at cap=8.0 the reduced level shrinks fast enough
 that even a correctly-seeded pad still lets a several-pixel-wide reduced image's border
-dominate at high sigma; cap=32.0 keeps the reduced level wide enough for the fix to hold
-the bar across the sigmas this file (and `docs/resolution-scale.md`'s table) cover.
+dominate at high sigma; cap=32.0 still missed on a bright plate (night x16, sigma=260),
+which `test_gauss8_bright_plate_holds_the_bar` pins; cap=64.0 holds the bar across the
+sigmas and exposures this file (and `docs/resolution-scale.md`'s table) cover.
 
 Fast rows only: 128x128 plates (vs. the 1080x1080 readings in
 `docs/resolution-scale.md`'s own table), sigma scaled to stay in the same "well past
@@ -124,6 +125,22 @@ def test_gauss8_display_bar_fast_rows(r: SubTestResult):
                 continue
             r.ok(f"sigma={int(sigma)} {pname}: max code diff {stats['max']} <= 1 "
                  f"(mean_signed={stats['mean_signed']:+.3f})")
+
+
+def test_gauss8_bright_plate_holds_the_bar(r: SubTestResult):
+    print("\n--- GAUSS8-51: the bar holds on a highlight-heavy plate (night x16) just past "
+          "the threshold, where a cap of 32 read 2 codes ---")
+    H = W = 384
+    p = _d8.plate_night(H, W, torch.device("cpu")) * 16.0
+    for sigma in (260.0, 400.0):
+        exact = _gauss_blur_bchw(p, sigma)
+        approx = _gauss_blur_pyramid_approx(p, sigma)
+        stats = _d8.code_diff_stats(_d8.aces_srgb8(approx), _d8.aces_srgb8(exact))
+        if stats["max"] > 1:
+            r.fail(f"gauss8 bright plate sigma={sigma}",
+                   f"worst-channel code diff {stats['max']} exceeds the 1-code bar (stats={stats})")
+            continue
+        r.ok(f"night x16 sigma={int(sigma)}: max code diff {stats['max']} <= 1")
 
 
 def test_gauss8_below_threshold_still_bitexact(r: SubTestResult):

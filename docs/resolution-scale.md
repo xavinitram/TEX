@@ -448,41 +448,42 @@ horizontally-blurred image) — skipping this made the day plate's corners visib
 after the boundary-dominated night-plate case was fixed. Cost is O(H)+O(W) extra, not O(sigma)
 or O(image area), so the flat-cost promise holds.
 
-**`GAUSS_BLUR_PYRAMID_QUALITY_CAP` raised 8.0 -> 32.0 (author-approved).** At cap=8.0 the
+**`GAUSS_BLUR_PYRAMID_QUALITY_CAP` raised 8.0 -> 64.0 (author-approved).** At cap=8.0 the
 reduced level shrinks fast enough, relative to the residual blur's own kernel radius
 (`3 * min(sigma, cap)`), that even a correctly-seeded pad still lets the border dominate a
-reduced image only a few pixels wide once sigma runs into the thousands. cap=32.0 keeps the
-reduced level wide enough, at the sigmas below, that the bar holds; the one real blur still
-runs at a bounded `sigma / factor <= quality_cap`, so cost stays flat regardless of sigma
-(measured 4K, this box: ~2-10ms at both cap=8 and cap=32, sigma=260..4096, CPU and CUDA;
-CUDA warm-call timings at sigma=260/1024/4096 were 1.9-2.8ms at cap=32 vs. 2.7-9.8ms at
-cap=8 — no regression from the higher cap).
+reduced image only a few pixels wide once sigma runs into the thousands. cap=32.0 held the bar
+at base exposure but not on a bright plate: the night plate pushed x4/x16 read 2-3 codes at
+sigma=260 (factor 16), the residual being the bilinear upsample of a field curved by point-like
+highlights. cap=64.0 halves the factor there and holds the bar at every exposure below. The one
+real blur still runs at a bounded `sigma / factor <= quality_cap`, so cost stays flat in sigma
+(4K warm calls, RTX 5070 Ti Laptop: CUDA 1.4-1.7ms at cap=64 vs 1.2-2.2ms at cap=32; CPU
+~10-11ms at either cap; sigma 260-4096).
 
-**The bar, before and after, at 1080x1080.** Both columns come from ONE run of the same script
-(plates generated on the GPU, both paths run on an RTX 5070 Ti Laptop); "before" is the previous
-release's shipped path (cap=8, no edge fix), "after" is cap=32 plus the edge fix. Cell = max
-codes (worst channel) / mean signed codes / % of pixels off by >= 2 codes. SSIMULACRA2 is the
-after path's, measured separately on CPU.
+**The bar, before and after, at 1080x1080.** "Before" is the previous release's shipped path
+(cap=8, no edge fix); "after" is cap=64 plus the edge fix. Both from the same script, plates
+generated on the GPU, both paths run on an RTX 5070 Ti Laptop. Cell = max codes (worst channel)
+/ mean signed codes / % of pixels off by >= 2 codes. SSIMULACRA2 is scored on the ACES sRGB
+8-bit images of the after path against the exact reference.
 
 | sigma | plate | before | after | after SSIMULACRA2 |
 |---:|---|---|---|---:|
-| 260 | day | 6 / +0.34 / 25.3% | 2 / +0.08 / 0.01% | 92.6 |
-| 260 | night | 18 / +3.42 / 82.1% | 1 / -0.04 / 0% | 92.5 |
-| 512 | day | 6 / +1.00 / 43.8% | 1 / +0.17 / 0% | 90.9 |
-| 512 | night | 13 / +5.21 / 100% | 1 / -0.00 / 0% | 94.5 |
-| 1024 | day | 9 / +3.19 / 96.4% | 1 / +0.10 / 0% | 91.6 |
-| 1024 | night | 27 / +11.45 / 100% | 1 / +0.02 / 0% | 95.4 |
-| 2048 | day | 43 / +26.30 / 100% | 1 / +0.03 / 0% | 92.8 |
-| 2048 | night | 20 / +11.89 / 100% | 1 / +0.01 / 0% | 95.9 |
-| 1024 (3840x3840) | day | — | 1 / -0.00 / 0% | — |
-| 1024 (3840x3840) | night | — | 1 / -0.00 / 0% | — |
+| 260 | day | 6 / +0.34 / 25.3% | 1 / -0.01 / 0% | 94.1 |
+| 260 | night | 18 / +3.42 / 82.1% | 1 / -0.00 / 0% | 97.6 |
+| 512 | day | 6 / +1.00 / 43.8% | 1 / -0.00 / 0% | 95.0 |
+| 512 | night | 13 / +5.21 / 100% | 1 / -0.00 / 0% | 98.0 |
+| 1024 | day | 9 / +3.19 / 96.4% | 1 / +0.13 / 0% | 91.3 |
+| 1024 | night | 27 / +11.45 / 100% | 1 / +0.00 / 0% | 96.6 |
+| 2048 | day | 43 / +26.30 / 100% | 1 / +0.04 / 0% | 93.3 |
+| 2048 | night | 20 / +11.89 / 100% | 1 / +0.01 / 0% | 96.6 |
 
-**The bar (<=1 code) is met on every row but one:** sigma=260 on the day plate leaves 0.01% of
-pixels at 2 codes, all near the frame border (the centre half stays within 1). Before the fix the
-previous release missed it everywhere, by up to 43 codes, almost all of it a brightness bias. The
-edge fix is what closes it; raising the cap alone does not (cap=32 without the fix still left a
-+3 code bias on the night plate at sigma=1024). Cost stays flat in sigma. The fast-row regression
-tests (the mechanism proof and the scaled-down bar check) live in
+**Bright plates (the same plates x4 and x16, where 10-25% of pixels exceed 1.0).** Before: up to
+81 codes (night x16, sigma=1024, +46 mean). After: max 1 code and 0% of pixels at >= 2 on every
+one of the 16 cells (sigma 260/512/1024/2048 x day/night x4/x16); SSIMULACRA2 88.9-94.2 at x16.
+
+**The bar (<=1 code) is met on every row measured.** The edge fix is what closes most of it;
+raising the cap alone does not (cap=32 without the fix still left a +3 code bias on the night
+plate at sigma=1024), and cap=64 closes the bright-plate residual. The fast-row regression
+tests (the mechanism proof, the scaled-down bar check, the bright-plate row) live in
 `tests/test_gauss8_display_bar.py`.
 
 **This changes results for an existing program that already called `gauss_blur` with
