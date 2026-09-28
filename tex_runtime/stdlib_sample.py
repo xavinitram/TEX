@@ -263,9 +263,10 @@ class _StdlibSample:
 
         B, H, W, C = img.shape
 
-        # Clamp float then convert to int — faster than .long() then clamp
-        px_i = px_t.clamp(0, W - 1).to(torch.int64)
-        py_i = py_t.clamp(0, H - 1).to(torch.int64)
+        # Clamp float then convert to int — faster than .long() then clamp. A NaN survives
+        # the clamp and would cast to INT64_MIN (an out-of-range index), so it is sent to 0.
+        px_i = px_t.clamp(0, W - 1).nan_to_num_(0.0).to(torch.int64)
+        py_i = py_t.clamp(0, H - 1).nan_to_num_(0.0).to(torch.int64)
 
         # B=1 fast path: flat index is ~40% faster than 2D advanced indexing
         # for spatial-sized coordinate tensors (the common fetch() case).
@@ -360,9 +361,10 @@ class _StdlibSample:
         x = torch.clamp(x, 0, W - 1)
         y = torch.clamp(y, 0, H - 1)
 
-        x0 = torch.floor(x).long()
+        # clamp after the cast: a NaN coordinate must land on a valid index, not INT64_MIN
+        x0 = torch.floor(x).long().clamp(0, W - 1)
         x1 = torch.clamp(x0 + 1, 0, W - 1)
-        y0 = torch.floor(y).long()
+        y0 = torch.floor(y).long().clamp(0, H - 1)
         y1 = torch.clamp(y0 + 1, 0, H - 1)
 
         fx = (x - x0.float()).unsqueeze(-1)
@@ -415,9 +417,9 @@ class _StdlibSample:
         x = torch.clamp(u * (Ws - 1), 0, Ws - 1).expand(shape)
         y = torch.clamp(v * (Hs - 1), 0, Hs - 1).expand(shape)
 
-        x0 = torch.floor(x).long()
+        x0 = torch.floor(x).long().clamp(0, Ws - 1)
         x1 = torch.clamp(x0 + 1, 0, Ws - 1)
-        y0 = torch.floor(y).long()
+        y0 = torch.floor(y).long().clamp(0, Hs - 1)
         y1 = torch.clamp(y0 + 1, 0, Hs - 1)
 
         fx = (x - x0.to(x.dtype)).unsqueeze(-1)

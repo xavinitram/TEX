@@ -91,3 +91,59 @@ def test_sample_mip_mixed_rank_uv_broadcasts():
     assert (c - d).abs().max() < 1e-6
 
 
+# -- NaN coordinates never become an out-of-range index ---------------------------------
+
+def test_fetch_nan_coordinate_lands_on_a_valid_pixel():
+    img = _img(H=4, W=4)
+    px = torch.full((1, 4, 4), NAN)
+    py = torch.zeros(1, 4, 4)
+    out = S.fn_fetch(img, px, py)
+    assert torch.isfinite(out).all()
+    assert torch.equal(out[0, 0, 0], img[0, 0, 0])
+    out2 = S.fn_fetch(img, torch.tensor(NAN), torch.tensor(NAN))
+    assert torch.isfinite(out2).all()
+
+
+def test_fetch_finite_coordinates_are_unchanged():
+    img = _img(H=4, W=4)
+    px = torch.tensor([-2.0, 0.4, 1.9, 9.0]).view(1, 1, 4).expand(1, 4, 4)
+    py = torch.zeros(1, 4, 4)
+    out = S.fn_fetch(img, px, py)
+    assert torch.equal(out[0, 0, 0], img[0, 0, 0])
+    assert torch.equal(out[0, 0, 1], img[0, 0, 0])
+    assert torch.equal(out[0, 0, 2], img[0, 0, 1])
+    assert torch.equal(out[0, 0, 3], img[0, 0, 3])
+
+
+def test_sample_lanczos_nan_coordinate_is_safe():
+    img = _img(H=4, W=4)
+    u = torch.full((1, 4, 4), NAN)
+    v = torch.full((1, 4, 4), 0.5)
+    out = S.fn_sample_lanczos(img, u, v)
+    assert out.shape == img.shape
+
+
+def test_sample_frame_nan_coordinate_is_safe():
+    img = _img(B=2, H=4, W=4)
+    u = torch.full((2, 4, 4), NAN)
+    v = torch.full((2, 4, 4), 0.5)
+    out = S.fn_sample_frame(img, 0.0, u, v)
+    assert out.shape == (2, 4, 4, 3)
+
+
+@pytest.mark.parametrize("code", [
+    "@OUT = fetch(@A, ix + @F.r, iy);",
+    "@OUT = @A[ix + @F.r, iy];",
+    "@OUT = sample(@A, u + @F.r * px, v);",
+])
+def test_nan_coordinate_program_runs_on_both_tiers(code):
+    A = _img(H=4, W=4, C=4)
+    F = torch.zeros(1, 4, 4, 4)
+    F[0, 1, 1, 0] = NAN
+    interp, cg = run_both(code, {"A": A, "F": F})
+    if cg is not None:
+        a, b = interp["OUT"], cg["OUT"]
+        assert torch.equal(torch.isnan(a), torch.isnan(b))
+        assert (torch.nan_to_num(a) - torch.nan_to_num(b)).abs().max() < 1e-5
+
+

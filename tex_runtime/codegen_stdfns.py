@@ -396,8 +396,8 @@ class _EmitStdFnsMixin:
             img_var = f"_bind[{bname!r}]"
             px = self._tmp()
             py = self._tmp()
-            self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).long()")
-            self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
+            self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
             # B=1 fast path: direct indexing, batch dim kept explicitly.
             #
             # TRK-5/FIX-4: the old form indexed the batch axis with a bare `0`

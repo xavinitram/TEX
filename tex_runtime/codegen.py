@@ -955,13 +955,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         px_tmp = self._tmp()
         py_tmp = self._tmp()
         if dx_code == "0":
-            self._emit(f"{px_tmp} = {ix_ref}.clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{px_tmp} = {ix_ref}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
         else:
-            self._emit(f"{px_tmp} = ({ix_ref} + {dx_code}).clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{px_tmp} = ({ix_ref} + {dx_code}).clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
         if dy_code == "0":
-            self._emit(f"{py_tmp} = {iy_ref}.clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{py_tmp} = {iy_ref}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
         else:
-            self._emit(f"{py_tmp} = ({iy_ref} + {dy_code}).clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{py_tmp} = ({iy_ref} + {dy_code}).clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
         tmp = self._tmp()
         self._emit(f"{tmp} = {img_var}[:, {py_tmp}, {px_tmp}, :]"
                    f" if {px_tmp}.dim() < 3"
