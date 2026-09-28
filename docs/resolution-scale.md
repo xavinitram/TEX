@@ -264,9 +264,23 @@ than on the checker, 0.25).
 | family | scale=½ (pinned, `test_scale47b_r1_envelope_*`) | scale=¼ | scale=⅛ |
 |---|---:|---:|---:|
 | `gauss_blur` | 0.10 | 0.20 | 0.40 |
-| `bilateral_filter` | 0.08 | 0.06 | 0.05 |
+| `bilateral_filter` | 0.08 (spatial_sigma 6); 0.10 (spatial_sigma 6-13) | 0.06 | 0.05 |
 | `erode` | 0.05 | 0.30 | **not recommended** — measured 0.25–0.48 |
 | `dilate` | 0.05 | 0.30 | **not recommended** — measured 0.53–0.75 |
+
+**`bilateral_filter` at the larger exact radii (v0.51).** The exact tier now runs to radius 40
+(spatial_sigma about 13.3), and a `scale=s` cook scales spatial_sigma BEFORE the call, so the
+regime dispatch sees the scaled radius: spatial_sigma=10 at `scale=½` runs the exact tap-loop at
+radius 15, about a sixteenth of the full-resolution cost
+(`tests/test_bilatx51_scale.py`). Measured worst-of-both-patterns maxdiff at 256²:
+spatial_sigma 6 / 10 / 13 read 0.082 / 0.093 / 0.098 at `scale=½`, 0.027 / 0.035 / 0.035 at
+`scale=¼`, 0.024 / 0.039 / 0.042 at `scale=⅛`. The `scale=½` band was pinned at 0.08 on a
+32×32 checker only, where these read about 0.04; on the 256² patterns spatial_sigma 6 was
+already 0.082 before this change. The `scale=½` band for spatial_sigma 6-13 is therefore
+re-measured at 0.10; `scale=¼` and `scale=⅛` hold their existing bands. On a plate with a hard
+0.8 step the `scale=½` maxdiff reaches 0.16 at 96² (0.08 at 192²): a coarse bilateral's range
+weights see the downsample's blended edge pixels, so the preview is least faithful right at hard
+edges.
 
 **`erode`/`dilate` are not recommended below `scale=¼`.** At `scale=⅛` the measured maxdiff
 (0.25–0.75, on a `[0,1]` channel range) is more than half the value range — past any band
