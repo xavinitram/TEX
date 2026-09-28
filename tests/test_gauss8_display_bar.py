@@ -28,19 +28,25 @@ dominate at high sigma; cap=32.0 still missed on a bright plate (night x16, sigm
 which `test_gauss8_bright_plate_holds_the_bar` pins; cap=64.0 holds the bar across the
 sigmas and exposures this file (and `docs/resolution-scale.md`'s table) cover.
 
+The v0.51 pyramid review evaluated replacing this caller-supplied-edge-pad
+mechanism with a single replicate-pad of the full-resolution image BEFORE the one
+`area` reduction — NOT ADOPTED: it fails precisely where the reduced grid collapses to
+one coarse pixel (a side <= `factor`), where there is no longer a distinct "border" to
+seed a plain replicate pad with (24 of 240 sweep cells above the 1-code bar, worst 53,
+vs. 2 for this shipped mechanism). See `_gauss_blur_bchw_edge_pad`'s own
+docstring for the full evidence. `_replicate_pad_h_conv`/`_replicate_pad_v_conv` were
+collapsed into one dim-parametrized `_replicate_pad_conv` helper instead (v0.51).
+
 Fast rows only: 128x128 plates (vs. the 1080x1080 readings in
 `docs/resolution-scale.md`'s own table), sigma scaled to stay in the same "well past
 threshold" regime the full-size table exercises.
 """
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import torch
 
 from helpers import *
+from helpers import load_display8_harness
 from TEX_Wrangle.tex_runtime import stdlib_core as _sc
 from TEX_Wrangle.tex_runtime.stdlib_core import (
     GAUSS_BLUR_PYRAMID_QUALITY_CAP as QUALITY_CAP,
@@ -50,19 +56,7 @@ from TEX_Wrangle.tex_runtime.stdlib_core import (
     _get_gauss_kernels,
 )
 
-_PKG = Path(__file__).resolve().parent.parent  # TEX_Wrangle/
-_TOOL = _PKG / "tools" / "display8.py"
-
-
-def _load_display8():
-    spec = importlib.util.spec_from_file_location("_display8_bar_harness", _TOOL)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_d8 = _load_display8()
+_d8 = load_display8_harness()
 
 
 def _naive_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -210,3 +204,98 @@ def test_gauss8_edge_pad_matches_kernel_of_plain_replicate_when_uniform(r: SubTe
         return
     r.ok("edge-pad blur matches plain replicate-pad blur exactly when there is no "
          "edge/interior content to mismatch")
+
+
+# ── v0.51: fast rows for the shape families the display-8 bar and
+# `docs/resolution-scale.md`'s tables never covered -- batch>1, 1/4 channels, fp16 and
+# tiny frames. The [1,3,H,W] fp32 square-plate bar above says nothing about any of
+# these; a v0.51 review note flagged the gap and a probe confirmed it by probe (no crash,
+# but no accuracy check existed for any of them). ─────────────────────────────────
+
+def test_gauss8_fast_rows_batch_gt1(r: SubTestResult):
+    print("\n--- batch>1 -- two independent plates in one call, each batch index "
+          "checked against the display-8 bar separately ---")
+    H = W = 96
+    day = _d8.plate_day(H, W, torch.device("cpu"))
+    night = _d8.plate_night(H, W, torch.device("cpu"))
+    batched = torch.cat([day, night], dim=0)  # [2, 3, H, W]
+    for sigma in (512.0, 1024.0):
+        exact = _gauss_blur_bchw(batched, sigma)
+        approx = _gauss_blur_pyramid_approx(batched, sigma)
+        for b, name in enumerate(("day", "night")):
+            stats = _d8.code_diff_stats(_d8.aces_srgb8(approx[b:b + 1]), _d8.aces_srgb8(exact[b:b + 1]))
+            if stats["max"] > 1:
+                r.fail(f"gauss8 batch>1 sigma={sigma} batch={b}({name})",
+                       f"worst-channel code diff {stats['max']} exceeds the 1-code bar (stats={stats})")
+                continue
+            r.ok(f"sigma={int(sigma)} batch={b}({name}): max code diff {stats['max']} <= 1")
+
+
+def test_gauss8_fast_rows_channel_counts(r: SubTestResult):
+    print("\n--- 1 and 4 channels -- the ACES display transform is RGB-only, so this "
+          "checks the pyramid path directly against the exact reference in linear space, "
+          "against the same 0.05-0.10 max-abs band docs/resolution-scale.md's R1 promise "
+          "already accepts for this builtin family (there is no display-8 pipeline for a "
+          "non-3-channel image) ---")
+    torch.manual_seed(11)
+    H = W = 96
+    for C in (1, 4):
+        img = torch.rand(1, C, H, W) * 4.0 + 0.01
+        for sigma in (512.0, 1024.0):
+            exact = _gauss_blur_bchw(img, sigma)
+            approx = _gauss_blur_pyramid_approx(img, sigma)
+            maxdiff = (exact - approx).abs().max().item()
+            bound = 0.10 * img.max().item()
+            if maxdiff > bound:
+                r.fail(f"gauss8 channels={C} sigma={sigma}",
+                       f"max abs diff {maxdiff:.4f} exceeds the stated {bound:.4f} bound")
+                continue
+            r.ok(f"channels={C} sigma={int(sigma)}: max abs diff {maxdiff:.4f} <= {bound:.4f}")
+
+
+def test_gauss8_fast_rows_fp16(r: SubTestResult):
+    print("\n--- fp16 -- a STATED fp16 bound of <= 2 codes (vs. the fp32 bar's 1 code), "
+          "since the reduce/blur/upsample chain itself runs in fp16 and the kernel cast in "
+          "`_gauss_blur_bchw` (M-3) rounds to fp16, not because this diff changed anything "
+          "about the mechanism -- the exact reference stays fp32 (there is no separate fp16 "
+          "'exact' answer to compare against) ---")
+    H = W = 96
+    plates = {"day": _d8.plate_day(H, W, torch.device("cpu")), "night": _d8.plate_night(H, W, torch.device("cpu"))}
+    for sigma in (512.0, 1024.0):
+        for pname, p in plates.items():
+            exact = _gauss_blur_bchw(p, sigma)
+            approx16 = _gauss_blur_pyramid_approx(p.half(), sigma).float()
+            stats = _d8.code_diff_stats(_d8.aces_srgb8(approx16), _d8.aces_srgb8(exact))
+            if stats["max"] > 2:
+                r.fail(f"gauss8 fp16 sigma={sigma} plate={pname}",
+                       f"worst-channel code diff {stats['max']} exceeds the stated fp16 bound of 2 "
+                       f"(stats={stats})")
+                continue
+            r.ok(f"fp16 sigma={int(sigma)} {pname}: max code diff {stats['max']} <= 2 (stated fp16 bound)")
+
+
+def test_gauss8_fast_rows_tiny_frames(r: SubTestResult):
+    print("\n--- tiny frames -- 1x1, 2x2 and elongated 1xN/Nx1 frames, where the "
+          "pyramid's own factor almost always exceeds every side (a flat-field reduction, "
+          "never padded/extended). Uses a direct worst-channel-code diff, not "
+          "`code_diff_stats`'s centre-half crop -- that crop (`h//4:3*h//4`) is EMPTY "
+          "for H or W < 4, which is the whole point of this row ---")
+    torch.manual_seed(13)
+    sigma = 1024.0
+    for H, W in ((1, 1), (2, 2), (1, 64), (64, 1), (3, 5)):
+        img = torch.rand(1, 3, H, W)
+        exact = _gauss_blur_bchw(img, sigma)
+        approx = _gauss_blur_pyramid_approx(img, sigma)
+        if approx.shape != img.shape:
+            r.fail(f"gauss8 tiny shape {H}x{W}", f"got {tuple(approx.shape)}, expected {tuple(img.shape)}")
+            continue
+        if not torch.isfinite(approx).all():
+            r.fail(f"gauss8 tiny finite {H}x{W}", "non-finite output")
+            continue
+        diff = (_d8.aces_srgb8(approx).double() - _d8.aces_srgb8(exact).double()).abs().amax(dim=-1)
+        maxcode = int(diff.max())
+        if maxcode > 1:
+            r.fail(f"gauss8 tiny bar {H}x{W}",
+                   f"worst-channel code diff {maxcode} exceeds the 1-code bar")
+            continue
+        r.ok(f"{H}x{W}: max code diff {maxcode} <= 1")

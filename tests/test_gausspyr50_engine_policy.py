@@ -178,7 +178,10 @@ def test_gausspyr50_huge_sigma_bounded_levels(r: SubTestResult):
     # to fix the boundary bias -- see that function's own docstring), but every shape of
     # the real convolution -- old and new -- still resolves its kernel through
     # `_get_gauss_kernels`, so THAT is the stable chokepoint to capture the one real
-    # blur's sigma from.
+    # blur's sigma from. (the v0.51 pyramid review evaluated collapsing this back to a
+    # plain `_gauss_blur_bchw` call via a pad-before-reduce reformulation; NOT ADOPTED --
+    # see `_gauss_blur_bchw_edge_pad`'s own docstring for the red-first evidence -- so this
+    # chokepoint is still the right one to capture from.)
     def _capturing_get_gauss_kernels(sigma, device):
         final_sigma_seen["v"] = sigma
         return real_get_gauss_kernels(sigma, device)
