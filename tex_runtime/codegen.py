@@ -47,6 +47,7 @@ from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
 from . import masked_flow as _masked_flow_mod
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
+                     _stage_codegen_param,  # TRK-236: seeded as `_THS`, `build()` below
                      _scale_pixel_arg,   # SCALE-CG-48: seeded as `_SCM`, `build()` below
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx,  # P0-D: cook grid
@@ -921,8 +922,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             return local
         local = self._tmp()
         self._preamble.append(f"    {local} = _bind[{name!r}]")
+        # TRK-236: `_THS` (`_stage_codegen_param`) carries the host reading of a genuine
+        # scalar `$param` forward onto the minted tensor (PERF-2) — see its own docstring.
+        # The `_torch.as_tensor(` call stays exactly where it was (the SAME text a
+        # pre-fix build emitted, just as the one argument of `_THS(...)` now) — the
+        # invisibility digest test (`test_codegen_value_parity.py`) pins that substring,
+        # not the whole statement, and every value shape converts exactly as before
+        # (`_THS` returns `minted` untouched for a tensor/vec-list `raw`).
         self._preamble.append(
-            f"    if not isinstance({local}, str): {local} = _torch.as_tensor({local})"
+            f"    if not isinstance({local}, str): "
+            f"{local} = _THS({local}, _torch.as_tensor({local}))"
         )
         self._param_locals[name] = local
         return local
@@ -1209,6 +1218,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # with a `pixel_args=` call ever emits a reference to it; every other program
         # pays one unused dict-store per build, the same cost class `_MF`/`_CK` already
         # pay for every program that doesn't mask or poll-cancel.
+        # TRK-236: `_THS` (`_stage_codegen_param`) is seeded the same way — a GLOBAL,
+        # never a parameter. Every program with at least one `$param` reference emits a
+        # call to it (`_get_param_local`'s preamble); the seed itself costs one dict-store
+        # per build regardless.
         # K1 (v0.50.0 Phase C, F2 + B3#1): a REAL module's own __dict__, registered in
         # sys.modules and evicted alongside its linecache entry — see
         # `_codegen_exec_namespace`'s own docstring for why a bare dict (no `__name__`)
@@ -1218,7 +1231,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         _register_codegen_linecache(filename, func_src)
         namespace = _codegen_exec_namespace(
             filename, {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel,
-                      "_SCM": _scale_pixel_arg})
+                      "_SCM": _scale_pixel_arg, "_THS": _stage_codegen_param})
         exec(code_obj, namespace)
         fn = namespace["_tex_fn"]
         # Stash the module code object + source for PC-3 marshal persistence.

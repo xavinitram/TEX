@@ -122,12 +122,16 @@ def materialize_codegen(blob: bytes, src: str, has_fn_calls: bool,
     # or not, so a rematerialized one needs it exactly as it needs `_MF`. Imported from
     # `.stdlib` (a leaf), never `.codegen`, to keep this module's own "zero `_CodeGen`
     # reference" contract (this file's own docstring) intact.
-    from .stdlib import _scale_pixel_arg
+    # TRK-236: `_THS` (`_stage_codegen_param`) is the same unconditional-per-call shape as
+    # `_SCM` — any persisted program with a `$param` reference calls it on every
+    # invocation (`_get_param_local`'s preamble), so a rematerialized one needs it too.
+    from .stdlib import _scale_pixel_arg, _stage_codegen_param
     # K1: a real, registered module's __dict__ -- see _codegen_exec_namespace's own
     # docstring; this rematerialization path is the second of B3#1's two independent
     # generated-code run sites (the warm-restart marshal path), fixed the same way build() is.
     namespace = _codegen_exec_namespace(
-        filename, {"_MF": _masked_flow_mod, "_SCM": _scale_pixel_arg})
+        filename, {"_MF": _masked_flow_mod, "_SCM": _scale_pixel_arg,
+                  "_THS": _stage_codegen_param})
     exec(code_obj, namespace)
     fn = namespace["_tex_fn"]
     fn._has_fn_calls = has_fn_calls

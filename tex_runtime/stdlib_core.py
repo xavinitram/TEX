@@ -138,6 +138,62 @@ def _host_scalar(x):
     return None
 
 
+def _is_vec_param_list(value) -> bool:
+    """Same shape test as `codegen.is_vec_param_list` (a list/tuple of 2-4 plain
+    numbers, `bool` excluded since it's an `int` subclass) — duplicated rather than
+    imported so this module stays a leaf `codegen.py`/`codegen_persist.py` can both
+    import without a cycle (this file cannot import FROM `codegen.py`)."""
+    if not isinstance(value, (list, tuple)) or len(value) not in (2, 3, 4):
+        return False
+    for c in value:
+        if isinstance(c, bool) or not isinstance(c, (int, float)):
+            return False
+    return True
+
+
+# TRK-236: `_get_param_local`'s emitted preamble (`codegen.py::_CodeGen._get_param_local`)
+# is the one remaining `$param` mint site that stages a Python scalar into a tensor WITHOUT
+# carrying its host reading forward — `_stage_wire_scalars` (`codegen.py`),
+# `compiled.py::_params_on_device` and `Interpreter`'s own bind loop all already do (see
+# this file's own module comment on `_tag_host_scalar`, above). An untagged CPU tensor
+# forces `gauss_blur`/`bilateral_filter`'s own `_host_scalar` read to fall through to a raw
+# `.item()` — a graph break under `torch.compile`/`auto` whose RESUME frame torch's own
+# `caching_precompile` guard serializer sometimes cannot pickle (`TypeError: cannot pickle
+# '_thread._local' object`, reproduced on real CUDA hardware with any program past the
+# compile op-count threshold that reaches this fallback) — crashing the compile once and
+# silently blacklisting the fingerprint to the interpreter forever (`compiled.py`'s own
+# never-hard-fail net). Tagging here closes the gap the same way the other three sites
+# already do.
+#
+# This MUST happen inside the emitted/traced preamble text itself, not by pre-staging
+# `bindings` before the codegen'd function is invoked (an earlier draft of this fix tried
+# that — the `_stage_wire_scalars` shape — and measured it inert: once a value is already
+# bound in the `bindings` dict handed to a `torch.compile`-wrapped callable, Dynamo treats
+# it as a traced GRAPH INPUT and does not expose a custom Python instance attribute like
+# `_tex_host_scalar` from inside the trace, even though the real object carries it. A
+# tensor freshly MINTED from a Python constant INSIDE the traced preamble (`torch.as_tensor`
+# on a literal `_bind[name]` value Dynamo is already constant-folding) does not have this
+# problem — confirmed directly: `torch._dynamo.explain`/a real CUDA `torch.compile` run
+# shows 0 breaks at `_host_scalar` when tagged this way, vs. the pre-staged version still
+# reaching the raw `.item()` fallback.
+def _stage_codegen_param(raw, minted):
+    """`$param` preamble staging with PERF-2 host-scalar tagging, seeded into the
+    generated module as `_THS` (`codegen.py`'s `build()` / `codegen_persist.py`'s
+    `materialize_codegen()`, same pattern as `_MF`/`_SCM`). `raw` is the value read
+    straight off `_bind[name]` (before any conversion); `minted` is what the SAME
+    preamble's own `_torch.as_tensor(raw)` call already produces. Byte-identical
+    RETURN VALUE to `minted` for every shape `as_tensor` doesn't itself leave alone —
+    an already-a-tensor `raw` (`_params_on_device`'s SAME "Python values only" scope)
+    or a vec/color list (staged at its own rank by `_stage_vec_params` elsewhere; this
+    class's `minted` shape is not the one that needs tagging) both pass `minted` through
+    unchanged. Only a genuine scalar `raw` (int/float/bool) gets its host reading carried
+    onto `minted`, exactly as `_tag_host_scalar`'s own contract requires (the value
+    `.item()` WOULD return, never the un-rounded Python number)."""
+    if raw.__class__ is torch.Tensor or _is_vec_param_list(raw):
+        return minted
+    return _tag_host_scalar(minted, raw)
+
+
 def _scale_pixel_arg(value, scale):
     """SCALE-CG-48: the runtime multiply behind every codegen-emitted `pixel_args=`-tagged
     argument (`_CodeGen._emit_function_call`, `tex_runtime/codegen.py`), and the ONLY
