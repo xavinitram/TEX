@@ -53,6 +53,7 @@ to invariant 2's own 1e-5, because unblocking the real backend surfaces a real, 
 in-tolerance Inductor kernel-fusion reassociation that a crash-then-fallback previously hid).
 """
 import threading
+import time
 
 import pytest
 
@@ -168,3 +169,55 @@ def test_precompile_flag_lock_serializes_two_off_scoped_callers():
     assert events[1] == (first_tag, "exit"), (
         f"off-scoped windows overlapped, lock did not serialize: {events}")
     assert dynamo_config.caching_precompile is True
+
+
+def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock():
+    """FIX-COMPILE51 C1 (B3#1): RED at `365fdb4` -- `_precompile_flag_lock` was taken only
+    by the `disable=True` (OFF-scoped) branch (`_precompile_off_ctx`); the `disable=False`
+    (default, ON-scoped) branch called `_dc.patch(caching_precompile=True)` directly, never
+    touching the lock at all. That means an off-scoped compile on one pool (`_COMPILE_POOL`/
+    `_WARM_POOL`) and a concurrent default-scoped compile on the other were never actually
+    serialized against each other, despite the module comment's and this file's own
+    `test_precompile_flag_lock_serializes_two_off_scoped_callers` claiming exactly that
+    coverage -- that test only ever pits two `disable=True` callers against each other, so
+    it cannot catch the missing lock in the `disable=False` branch.
+
+    This proves the missing coverage directly, on the LOCK OBJECT itself, rather than by
+    sampling `caching_precompile`'s live value across threads: this torch build's
+    `ConfigModule.patch()` stores the patched value in a `contextvars.ContextVar`, which
+    Python isolates per OS thread by design (confirmed separately: a value one thread
+    `.set()`s is invisible to a concurrently running thread's own `.get()`), so two real
+    `threading.Thread`s sampling the flag value across each other's windows would read
+    each thread's own default and never observe the cross-thread symptom B3#1 measured on
+    its own box -- a test built that way would be RED for the wrong reason at best, and a
+    false pass at worst (exactly the class of weak test B4#1 flagged elsewhere in this
+    diff). The lock is the actual shared, cross-thread-visible resource FIX-COMPILE51 must
+    cover for both branches, so this test holds `_precompile_flag_lock` externally
+    (simulating a live off-scoped compile in progress on the OTHER pool) and asserts that
+    entering the default (`disable=False`) scope BLOCKS until it is released -- AFTER the
+    fix, both branches share one lock-wrapped helper, so entering either one while the
+    other's window is open must wait for it."""
+    dynamo_config.caching_precompile = False
+
+    def _holder():
+        with C._precompile_flag_lock:
+            time.sleep(0.1)  # hold for a fixed window, released on its own
+
+    holder = threading.Thread(target=_holder)
+    holder.start()
+    try:
+        time.sleep(0.02)  # let the holder actually acquire the lock first
+        start = time.monotonic()
+        ctx = C._precompile_ctx(disable=False)
+        ctx.__enter__()
+        try:
+            elapsed = time.monotonic() - start
+        finally:
+            ctx.__exit__(None, None, None)
+    finally:
+        holder.join(5)
+
+    assert elapsed >= 0.04, (
+        f"entering the default (disable=False) scope returned in {elapsed * 1000:.1f}ms "
+        f"while _precompile_flag_lock was held by another caller -- the disable=False "
+        f"branch does not actually acquire the shared lock")

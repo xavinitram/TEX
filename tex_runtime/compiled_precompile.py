@@ -47,15 +47,36 @@ from typing import Any
 # not TEX's own code (see the COMPILE-51 finding writeup). Scoped OFF, in-memory
 # only, for the `_has_fn_calls` class `fncalls_compile` tracks; every other
 # compiled program keeps disk-persisted `caching_precompile` (PC-2) unchanged.
-# The flag is process-global while `_COMPILE_POOL`/`_WARM_POOL` run concurrently,
-# so `_precompile_flag_lock` serializes an off-scoped window against either pool.
+# The flag is process-global while `_COMPILE_POOL`/`_WARM_POOL` (both defined in
+# `compiled.py`) run concurrently, so `_precompile_flag_lock` serializes EVERY
+# scoped window against every other one, whichever value it sets -- FIX-COMPILE51
+# C1 (B3#1): the pre-fix code took this lock ONLY for the `disable=True` branch
+# (`_precompile_off_ctx`); the `disable=False` (default) branch called
+# `_dc.patch(caching_precompile=True)` directly, with no lock at all, so an
+# off-scoped compile on one pool and a concurrently running default-scoped compile
+# on the other were never actually serialized against each other despite this
+# comment's own claim (confirmed missing directly: entering the default branch
+# while another caller held this lock returned immediately instead of blocking --
+# see `tests/test_compile51b_precompile_disable.py`). Routing BOTH branches
+# through the SAME lock-wrapped helper (`_precompile_scoped`) closes that: the
+# cost is that an ON-scoped compile on one pool can now wait, briefly, behind an
+# OFF-scoped compile finishing on the other pool, and vice versa -- one compile's
+# own wrap window, not the whole cook -- and correctness costs more than that
+# pause.
 _precompile_flag_lock = threading.Lock()
 
 
 @contextlib.contextmanager
-def _precompile_off_ctx(_dc):
-    with _precompile_flag_lock, _dc.patch(caching_precompile=False):
+def _precompile_scoped(_dc, *, caching_precompile: bool):
+    """Shared body for both scoped values (FIX-COMPILE51 C1) -- see the module
+    comment above `_precompile_flag_lock` for why every caller, whichever value it
+    sets, must share this one lock."""
+    with _precompile_flag_lock, _dc.patch(caching_precompile=caching_precompile):
         yield
+
+
+def _precompile_off_ctx(_dc):
+    return _precompile_scoped(_dc, caching_precompile=False)
 
 
 def _precompile_ctx(*, disable: bool = False):
@@ -65,7 +86,8 @@ def _precompile_ctx(*, disable: bool = False):
     try:
         import torch._dynamo.config as _dc
         if hasattr(_dc, "caching_precompile"):
-            return _precompile_off_ctx(_dc) if disable else _dc.patch(caching_precompile=True)
+            return (_precompile_off_ctx(_dc) if disable
+                    else _precompile_scoped(_dc, caching_precompile=True))
     except Exception:
         pass
     return contextlib.nullcontext()
