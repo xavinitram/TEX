@@ -1836,11 +1836,31 @@ def clear_roi_memo() -> None:
 # ── JOIN-49 / JOINWIRE-50 re-export (SPLIT-47's pattern) ──────────────────────
 # `StageSpec`/`chain_windows_dag`/`stage_dag_arg_halos` (and the `_dag_grow`/`_dag_union`
 # arithmetic they share with `chain_windows` above) now live in `tex_roi_dag.py` — see the
-# module note ahead of the old JOIN-49 section for why. This import runs at THIS module's
-# load time, after every name `tex_roi_dag` itself imports FROM `tex_roi` (`roi_plan`,
-# `binding_footprints`, `POINT`, `WHOLE_FRAME`, `canonical_roi`, `covers`, `_scale_halo`) is
-# already bound above — so `from .tex_roi import StageSpec` / `chain_windows_dag` and every
-# existing caller/test keep resolving exactly as before the split (ROUTE-45's shape).
-from .tex_roi_dag import (        # noqa: E402
-    StageSpec, chain_windows_dag, stage_dag_arg_halos, _dag_grow, _dag_union,
-)
+# module note ahead of the old JOIN-49 section for why.
+#
+# R2 (v0.50 Phase C, FIX-REL50): a plain `from .tex_roi_dag import (...)` here is a top-
+# level import of `tex_roi_dag` at `tex_roi`'s OWN load time — exactly what the module
+# note above `chain_windows`'s own function-local `_dag_grow` import says this module must
+# never do, because `tex_roi_dag` already imports FROM `tex_roi` at ITS top level. Whether
+# that eager form works at all depends on import ORDER: it happens to work when `tex_roi`
+# is imported first (`tex_roi_dag`'s own top-level import of `tex_roi` then just finds it
+# mid-import in `sys.modules` and reads names already bound above this line) but not the
+# other way round — importing `tex_roi_dag` FIRST in a fresh process starts `tex_roi.py`
+# running, which reaches this exact line while `tex_roi_dag`'s body is still stuck on the
+# very import that started the chain, so `StageSpec` etc. do not exist on it yet:
+# `ImportError: cannot import name 'StageSpec' from partially initialized module
+# 'TEX_Wrangle.tex_roi_dag' (most likely due to a circular import)`. The same defect class
+# FIX-OBSROUTE's R1 already fixed for `tex_engine_tiers`/the SPLIT-I mixins — resolved the
+# same way `tex_memory._NON_LOCAL_FNS` resolves its own derived historical name: a PEP 562
+# module `__getattr__`, so the import happens on first attribute access (long after both
+# modules have finished loading, whichever was imported first) instead of at load time.
+_ROI_DAG_REEXPORTS = frozenset((
+    "StageSpec", "chain_windows_dag", "stage_dag_arg_halos", "_dag_grow", "_dag_union",
+))
+
+
+def __getattr__(name):
+    if name in _ROI_DAG_REEXPORTS:
+        from . import tex_roi_dag as _trd
+        return getattr(_trd, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
