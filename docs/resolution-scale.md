@@ -630,6 +630,106 @@ with no device-shaped branch, so bit-exactness modulo float rounding is the expe
 not a surprise). `tests/test_bilat50_radius.py` (19 cases) and `tests/test_fixapprox_a1_window_
 decline.py` both pass there with CUDA present.
 
+## The exact tier's own ceiling, raised 24 -> 40 with a faster mechanism (BILATX-51)
+
+**Three regimes now, not two, below the separable tier.** `radius<=3` is untouched (the
+original untiled weighted-average math, still bit-identical by construction). `3<radius<=
+_BILATERAL_EXACT_RADIUS_MAX` (now 40, was 24) runs a NEW implementation of the SAME exact
+math, `_bilateral_exact_taploop_bchw`: instead of `unfold`-ing every tap into a
+`[B,C,h,w,kH,kW]` patch tensor (the OLD `_bilateral_exact_bchw`'s own row-tiled mechanism),
+it accumulates one elementwise `[B,C,H,W]`-shaped add per tap, in a fixed row-major `(dy,dx)`
+order. The old tiled path is UNCHANGED and still runs `radius<=3` (where it always degenerated
+to a single untiled pass) — it keeps its one remaining caller, so it stays in the product; its
+channel-count tile-budget fix (the per-tile budget must divide by `B*C`, not just
+`W*ksize^2`, or a multi-channel image runs the patch tensor to `B*C` times the declared
+budget) was carried over since a future caller could still exercise its tiling loop. Past
+radius 40, dispatch is unchanged: separable up to `_BILATERAL_SEPARABLE_RADIUS_MAX` (96), then
+detail-transfer.
+
+**Why the old ceiling was 24, and why a faster mechanism (not just cost) let it move.** The
+original `_BILATERAL_EXACT_RADIUS_MAX=24` was bounded by TIME, not just memory: FIX-501 F3
+(v0.51) made `radius>3` route the tiled path's kernel-window reduction through a strictly
+sequential, shape-independent accumulator (one elementwise add per tap) instead of
+`torch.sum`, fixing a CUDA windowed-vs-whole-frame divergence — but paying for it with an
+`unfold`/patches allocation THAT SAME SIZE, on top of the now-sequential reduction. The
+tap-loop mechanism removes the `unfold` allocation entirely: each tap is read directly from
+the padded frame (a `[B,C,H,W]`-shaped slice, not a `[B,C,h,w,kH,kW]` patch), so peak memory
+stops growing with `ksize^2` and wall time drops sharply at the SAME radius (see the timing
+table below). This is a mechanism change, not an accuracy change: 3<radius<=24 is within
+`2e-6` max-abs of the old tiled path (well inside the shipped 1e-5 tolerance; measured on this
+box), and 25<=radius<=40 is exact (not approximate) — it never had a value before because the
+old ceiling stopped at 24.
+
+**Timing and CUDA peak memory, old tiled vs new tap-loop, r=4/10/24/30/40.** CPU on the
+author's own workstation, CUDA on the second workstation's RTX 2080 SUPER, each with the GPU
+otherwise idle; best-of-3 wall time at r=4/10, best-of-1 at r>=24 (the slower cells). `old_
+tiled` at CPU r>=24 (both resolutions) and at CUDA 4K r>=24 is not run: the measured cost
+through the smaller radii already shows the O(r²)-with-a-much-larger-constant trend (FIX-501
+F3's sequential per-tap accumulator, stacked on the `unfold` allocation) reaching minutes —
+CUDA 1080p alone confirms this directly (123 s / 192 s / 336 s at r=24/30/40, matching the
+author's own prototype note of ~196 s at r=30). The author's own decision is unaffected either
+way — this ask replaces the MECHANISM for `3<r<=40`, it does not need every old-tiled cell
+measured to justify that a much-lower-cost replacement is worth shipping.
+
+| radius | size | device | old_tiled (s) | new_taploop (s) | new peak (CUDA, MiB) |
+|---:|---|---|---:|---:|---:|
+| 4 | 1080p | CPU | 2.67 | 0.70 | n/a |
+| 10 | 1080p | CPU | 31.7 | 3.83 | n/a |
+| 24 | 1080p | CPU | skipped (see above) | 21.3 | n/a |
+| 30 | 1080p | CPU | skipped (see above) | 33.1 | n/a |
+| 40 | 1080p | CPU | skipped (see above) | 58.5 | n/a |
+| 4 | 4K | CPU | 11.5 | 3.64 | n/a |
+| 10 | 4K | CPU | 136 | 19.7 | n/a |
+| 24 | 4K | CPU | skipped (see above) | 107 | n/a |
+| 30 | 4K | CPU | skipped (see above) | 165 | n/a |
+| 40 | 4K | CPU | skipped (see above) | 292 | n/a |
+| 4 | 1080p | CUDA | 0.264 | 0.083 | 200 |
+| 10 | 1080p | CUDA | 7.72 | 0.451 | 224 |
+| 24 | 1080p | CUDA | 124 | 2.45 | 226 |
+| 30 | 1080p | CUDA | 192 | 3.81 | 226 |
+| 40 | 1080p | CUDA | 337 | 6.71 | 226 |
+| 4 | 4K | CUDA | 1.13 | 0.328 | 793 |
+| 10 | 4K | CUDA | 46.2 | 1.78 | 793 |
+| 24 | 4K | CUDA | skipped (see above) | 9.64 | 795 |
+| 30 | 4K | CUDA | skipped (see above) | 14.9 | 797 |
+| 40 | 4K | CUDA | skipped (see above) | 26.3 | 797 |
+
+CUDA peak for the OLD tiled path grows with radius (its own `unfold`/patches allocation is
+`O(radius²)`): 211/208/256/344/531 MiB at r=4/10/24/30/40 (1080p); 476/476 MiB at r=4/10 (4K,
+not measured past r=10 there — see above). The new tap-loop's peak is flat (within noise)
+across radius at a given resolution — 200-226 MiB (1080p), 793-797 MiB (4K) — confirming the
+mechanism's own O(image size) memory claim.
+
+**Separable pass at r=41/64/96 (unchanged by this ask — timed here only to show where the
+tap-loop tier hands off).**
+
+| radius | size | CPU (s) | CUDA (s) | CUDA peak (MiB) |
+|---:|---|---:|---:|---:|
+| 41 | 1080p | 2.85 | 0.231 | 272 |
+| 64 | 1080p | 4.42 | 0.358 | 272 |
+| 96 | 1080p | 6.58 | 0.532 | 272 |
+| 41 | 4K | 11.1 | 0.909 | 1077 |
+| 64 | 4K | 17.2 | 1.41 | 1077 |
+| 96 | 4K | 25.7 | 2.10 | 1077 |
+
+**Display-8 codes for the separable pass at ss=13.7/16/32 (day/night, x1/x16) were NOT
+re-measured by this ask** — the separable tier's own quality is BILAT-51/BILAT8-51's
+deliverable, not touched by this ask (which only replaces the exact tier's mechanism for
+`3<radius<=40` and moves the ceiling). A same-radius exact reference for that comparison
+does not exist below radius=40 either way; producing one at radius=41-96 would need the OLD
+tiled path run at exactly the radii this ask's own measurement above shows are impractical to
+run precisely. See the display-8 sections above (BILAT8-51) for the separable pass's own
+existing readings.
+
+**The regime table (footprint/dispatch), for reference:**
+
+| radius range | mechanism | codes vs display-8 bar | notes |
+|---|---|---|---|
+| <=3 | original untiled exact | 0 (unchanged, by construction) | untouched |
+| 3<r<=40 | tap-loop exact (`_bilateral_exact_taploop_bchw`) | 0 (exact, by construction) | replaces the old tiled path's mechanism for this range; ceiling was 24 |
+| 40<r<=96 | separable (row-then-column) | see BILAT8-51/BILAT-51's own readings above | unchanged by this ask |
+| r>96 | detail-transfer | flat-cost fallback | unchanged by this ask; open item past 96 (detail-transfer's own quality) tracked separately, not this ask |
+
 ## Precision under scale
 
 A coarse cook (`scale` neither `None` nor `1.0`) whose caller left `precision` at its literal
