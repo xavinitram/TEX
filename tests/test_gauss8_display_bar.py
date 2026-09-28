@@ -162,6 +162,20 @@ def test_gauss8_non_multiple_frame_size_stays_registered(r: SubTestResult):
         r.ok(f"side={side}: max code diff {stats['max']} <= 1")
 
 
+def test_gauss8_border_interpolates_not_clamps(r: SubTestResult):
+    print("\n--- GAUSS8-51: the outermost half coarse pixel interpolates toward the border "
+          "instead of clamping to the first coarse sample (1084, night x16, read 2 codes) ---")
+    p = (_d8.plate_night(1100, 1100, torch.device("cpu"), seed=3) * 16.0)[:, :, :1084, :1084].contiguous()
+    exact = _gauss_blur_bchw(p, 260.0)
+    approx = _gauss_blur_pyramid_approx(p, 260.0)
+    stats = _d8.code_diff_stats(_d8.aces_srgb8(approx), _d8.aces_srgb8(exact))
+    if stats["max"] > 1:
+        r.fail("gauss8 border interpolation",
+               f"worst-channel code diff {stats['max']} exceeds the 1-code bar (stats={stats})")
+        return
+    r.ok(f"1084 night x16 sigma=260: max code diff {stats['max']} <= 1")
+
+
 def test_gauss8_below_threshold_still_bitexact(r: SubTestResult):
     print("\n--- GAUSS8-51: invariant 7 — the exact path below the threshold is untouched "
           "by the edge-pad fix or the raised cap ---")

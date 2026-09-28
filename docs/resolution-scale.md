@@ -489,7 +489,15 @@ result — up to 4 codes on 75% of pixels at 830x830 (night x16, sigma=260) whil
 the result; this changes nothing about what is approximated, since the exact blur already
 treats everything past the border as the replicated edge. A sweep over odd sizes (826, 828,
 830, 827x1031, 1084, 1099x1097, 17x23, 3x5 and more), day/night at x1 and x16, sigma 260-8192,
-leaves one cell above 1 code: 1084x1084, night x16, sigma=260, 2 codes on 0.001% of pixels.
+then left one cell above 1 code (1084x1084, night x16, sigma=260, 2 codes on 0.001% of
+pixels, all in the leftmost columns). Cause: a bilinear upsample has no coarse sample outside
+the frame, so it clamped the outermost half coarse pixel to the first sample instead of
+interpolating toward the border, where the exact blur still has a gradient; the right/bottom
+padding had hidden this on those two sides only. The path now adds one coarse sample past each
+border before blurring (under replicate semantics that sample IS the edge row/column, which the
+edge fix already computes), upsamples the extended grid and crops. The same sweep, plus a plate
+with bright features touching all four borders, now reads max 1 code in every one of 360 cells
+(sigma 260-8192), at unchanged cost.
 
 **The bar (<=1 code) is met on every row of the tables above.** The edge fix is what closes most of it;
 raising the cap alone does not (cap=32 without the fix still left a +3 code bias on the night

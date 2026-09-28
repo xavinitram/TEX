@@ -1125,11 +1125,34 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     top_edge = torch.nn.functional.interpolate(img[:, :, 0:1, :], size=(1, reduced_w), mode='area')
     bottom_edge = torch.nn.functional.interpolate(img[:, :, -1:, :], size=(1, reduced_w), mode='area')
     corners = (img[:, :, 0:1, 0:1], img[:, :, 0:1, -1:], img[:, :, -1:, 0:1], img[:, :, -1:, -1:])
-    blurred = _gauss_blur_bchw_edge_pad(reduced, residual, left_edge, right_edge, top_edge, bottom_edge, corners)
+    # A bilinear upsample (align_corners=False) has no coarse sample outside the frame,
+    # so it CLAMPS the outermost half coarse pixel (factor/2 full-res rows/columns) to the
+    # first sample instead of interpolating toward the border, where the exact blur
+    # still has a gradient (measured: 2 codes in the leftmost columns of a bright plate).
+    # Add one coarse sample past each border before blurring -- under the exact blur's
+    # replicate semantics the block just outside the frame IS the edge row/column, so
+    # the edge strips (and corner pixels) are exactly those samples -- then upsample the
+    # extended grid and crop away the extra `factor` on each side. A side that reduced
+    # to one coarse pixel is a flat field and is left unextended (extending it would
+    # upsample to 3*factor, unbounded in sigma).
+    tl, tr, bl, br = corners
+    ext_h, ext_w = out_h > factor, out_w > factor
+    mid = reduced
+    if ext_w:
+        mid = torch.cat([left_edge, mid, right_edge], dim=3)
+        top_edge = torch.cat([tl, top_edge, tr], dim=3)
+        bottom_edge = torch.cat([bl, bottom_edge, br], dim=3)
+    if ext_h:
+        mid = torch.cat([top_edge, mid, bottom_edge], dim=2)
+        left_edge = torch.cat([tl, left_edge, bl], dim=2)
+        right_edge = torch.cat([tr, right_edge, br], dim=2)
+    blurred = _gauss_blur_bchw_edge_pad(mid, residual, left_edge, right_edge, top_edge, bottom_edge, corners)
     poll_cook_cancel(heavy=True)
-    return torch.nn.functional.interpolate(
-        blurred, size=(img.shape[-2], img.shape[-1]), mode='bilinear', align_corners=False,
-    )[:, :, :out_h, :out_w]
+    up_h = mid.shape[-2] * factor if ext_h else img.shape[-2]
+    up_w = mid.shape[-1] * factor if ext_w else img.shape[-1]
+    off_h, off_w = (factor if ext_h else 0), (factor if ext_w else 0)
+    up = torch.nn.functional.interpolate(blurred, size=(up_h, up_w), mode='bilinear', align_corners=False)
+    return up[:, :, off_h:off_h + out_h, off_w:off_w + out_w]
 
 
 def _gauss_blur_auto(img: torch.Tensor, sigma: float) -> torch.Tensor:
