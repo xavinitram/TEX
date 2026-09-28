@@ -399,77 +399,63 @@ computable there at all (§ above). 1080p (1080×1080), CPU, this box.
 | `gauss_blur` | smooth+edges | sigma=1024 | 0.049 | 84.9 |
 | `gauss_blur` | realistic | sigma=260 | 0.036 | 85.6 |
 | `gauss_blur` | realistic | sigma=1024 | 0.041 | 84.9 |
-| `bilateral_filter` | checker | ss=8.5 (just past) | 0.0004 | 97.7 |
-| `bilateral_filter` | checker | ss=64 (well past) | 0.0001 | 100.0 |
-| `bilateral_filter` | smooth+edges | ss=8.5 | 0.078 | 56.2 |
-| `bilateral_filter` | smooth+edges | ss=64 | 0.083 | 50.4 |
-| `bilateral_filter` | realistic | ss=8.5 | 0.087 | 43.4 |
-| `bilateral_filter` | realistic | ss=64 | 0.110 | 25.0 |
 
-**Reading the table**: `gauss_blur`'s pyramid holds up well on both realistic corpora
-(smooth+edges and realistic both stay in the "high quality" 80s regardless of how far past the
-threshold sigma goes) and only degrades on the adversarial checker at a very large sigma — the
-same "checker isn't reliably the worse case until it is" pattern this document's R1 table
-already records elsewhere. `bilateral_filter`'s detail-transfer path scores much lower on both
-realistic corpora (40s-50s, "low-to-medium quality") than its own max-abs band alone would
-suggest — the max-abs number (0.08-0.11) sits inside BILAT-50's own accepted band, but the
-edge-preserving filter's whole PURPOSE is to keep hard boundaries crisp, and SSIMULACRA2 is
-more sensitive to boundary/detail mismatches than a uniform per-pixel max-abs is. This is a
-real, disclosed quality gap on top of BILAT-50's own numbers, not a new bug: the mechanism
-(add back the full-resolution detail a downscale discarded) is a bounded-cost STAND-IN for a
-true joint bilateral upsample (RADIUS-50a-design.md D3, option 2 — not built, no evidence yet
-that a real workflow needs it), and this table is the disclosure that stand-in owes past its
-own max-abs band.
+**`bilateral_filter`'s row is corrected below (BILAT-51), not repeated here** — its original
+reading in this table compared every past-threshold `spatial_sigma` against ONE fixed anchor
+(the exact filter at `ss=8.0`/`radius=24`), which understated the detail-transfer path's own
+error once `ss` grew large (see "Correcting the method" below). `gauss_blur`'s reading above is
+unaffected (out of scope for this correction) and still holds up well on both realistic corpora,
+degrading only on the adversarial checker at a very large sigma.
 
-## `bilateral_filter` past radius 24: measuring alternatives against the SAME-σ exact reference (BILAT-51)
+## `bilateral_filter` past radius 24 (BILAT-50/BILAT-51): measured against the SAME-σ exact reference
 
-The table above scores every past-threshold `spatial_sigma` against ONE fixed anchor (the
-exact filter at `ss=8.0`/`radius=24` — the boundary case, reused because a same-σ exact
-reference was not available for `ss=64`). That anchor conflates two different things: the
-picture legitimately getting blurrier as `ss` grows, and the approximation's OWN error. This
-round re-measured three candidates against the TRUE exact filter AT THE SAME `spatial_sigma`
-— the same tiled math the exact tier already runs, extended past its shipped ceiling purely
-for this measurement — wherever that stays feasible (confirmed feasible through `radius=96`;
-`radius=192`, i.e. `ss=64`, was not attempted — extrapolating the measured `O(r²)` growth
-below puts it at several minutes per call, well past what a measurement pass justifies for a
-number this document would then have to caveat anyway):
+**Correcting the method.** The original v0.50 table (above) scored every past-threshold
+`spatial_sigma` against ONE fixed anchor — the exact filter at `ss=8.0`/`radius=24`, reused for
+every larger `ss` because a same-σ exact reference wasn't available at the time. That anchor
+conflates two different things: the picture legitimately getting blurrier as `ss` grows, and the
+approximation's OWN error. Every number below instead compares against the TRUE exact filter AT
+THE SAME `spatial_sigma` — the same tiled math the exact tier already runs, extended purely for
+this measurement (confirmed feasible through `radius=96`, i.e. `ss=32`; `radius=192`/`ss=64` was
+not attempted for the full corpus sweep — the measured `O(r²)` growth puts it at several minutes
+per reference call). Three methods, one shared corpus (checker / smooth+edges / realistic, §
+above), 1080p, CPU:
 
-| candidate | mechanism | realistic, ss=8.5 | realistic, ss=16 | realistic, ss=32 | 1080p time (CPU) |
-|---|---|---:|---:|---:|---:|
-| `bilateral_filter` today (BILAT-50 detail-transfer) | downscale + residual add-back | 8.3 | 3.3 | -11.6 | ~5-15 ms (all σ) |
-| Joint bilateral upsample (Kopf et al., single-jump + iterative 2×-step variants both tried) | range-weighted gather from the coarse grid, replayed to full res | -28.8 | -34.5 | -52.9 | ~1.4-2.4 s |
-| Bilateral grid (Chen/Paris/Durand), nearest-splat + separable box-blur, trilinear sample-back | 3-D `(x,y,intensity)` histogram grid | 30.6 | 11.5 | -1.2 | ~0.08-0.13 s |
-| Raising the exact tiled ceiling itself | the same exact math, tiled, at the actually-requested radius | 100 (it IS the reference) | 100 | 100 | **7.6 s at r=24 → 11.1 s at r=32 → 19.1 s at r=40** (1080p CPU; CUDA: 0.85 s → 1.57 s at r=24→40) |
+| method | mechanism | corpus | ss=8.5 | ss=16 | ss=32 |
+|---|---|---|---:|---:|---:|
+| v0.49 (fixed 7×7 clamp) | today's exact math, window frozen at radius=3 regardless of `ss` | checker | 100 / 0.0 | 100 / 0.0 | 100 / 0.0 |
+| v0.49 | " | smooth+edges | 69.6 / 0.052 | 52.0 / 0.066 | 33.7 / 0.075 |
+| v0.49 | " | realistic | 34.6 / 0.063 | 23.9 / 0.083 | 18.5 / 0.092 |
+| v0.50 (BILAT-50 detail-transfer) | downscale + residual add-back | checker | 97.7 / 0.0004 | 97.1 / 0.001 | 97.6 / 0.0002 |
+| v0.50 | " | smooth+edges | 46.8 / 0.080 | 32.1 / 0.079 | 6.0 / 0.080 |
+| v0.50 | " | realistic | 8.3 / 0.095 | 3.3 / 0.093 | -11.6 / 0.116 |
+| **v0.51 (BILAT-51, shipped)** | separable (row-then-column) bilateral pass | checker | 100 / 0.0 | 100 / 0.0 | 100 / 0.0 |
+| **v0.51** | " | smooth+edges | 93.3 / 0.027 | 91.8 / 0.029 | 87.8 / 0.031 |
+| **v0.51** | " | realistic | 91.9 / 0.026 | 91.4 / 0.026 | 89.1 / 0.033 |
 
-**None of the three alternatives clears SSIMULACRA2 ≥ 80 against this stricter, same-σ
-reference, at any of the measured radii — including today's shipped detail-transfer path.**
-The two new candidates built and measured for this round (a hand-implemented Kopf-style joint
-bilateral upsample, tried both as a single downscale jump and as an iterative 2×-per-step
-pyramid; a hand-implemented bilateral grid) do not beat the shipped baseline once compared
-against the correct per-σ ground truth — the joint-upsample prototype scored WORSE than
-today's detail-transfer at every radius tested (a range-weighted replay from a heavily
-downscaled guide loses exactly the edge localization it is meant to add, once the downscale
-factor gets large — the naive form of the well-known problem Kopf's own paper motivates its
-iterative variant with, and the iterative form built here still did not recover it within this
-round's time budget); the bilateral-grid prototype does modestly better at the smallest
-past-threshold σ (30.6) but degrades to worse-than-baseline by σ=32. **Raising the exact tiled
-ceiling is bit-exact by construction (it is not an approximation) but costs grow with the SAME
-`O(r²)` law §3 of `RADIUS-50a-design.md` already measured** — an already-shipped `radius=24`
-call costs 7.6 s on this CPU box (0.85 s CUDA) at 1080p; every larger `spatial_sigma` a real
-program requests past a raised ceiling would pay this cost on the DEFAULT path, the exact
-invariant-7 violation `RADIUS-50a-design.md` D3 already rejected raising-the-cap-alone for.
+(cell = SSIMULACRA2 / max-abs.)
 
-**Recommendation: ship no change to the default path.** No measured alternative both clears
-the ≥ 80 bar and stays at acceptable cost across the radii this round measured; shipping an
-unvalidated joint-bilateral-upsample or bilateral-grid replacement that scores WORSE than the
-already-tested, already-shipped detail-transfer path (as both did here) would trade a disclosed,
-understood quality gap for an undisclosed, less-understood one. **What would close the gap**:
-a properly-tuned joint bilateral upsample — likely needing a per-level range-sigma schedule
-distinct from the coarse filter's own `sr` (this round reused one `sr` for both, which the
-result suggests is too tight once the guide itself is several factors of two blurrier than the
-signal it's meant to localize) — or a bilateral grid built with true trilinear (not
-nearest-cell) splatting and a properly Gaussian (not 3-tap-iterated-box) grid blur, each a
-build and tuning pass past this round's own budget, not a one-line follow-up.
+**Reading the corrected table**: measured correctly, v0.50's detail-transfer path was WORSE
+than the v0.49 clamp it replaced on realistic content at every one of these radii (8.3 vs 34.6
+at ss=8.5, and actually negative — perceptually worse than doing nothing differently — by
+ss=32), not merely "lower than its own max-abs band would suggest" as the original table's
+prose put it; the fixed-anchor methodology had been hiding this. The separable pass shipped in
+BILAT-51 clears SSIMULACRA2 ≥ 80 on every corpus at every one of these radii, beating both
+priors by a wide margin. Two other candidates were also built and measured this round (a
+Kopf-style joint bilateral upsample, including a per-level range-sigma-scheduled variant; a
+bilateral grid with true trilinear splat/slice and a separable Gaussian space+range blur, tried
+at a few grid resolutions) and neither beat the separable pass or even the v0.49 clamp on
+realistic content. The summary is that a naive hand-built JBU or bilateral grid is a real
+build-and-tune project, not a quick win, and this round's separable result made further tuning
+of either moot once it cleared the bar outright.
+
+**Cost trade, stated plainly**: the separable pass is NOT flat-cost like detail-transfer was —
+it grows with `radius` (`O(image size × radius)`, measured ~0.3 s at radius=26 up to ~1.2 s at
+radius=96, 1080p CPU; ~3.5 s at radius=256). It stays the default only up to
+`_BILATERAL_SEPARABLE_RADIUS_MAX` (256); past that, `spatial_sigma` is large enough that even
+this cost would grow unreasonably, and `bilateral_filter` falls back to the original flat-cost
+detail-transfer path rather than let a single call's cost grow without bound. `radius ≤ 24`
+(spatial_sigma ≤ ~8.0) is untouched — byte-for-byte the same exact math as every release before
+this one.
 
 ## Precision under scale
 
