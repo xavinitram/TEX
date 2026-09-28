@@ -389,7 +389,7 @@ three are sRGB-gamma-encoded to 8-bit PNG before scoring (SSIMULACRA2 expects di
 input); the approximation is compared against the best available exact reference — the exact
 convolution below `gauss_blur`'s own threshold, the exact tier's own boundary filter
 (radius=24) for `bilateral_filter` past its threshold, since a true exact reference is not
-computable there at all (§ above). 1080p (1080×1080), CPU, this box.
+computable there at all (§ above). 1080p (1080×1080), CPU (an RTX 5070 Ti Laptop workstation).
 
 | builtin | corpus | magnitude | max-abs | SSIMULACRA2 |
 |---|---|---:|---:|---:|
@@ -449,13 +449,81 @@ build-and-tune project, not a quick win, and this round's separable result made 
 of either moot once it cleared the bar outright.
 
 **Cost trade, stated plainly**: the separable pass is NOT flat-cost like detail-transfer was —
-it grows with `radius` (`O(image size × radius)`, measured ~0.3 s at radius=26 up to ~1.2 s at
-radius=96, 1080p CPU; ~3.5 s at radius=256). It stays the default only up to
-`_BILATERAL_SEPARABLE_RADIUS_MAX` (256); past that, `spatial_sigma` is large enough that even
-this cost would grow unreasonably, and `bilateral_filter` falls back to the original flat-cost
-detail-transfer path rather than let a single call's cost grow without bound. `radius ≤ 24`
-(spatial_sigma ≤ ~8.0) is untouched — byte-for-byte the same exact math as every release before
-this one.
+it grows with `radius` (`O(image size × radius)`). `radius ≤ 24` (spatial_sigma ≤ ~8.0) is
+untouched — byte-for-byte the same exact math as every release before this one.
+
+## Time + memory: separable vs detail-transfer vs exact-tiled, r=25/32/64/128/256
+
+Best-of-5 wall time (best-of-2/3 at the two most expensive exact-tiled cells, named below),
+realistic corpus; CPU on an RTX 5070 Ti Laptop workstation, CUDA on an RTX 2080 SUPER (sm_75),
+each measured with the GPU otherwise idle.
+`exact_tiled` past radius=64 is NOT run directly (its own `O(r²)` cost — confirmed by the
+measured cells below — makes the remaining ones multi-minute-to-multi-hour; the trend is
+extrapolated from the measured points, not asserted from a new run):
+
+| radius | size | device | detail_transfer | separable | exact_tiled |
+|---:|---|---|---:|---:|---:|
+| 25 | 1080p | CPU | 0.005 s | 0.401 s | 7.33 s |
+| 32 | 1080p | CPU | 0.005 s | 0.524 s | 10.9 s |
+| 64 | 1080p | CPU | 0.004 s | 1.00 s | 54.9 s (2 reps) |
+| 128 | 1080p | CPU | 0.003 s | 1.85 s | not run — extrapolated ≈220 s |
+| 256 | 1080p | CPU | 0.004 s | 3.79 s | not run — extrapolated ≈880 s |
+| 25 | 4K | CPU | 0.061 s | 9.22 s | 103 s |
+| 32 | 4K | CPU | 0.062 s | 13.1 s | 182 s |
+| 64 | 4K | CPU | 0.060 s | 25.9 s | not run — extrapolated ≈700 s |
+| 128 | 4K | CPU | 0.053 s | 51.2 s | not run — extrapolated ≈2900 s |
+| 256 | 4K | CPU | 0.054 s | **106 s** | not run — extrapolated ≈3.2 h |
+| 25 | 1080p | CUDA | 0.0008 s | 0.062 s | 0.89 s |
+| 32 | 1080p | CUDA | 0.0008 s | 0.079 s | 1.41 s |
+| 64 | 1080p | CUDA | 0.0009 s | 0.156 s | 5.47 s (3 reps) |
+| 128 | 1080p | CUDA | 0.0008 s | 0.310 s | not run — extrapolated ≈22 s |
+| 256 | 1080p | CUDA | 0.0009 s | 0.615 s | not run — extrapolated ≈88 s |
+| 25 | 4K | CUDA | 0.005 s | 0.739 s | 11.1 s |
+| 32 | 4K | CUDA | 0.005 s | 0.940 s | 17.5 s |
+| 64 | 4K | CUDA | 0.005 s | 1.86 s | 68.5 s (3 reps) |
+| 128 | 4K | CUDA | 0.006 s | 3.71 s | not run — extrapolated ≈274 s |
+| 256 | 4K | CUDA | 0.006 s | 7.39 s | not run — extrapolated ≈18 min |
+
+**Memory**: CUDA's own `torch.cuda.max_memory_allocated` (the only precise reading available —
+CPU peak was estimated from `psutil` RSS deltas, which are noisy on Windows and reported for
+context only, not as a load-bearing number) shows `separable` FLAT at ~122.5 MB (1080p) /
+~1475.7 MB (4K) across every radius 25→256 — confirming the O(image size)-only memory design
+(one `[B,C,H,W]` tap tensor alive at a time, never an `O(radius²)` window) — while
+`exact_tiled` grows with radius even under tiling (1080p: 247→209→695 MB at r=25/32/64; 4K:
+896→1122→2846 MB). `detail_transfer` is flat too, as always (~74–75 MB / ~886 MB).
+
+**Where separable's cost exceeds a sane interactive budget** (~200 ms, this document's own
+working assumption — no builtin in this codebase has ever been "interactive" much past its
+exact tier's own boundary, so this is about disclosure, not a new promise): on CPU, separable
+is already past 200 ms at the SMALLEST measured radius (25) at both resolutions — CPU was never
+interactive here, matching the exact tier's own pre-existing 7.3 s at its radius=24 boundary.
+On CUDA at 1080p, it crosses 200 ms between radius=64 (156 ms) and radius=128 (310 ms). On CUDA
+at 4K, it is already past 200 ms at radius=25 (739 ms). Separable was never meant to compete
+with detail-transfer's near-zero cost on interactivity; its job is to be the accurate default
+for a committed (non-preview) cook, at a cost in the same order the exact tier's own boundary
+case already pays.
+
+**The crossover moved: 256 → 96, red-first (`tests/test_bilat50_radius.py::test_bilat51_
+separable_ceiling_matches_measured_evidence`).** Two independent things point the same way.
+First, this ask's own SSIMULACRA2 sweep (the table above) only measured separable beating both
+priors through `spatial_sigma=32` (radius=96) — the first-shipped ceiling of 256 silently
+extended the regime into a radius this ask never scored for accuracy. Second, the cost sweep
+above found the worst measured cell (radius=256, 4K, CPU) at **106 seconds** — cost that keeps
+growing (measured, not merely extrapolated, up to radius=128) with no accuracy evidence past
+radius=96 to justify paying it. `_BILATERAL_SEPARABLE_RADIUS_MAX` is now `96`: every radius this
+ask actually measured stays exactly as scored above; radius=96 itself was not run directly but
+interpolates to ≈39 s at 4K/CPU and ≈2.8 s at 4K/CUDA from the measured radius=64/128 points —
+both well under half the radius=256 worst case they replace, and the same order as the exact
+tier's own already-accepted boundary cost (54.9 s at radius=64, 1080p CPU); a
+`spatial_sigma` past that now falls back to detail-transfer (flat, ms-scale) rather than an
+unvalidated extension of separable's measured range. `radius ≤ 24` is unaffected either way.
+
+**CUDA correctness**: `_bilateral_separable_bchw` on CUDA (the second workstation's RTX 2080
+SUPER) matches its own CPU output within `8.3e-7` max-abs across radius 25/64/128 on two canvas
+sizes — well inside invariant 2's `1e-5` tolerance (this is a plain tensor-op implementation
+with no device-shaped branch, so bit-exactness modulo float rounding is the expected reading,
+not a surprise). `tests/test_bilat50_radius.py` (19 cases) and `tests/test_fixapprox_a1_window_
+decline.py` both pass there with CUDA present.
 
 ## Precision under scale
 
