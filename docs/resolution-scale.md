@@ -421,6 +421,56 @@ true joint bilateral upsample (RADIUS-50a-design.md D3, option 2 — not built, 
 that a real workflow needs it), and this table is the disclosure that stand-in owes past its
 own max-abs band.
 
+## `bilateral_filter` past radius 24: measuring alternatives against the SAME-σ exact reference (BILAT-51)
+
+The table above scores every past-threshold `spatial_sigma` against ONE fixed anchor (the
+exact filter at `ss=8.0`/`radius=24` — the boundary case, reused because a same-σ exact
+reference was not available for `ss=64`). That anchor conflates two different things: the
+picture legitimately getting blurrier as `ss` grows, and the approximation's OWN error. This
+round re-measured three candidates against the TRUE exact filter AT THE SAME `spatial_sigma`
+— the same tiled math the exact tier already runs, extended past its shipped ceiling purely
+for this measurement — wherever that stays feasible (confirmed feasible through `radius=96`;
+`radius=192`, i.e. `ss=64`, was not attempted — extrapolating the measured `O(r²)` growth
+below puts it at several minutes per call, well past what a measurement pass justifies for a
+number this document would then have to caveat anyway):
+
+| candidate | mechanism | realistic, ss=8.5 | realistic, ss=16 | realistic, ss=32 | 1080p time (CPU) |
+|---|---|---:|---:|---:|---:|
+| `bilateral_filter` today (BILAT-50 detail-transfer) | downscale + residual add-back | 8.3 | 3.3 | -11.6 | ~5-15 ms (all σ) |
+| Joint bilateral upsample (Kopf et al., single-jump + iterative 2×-step variants both tried) | range-weighted gather from the coarse grid, replayed to full res | -28.8 | -34.5 | -52.9 | ~1.4-2.4 s |
+| Bilateral grid (Chen/Paris/Durand), nearest-splat + separable box-blur, trilinear sample-back | 3-D `(x,y,intensity)` histogram grid | 30.6 | 11.5 | -1.2 | ~0.08-0.13 s |
+| Raising the exact tiled ceiling itself | the same exact math, tiled, at the actually-requested radius | 100 (it IS the reference) | 100 | 100 | **7.6 s at r=24 → 11.1 s at r=32 → 19.1 s at r=40** (1080p CPU; CUDA: 0.85 s → 1.57 s at r=24→40) |
+
+**None of the three alternatives clears SSIMULACRA2 ≥ 80 against this stricter, same-σ
+reference, at any of the measured radii — including today's shipped detail-transfer path.**
+The two new candidates built and measured for this round (a hand-implemented Kopf-style joint
+bilateral upsample, tried both as a single downscale jump and as an iterative 2×-per-step
+pyramid; a hand-implemented bilateral grid) do not beat the shipped baseline once compared
+against the correct per-σ ground truth — the joint-upsample prototype scored WORSE than
+today's detail-transfer at every radius tested (a range-weighted replay from a heavily
+downscaled guide loses exactly the edge localization it is meant to add, once the downscale
+factor gets large — the naive form of the well-known problem Kopf's own paper motivates its
+iterative variant with, and the iterative form built here still did not recover it within this
+round's time budget); the bilateral-grid prototype does modestly better at the smallest
+past-threshold σ (30.6) but degrades to worse-than-baseline by σ=32. **Raising the exact tiled
+ceiling is bit-exact by construction (it is not an approximation) but costs grow with the SAME
+`O(r²)` law §3 of `RADIUS-50a-design.md` already measured** — an already-shipped `radius=24`
+call costs 7.6 s on this CPU box (0.85 s CUDA) at 1080p; every larger `spatial_sigma` a real
+program requests past a raised ceiling would pay this cost on the DEFAULT path, the exact
+invariant-7 violation `RADIUS-50a-design.md` D3 already rejected raising-the-cap-alone for.
+
+**Recommendation: ship no change to the default path.** No measured alternative both clears
+the ≥ 80 bar and stays at acceptable cost across the radii this round measured; shipping an
+unvalidated joint-bilateral-upsample or bilateral-grid replacement that scores WORSE than the
+already-tested, already-shipped detail-transfer path (as both did here) would trade a disclosed,
+understood quality gap for an undisclosed, less-understood one. **What would close the gap**:
+a properly-tuned joint bilateral upsample — likely needing a per-level range-sigma schedule
+distinct from the coarse filter's own `sr` (this round reused one `sr` for both, which the
+result suggests is too tight once the guide itself is several factors of two blurrier than the
+signal it's meant to localize) — or a bilateral grid built with true trilinear (not
+nearest-cell) splatting and a properly Gaussian (not 3-tap-iterated-box) grid blur, each a
+build and tuning pass past this round's own budget, not a one-line follow-up.
+
 ## Precision under scale
 
 A coarse cook (`scale` neither `None` nor `1.0`) whose caller left `precision` at its literal
