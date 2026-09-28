@@ -139,10 +139,15 @@ def _host_scalar(x):
 
 
 def _is_vec_param_list(value) -> bool:
-    """Same shape test as `codegen.is_vec_param_list` (a list/tuple of 2-4 plain
-    numbers, `bool` excluded since it's an `int` subclass) — duplicated rather than
-    imported so this module stays a leaf `codegen.py`/`codegen_persist.py` can both
-    import without a cycle (this file cannot import FROM `codegen.py`)."""
+    """True for a vec/color `$param` value — a list/tuple of 2-4 plain numbers,
+    `bool` excluded since it's an `int` subclass (a ComfyUI batch list holds
+    TENSORS and an array param holds 5+ entries, so neither is mistaken for the
+    vecN channel-last class). The one definition (v0.51):
+    lives here, a leaf `codegen.py`/`codegen_persist.py` can both import without a
+    cycle (this file cannot import FROM `codegen.py`), and is re-exported from
+    `.stdlib` as `is_vec_param_list` for `codegen.py`'s own pre-existing name and
+    call sites (`codegen.py`, `compiled.py`), the same leaf-to-consumer shape
+    `_stage_codegen_param`/`_scale_pixel_arg` already use."""
     if not isinstance(value, (list, tuple)) or len(value) not in (2, 3, 4):
         return False
     for c in value:
@@ -960,41 +965,40 @@ GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA = 256.0
 # (an approximate path must not change any 8-bit code after ACES RRT + sRGB ODT — see
 # docs/resolution-scale.md's "gauss_blur past the exact threshold" section). At cap=8.0
 # the reduced level shrinks fast enough, relative to the residual blur's own kernel
-# radius (`3 * min(sigma, cap)`), that even a CORRECTLY-seeded replicate pad (below)
-# still lets the border dominate a reduced image only a few pixels wide once sigma runs
-# into the thousands. cap=32.0 held the bar on the display-8 plates at their base
-# exposure but not on a bright one: a night plate of small practical lights pushed x16
-# (sigma=260, factor 16) still read 2-3 codes, the residual being the bilinear upsample
-# of a field curved by point-like highlights. cap=64.0 halves the factor there and holds
-# the bar at x1/x4/x16 on both plates, sigma 260-2048, at the same flat cost (4k, CUDA
-# ~1.4-1.7ms, CPU ~10ms at either cap) — see docs/resolution-scale.md; cost stays flat regardless (the one real blur still runs at a bounded
-# `sigma / factor <= quality_cap`, and the extra edge-strip work the fix adds is
-# O(H)+O(W), not O(sigma) — measured flat at 4k, see docs/resolution-scale.md).
+# radius (`3 * min(sigma, cap)`), that even a correctly-seeded replicate pad still lets
+# the border dominate a reduced image only a few pixels wide once sigma runs into the
+# thousands. cap=32.0 held the bar on the display-8 plates at their base exposure but
+# not on a bright one: a night plate of small practical lights pushed x16 (sigma=260,
+# factor 16) still read 2-3 codes, the residual being the bilinear upsample of a field
+# curved by point-like highlights. cap=64.0 halves the factor there and holds the bar
+# at x1/x4/x16 on both plates, sigma 260-2048, at the same flat cost (4k, CUDA
+# ~1.4-1.7ms, CPU ~10ms at either cap) — see docs/resolution-scale.md. The one real blur
+# still runs at a bounded `sigma / factor <= quality_cap`, so cost stays flat regardless
+# of sigma; the extra edge-strip work the fix adds is O(H)+O(W), not O(sigma) —
+# measured flat at 4k, see docs/resolution-scale.md.
 GAUSS_BLUR_PYRAMID_QUALITY_CAP = 64.0
 
 
-def _replicate_pad_h_conv(x: torch.Tensor, left_val: torch.Tensor, right_val: torch.Tensor,
-                           kh: torch.Tensor, radius: int, C: int) -> torch.Tensor:
-    """Pad `x` in W with `radius` copies of `left_val`/`right_val` (each broadcastable
-    to `[B, C, H, 1]`) instead of `x`'s own border column, then convolve horizontally.
-    Shared by `_gauss_blur_bchw_edge_pad`'s main pass and its own edge-strip pre-pass
-    (GAUSS8-51) so both use the identical padding mechanics."""
+def _replicate_pad_conv(x: torch.Tensor, low_val: torch.Tensor, high_val: torch.Tensor,
+                         k: torch.Tensor, radius: int, C: int, dim: int) -> torch.Tensor:
+    """Pad `x` along `dim` (-1 for horizontal, -2 for vertical) with `radius` copies of
+    `low_val`/`high_val` (each broadcastable to `x`'s shape with `dim` singleton)
+    instead of `x`'s own border row/column, then convolve along that axis with `k`.
+
+    v0.51: one dim-parametrized helper, replacing
+    `_replicate_pad_h_conv`/`_replicate_pad_v_conv` — two bodies that were identical
+    except for which trailing axis was padded/expanded and the parameter names. `dim`
+    already carries every bit of the information the two separate names did; see
+    `_gauss_blur_bchw_edge_pad`'s own docstring for why this GAUSS8-51-era mechanism
+    is still here at all (The v0.51 pyramid review evaluated and rejected a simpler replacement)."""
     if radius == 0:
         return x
-    left = left_val.to(x.dtype).expand(x.shape[0], C, x.shape[2], radius)
-    right = right_val.to(x.dtype).expand(x.shape[0], C, x.shape[2], radius)
-    return torch.nn.functional.conv2d(torch.cat([left, x, right], dim=-1), kh, groups=C)
-
-
-def _replicate_pad_v_conv(x: torch.Tensor, top_val: torch.Tensor, bottom_val: torch.Tensor,
-                           kv: torch.Tensor, radius: int, C: int) -> torch.Tensor:
-    """The vertical counterpart of `_replicate_pad_h_conv` (`top_val`/`bottom_val`
-    broadcastable to `[B, C, 1, W]`)."""
-    if radius == 0:
-        return x
-    top = top_val.to(x.dtype).expand(x.shape[0], C, radius, x.shape[3])
-    bottom = bottom_val.to(x.dtype).expand(x.shape[0], C, radius, x.shape[3])
-    return torch.nn.functional.conv2d(torch.cat([top, x, bottom], dim=-2), kv, groups=C)
+    shape = list(x.shape)
+    shape[1] = C
+    shape[dim] = radius
+    low = low_val.to(x.dtype).expand(*shape)
+    high = high_val.to(x.dtype).expand(*shape)
+    return torch.nn.functional.conv2d(torch.cat([low, x, high], dim=dim), k, groups=C)
 
 
 def _gauss_blur_bchw_edge_pad(
@@ -1013,6 +1017,30 @@ def _gauss_blur_bchw_edge_pad(
     ever called from that path; `_gauss_blur_bchw` itself is untouched (invariant 7:
     nothing below `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` is reachable through here).
 
+    The v0.51 pyramid review: a pad-before-reduce reformulation
+    that replicate-pads the FULL-RESOLUTION image once and lets a single, unmodified
+    `_gauss_blur_bchw` do the residual blur — deleting this function and its two
+    pad-conv helpers entirely — was evaluated red-first against the required 360-cell
+    odd-size sweep and FAILED it: the algebra ("replicate-pad commutes with
+    area-average of a constant run, so the reduced grid's own border already equals
+    the true edge") holds only when the reduced grid has more than one coarse pixel.
+    When a side is no longer than `factor` (the "flat field" branch below, `ext_h`/
+    `ext_w` False), the ENTIRE reduced grid collapses to a single coarse pixel and a
+    plain-replicate-pad-of-that-pixel discards the true edge-vs-interior distinction
+    the exact convolution still carries at that size — measured on the odd-size sweep
+    (`plate_day`/`plate_night`, x1 and x16, sigma 260-8192, 240 cells): 24 cells above
+    the 1-code bar, worst 53 codes (17x23, 3x5, 100x1097), where this shipped
+    mechanism reads 238 of 240 at <=1 code (`docs/resolution-scale.md`, "display-8
+    bar" section). This function's
+    caller-supplied edge strips (`left_edge`/`right_edge`/`top_edge`/`bottom_edge`,
+    downsampled ONLY along the axis parallel to the border, never mixed with the
+    single-coarse-pixel interior value) are precisely what keeps the flat-field
+    branch close to the exact answer; a from-scratch pad-before-reduce would need
+    to re-derive an equivalent per-branch special case to match it, at which point
+    it is not simpler. the review's OWN simplification (the dim-parametrized
+    `_replicate_pad_conv` helper above, replacing the former `_replicate_pad_h_conv`/
+    `_replicate_pad_v_conv` pair) is applied instead.
+
     The vertical pass's own pad must be the horizontally-blurred top/bottom edge
     (matching `_gauss_blur_bchw`'s own pad-then-conv order: its vertical pad reads
     `result`, the ALREADY horizontally-blurred image, never the pre-blur input) --
@@ -1028,11 +1056,11 @@ def _gauss_blur_bchw_edge_pad(
     kh = kernel_h.to(img.dtype).expand(C, 1, 1, -1)
     kv = kernel_v.to(img.dtype).expand(C, 1, -1, 1)
     tl, tr, bl, br = corners
-    result = _replicate_pad_h_conv(img, left_edge, right_edge, kh, radius, C)
+    result = _replicate_pad_conv(img, left_edge, right_edge, kh, radius, C, dim=-1)
     poll_cook_cancel(heavy=True)
-    top_edge_blurred = _replicate_pad_h_conv(top_edge, tl, tr, kh, radius, C)
-    bottom_edge_blurred = _replicate_pad_h_conv(bottom_edge, bl, br, kh, radius, C)
-    result = _replicate_pad_v_conv(result, top_edge_blurred, bottom_edge_blurred, kv, radius, C)
+    top_edge_blurred = _replicate_pad_conv(top_edge, tl, tr, kh, radius, C, dim=-1)
+    bottom_edge_blurred = _replicate_pad_conv(bottom_edge, bl, br, kh, radius, C, dim=-1)
+    result = _replicate_pad_conv(result, top_edge_blurred, bottom_edge_blurred, kv, radius, C, dim=-2)
     return result
 
 
@@ -1077,6 +1105,11 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     the same way, once before the downsample and once before the upsample, so a
     cancel fired mid-approximation is observed at the same grain those siblings
     already give, not only after the whole call returns.
+
+    v0.51: evaluated a pad-before-reduce reformulation that would
+    have deleted `_gauss_blur_bchw_edge_pad` and its pad-conv helpers entirely; NOT
+    ADOPTED (see that function's own docstring for the red-first evidence). This
+    function's own shape is therefore unchanged from GAUSS8-51.
     """
     out_h, out_w = img.shape[-2], img.shape[-1]
     factor = 1
