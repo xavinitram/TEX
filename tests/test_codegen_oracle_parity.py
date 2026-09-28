@@ -275,3 +275,34 @@ _SCATTER_SAMPLE_ROWS = [
 @pytest.mark.parametrize("label,code", _SCATTER_SAMPLE_ROWS, ids=[r[0] for r in _SCATTER_SAMPLE_ROWS])
 def test_sample_sees_scatter_writes_in_the_same_loop(label, code):
     assert_parity(code, {"A": _img(H=5, W=5)})
+
+
+# ── emit-time state scoped to a user function stays inside it ─────────────────────────
+
+_FN_SCOPE_ROWS = [
+    ("a sample hoist made inside a function is not reused after it",
+     "float f(float k) {\n  vec3 s = vec3(0.0);\n  int i = 0;\n"
+     "  while (i < 2) { s = s + sample(@A, u, v).rgb; i = i + 1; }\n  return s.r * k;\n}\n"
+     "float a = f(1.0);\nvec3 acc = vec3(0.0);\nint j = 0;\n"
+     "while (j < 2) { acc = acc + sample(@A, u, v).rgb; j = j + 1; }\n"
+     "@OUT = acc + vec3(a);"),
+    ("a function-local initializer does not shadow the outer one",
+     "float x = u + 0.1;\nfloat g() { float x = u; return x; }\nvec3 acc = vec3(0.0);\n"
+     "for (int k = 0; k < 2; k++) {\n  float pin = ix + iy;\n  int i = 0;\n"
+     "  while (i < 3) { acc = acc + sample(@A, x, v).rgb; i = i + 1; }\n"
+     "  if (pin < -1.0) { break; }\n}\n@OUT = acc + vec3(g()) * 0.0;"),
+]
+
+
+@pytest.mark.parametrize("label,code", _FN_SCOPE_ROWS, ids=[r[0] for r in _FN_SCOPE_ROWS])
+def test_function_scoped_emit_state_does_not_leak(label, code):
+    assert_parity(code, {"A": _img(H=6, W=6)})
+
+
+def test_scalar_loop_branch_local_that_never_ran():
+    """A local declared in a branch the loop never took is still None after the loop."""
+    code = ("float acc = 0.0;\n"
+            "for (int i = 0; i < 12; i++) { if (i > 100) { float t = 2.0; acc = acc + t; } acc = acc + 1.0; }\n"
+            "@OUT = vec3(acc) + @A.rgb * 0.0;")
+    ref, got = assert_parity(code, {"A": _img()})
+    assert ref["OUT"][..., 0].unique().tolist() == [12.0]

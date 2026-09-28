@@ -1720,18 +1720,36 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._use_native_flow_control = False
         saved_scalar_loop = self._scalar_loop
         self._scalar_loop = False
+        saved_hoists, saved_inits = self._enter_function_scope(stmt, body_vars)
 
         for s in stmt.body:
             self._emit_stmt(s)
 
         # Default return if no explicit return
         self._emit(f"return _torch.scalar_tensor(0.0, dtype=_torch.float32, device=_dev)")
+        self._hoisted_bchw = saved_hoists
+        self._var_initializers = saved_inits
         self._scalar_loop = saved_scalar_loop
         self._use_native_flow_control = saved_native_flow
         self._in_user_function = saved_in_fn
         self._local_vars = saved_locals
         self._spatial_vars = saved_spatial_vars
         self._indent -= 1
+
+    def _enter_function_scope(self, stmt: FunctionDef, body_vars: set[str]):
+        """Scope the two emit-time memos a function body would otherwise leak.
+
+        A sample hoist made in the body binds temps local to the emitted `def`; left in
+        `_hoisted_bchw`, a later top-level loop skips its own hoist and references them
+        (NameError). The body's parameters and locals shadow outer names, so their
+        outer `_var_initializers` entries must not resolve inside it, and the body's own
+        entries must not resolve outside it (a folded direct fetch of the wrong
+        coordinate). Returns the saved pair for the caller to restore."""
+        saved_hoists, saved_inits = self._hoisted_bchw, self._var_initializers
+        shadowed = body_vars | {pname for _, pname in stmt.params}
+        self._hoisted_bchw = {}
+        self._var_initializers = {k: v for k, v in saved_inits.items() if k not in shadowed}
+        return saved_hoists, saved_inits
 
     def _emit_return_stmt(self, stmt: ReturnStmt):
         """Emit a return statement inside a user function."""
@@ -2743,7 +2761,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             for vname in sorted(modified_vars):  # deterministic emission order
                 local = self._local_vars.get(vname)
                 if local is not None:
-                    self._emit(f"if not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
+                    # A local declared in a branch the loop never took (or in the
+                    # body of a loop that ran zero passes) is still None.
+                    self._emit(f"if {local} is not None and not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
 
         # Write back modified vars to _env
         for vname in writeback_vars:

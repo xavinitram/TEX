@@ -559,6 +559,7 @@ class MaskedEmitMixin:
         self._use_native_flow_control = False
         saved_scalar_loop = self._scalar_loop
         self._scalar_loop = False
+        saved_hoists, saved_inits = self._enter_function_scope(stmt, body_vars)
 
         # The body is its own declaration scope (the type checker gives it one), so the
         # inherited depths are shadowed rather than shared; the params are declared AT the
@@ -604,6 +605,8 @@ class MaskedEmitMixin:
 
         self._mf_depth = saved_depth
         self._mf_decl_depth = saved_decl
+        self._hoisted_bchw = saved_hoists
+        self._var_initializers = saved_inits
         self._scalar_loop = saved_scalar_loop
         self._use_native_flow_control = saved_native_flow
         self._in_user_function = saved_in_fn
