@@ -557,6 +557,9 @@ _WATCHED = {
     # `noise.py`, were already watched above).
     "stdlib_core.py", "stdlib_math.py", "stdlib_color.py", "stdlib_sample.py",
     "stdlib_noise.py", "stdlib_sdf.py", "stdlib_string.py", "stdlib_array.py",
+    # The type enum the checker/optimizer/codegen all read, and the registry whose tags drive
+    # the codegen taxonomy.
+    "types.py", "stdlib_registry.py",
 }
 
 

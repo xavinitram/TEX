@@ -292,10 +292,12 @@ def _load_fused_from_disk(memo_key: tuple):
         return None
 
 
-def _save_fused_to_disk(memo_key: tuple, fused_program, binding_types) -> None:
+def _save_fused_to_disk(memo_key: tuple, fused_program, binding_types,
+                        refs, asg, params) -> None:
     try:
         from .tex_cache import get_cache
-        get_cache()._save_to_disk(_fused_fp(memo_key), fused_program, binding_types)
+        get_cache()._save_to_disk(_fused_fp(memo_key), fused_program, binding_types,
+                                  refs, asg, params)
     except Exception:
         pass  # best-effort; a miss just recompiles next restart
 
@@ -691,7 +693,7 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     _FUSED_MEMO[memo_key] = result
     while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
         _FUSED_MEMO.popitem(last=False)
-    _save_fused_to_disk(memo_key, fused, binding_types)  # CT-1 persist
+    _save_fused_to_disk(memo_key, fused, binding_types, refs, asg, params)  # CT-1 persist
     return (*result, merged_bindings)
 
 
