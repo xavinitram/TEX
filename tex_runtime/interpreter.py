@@ -1413,8 +1413,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             # exactly like str()/format(): one value for scalar/uniform tensors,
             # mean + one-time warning for a genuinely multi-valued field.
             if isinstance(value, torch.Tensor):
-                v = _scalar_from_tensor(value, "string")
-                return str(int(v)) if v == int(v) else str(v)
+                return TEXStdlib._number_text(_scalar_from_tensor(value, "string"))
             return str(value)
         return value
 

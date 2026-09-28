@@ -1046,6 +1046,7 @@ def _prepare_output_comfy(raw: torch.Tensor | str, output_type: str) -> Any:
     """The ComfyUI wire format: clamp to [0,1], drop alpha, expand gray -> RGB. Lossy by
     necessity — that IS the IMAGE contract every downstream node expects. Byte-identical
     to every version before v0.22 and canary-pinned (test_eng3_comfy_profile_canary)."""
+    import math
     torch = _torch_mod()
     if output_type == "STRING":
         if isinstance(raw, str):
@@ -1054,7 +1055,7 @@ def _prepare_output_comfy(raw: torch.Tensor | str, output_type: str) -> Any:
         if isinstance(raw, torch.Tensor):
             if raw.dim() == 0:
                 v = raw.item()
-                return str(int(v)) if v == int(v) else str(v)
+                return str(int(v)) if math.isfinite(v) and v == int(v) else str(v)
             return str(raw.float().mean().item())
         return str(raw)
 
@@ -1120,9 +1121,12 @@ def _prepare_output_comfy(raw: torch.Tensor | str, output_type: str) -> Any:
         return raw
 
     elif output_type == "INT":
-        if raw.dim() == 0:
-            return int(raw.item())
-        return int(raw.float().mean().item())  # .float(): mean() rejects integer dtypes
+        v = raw.item() if raw.dim() == 0 else raw.float().mean().item()  # .float(): mean() rejects integer dtypes
+        if not math.isfinite(v):
+            raise RuntimeError(
+                f"TEX Error: an INT output cannot hold {v} (a NaN or infinite value); "
+                "guard the value before it reaches the INT output.")
+        return int(v)
 
     # Unmapped output types pass through unchanged — keep on the compute
     # device (see IMAGE above). Unreachable from the node (map_inferred_type

@@ -9,6 +9,7 @@ directly, unless registering only this domain is what you want.
 """
 from __future__ import annotations
 import hashlib
+import math
 import re
 import torch
 from .stdlib_registry import stdlib
@@ -23,6 +24,11 @@ class _StdlibString:
 
     # -- String functions -----------------------------------------------
 
+    @staticmethod
+    def _number_text(v: float) -> str:
+        """A whole finite number prints as an int; NaN/Inf print as 'nan'/'inf'."""
+        return str(int(v)) if math.isfinite(v) and v == int(v) else str(v)
+
     @stdlib("str", sig='str(x) \\u2192 string', category='Strings', doc='Convert a number to a string.', ex='string s = str(42);')
     @staticmethod
     def fn_str(x) -> str:
@@ -30,8 +36,7 @@ class _StdlibString:
         if isinstance(x, str):
             return x
         if isinstance(x, torch.Tensor):
-            v = _scalar_from_tensor(x, "str")
-            return str(int(v)) if v == int(v) else str(v)
+            return _StdlibString._number_text(_scalar_from_tensor(x, "str"))
         return str(x)
 
     @stdlib("len", sig='len(x) \\u2192 float', category='Strings', doc='Length of a string, array, or vec-array (element count).', ex='float n = len("hello");')
@@ -231,7 +236,7 @@ class _StdlibString:
             if isinstance(a, torch.Tensor):
                 v = _scalar_from_tensor(a, "format")
                 # Round to 6 significant digits to counteract float32 noise
-                if v == int(v):
+                if math.isfinite(v) and v == int(v):
                     converted.append(int(v))
                 else:
                     converted.append(float(f"{v:.6g}"))

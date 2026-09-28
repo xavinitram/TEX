@@ -255,3 +255,28 @@ def test_dodge_burn_in_range_values_unchanged():
     assert abs(S.fn_color_burn(_px(0.75, 0.75, 0.75), _px(0.5, 0.5, 0.5))[0, 0, 0, 0].item() - 0.5) < 1e-6
 
 
+# -- non-finite numbers in text and INT -------------------------------------------------
+
+@pytest.mark.parametrize("v,txt", [(NAN, "nan"), (float("inf"), "inf"), (float("-inf"), "-inf")])
+def test_str_and_format_survive_non_finite(v, txt):
+    t = torch.tensor(v)
+    assert S.fn_str(t) == txt
+    assert txt in S.fn_format("x={}", t)
+
+
+def test_str_and_format_whole_numbers_unchanged():
+    assert S.fn_str(torch.tensor(42.0)) == "42"
+    assert S.fn_format("{}-{}", torch.tensor(3.0), torch.tensor(0.5)) == "3-0.5"
+
+
+def test_string_and_int_egress_non_finite():
+    from TEX_Wrangle.tex_marshalling import prepare_output
+    assert prepare_output(torch.tensor(NAN), "STRING") == "nan"
+    assert prepare_output(torch.tensor(float("inf")), "STRING") == "inf"
+    with pytest.raises(RuntimeError, match="INT output"):
+        prepare_output(torch.tensor(NAN), "INT")
+    with pytest.raises(RuntimeError, match="INT output"):
+        prepare_output(torch.tensor(float("inf")), "INT")
+    assert prepare_output(torch.tensor(7.0), "INT") == 7
+
+
