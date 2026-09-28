@@ -48,7 +48,7 @@ from .interpreter_analysis import (_collect_binding_reads_and_non_spatial,
                                    _collect_binding_reads, _reads_and_non_spatial_cached,
                                    _binding_reads_cached, _non_spatial_names_cached,
                                    _collect_identifiers, _collect_expr_names)
-from .interpreter_values import (_safe_array_index, _const_index, _host_index,
+from .interpreter_values import (_list_index, _safe_array_index, _const_index, _host_index,
                                  _int_valued_scalar, _ensure_spatial, _matvec,
                                  _broadcast_pair, _tensor_where, _record_ingest_event)
 
@@ -872,7 +872,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             ci = _const_index(node.index, len(array))
             if ci is None:
                 index = self._eval(node.index)
-                ci = max(0, min(int(round(index.item() if isinstance(index, torch.Tensor) else float(index))), len(array) - 1))
+                ci = _list_index(index.item() if isinstance(index, torch.Tensor) else index, len(array))
             return array[ci]
 
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]

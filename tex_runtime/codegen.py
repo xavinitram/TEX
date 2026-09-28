@@ -1415,7 +1415,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # String arrays are Python lists
         self._emit(f"if isinstance({arr}, list):")
         self._indent += 1
-        self._emit(f"{tmp} = {arr}[max(0, min(int(round({idx}.item() if _torch.is_tensor({idx}) else float({idx}))), len({arr}) - 1))]")
+        # floor+clamp, NaN -> 0: the spelling of interpreter_values._list_index
+        iv = self._tmp()
+        self._emit(f"{iv} = float({idx}.item() if _torch.is_tensor({idx}) else {idx})")
+        self._emit(f"{tmp} = {arr}[0 if not {iv} >= 0.0 else (max(len({arr}) - 1, 0) if {iv} >= len({arr}) else int(_math.floor({iv})))]")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1

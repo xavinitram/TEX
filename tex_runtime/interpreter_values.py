@@ -56,6 +56,17 @@ def _const_index(index_node, size: int) -> int | None:
     return None
 
 
+def _list_index(v, size: int) -> int:
+    """Floor+clamp a runtime index into a string array (a Python list); NaN reads 0.
+    Codegen's emitted string-array read spells the same rule inline."""
+    v = float(v)
+    if not v >= 0.0:
+        return 0
+    if v >= size:
+        return max(size - 1, 0)
+    return int(math.floor(v))
+
+
 def _host_index(index: torch.Tensor, size: int) -> int | None:
     """Floor+clamp a RUNTIME index using the host reading it carries (TRK-68), or None
     when it has none — the runtime-scalar counterpart to `_const_index`'s compile-time
@@ -67,7 +78,8 @@ def _host_index(index: torch.Tensor, size: int) -> int | None:
     if index.__class__ is not torch.Tensor or index.dim() != 0:
         return None
     v = _host_scalar(index)
-    if v is None:
+    if v is None or not math.isfinite(v):
+        # NaN/Inf: hand back to the caller's device-side floor+clamp, which never raises.
         return None
     return max(0, min(int(math.floor(v)), size - 1))
 
