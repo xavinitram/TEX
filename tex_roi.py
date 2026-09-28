@@ -48,6 +48,8 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass
 
+import torch
+
 from .tex_compiler.ast_nodes import (
     BindingRef, NumberLiteral, ChannelAccess, FunctionCall, Assignment, Identifier,
     BindingIndexAccess, BindingSampleAccess, ArrayIndexAccess, VarDecl, FunctionDef,
@@ -60,6 +62,7 @@ from .tex_lazy import (
     _has_prunable_flow,
 )
 from .tex_runtime import codegen_stencil as _st
+from .tex_runtime.stdlib import _dtype_rounded
 
 
 # ── The footprint lattice ─────────────────────────────────────────────────────
@@ -187,6 +190,16 @@ def _reach_of(fp, args: list):
         v = _static_number(args[i]) if i < len(args) else None
         if v is None:
             return "unbounded"                          # symbolic radius → blocks narrowing
+        # R1 (v0.51 Phase C, B1#1): the builtins this descriptor covers
+        # (`bilateral_filter`, `gauss_blur`) resolve their own sigma/radius from the
+        # fp32-rounded value (`_dtype_rounded(raw, torch.float32)`), never the raw AST
+        # literal — an ordinary 7-8 sig-fig literal can round to the OTHER side of a
+        # `ceil(mult*v)` integer boundary. Round here the SAME way, with the SAME
+        # fallback-to-raw-on-None the runtime uses, so the declared reach and the
+        # approx-decline both agree with what the builtin actually does at cook time.
+        rounded = _dtype_rounded(v, torch.float32)
+        if rounded is not None:
+            v = rounded
         if approx_above is not None and abs(v) > approx_above:
             return "unbounded"                          # foldable, but past the approx threshold
         return int(math.ceil(mult * abs(v)))
