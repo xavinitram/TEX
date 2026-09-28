@@ -83,9 +83,13 @@ from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV he
 # hard budget. One more new eagerly-imported leaf module split out of it, the same SPLIT-47
 # shape: the AUTOSAFE-50 promotion-TRIAL domain (`compiled_promotion.py`). +1 for this one
 # new module, nothing else moved.
+#
+# 57 -> 58: `compiled.py` reached its 2000-line budget again; the dynamo precompile-scoping
+# helpers moved into their own eagerly-imported leaf module (`compiled_precompile.py`),
+# imported at `compiled.py` module scope. +1 for this one new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 57
+_TEX_ENGINE_TEX_MODULES_MAX = 58
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:
