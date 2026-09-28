@@ -949,21 +949,25 @@ class _StdlibSample:
         w_spatial_1d = torch.exp(-0.5 * (d * d) / max(ss * ss, 1e-10))
         inv_2sr = -0.5 / max(sr * sr, 1e-10)
         idx_base = torch.arange(n, device=device)
-        acc = torch.zeros_like(bchw)
+        # Up to 193 sequential taps: accumulate in fp32 whatever the image dtype (a no-op
+        # for fp32), as the tap-loop tier does, and cast the result back at the end.
+        src = bchw.float()
+        ref32 = range_ref.float()
+        acc = torch.zeros_like(src)
         wsum_shape = list(bchw.shape)
         wsum_shape[1] = 1
-        wsum = torch.zeros(wsum_shape, device=device, dtype=bchw.dtype)
+        wsum = torch.zeros(wsum_shape, device=device, dtype=torch.float32)
         for i, off in enumerate(range(-radius, radius + 1)):
             idx = (idx_base + off).clamp(0, n - 1)
-            tap = torch.index_select(bchw, dim, idx)
-            tap_ref = torch.index_select(range_ref, dim, idx)
-            diff = range_ref - tap_ref
+            tap = torch.index_select(src, dim, idx)
+            tap_ref = torch.index_select(ref32, dim, idx)
+            diff = ref32 - tap_ref
             cd2 = (diff * diff).sum(dim=1, keepdim=True)
             w_range = torch.exp(cd2 * inv_2sr)
             w = w_spatial_1d[i] * w_range
             acc = acc + tap * w
             wsum = wsum + w
-        return acc / wsum.clamp(min=1e-10)
+        return (acc / wsum.clamp(min=1e-10)).to(bchw.dtype)
 
     @staticmethod
     def _bilateral_separable_bchw(bchw, ss, sr, radius):

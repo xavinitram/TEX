@@ -300,3 +300,12 @@ def test_sdf_polygon_non_finite_sides_is_a_diagnostic():
     assert "finite" in str(ei.value)
 
 
+# -- separable bilateral accumulates in fp32 --------------------------------------------
+
+def test_separable_bilateral_fp16_tracks_fp32():
+    g = torch.Generator().manual_seed(3)
+    base = torch.rand(1, 3, 40, 40, generator=g)
+    ref = S._bilateral_separable_bchw(base.clone(), 20.0, 0.3, 60)
+    half = S._bilateral_separable_bchw(base.half(), 20.0, 0.3, 60)
+    assert half.dtype == torch.float16
+    assert (half.float() - ref).abs().max() < 2e-3
