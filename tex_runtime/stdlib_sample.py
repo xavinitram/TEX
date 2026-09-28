@@ -643,13 +643,24 @@ class _StdlibSample:
     # ultimate fallback past `_BILATERAL_SEPARABLE_RADIUS_MAX`, keeping the "no call
     # ever costs more than O(image size) at truly extreme spatial_sigma" guarantee this
     # codebase holds for every other builtin's own past-threshold tier.
-    _BILATERAL_EXACT_RADIUS_MAX = 24  # ksize=49 (spatial_sigma up to ~8.0). A prior design
-    # pass measured the UNTILED exact filter needing ~60GB at this exact radius on
-    # a canvas far smaller than 1080p (an O(r^2) memory blow-up, not a resolution-specific
-    # fluke) -- row-tiling keeps the identical math memory-bounded at any resolution up to
-    # here; past it the O(r^2) per-pixel tap count makes even a tiled exact pass too slow
-    # for a builtin on the default path, and the detail-transfer path (O(image size),
-    # independent of sigma) takes over.
+    _BILATERAL_EXACT_RADIUS_MAX = 40  # ksize=81 (spatial_sigma up to ~13.33). BILATX-51
+    # raised this from 24: a prior design pass measured the UNTILED exact filter needing
+    # ~60GB at radius=24 on a canvas far smaller than 1080p (an O(r^2) memory blow-up, not
+    # a resolution-specific fluke) -- the OLD row-tiled `unfold` path kept that same math
+    # memory-bounded but stayed O(r^2) in TIME (196s at radius=30, 1080p). The NEW tap-loop
+    # exact path (`_bilateral_exact_taploop_bchw`, used for 3<radius<=40) restates the
+    # identical math as one elementwise pass per tap -- still O(r^2) taps, but each tap
+    # touches the whole frame only once and never materializes an unfolded patch tensor,
+    # so peak memory is O(image size) (measured ~138 MiB flat, RTX 2080 SUPER, 1920x1080)
+    # and wall time is far lower (author's own measurement: r26 2.2s, r30 2.9s, r41 5.4s --
+    # note r41 already falls to the separable tier below). Past 40 the O(r^2) tap count
+    # itself (not memory) makes even this faster exact pass too slow for the default path,
+    # and the separable tier (O(image size * radius), not O(image size * radius^2)) takes
+    # over.
+    #
+    # `radius<=3` is UNCHANGED: `_bilateral_exact_bchw` (the old row-tiled path, still the
+    # only implementation of this regime) degenerates to a single untiled pass there
+    # (A5's own proof) and stays bit-identical to v0.50.0 (`test_bilat50_radius.py`).
     # A1 (v0.50 Phase C): the `spatial_sigma` value past which `fn_bilateral_filter`
     # itself switches to the detail-transfer downscale approximation (`radius =
     # ceil(3*ss) > _BILATERAL_EXACT_RADIUS_MAX` <=> `ss > _BILATERAL_EXACT_RADIUS_MAX /
@@ -747,7 +758,16 @@ class _StdlibSample:
         B, C, H, W = bchw.shape
         w_spatial, ksize = TEXStdlib._bilateral_spatial_weights(ss, radius, bchw.device)
         padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
-        tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, W * ksize * ksize))
+        # BILATX-51: the per-tile intermediate is [B, C, tile_h, W, ksize, ksize] -- the
+        # budget must divide by B*C too, not just W*ksize^2, or a >1-channel image (every
+        # real RGB image) silently runs the actual patch tensor to B*C times the declared
+        # budget (measured: 3x on a 3-channel image, unnoticed because this codebase's own
+        # C=1 mask-shaped test images and B=1 assumption never exercised the gap). This
+        # function's only remaining caller is radius<=3 (BILATX-51 moved 3<radius<=40 to
+        # `_bilateral_exact_taploop_bchw`), where tile_h always degenerates to a single
+        # tile anyway -- kept correct regardless, since a future caller could reintroduce
+        # a larger radius here.
+        tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, B * C * W * ksize * ksize))
         if tile_h >= H:
             tile_h = H
         # FIX-501 F3: `tile_h` above is derived from THIS call's own `W` -- a windowed
@@ -774,6 +794,53 @@ class _StdlibSample:
             outputs.append(TEXStdlib._bilateral_weighted_avg(
                 patches, center, w_spatial, sr, deterministic=deterministic))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
+
+    @staticmethod
+    def _bilateral_exact_taploop_bchw(bchw, ss, sr, radius):
+        """BILATX-51: the exact bilateral filter for `3 < radius <= _BILATERAL_EXACT_
+        RADIUS_MAX`, replacing `_bilateral_exact_bchw`'s row-tiled `unfold` for this
+        regime. Same math, restated as one elementwise pass PER TAP (`(2*radius+1)^2`
+        of them) instead of materializing every tap as a `[B,C,h,w,kH,kW]` unfolded
+        patch tensor -- peak memory here is O(image size), not O(image size * ksize^2),
+        which is what let the author's own prototype measure ~138 MiB flat at radius=30
+        on a 1920x1080 frame where the old tiled path needed 196s (tiling itself was
+        cheap; the per-tile `unfold` allocation was not). Measured within 2e-6 of the
+        shipped tiled exact tier it replaces (author's own comparison), and the fixed
+        `dy`-then-`dx` (row-major) tap order below matches `_sum_kernel_taps_fixed_
+        order`'s own accumulation order exactly -- so a windowed cook and a whole-frame
+        cook agree bit-for-bit on CUDA the same way FIX-501 F3 already made the tiled
+        path do, without needing that helper: this loop's per-tap add is already
+        shape-independent (each add combines two `[B,C,H,W]`-shaped tensors, never a
+        tensor whose shape depends on how the caller tiled).
+
+        The spatial weight is read from `_bilateral_spatial_weights`'s own precomputed
+        tensor (same `exp(d2*inv_2ss)` form, same float32 dtype and argument order the
+        tiled path already uses) rather than recomputed inline, so this tier's spatial
+        term is identical -- not merely close -- to today's.
+        """
+        B, C, H, W = bchw.shape
+        w_spatial, ksize = TEXStdlib._bilateral_spatial_weights(ss, radius, bchw.device)
+        padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
+        inv_2sr = -0.5 / max(sr * sr, 1e-10)
+        acc = torch.zeros_like(bchw)
+        wsum_shape = list(bchw.shape)
+        wsum_shape[1] = 1
+        wsum = torch.zeros(wsum_shape, device=bchw.device, dtype=bchw.dtype)
+        for ky in range(ksize):
+            # CANCEL-44/PACE-47c idiom: one poll per `dy` row of taps, per BILATX-51's
+            # own ask -- this tier no longer tiles by rows of the IMAGE (there is only
+            # ever one tile now), so the natural multi-pass boundary to poll between is
+            # a row of the TAP grid instead.
+            poll_cook_cancel(heavy=True)
+            for kx in range(ksize):
+                tap = padded[:, :, ky:ky + H, kx:kx + W]
+                diff = tap - bchw
+                cd2 = (diff * diff).sum(dim=1, keepdim=True)
+                w_range = torch.exp(cd2 * inv_2sr)
+                w = w_spatial[0, 0, 0, 0, ky, kx] * w_range
+                acc = acc + tap * w
+                wsum = wsum + w
+        return acc / wsum.clamp(min=1e-10)
 
     @staticmethod
     def _bilateral_detail_transfer_bchw(bchw, ss, sr):
@@ -971,14 +1038,18 @@ class _StdlibSample:
         # `ksize` (small radius) -- so it is correct, and bit-identical (proven,
         # `tests/test_bilat50_radius.py::test_bilat50_a5_exact_bchw_matches_inline_and_
         # degenerates_to_one_tile`), for `radius<=3` too.
-        # BILAT-51: three regimes now -- exact (unchanged, bit-identical for
-        # radius<=_BILATERAL_EXACT_RADIUS_MAX), separable (measured to beat both the
-        # v0.49 clamp and BILAT-50's detail-transfer on realistic content, up to
-        # _BILATERAL_SEPARABLE_RADIUS_MAX), then detail-transfer again as the flat-cost
-        # fallback for spatial_sigma large enough that even the separable pass's O(radius)
-        # cost would be excessive.
-        if radius <= TEXStdlib._BILATERAL_EXACT_RADIUS_MAX:
+        # BILATX-51: four regimes now -- `radius<=3` unchanged (bit-identical, the old
+        # untiled `_bilateral_exact_bchw` path), `3<radius<=_BILATERAL_EXACT_RADIUS_MAX`
+        # the new tap-loop exact pass (`_bilateral_exact_taploop_bchw`, same math restated
+        # for lower peak memory and much lower time than the old tiled `unfold` path at
+        # this radius), separable (measured to beat both the v0.49 clamp and BILAT-50's
+        # detail-transfer on realistic content, up to _BILATERAL_SEPARABLE_RADIUS_MAX),
+        # then detail-transfer again as the flat-cost fallback for spatial_sigma large
+        # enough that even the separable pass's O(radius) cost would be excessive.
+        if radius <= 3:
             result = TEXStdlib._bilateral_exact_bchw(bchw, ss, sr, radius)
+        elif radius <= TEXStdlib._BILATERAL_EXACT_RADIUS_MAX:
+            result = TEXStdlib._bilateral_exact_taploop_bchw(bchw, ss, sr, radius)
         elif radius <= TEXStdlib._BILATERAL_SEPARABLE_RADIUS_MAX:
             result = TEXStdlib._bilateral_separable_bchw(bchw, ss, sr, radius)
         else:
