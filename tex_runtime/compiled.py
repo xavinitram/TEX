@@ -14,6 +14,7 @@ torch.compile handles shape-based recompilation internally via guards.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import glob
 import logging
 import math
@@ -299,18 +300,47 @@ def _get_or_make_cancel_codegen_fn(program: Any, type_map: dict | None,
     return None if cg_fn is _CANCEL_CG_UNSUPPORTED else cg_fn
 
 
-def _precompile_ctx():
-    """Context manager enabling dynamo's persistent precompile cache (PC-2),
-    scoped so the process-global flag is only held around dynamo entry on the
-    compile worker thread. No-op when unsupported."""
+# COMPILE-51b: `caching_precompile`'s guard-state pickler crashes ("cannot pickle
+# '_thread._local'") on the first real compile whose trace needs a resume frame
+# across a `torch._dynamo.disable()` boundary -- `_get_gauss_kernels`'s own
+# kernel-cache lock (COMPILETRY-50 D2) is such a boundary. Torch-internal (2.12),
+# not TEX's own code (see the COMPILE-51 finding writeup). Scoped OFF, in-memory
+# only, for the `_has_fn_calls` class `fncalls_compile` tracks; every other
+# compiled program keeps disk-persisted `caching_precompile` (PC-2) unchanged.
+# The flag is process-global while `_COMPILE_POOL`/`_WARM_POOL` run concurrently,
+# so `_precompile_flag_lock` serializes an off-scoped window against either pool.
+_precompile_flag_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _precompile_off_ctx(_dc):
+    with _precompile_flag_lock, _dc.patch(caching_precompile=False):
+        yield
+
+
+def _precompile_ctx(*, disable: bool = False):
+    """Dynamo's persistent precompile cache (PC-2). `disable=True` (COMPILE-51b)
+    scopes `caching_precompile` OFF for the `_has_fn_calls` class instead (see
+    module comment). No-op when unsupported."""
     try:
         import torch._dynamo.config as _dc
         if hasattr(_dc, "caching_precompile"):
-            return _dc.patch(caching_precompile=True)
+            return _precompile_off_ctx(_dc) if disable else _dc.patch(caching_precompile=True)
     except Exception:
         pass
-    import contextlib
     return contextlib.nullcontext()
+
+
+def _wants_precompile_off(program, type_map, fingerprint) -> bool:
+    """COMPILE-51b: True when this program's codegen fn is `_has_fn_calls`.
+    Reuses `_get_or_make_codegen_fn`'s per-fingerprint memo (PC-3): no extra emit."""
+    if program is None or type_map is None:
+        return False
+    try:
+        cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
+    except Exception:
+        return False
+    return bool(getattr(cg_fn, '_has_fn_calls', False))
 
 
 # Error signatures that mean a persisted precompile entry failed to ATTACH
@@ -681,8 +711,10 @@ def execute_compiled(
             # caching_precompile persists dynamo entries under
             # TORCHINDUCTOR_CACHE_DIR so a warm restart skips most of the compile
             # (PC-2). Scoped to this worker so the process-global flag is never
-            # held across another node's cook.
-            with _precompile_ctx(), torch.inference_mode():
+            # held across another node's cook. COMPILE-51b: `_has_fn_calls` scopes
+            # it OFF instead.
+            with _precompile_ctx(disable=_wants_precompile_off(
+                    program, type_map, fingerprint)), torch.inference_mode():
                 # Get or create the compiled callable (on THIS thread)
                 if cache_key not in _compiled_cache:
                     entry = _try_compile(device_type, program, type_map,
@@ -1041,7 +1073,9 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
         _mark_pool_busy(pool_name)
         fnc_backend = None
         try:
-            with _precompile_ctx(), torch.inference_mode():
+            # COMPILE-51b: `_has_fn_calls` scopes caching_precompile OFF instead.
+            with _precompile_ctx(disable=_wants_precompile_off(
+                    program, type_map, fingerprint)), torch.inference_mode():
                 if cache_key not in _compiled_cache:
                     entry = _try_compile(device_type, program, type_map,
                                          used_builtins=used_builtins,

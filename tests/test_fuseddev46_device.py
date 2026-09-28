@@ -107,13 +107,23 @@ def test_fuseddev46_fused_torch_compile_cuda_stays_on_device(r: SubTestResult):
             r.fail("FUSEDDEV-46 device", f"torch_compile output landed on {b.device}, "
                   f"expected {a.device}")
             return
-        if not torch.equal(a, b):
+        # COMPILE-51b: this program's terminal (gauss_blur) is the `_has_fn_calls` class
+        # (COMPILETRY-50) `fncalls_compile` grants exactly ONE real torch.compile attempt.
+        # Before COMPILE-51b's fix, that attempt always crashed (the `caching_precompile`
+        # guard-state pickler at `_get_gauss_kernels`'s own disable() boundary) and the
+        # fingerprint was blacklisted, so this comparison was silently interp-vs-interp
+        # (the "blacklisted" check above already catches THAT regression). Now that a real
+        # Inductor backend is reached, this is the first real interp-vs-torch.compile
+        # comparison for this program — invariant 2's own tolerance (tol=1e-5 fp32) is the
+        # contract to hold it to, not bit-exact `torch.equal`: Inductor's kernel fusion is
+        # free to reassociate float ops (a real, expected ~1e-7-scale divergence here).
+        if not torch.allclose(a, b, atol=1e-5, rtol=1e-5):
             maxdiff = (a.double() - b.double()).abs().max().item()
             r.fail("FUSEDDEV-46 bit-exact",
                   f"torch_compile diverged from the interpreter, maxdiff={maxdiff:.3e}")
             return
-        r.ok("fused chain runs on CUDA under torch_compile, bit-identical to the "
-             "interpreter, and the fingerprint is not blacklisted")
+        r.ok("fused chain runs on CUDA under torch_compile, within invariant 2's own "
+             "tolerance of the interpreter, and the fingerprint is not blacklisted")
     except Exception as e:
         r.fail("FUSEDDEV-46 fused crashed", f"{type(e).__name__}: {e}")
 
@@ -138,13 +148,16 @@ def test_fuseddev46_single_node_torch_compile_cuda_stays_on_device(r: SubTestRes
         out_tc = tex_engine.cook(code, dict(bindings), device_mode="cuda",
                                  precision="fp32", compile_mode="torch_compile", cancel=None)
         a, b = out_none.outputs["OUT"], out_tc.outputs["OUT"]
-        if not torch.equal(a, b):
+        # COMPILE-51b: see the fused row's own comment above — same `_has_fn_calls`
+        # class, same reason invariant 2's tolerance (1e-5) is the right bar here, not
+        # bit-exact `torch.equal`.
+        if not torch.allclose(a, b, atol=1e-5, rtol=1e-5):
             maxdiff = (a.double() - b.double()).abs().max().item()
             r.fail("FUSEDDEV-46 single-node bit-exact",
                   f"torch_compile diverged from the interpreter, maxdiff={maxdiff:.3e}")
             return
-        r.ok("a plain single-node cook runs on CUDA under torch_compile, bit-identical "
-             "to the interpreter")
+        r.ok("a plain single-node cook runs on CUDA under torch_compile, within "
+             "invariant 2's own tolerance of the interpreter")
     except Exception as e:
         r.fail("FUSEDDEV-46 single-node crashed", f"{type(e).__name__}: {e}")
 
