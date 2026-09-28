@@ -598,7 +598,7 @@ class Parser:
         size = None
         if self.peek() == TokenType.INT_LIT:
             size_tok = self.advance()
-            size = int(size_tok.value)
+            size = int(size_tok.value, 16) if size_tok.value[:2] in ("0x", "0X") else int(size_tok.value)
             if size <= 0:
                 raise self._make_error(f"Array size must be positive, got {size}.",
                                       size_tok.loc, code="E2004")
