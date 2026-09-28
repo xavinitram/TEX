@@ -80,6 +80,29 @@ def test_fix501_bilateral_exact_tier_window_identity_cuda(r: SubTestResult):
     _repro_roi(r, 3.0, seed=202, device="cuda")   # radius=9
 
 
+def test_fix501_bilateral_taploop_tier_window_identity_cpu(r: SubTestResult):
+    print("\n--- BILATX-51: the tap-loop exact tier (3<radius<=40, "
+          "_bilateral_exact_taploop_bchw) keeps windowed cook == whole-frame crop, CPU "
+          "(control) ---")
+    _repro_roi(r, 8.0, seed=204, device="cpu")           # radius=24, old tiled ceiling
+    _repro_roi(r, 10.0, seed=205, device="cpu")          # radius=30
+    _repro_roi(r, 40.0 / 3.0, seed=206, device="cpu")    # radius=40, the new ceiling
+
+
+def test_fix501_bilateral_taploop_tier_window_identity_cuda(r: SubTestResult):
+    if not _CUDA:
+        r.skip("BILATX-51 taploop CUDA window identity", "no CUDA device present on this box")
+        return
+    print("\n--- BILATX-51: the tap-loop exact tier's per-tap accumulation is already "
+          "shape-independent (each add combines two full-frame-shaped tensors, never a "
+          "tensor shaped by how the caller tiled) -- windowed cook == whole-frame crop on "
+          "CUDA at radius 24, 30 and 40 (the new ceiling), without needing FIX-501 F3's own "
+          "`_sum_kernel_taps_fixed_order` helper ---")
+    _repro_roi(r, 8.0, seed=204, device="cuda")           # radius=24
+    _repro_roi(r, 10.0, seed=205, device="cuda")          # radius=30
+    _repro_roi(r, 40.0 / 3.0, seed=207, device="cuda")    # radius=40, the new ceiling
+
+
 def test_fix501_bilateral_radius_le_3_unchanged_on_cuda(r: SubTestResult):
     if not _CUDA:
         r.skip("FIX-501 F3 CUDA window identity", "no CUDA device present on this box")

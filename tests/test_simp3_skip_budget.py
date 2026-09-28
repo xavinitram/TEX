@@ -264,7 +264,13 @@ _SKIP_VOCAB = re.compile(
 #: window_identity_cuda`, `test_fix501_bilateral_radius_le_3_unchanged_on_cuda`) skip only
 #: when the box has no CUDA device -- the same named environment every other CUDA-only row
 #: in this pin already needs; both run for real on this ask's own box (CUDA present here).
-_SKIP_BUDGET = 133
+#: Re-pinned from 133 to 135 (BILATX-51): two new rows, `test_bilatx51_taploop.py::
+#: test_bilatx51_taploop_peak_cuda_memory_bounded` and `test_fix501_bilateral_cuda_window_
+#: identity.py::test_fix501_bilateral_taploop_tier_window_identity_cuda`, skip only when the
+#: box has no CUDA device -- the same named environment every CUDA-only row in this pin
+#: already needs; both run for real on the box this ask's own GPU readings were taken on
+#: (CUDA present there).
+_SKIP_BUDGET = 135
 
 
 def _literal(node) -> str:
