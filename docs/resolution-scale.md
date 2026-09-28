@@ -597,9 +597,9 @@ above), 1080p, CPU:
 | v0.50 (BILAT-50 detail-transfer) | downscale + residual add-back | checker | 97.7 / 0.0004 | 97.1 / 0.001 | 97.6 / 0.0002 |
 | v0.50 | " | smooth+edges | 46.8 / 0.080 | 32.1 / 0.079 | 6.0 / 0.080 |
 | v0.50 | " | realistic | 8.3 / 0.095 | 3.3 / 0.093 | -11.6 / 0.116 |
-| **v0.51 (BILAT-51, shipped)** | separable (row-then-column) bilateral pass | checker | 100 / 0.0 | 100 / 0.0 | 100 / 0.0 |
-| **v0.51** | " | smooth+edges | 93.3 / 0.027 | 91.8 / 0.029 | 87.8 / 0.031 |
-| **v0.51** | " | realistic | 91.9 / 0.026 | 91.4 / 0.026 | 89.1 / 0.033 |
+| **v0.50.1 (BILAT-51, shipped; measured before the v0.51 range-weight fix)** | separable (row-then-column) bilateral pass | checker | 100 / 0.0 | 100 / 0.0 | 100 / 0.0 |
+| **v0.50.1** | " | smooth+edges | 93.3 / 0.027 | 91.8 / 0.029 | 87.8 / 0.031 |
+| **v0.50.1** | " | realistic | 91.9 / 0.026 | 91.4 / 0.026 | 89.1 / 0.033 |
 
 (cell = SSIMULACRA2 / max-abs.)
 
@@ -712,7 +712,7 @@ detail-transfer.
 
 **Why the old ceiling was 24, and why a faster mechanism (not just cost) let it move.** The
 original `_BILATERAL_EXACT_RADIUS_MAX=24` was bounded by TIME, not just memory: FIX-501 F3
-(v0.51) made `radius>3` route the tiled path's kernel-window reduction through a strictly
+(v0.50.1) made `radius>3` route the tiled path's kernel-window reduction through a strictly
 sequential, shape-independent accumulator (one elementwise add per tap) instead of
 `torch.sum`, fixing a CUDA windowed-vs-whole-frame divergence — but paying for it with an
 `unfold`/patches allocation THAT SAME SIZE, on top of the now-sequential reduction. The
@@ -777,13 +777,16 @@ tap-loop tier hands off).**
 | 96 | 4K | 25.7 | 2.10 | 1077 |
 
 **Display-8 codes for the separable pass at ss=13.7/16/32 (day/night, x1/x16) were NOT
-re-measured by this ask** — the separable tier's own quality is BILAT-51/BILAT8-51's
-deliverable, not touched by this ask (which only replaces the exact tier's mechanism for
-`3<radius<=40` and moves the ceiling). A same-radius exact reference for that comparison
-does not exist below radius=40 either way; producing one at radius=41-96 would need the OLD
-tiled path run at exactly the radii this ask's own measurement above shows are impractical to
-run precisely. See the display-8 sections above (BILAT8-51) for the separable pass's own
-existing readings.
+re-measured by this ask** — the separable tier's own quality is not touched by this ask (which
+only replaces the exact tier's mechanism for `3<radius<=40` and moves the ceiling). Producing a
+same-radius exact reference at radius=41-96 would need the OLD tiled path run at exactly the radii
+this ask's own measurement above shows are impractical to run precisely. What exists: on a 40-cell
+1080p sweep at spatial_sigma 8.5 and 10 (five plates, four range_sigma values; radii that now run
+the exact tier) the separable pass, with its range weight taken against the original image in both
+passes, read up to 27 codes on the hardest plates and never worse than before its fix; a sparse
+exact correction on top of it reached 1 code on 33 of 40 cells but added 22 s at 4K in the worst
+case (uniform noise, 100% of pixels flagged) and was not shipped. The separable tier (radius 41-96)
+is therefore improved, not held to the display-8 bar.
 
 **The regime table (footprint/dispatch), for reference:**
 
@@ -791,7 +794,7 @@ existing readings.
 |---|---|---|---|
 | <=3 | original untiled exact | 0 (unchanged, by construction) | untouched |
 | 3<r<=40 | tap-loop exact (`_bilateral_exact_taploop_bchw`) | 0 (exact, by construction) | replaces the old tiled path's mechanism for this range; ceiling was 24 |
-| 40<r<=96 | separable (row-then-column) | see BILAT8-51/BILAT-51's own readings above | unchanged by this ask |
+| 40<r<=96 | separable (row-then-column) | improved, not at the bar (see the paragraph above) | unchanged by this ask |
 | r>96 | detail-transfer | flat-cost fallback | unchanged by this ask; open item past 96 (detail-transfer's own quality) tracked separately, not this ask |
 
 ## Precision under scale

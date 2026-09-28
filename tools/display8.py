@@ -95,12 +95,16 @@ def code_diff_stats(a: torch.Tensor, b: torch.Tensor) -> dict:
     """Summarize a pixel-wise 8-bit-code difference between two `aces_srgb8`
     outputs (worst channel per pixel), both overall and restricted to the
     centre half of the frame (`centre_*`, excluding a border margin where
-    boundary handling can dominate). `a`/`b` are [H, W, 3] int16."""
+    boundary handling can dominate). `a`/`b` are [H, W, 3] int16. On frames
+    with H or W < 4 the centre half is empty, so the centre stats fall back
+    to the full frame (every pixel there is border anyway)."""
     sd = (a - b).double()
     d = sd.abs().amax(dim=-1)
     n = d.numel()
     h, w = d.shape
     c = d[h // 4:3 * h // 4, w // 4:3 * w // 4]
+    if c.numel() == 0:
+        c = d
     return {
         "changed": float((d >= 1).sum()) / n,
         "ge2": float((d >= 2).sum()) / n,

@@ -5,6 +5,194 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0] - 2026-09-28 — "What the artist sees"
+
+A minor release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
+name. **Two builtins' output changes for programs that were already using them past a threshold**
+(`gauss_blur` past sigma 256; `bilateral_filter` past radius 24) — see "Changed" below; every
+other item is additive, a fix, or measurement tooling. The codegen and tier-verdict caches go cold
+once on upgrade (`tex_runtime/stdlib_core.py`, `stdlib_sample.py`, `codegen.py`, `compiled.py`
+and a new `compiled_precompile.py` are cache-watched files); the compiled-program (`.pkl`) cache
+stays warm.
+
+The criterion this release measures the approximate paths against, stated once: **an approximate
+path must not change what the artist sees.** A scene-linear plate is blurred with the shipped
+path and with the exact reference, both are mapped through the ACES 1.x RRT + sRGB ODT (Hill's
+fitted form) and rounded to 8 bits, and every pixel must be within 1 code (worst channel). It is
+reported beside SSIMULACRA2 and max-abs, never instead of them. The harness is `tools/display8.py`
+(measurement tooling; the runtime never imports it). The exact-vs-exact CPU-vs-GPU floor on the
+same plates is 0 pixels changed, so a 1-code allowance is not slack.
+
+### Changed — `gauss_blur` past sigma 256 meets the display-8 bar
+
+`gauss_blur` is exact to sigma 256 and bit-identical to every prior release there. Above it, an
+automatic downscale-pyramid approximation runs; measured against the exact blur it used to change
+the picture. On two 1080x1080 plates (a daylight exterior with hard highlights; a near-black
+interior with forty very bright small lights) the `0.50.1` path read **up to 43 codes with a
++26 code mean bias** (day, sigma 2048) and up to 27 codes / +11.5 mean (night, sigma 1024); on the
+same plates pushed x16 in exposure, up to 81 codes. Four fixes, each proved red-first:
+
+- **True-edge padding.** The residual blur on the reduced grid padded with the reduced image's own
+  edge pixel, which is a block average taken inward from the border and had already mixed
+  interior content into what should be a pure boundary constant. It now pads with the true border
+  row/column, downsampled only along the axis parallel to it. This alone removed most of the bias.
+- **The reduced grid is an exact subsampling of the frame.** A frame whose side is not a multiple
+  of the downscale factor (828 / 8 = 103.5) used to round its reduced grid and misregister the
+  result: 4 codes on 75% of pixels at 830x830 (night x16, sigma 260). The path now replicate-pads
+  to the next multiple and crops, which changes nothing that is approximated (the exact blur
+  already treats everything past the border as the replicated edge).
+- **One-sample border extension.** A bilinear upsample has no coarse sample outside the frame, so
+  it clamped the outermost half coarse pixel where the exact blur still has a gradient. The path
+  now adds one coarse sample past each border before blurring and crops after upsampling.
+- **Quality cap 8 -> 96** (`GAUSS_BLUR_PYRAMID_QUALITY_CAP`). A larger cap means a smaller
+  downscale factor for the same sigma. Cap 32 still missed on bright plates and cap 64 on a thin
+  frame (a 100x1097 night plate x16 read 2 codes beside lights at sigma 260-300); cap 96 closes
+  both. The one real blur still runs at a bounded `sigma / factor <= cap`.
+
+**Now:** max 1 code, and 0% of pixels at 2 or more, on every cell of the plate tables: day and
+night, sigma 260/512/1024/2048 at x1 (SSIMULACRA2 91.3-98.0), and the same at x4 and x16
+(SSIMULACRA2 88.9-94.2 at x16). A 3840x3840 spot check at sigma 1024 holds the same bound. An
+odd-size sweep (826, 828, 830, 1084, 827x1031, 1099x1097, 17x23, 3x5 and more), including a plate
+with bright features touching all four borders, read max 1 code on all 360 cells (sigma 260-8192)
+before the final cap change; after it, the thin strips (two seeds, both orientations) and a
+420-cell odd-size sweep (sigma 260-8192, extended to 400) read max 1 code. The plate tables in
+`docs/resolution-scale.md` were measured at cap 64 and not re-run; at sigma 512 and above the factor,
+and so the result, is identical at cap 96.
+
+**Cost stays flat in sigma**, except a bounded step for sigma 256-384 (where cap 96 halves the
+factor): at 4K, about 85-95 ms on CPU (a Threadripper 3970X) against 22 ms at cap 64, and about
+6 ms against 1.7 ms on CUDA; sigma 385 and above is unchanged (4K warm calls at cap 64: CUDA
+1.4-1.7 ms on an RTX 5070 Ti Laptop, flat from sigma 260 to 4096). A cheaper boundary formulation
+(replicate-pad the full-resolution image once before the reduction) was tried and not adopted: on
+a side no longer than the factor the reduced grid collapses to one pixel and it lost the
+edge-versus-interior distinction, reading up to 53 codes on 24 of 240 cells.
+
+**This changes results for an existing program that called `gauss_blur` with sigma above 256**:
+the output moves toward the exact blur, by up to the amounts above. Every call at or below 256
+is untouched (`torch.equal` against the previous output).
+
+### Changed — `bilateral_filter` is exact to radius 40
+
+`bilateral_filter` now runs four regimes: `radius <= 3` unchanged; `3 < radius <= 40` exact (the
+exact tier used to stop at 24); `41 <= radius <= 96` the separable pass; past 96 the flat-cost
+detail-transfer path (unchanged, see Known issues).
+
+- **Exact tap-loop, `3 < radius <= 40`.** The same weighted-average math as before, computed as
+  one elementwise add per tap in a fixed row-major order instead of unfolding every tap into a
+  `[B,C,h,w,k,k]` patch tensor. Memory is flat in radius: a CUDA cook holds 200-226 MiB at 1080p
+  and 793-797 MiB at 4K at every radius from 4 to 40, where the tiled path grew from 211 to
+  531 MiB (1080p, radius 4 to 40). Timing, tiled path -> tap-loop, RTX 2080 SUPER, 1080p: radius 4
+  0.26 -> 0.083 s; radius 10 7.7 -> 0.45 s; radius 24 124 -> 2.5 s; radius 30 192 -> 3.8 s; radius
+  40 337 -> 6.7 s (4K: radius 40 in 26 s). `radius <= 3` is bit-identical to before; `4 <= radius
+  <= 24` is within 1e-5 of the previous exact path (measured 2e-6 or better, equal on the cases
+  tried); `25 <= radius <= 40` is exact where it used to be approximate. Exact means 0 codes on
+  the display-8 bar by construction.
+- **A windowed, tiled or DAG-joined cook is pixel-identical to the whole-frame cook through radius
+  40**, CPU and CUDA (the footprint's decline threshold moved with the ceiling: a narrowed window
+  is served through radius 40 and declined from 41).
+- **fp16 mode accumulates in fp32.** A naive sequential sum over up to 6561 taps compounded fp16
+  rounding up to 36x worse than the tiled path's reduction did at radius 40 (about 0.030 absolute
+  error against 0.0008); both accumulators and every per-tap intermediate are now fp32, cast back
+  on return. The fixed tap order is untouched.
+- **Separable pass, `41 <= radius <= 96`.** The range weight of both the row and the column pass
+  is now taken against the ORIGINAL image; the column pass used to compare row-blurred pixels
+  against each other, a weaker edge test that under-preserved hard edges. Never worse than before
+  on any measured cell. **Honest limit: this tier is improved, not held to the display-8 bar.** On
+  a 40-cell 1080p sweep at spatial_sigma 8.5 and 10 the separable pass alone still read up to 27
+  codes on the hardest plates (a sparse exact correction on top of it reached 1 code on 33 of 40
+  cells but adds 22 s at 4K in the worst case, and was measured and not shipped). Its cost grows
+  with radius (`O(image size x radius)`): 1080p CUDA (RTX 2080 SUPER) 0.23 / 0.36 / 0.53 s at
+  radius 41 / 64 / 96.
+
+**This changes results for an existing program** with `24 < radius <= 40` (exact now, an
+approximation before) and with `41 <= radius <= 96` (the improved separable pass).
+
+### Changed — `scale=` on `bilateral_filter`
+
+A scaled cook scales `spatial_sigma` before the call, so a scaled bilateral stays on the exact
+tier at the scaled radius (spatial_sigma 10 at half scale runs the exact tap-loop at radius 15,
+about a sixteenth of the full-resolution cost; pinned by a test). The half-scale envelope was
+pinned at 0.08 on a 32x32 checker only; on 256x256 patterns spatial_sigma 6 / 10 / 13 read
+0.082 / 0.093 / 0.098, so it is re-measured at **0.10 for spatial_sigma 6-13** (quarter and eighth
+scale hold their bands). On a plate with a hard 0.8 step the half-scale maxdiff reaches 0.16 at
+96x96: a coarse bilateral's range weights see the downsample's blended edge pixels, so a preview is
+least faithful at hard edges. **The bands are maxdiff on display-range input (channel values in
+[0,1]).** On an 828x828 scene-linear plate pushed x16 a half-scale bilateral (spatial_sigma 10,
+range_sigma 1.0) reached 0.76 linear maxdiff; treat a scaled cook of an HDR plate as a coarse
+preview.
+
+### Added — joins and checkpoints
+
+- **`tex_chain.cook_stage_dag(..., store=None)`**: a host chooses which clean whole-frame stages
+  are stored in `result_cache` — a set of stage indices. `store=None` (every existing caller) is
+  today's behaviour, every eligible stage stored. `store` can only NARROW what is written: a stage
+  that served a window is never stored even if named, and reading a stored boundary is
+  unconditional on `store`. An index outside `range(len(stages))` raises `ValueError` before any
+  stage cooks.
+- **The checkpointed route for a join is `cook_stage_dag(..., result_cache=, upstream=)`** — the
+  existing composition, now proven for the two shapes not yet covered: a checkpoint boundary at a
+  join stage's own output, and an approximate builtin (`gauss_blur` past sigma 256,
+  `bilateral_filter` past radius 40) declining its window while going through the checkpointed
+  route. Each is `torch.equal` to a fresh whole-frame cook. No mechanism changed. Measured, a 4K
+  Merge-below-edit DAG with one clean boundary, CPU (an RTX 5070 Ti Laptop workstation), median
+  of 15 warm calls: 48.0 ms (whole-frame recook, which is what `cook_checkpointed` falls back to
+  on a non-linear graph) -> 5.8 ms (about 8.3x). `cook_checkpointed` stays linear-only.
+
+### Added — `tools/display8.py`
+
+The display-8 harness: `aces_srgb8`, `plate_day` / `plate_night` (deterministic HDR test plates),
+and `code_diff_stats`, torch-only, no new dependency, not imported by the runtime. A host can run it
+on its own plates.
+
+### Fixed
+
+- **A windowed cook could read one pixel short of a literal sigma.** The ROI planner sized the halo
+  of `gauss_blur` / `bilateral_filter` from the raw double-precision literal while the runtime
+  rounds the argument to fp32 before taking `ceil(3 * sigma)`; a literal such as 4.3333333 sits on
+  a radius boundary (13 against 14), so the window was one pixel short and differed from the
+  whole-frame cook (maxdiff 2.9e-4 over 2841 elements at 1024x576). The planner now rounds through
+  the same helper as the runtime, for the reach and for the approximate-path decline test.
+- **Compiled tiers and `gauss_blur` / `bilateral_filter`.** On a real backend, the first
+  `torch_compile` attempt for a program calling either builtin died in Dynamo's guard-state
+  pickling (`cannot pickle '_thread._local'`) and the never-fail net blacklisted that program for
+  good. Programs calling a builtin now compile with Dynamo's disk-persisted precompile cache scoped
+  off (in-memory only); every other program keeps it on. Both branches of that scoping now take one
+  lock: on torch builds where the Dynamo config patch is a process-wide global, an off-scoped
+  compile on one pool could flip the flag under a concurrent on-scoped compile on the other (on the
+  torch 2.12 build measured, the patch is per-thread and the lock is conservative). A compiled
+  result for these programs differs from the interpreter by about 1e-7 (kernel-fusion
+  reassociation), inside the 1e-5 tolerance.
+- **`$param` host scalars reach codegen.** A `$param` sigma or radius in a compiled program was
+  minted into a fresh tensor with no host reading attached, so `gauss_blur` / `bilateral_filter`
+  fell through to a raw `.item()` — a graph break under `torch_compile` / `"auto"` for the common
+  case of an externally bound blur radius. The reading now travels with the parameter.
+- **The tiled exact bilateral's tile budget ignored the channel count.** The per-tile budget
+  divided by `W * ksize^2` only, so a 3-channel image ran the patch tensor to 3x the declared
+  budget (23,971,584 elements against 8,000,000 at 64x64x3, radius 24). It now divides by
+  `B * C * W * ksize^2`; the path it guards now serves `radius <= 3`.
+
+No speedup from the compiled tiers is claimed. Measured on an RTX 5070 Ti Laptop, a pure
+elementwise chain is about 15% faster under `torch_compile` at 4K (66 against 78 ms) and no faster
+at 1080p; a program containing `gauss_blur` / `bilateral_filter` shows no reliable win, and
+`"auto"` sits at or above `"none"` in every 1080p row measured.
+
+### Known issues
+
+- **`torch_compile` on a deep chain of blurs can run for hours without finishing.** Observed: one
+  program of three `gauss_blur` and two `bilateral_filter` calls plus a grade, 1080p,
+  `mode="reduce-overhead"` on CUDA, ran about 2.5 hours at 0% GPU and 20.6 GB of RAM without
+  returning and was stopped. The cause is not found. Compile mode `"none"` (the default) is
+  unaffected.
+- **`bilateral_filter` past radius 96** still uses the flat-cost detail-transfer path, unchanged
+  and below the display-8 bar (up to 62 codes on the plates measured; SSIMULACRA2 8.3 / 3.3 / -11.6
+  on realistic images at spatial_sigma 8.5 / 16 / 32).
+- The separable tier (radius 41-96) is not held to the display-8 bar (see above).
+
+### Not in this release
+
+Planned for `v0.52.0`: a compiled-tier speedup (and `scale=` on the compiled tiers, which waits on
+it), and a `bilateral_filter` that holds the display-8 bar past radius 40, including past 96.
+
 ## [0.50.1] - 2026-09-28 — "The same sigma, not a stand-in"
 
 A patch release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
