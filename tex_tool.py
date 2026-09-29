@@ -24,9 +24,11 @@ generated, and install is validate-only by default (no compile without explicit 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any
@@ -330,7 +332,8 @@ def _source_injection_points(gs: dict, n_stages: int):
             continue
         if not isinstance(b, str):
             return None
-        out.update((j, b) for j in range(n_stages) if j == s)
+        if s in range(n_stages):
+            out.add((s, b))
         if s == n_stages:
             out.add(("terminal", b))
     return out
@@ -667,12 +670,14 @@ def _read_capped(path: str) -> str:
     # Read at most the cap (+1 to detect overflow) instead of stat-then-read: the pre-stat is a
     # TOCTOU (a symlinked/swapped/grown file could report small then read huge) and read() would
     # slurp the whole file regardless. Bounding the read makes MAX_TOOL_BYTES actually enforced.
+    if not stat.S_ISREG(os.stat(path).st_mode):     # a FIFO or device would block open() forever
+        raise TEXToolError(f"'{path}' is not a regular file")
     with open(path, "rb") as fh:
         raw = fh.read(MAX_TOOL_BYTES + 1)
     if len(raw) > MAX_TOOL_BYTES:
         raise TEXToolError(f"'{path}' exceeds the {MAX_TOOL_BYTES}-byte limit")
     try:
-        return raw.decode("utf-8")
+        return raw.decode("utf-8-sig")              # a Notepad-saved file carries a BOM
     except UnicodeDecodeError as e:
         raise TEXToolError(f"'{path}' is not valid UTF-8: {e}")
 
@@ -715,7 +720,7 @@ def _repr_params(manifest: ToolManifest, *, warm: bool = False) -> dict:
     PREFLIGHT wants the param's SEMANTIC type (a `c`/`v*` param must type-check as a vector for
     `$col.rgb`), so it uses `_hint_value`. WARM must instead match what the COOK fingerprints:
     the engine keys on `infer_binding_type(RAW value)` BEFORE `_convert_param_value` runs
-    (tex_engine.prepare ~874/884/955), so a cook feeds the raw default (a hex/comma STRING for
+    (see `tex_engine.prepare`), so a cook feeds the raw default (a hex/comma STRING for
     `c`/`v*`, and an INT for an `f` param whose JSON default serialized as an int). Using the raw
     default here makes the warm key match the cook's; `_hint_value`'s VEC3/FLOAT would miss."""
     if warm:
@@ -780,10 +785,9 @@ def preflight_tool(manifest: ToolManifest) -> dict:
 def _preflight_fused(manifest: ToolManifest) -> dict:
     """Assemble the fused stages (with placeholder image tensors) and run chain_preflight."""
     try:
-        import torch
         from .tex_marshalling import infer_binding_type
         from .tex_fusion import chain_preflight
-    except Exception as e:                       # pragma: no cover - torch always present
+    except Exception as e:                       # pragma: no cover - import guard
         return {"ok": False, "diagnostics": [{"code": "E0000", "severity": "error",
                 "message": f"preflight unavailable: {e}"}], "stats": None}
     # chain_preflight is total, but the GraphSpec ASSEMBLY before it (_stages_from_spec) can
@@ -1059,8 +1063,24 @@ def tools_dir() -> str | None:
     return os.path.join(base, "tex_wrangle", _TOOL_STORE)
 
 
+_MAX_STEM = 100
+_WINDOWS_DEVICES = frozenset({"CON", "PRN", "AUX", "NUL"}
+                             | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
+
+
 def _safe_tool_filename(name: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "tool"
+    """The store file name for a tool name: ASCII letters, digits and `_.-` survive. A name with
+    no such character gets a short hash of itself (so two of them do not share one file), an
+    over-long stem is cut with the hash of the full name appended, and a Windows device name
+    (`CON`, `NUL`, `COM1`, ...) is prefixed with `_`."""
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    digest = hashlib.sha1(name.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    if not stem:
+        stem = "tool_" + digest
+    elif len(stem) > _MAX_STEM:
+        stem = stem[:_MAX_STEM] + "_" + digest
+    if stem.split(".")[0].upper() in _WINDOWS_DEVICES:
+        stem = "_" + stem
     return stem + ".textool"
 
 
@@ -1079,14 +1099,20 @@ def write_tool(manifest_or_dict, dest_dir: str | None = None) -> str:
     # Re-publishing the SAME tool overwrites (an update); a collision with a DIFFERENT name
     # must not silently clobber it — fail loud so the publisher renames.
     if os.path.exists(path):
+        existing = None
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8-sig") as fh:
                 existing = json.load(fh)
-            if existing.get("name") != raw["name"]:
-                raise TEXToolError(f"tool file '{os.path.basename(path)}' already holds a "
-                                   f"different tool ('{existing.get('name')}'); rename this one")
-        except (OSError, json.JSONDecodeError):
-            pass                                # unreadable/corrupt existing file: overwrite it
+        except FileNotFoundError:
+            pass                                # removed since the exists() check
+        except OSError as e:                    # locked or denied: we cannot tell whose it is
+            raise TEXToolError(f"tool file '{os.path.basename(path)}' exists but could not be "
+                               f"read ({e}); not overwriting it") from e
+        except (ValueError, RecursionError):
+            pass                                # not UTF-8 / not JSON: corrupt, overwrite it
+        if isinstance(existing, dict) and existing.get("name") != raw["name"]:
+            raise TEXToolError(f"tool file '{os.path.basename(path)}' already holds a "
+                               f"different tool ('{existing.get('name')}'); rename this one")
     # BOUNDED (P0-7): see `tex_recovery.bounded_mkstemp` — an ACL-denied directory makes a
     # bare `mkstemp` retry ~2.1 billion times rather than raise.
     from .tex_recovery import bounded_mkstemp
@@ -1161,8 +1187,8 @@ def _compile_tool_program(manifest: ToolManifest, image_channels: int = 3):
     """Compile a tool to (program_ast, type_map, used_builtins, fingerprint) for warming, at the
     given IMAGE channel count. Single-stage via compile(); FUSED via prepare_fused -- the real
     spliced program keyed by the fused fingerprint, NOT terminal_code in isolation (a different
-    program than what cooks). Promoted params are typed by their LANG-1 hint (_repr_params), so
-    the warm fingerprint matches the cook's (the fused path used to key off raw defaults)."""
+    program than what cooks). Promoted params are typed from their RAW defaults (`warm=True`), the
+    form the cook fingerprints, not from the LANG-1 hint."""
     from .tex_marshalling import infer_binding_type
     if manifest.is_fused:
         from .tex_fusion import prepare_fused, fused_fingerprint
@@ -1283,7 +1309,7 @@ def install_tool(manifest_or_path, dest_dir: str | None = None, *, warm: bool = 
                  device: str = "cuda", precision: str = "fp32", cancel=None) -> dict:
     """Install a tool into the store. VALIDATE-ONLY by default (TOOL-5-A): parses, schema-
     checks, type-checks, writes the manifest. Compiles NOTHING unless warm=True (explicit
-    consent), in which case it re-derives warm keys and drives tex_api.prewarm off the hot
+    consent), in which case it re-derives warm keys and runs `warm_tool` off the hot
     path. Returns {path, ok, warnings, warm_keys, preflight}.
 
     `cancel` (v0.43 TOOL-7a): an optional CancelToken, threaded straight through to
