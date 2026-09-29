@@ -20,16 +20,15 @@ plain re-export keeps every in-place mutation (`_trial_futures[cache_key] = ...`
 `_promotion_stats["failed"] += 1`) visible from both this module and `compiled.py`'s own
 call sites (the same rule SPLIT-47 already used for `_deferred_ev`/`_warnings_shown`).
 
-This module reaches back into `compiled.py` for the three names that stay there
-(`_canon_device`, `_compiled_cache`, `_WARM_POOL`) lazily, inside each function body that
-needs them — the same posture `compiled_capability.py` already uses for
+This module reaches back into `compiled.py` for the names that stay there
+(`_canon_device`, `_compiled_cache`, `_pool_for`, `_mark_pool_busy`, `_mark_pool_free`)
+lazily, inside each function body that needs them — the same posture `compiled_capability.py` already uses for
 `compiled._backend_status`/`compiled._setup_msvc_env` — so this module never imports
 `compiled.py` at its own module scope and there is no load-time cycle."""
 from __future__ import annotations
 
 import concurrent.futures
 import time as _time
-from typing import Any
 
 import torch
 
@@ -73,8 +72,7 @@ def promotion_stats() -> dict:
     """AUTOSAFE-50: a copy of the cumulative promotion counters -- how many cooks
     deferred an in-flight TRIAL invocation past the bounded wait ("bounded"), and how
     many times a background compile or a TRIAL invocation ended in failure ("failed").
-    Read-only for hosts/tests; `_reset_capability_cache_for_test`-style callers reset via
-    `_reset_promotion_stats_for_test`."""
+    Read-only for hosts/tests; tests reset with `_reset_promotion_stats_for_test`."""
     return dict(_promotion_stats)
 
 

@@ -190,3 +190,97 @@ def test_persisted_tier_verdicts_are_tagged_with_the_gpu(monkeypatch):
 def test_autotier_has_no_per_key_seed_alias():
     from TEX_Wrangle.tex_runtime import autotier as AT
     assert not hasattr(AT, "seed_from_disk")
+
+
+def test_loop_depth_counts_loops_inside_user_functions():
+    from TEX_Wrangle.tex_cache import parse_and_split
+    from TEX_Wrangle.tex_runtime import compiled_capability as CC
+    code = ("float f(float a) { float s = 0.0; for (int i=0;i<2;i++) { for (int j=0;j<2;j++) "
+            "{ for (int k=0;k<2;k++) { s += a; } } } return s; }\n@OUT = vec4(f(@A.r));")
+    prog = parse_and_split(code, {"A": TEXType.VEC3, "OUT": TEXType.VEC4})
+    assert CC._max_loop_depth(prog) == 3
+
+
+def test_cpu_probe_wants_a_cplusplus_compiler_not_a_c_one(monkeypatch):
+    import shutil
+    import torch._inductor.cpp_builder as cb
+    from TEX_Wrangle.tex_runtime import compiled_capability as CC
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def no_torch_choice():
+        raise RuntimeError("no compiler")
+    monkeypatch.setattr(cb, "get_cpp_compiler", no_torch_choice)
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n if n in ("gcc", "cc", "clang") else None)
+    assert CC._probe_cpu_inductor()[0] is False       # a C compiler cannot build inductor's C++
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n if n == "g++" else None)
+    assert CC._probe_cpu_inductor()[0] is True
+
+
+def test_capability_future_cleared_by_another_thread_does_not_raise(monkeypatch):
+    import concurrent.futures
+    from TEX_Wrangle.tex_runtime import compiled_capability as CC
+
+    class ClearsOnRelease:
+        """Another caller resets the shared slot the moment this one lets go of the lock."""
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            CC._capability_future = None
+
+    class FakePool:
+        def submit(self, fn):
+            f = concurrent.futures.Future()
+            f.set_result(None)
+            return f
+
+    monkeypatch.setattr(CC, "_capability_future", None)
+    monkeypatch.setattr(CC, "_capability_cache", None)
+    monkeypatch.setattr(CC, "_capability_pool_lock", ClearsOnRelease())
+    monkeypatch.setattr(CC, "_get_capability_pool", lambda: FakePool())
+    assert CC.compile_capability_async() is None
+
+
+def test_the_cache_sweep_spares_a_sibling_store_that_is_still_being_written(tmp_path, monkeypatch):
+    import os
+    import time
+    import types
+    from TEX_Wrangle import tex_cache
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.setattr(tex_cache, "get_cache",
+                        lambda: types.SimpleNamespace(torch_compile_cache_dir=tmp_path))
+    stale, live = tmp_path / "old_epoch", tmp_path / "other_install"
+    for d in (stale, live):
+        (d / "fxgraph").mkdir(parents=True)
+        (d / "fxgraph" / "k.bin").write_bytes(b"x")
+    week_ago = time.time() - 7 * 86400
+    os.utime(stale / "fxgraph" / "k.bin", (week_ago, week_ago))
+    ES._ensure_inductor_cache_dir()
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_a_callback_that_raises_a_base_exception_does_not_silence_later_cooks():
+    from TEX_Wrangle.tex_runtime import cook_observer as CO
+    seen = []
+
+    def interrupting(entry, thread):
+        raise KeyboardInterrupt
+
+    handle = CO.register(interrupting)
+    try:
+        try:
+            with CO.scope("run"):
+                pass
+        except KeyboardInterrupt:
+            pass
+    finally:
+        CO.unregister(handle)
+    assert getattr(CO._local, "depth", 0) == 0
+    handle = CO.register(lambda entry, thread: seen.append(entry))
+    try:
+        with CO.scope("run"):
+            pass
+    finally:
+        CO.unregister(handle)
+    assert seen == ["run"]

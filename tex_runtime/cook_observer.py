@@ -8,31 +8,30 @@ never sees those internal calls. A re-export plus an internal self-call defeats 
 the old name, and the next such move would defeat it again. This module is the alternative:
 a host registers a callback here once, instead of monkey-patching a name that might move.
 
-**The six cook entry points**, each calling `enter`/`leave` (below) at its own top and
-bottom: `tex_engine.run`, `tex_engine.cook`, `tex_chain.cook_stage_list`,
-`tex_chain.cook_fused_cached`, `tex_checkpoint.cook_checkpointed` and
-`tex_chain.boundary_lineage_key`. A callback registered with `register` is called as
+**The seven cook entry points**, each wrapping its body in `with cook_observer.scope(name)`:
+`tex_engine.run`, `tex_engine.cook`, `tex_chain.cook_stage_list`,
+`tex_chain.cook_fused_cached`, `tex_chain.cook_stage_dag`, `tex_checkpoint.cook_checkpointed`
+and `tex_chain.boundary_lineage_key`. A callback registered with `register` is called as
 `cb(entry, thread)` once — see "Once", below — for every one of them, by name (`entry` is
 the plain function name: `"run"`, `"cook"`, `"cook_stage_list"`, `"cook_fused_cached"`,
-`"cook_checkpointed"`, `"boundary_lineage_key"`).
+`"cook_stage_dag"`, `"cook_checkpointed"`, `"boundary_lineage_key"`).
 
 **"Once" means once per EXTERNAL call, not once per function body.** `cook` calls
 `run(prepare(...))`; `cook_fused_cached` calls `cook_stage_list` (up to three times, on the
 CACHE-6 hot path) and `boundary_lineage_key`; `cook_checkpointed` calls both of those too
 (via `tex_engine.cook_stage_list`/`tex_engine.boundary_lineage_key`, module-lookup, per
 cut). None of that nesting is a second cook — it is one host-observed cook recursing
-through some of the six functions underneath. `enter`/`leave` track a per-thread depth: the
-OUTERMOST call among the six on a thread notifies, every call nested inside it (by any of
-the six, in any combination) shares that single notification. This is the shape a
+through some of the seven functions underneath. `enter`/`leave` track a per-thread depth: the
+OUTERMOST call among the seven on a thread notifies, every call nested inside it (by any of
+the seven, in any combination) shares that single notification. This is the shape a
 count-once audit wants — an embedding host's audit that enforces "one cook-queue
 worker thread" by counting cooks, which is exactly the property a double-notified nested
 call would break. A host that wants the nesting depth instead of the collapsed count is not
 served by this seam as specified; nothing here prevents building that separately.
 
-**Zero cost when nothing is registered.** Every call site guards `enter`/`leave` behind a
-plain truthiness check on `_callbacks` (a dict) — `if _callbacks: enter(name)` — so an
-unregistered process pays one dict-truthiness check per entry point and never calls into
-this module at all. This mirrors the `_profile.enabled()` gate `tex_engine.run` already
+**Zero cost when nothing is registered.** `scope()` reads `_callbacks` (a dict) once on
+entry and skips `enter`/`leave` entirely when it is empty, so an unregistered process pays
+one dict-truthiness check per entry point. This mirrors the `_profile.enabled()` gate `tex_engine.run` already
 takes for the same reason (see that module).
 
 **Callback exceptions never break a cook.** `enter` catches anything a callback raises,
@@ -54,16 +53,9 @@ import threading
 import warnings
 from typing import Callable
 
-#: `cb(entry, thread)` — `entry` is one of the six names in the module docstring; `thread`
+#: `cb(entry, thread)` — `entry` is one of the seven names in the module docstring; `thread`
 #: is the `threading.Thread` that is doing the cooking (`threading.current_thread()`).
 CookObserverCallback = Callable[[str, "threading.Thread"], None]
-
-#: The six cook entry points this seam covers, spelled once so a docstring or a test can
-#: name "the six" without retyping the list by hand.
-ENTRY_POINTS = (
-    "run", "cook", "cook_stage_list", "cook_fused_cached",
-    "cook_checkpointed", "boundary_lineage_key",
-)
 
 _lock = threading.Lock()
 _callbacks: dict[int, CookObserverCallback] = {}
@@ -126,11 +118,9 @@ def _dispatch(entry: str) -> None:
 
 
 def enter(entry: str) -> None:
-    """Call at the top of one of the six cook entry points, guarded by the caller with
-    `if _callbacks:` (see the module docstring's zero-cost note — this function itself does
-    no such check, so calling it unconditionally would cost one call+attribute-lookup even
-    when nothing is registered). Notifies every registered callback with `entry` ONLY when
-    this is the outermost call among the six on the current thread; a nested call
+    """Call at the top of one of the seven cook entry points (normally through `scope()`,
+    which does the zero-cost `_callbacks` check this function itself does not). Notifies every registered callback with `entry` ONLY when
+    this is the outermost call among the seven on the current thread; a nested call
     increments the depth counter and returns without dispatching. Always pair with `leave()`
     in a `finally`, so an exception out of the cook body still balances the depth.
 
@@ -142,7 +132,11 @@ def enter(entry: str) -> None:
     depth = getattr(_local, "depth", 0) + 1
     _local.depth = depth
     if depth == 1:
-        _dispatch(entry)
+        try:
+            _dispatch(entry)
+        except BaseException:   # e.g. KeyboardInterrupt from a callback: no leave() will follow
+            _local.depth -= 1
+            raise
 
 
 def leave() -> None:
@@ -160,11 +154,8 @@ class _Scope:
         self._active = False
 
     def __enter__(self) -> "_Scope":
-        # O3: ONE snapshot of "is anything registered?" per outermost call, taken here
-        # rather than re-read by `__exit__` — the same race B4#3 named for the 6
-        # copy-pasted blocks (a register/unregister landing between a block's own enter
-        # guard and its leave guard) is closed the same way each of them closed it: read
-        # `_callbacks` once, act on that one answer for the whole scope.
+        # ONE snapshot of "is anything registered?", taken here rather than re-read by
+        # `__exit__`: a register/unregister landing between the two must not unbalance the depth.
         self._active = bool(_callbacks)
         if self._active:
             enter(self._entry)
@@ -177,17 +168,13 @@ class _Scope:
 
 
 def scope(entry: str) -> "_Scope":
-    """A context manager replacing the 6 copy-pasted
-    `_obs_active = bool(_callbacks); if _obs_active: enter(name)` / `finally: if _obs_active:
-    leave()` blocks at `tex_engine.run`/`cook`, `tex_chain.cook_stage_list`/
-    `cook_fused_cached`/`boundary_lineage_key` and `tex_checkpoint.cook_checkpointed`:
+    """The context manager every cook entry point wraps its body in:
 
         with cook_observer.scope("run"):
             ...cook body...
 
-    Same zero-added-notification-when-unregistered contract as the hand-rolled blocks
-    (`__enter__` reads `_callbacks` once and skips `enter()` entirely when it is empty), and
-    the same `enter()`-never-raises guarantee (O1) means `__enter__` cannot leave `_active`
-    set without having actually entered, so `__exit__`'s `leave()` always pairs correctly
-    even if a callback misbehaves."""
+    `__enter__` reads `_callbacks` once and skips `enter()` entirely when it is empty. A
+    callback that raises an ordinary exception is contained by `enter()` (O1); one that raises
+    a `BaseException` propagates after `enter()` has undone its depth increment, so
+    `__exit__`'s `leave()` always pairs correctly."""
     return _Scope(entry)

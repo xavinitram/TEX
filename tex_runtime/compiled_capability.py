@@ -38,7 +38,7 @@ import torch
 
 from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
                                       VecConstructor, MatConstructor, CastExpr,
-                                      ForLoop, WhileLoop, IfElse)
+                                      ForLoop, WhileLoop, IfElse, FunctionDef)
 from .codegen import _iter_child_nodes
 
 _OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
@@ -74,6 +74,8 @@ def _max_loop_depth(program: Any) -> int:
                 mx = max(mx, _depth(s.then_body, current))
                 if s.else_body:
                     mx = max(mx, _depth(s.else_body, current))
+            elif isinstance(s, FunctionDef):
+                mx = max(mx, _depth(s.body, current))
         return mx
     return _depth(program.statements, 0)
 
@@ -137,8 +139,9 @@ def _probe_cuda_inductor() -> tuple:
 
 
 def _probe_cpu_inductor() -> tuple:
-    """(ok, reason). Non-Windows: a C compiler on PATH — inductor's own prerequisite,
-    checked without invoking it. Windows: run the codebase's existing vcvarsall search
+    """(ok, reason). Non-Windows: the C++ compiler inductor's CPU backend compiles with
+    (torch's own choice, honouring `$CXX`; else g++ or clang++ on PATH), checked without
+    invoking it. Windows: run the codebase's existing vcvarsall search
     (`_setup_msvc_env`, idempotent) then check PATH for `cl.exe`. `_setup_msvc_env` is
     what promotes INCLUDE/LIB/PATH into this process's own environment (or leaves them
     exactly as a Developer Command Prompt already set them) — a PATH-only check after it
@@ -147,9 +150,15 @@ def _probe_cpu_inductor() -> tuple:
     pinned ratchet; `shutil.which`'s own internal PATH read is not one)."""
     import shutil
     if sys.platform != "win32":
-        if shutil.which("cc") or shutil.which("gcc") or shutil.which("clang"):
+        try:
+            from torch._inductor.cpp_builder import get_cpp_compiler
+            get_cpp_compiler()
             return True, None
-        return False, "no C compiler (cc/gcc/clang) found on PATH"
+        except Exception:
+            pass
+        if shutil.which("g++") or shutil.which("clang++"):
+            return True, None
+        return False, "no C++ compiler (g++/clang++/$CXX) found on PATH"
     from .compiled import _setup_msvc_env
     _setup_msvc_env()
     if shutil.which("cl") is not None:
@@ -160,7 +169,7 @@ def _probe_cpu_inductor() -> tuple:
 
 def compile_capability() -> dict:
     """Read-only, process-wide capability report for torch.compile's inductor backend —
-    the answer "auto" (`run_auto`, below) needs BEFORE deciding whether to even attempt a
+    the answer "auto" (`run_auto` in `compiled.py`) needs BEFORE deciding whether to even attempt a
     background compile. Probed ONCE per process (cached; see
     `_reset_capability_cache_for_test`) by `importlib.util.find_spec("triton")` (CUDA) and
     the codebase's existing MSVC search (`_setup_msvc_env`, CPU on Windows) / a PATH check
@@ -240,7 +249,7 @@ def _reset_capability_cache_for_test() -> None:
 # stall — every OTHER caller (a host's own diagnostic, `tex_api.compile_capability`,
 # `tex doctor`) wants a definite answer now and may block for it, exactly as before;
 # `compile_capability()` itself is UNCHANGED. Only `run_auto`'s cook-thread call site
-# below switches to this.
+# (in `compiled.py`) switches to this.
 _capability_future: "Future | None" = None
 
 
@@ -266,14 +275,12 @@ class _DaemonProbePool:
     def _run(self) -> None:
         while True:
             fut, fn = self._q.get()
-            if not fut.set_running_or_notify_cancel():
-                continue
-            try:
-                result = fn()
-            except BaseException as exc:   # propagate to the future, never crash the worker
-                fut.set_exception(exc)
-            else:
-                fut.set_result(result)
+            if fut.set_running_or_notify_cancel():
+                try:
+                    fut.set_result(fn())
+                except BaseException as exc:   # propagate to the future, never crash the worker
+                    fut.set_exception(exc)
+            del fut, fn   # do not keep the finished job (and what it captured) alive while idle
 
     def submit(self, fn) -> Future:
         fut: Future = Future()
@@ -350,17 +357,21 @@ def compile_capability_async() -> dict | None:
     if _capability_cache is not None:
         return compile_capability()
     global _capability_future
-    if _capability_future is None:
+    fut = _capability_future
+    if fut is None:
         pool = _get_capability_pool()   # its own lock, taken and released before ours
         with _capability_pool_lock:
             if _capability_future is None:
                 _capability_future = pool.submit(compile_capability)
-    if _capability_future.done():
+            fut = _capability_future
+    if fut.done():
         try:
-            _capability_future.result()
+            fut.result()
         except Exception:
             pass
         if _capability_cache is not None:
             return compile_capability()
-        _capability_future = None   # transient failure, retry budget not yet spent: retry
+        with _capability_pool_lock:   # transient failure, retry budget not yet spent: retry
+            if _capability_future is fut:
+                _capability_future = None
     return None
