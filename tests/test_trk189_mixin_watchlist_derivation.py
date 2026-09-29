@@ -123,3 +123,19 @@ def test_trk189_engine_mixins_ride_every_watchlist_engine_is_on(r: SubTestResult
         _check_family(r, "tex_engine.py", pkg_dir, "SPLIT-E")
     except Exception as e:
         r.fail("TRK-189 engine mixins", f"{type(e).__name__}: {e}")
+
+
+def test_trk189_every_stdlib_file_rides_the_codegen_watchlist(r: SubTestResult):
+    print("\n--- TRK-189: every tex_runtime/stdlib*.py rides the codegen watch-list ---")
+    # `stdlib.py` is on `_CODEGEN_FILES` and its leaves are `stdlib_*.py`, but the registry
+    # (`stdlib_registry.py`, which builds `get_functions()` and the spatial/sync tags) is a
+    # sibling that only a derived check would notice missing.
+    try:
+        runtime_dir = os.path.join(os.path.dirname(os.path.abspath(C.__file__)), "tex_runtime")
+        on_disk = {os.path.basename(p) for p in glob.glob(os.path.join(runtime_dir, "stdlib*.py"))}
+        watched = {p.name for p in C.epoch_partitions()["codegen"]}
+        missing = on_disk - watched
+        assert not missing, f"stdlib files on no codegen watch-list: {sorted(missing)}"
+        r.ok(f"all {len(on_disk)} stdlib files ride the codegen watch-list")
+    except Exception as e:
+        r.fail("TRK-189 stdlib family", f"{type(e).__name__}: {e}")
