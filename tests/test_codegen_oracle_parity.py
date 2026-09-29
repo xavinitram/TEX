@@ -422,3 +422,28 @@ def test_array_collect_lowering_is_kept_where_exact():
         "the counter bumped before the collect": False,
         "a counter seeded at one": False,
     }
+
+
+# ── masked (0.25) if-arm closures: a for-loop header writes through to the hoisted local ──
+#
+# Each arm body is emitted once into a `def` both dispatch paths call; a name the arm's
+# for-header assigns must be declared `nonlocal` there like any other write.
+
+_ARM_HEADER_ROWS = [
+    ("for-init assignment inside a per-pixel arm",
+     "//!tex 0.25\nint k = 0; float acc = 0.0;\n"
+     "for (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; } }\n"
+     "if (u > 0.5) { for (k = 0; k < 4; k = k + 1) { acc = acc + 1.0; } }\n"
+     "@OUT = vec3(acc, float(k), 0.0);"),
+    ("the same arm inside a masked loop pass",
+     "//!tex 0.25\nint k = 0; float acc = 0.0;\n"
+     "for (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; }\n"
+     "  if (u > 0.5) { for (k = 0; k < 4; k = k + 1) { acc = acc + 1.0; } } }\n"
+     "@OUT = vec3(acc, float(k), 0.0);"),
+]
+
+
+@pytest.mark.parametrize("label,code", _ARM_HEADER_ROWS, ids=[r[0] for r in _ARM_HEADER_ROWS])
+def test_masked_arm_for_header_writes_the_outer_variable(label, code):
+    ref, _ = assert_parity(code, {"A": _img()})
+    assert ref["OUT"][..., 1].max().item() == 4.0  # the arm ran and left k at its bound

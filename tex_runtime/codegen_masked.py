@@ -45,13 +45,30 @@ from __future__ import annotations
 from ..tex_compiler.ast_nodes import (
     ArrayDecl, ArrayIndexAccess, Assignment, BindingIndexAccess, BindingRef, BreakStmt,
     ChannelAccess, ContinueStmt, ExprStatement, ForLoop, FunctionDef, Identifier, IfElse,
-    ParamDecl, ReturnStmt, VarDecl, WhileLoop, try_extract_static_range,
+    ParamDecl, ReturnStmt, VarDecl, WhileLoop, collect_assigned_vars, try_extract_static_range,
 )
 
 __all__ = ["MaskedEmitMixin"]
 
 #: The name the generated source binds its `masked_flow.CgFlow` to.
 _STATE = "_mf"
+
+
+def _for_header_names(stmts) -> set[str]:
+    """Env names a for-loop header (init or update) assigns, at any depth.
+
+    `collect_assigned_vars` walks loop bodies only, so a hoisted local written by a header
+    inside a shared arm closure would get no `nonlocal` and bind a closure-local instead."""
+    out: set[str] = set()
+    for s in stmts or ():
+        if isinstance(s, ForLoop):
+            out |= collect_assigned_vars([h for h in (s.init, s.update) if h is not None])[0]
+            out |= _for_header_names(s.body)
+        elif isinstance(s, WhileLoop):
+            out |= _for_header_names(s.body)
+        elif isinstance(s, IfElse):
+            out |= _for_header_names(s.then_body) | _for_header_names(s.else_body)
+    return out
 
 
 def _root_of(target):
@@ -198,6 +215,7 @@ class MaskedEmitMixin:
         self._mf_cont_counter += 1
         fn_name = f"_mfc{self._mf_cont_counter}"
         env_mods, _bind_mods = self._collect_modified_vars(stmts) if stmts else (set(), set())
+        env_mods = env_mods | _for_header_names(stmts)
         nonlocal_pyvars = sorted({self._local_vars[n] for n in env_mods if n in self._local_vars})
         self._emit(f"def {fn_name}():")
         self._indent += 1
