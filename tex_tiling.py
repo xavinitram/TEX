@@ -253,18 +253,18 @@ def _tile_plan(program, bindings: dict[str, Any], device,
         H = shared_tile_height(bindings, non_spatial)
         if H is None:
             return None
-        # TRK-166: select the anchor by NAME, not by value — a registered non-spatial
-        # binding (a LUT) whose own leading dim coincidentally equals H must not be picked
-        # here either, mirroring `run_tiled`'s per-strip narrow loop (`tex_memory.py`).
-        spatial = None
-        for name, v in bindings.items():
-            if name in non_spatial:
-                continue
-            if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H:
-                spatial = (v.shape[0], v.shape[1], v.shape[2])
-                break
-        if spatial is None:
+        # TRK-166: select the height-H bindings by NAME, not by value — a registered
+        # non-spatial binding (a LUT) whose own leading dim coincidentally equals H must not
+        # be counted here either, mirroring `run_tiled`'s per-strip narrow loop. The peak is
+        # sized off the LARGEST batch and width among them, never the first one's: a [B,H,1]
+        # companion bound before the image would otherwise under-size `est` by a factor of W
+        # and skip strips the cook needs (`_halo_tile_plan` avoids the same trap).
+        dims = [(v.shape[0], v.shape[2]) for name, v in bindings.items()
+                if name not in non_spatial and isinstance(v, torch.Tensor)
+                and v.dim() >= 3 and v.shape[1] == H]
+        if not dims:
             return None
+        spatial = (max(b for b, _w in dims), H, max(w for _b, w in dims))
         est = estimate_peak_bytes(program, spatial, dtype_bytes, fingerprint)  # P4/LAT-2: memoized walk
         free = _free_memory_for_plan(device, free_hint, est)
         if not free or est <= 0:
@@ -299,7 +299,10 @@ def _tdr_strip_floor(fingerprint, spatial, precision, device) -> int:
     """ROI-5: the minimum strip count that keeps each strip's estimated cook time under the ~2 s
     WDDM TDR watchdog, derived from autotier's persisted WHOLE-FRAME median (BlinkScript's driver
     timeouts are this failure, un-planned-for). Best-effort: 0 when the program was never measured
-    on this device (the very first big cook can't be pre-timed — the reach of persisted medians)."""
+    on this device. The median is only written by `compile_mode='auto'` measuring runs (or read
+    back from a persisted verdict of one), so a default-mode cook is never pre-timed: on that path
+    the memory-pressure gate is the only strip trigger. Timing the default path would breach the
+    default-path invariant, so this limit is documented rather than lifted."""
     if not str(device).startswith("cuda"):
         return 0
     try:
@@ -399,9 +402,9 @@ def _preflight_memory(program, bindings: dict[str, Any], device,
     models first (best-effort; never raises). MEM-3: dtype_bytes=2 for an explicit
     fp16 cook (auto is still unresolved here, so it stays the conservative 4).
 
-    Returns the free-VRAM reading it bought, as a `free_hint` for `_tile_plan` to reuse
-    instead of buying a second query microseconds later (P1). Returns None whenever
-    `_tile_plan` must query for itself — either the reading is unknown/uncomputed, OR the
+    Returns the free-VRAM reading it bought, as a `free_hint` for the tile planners
+    (`_tile_plan`, `_halo_tile_plan`) to reuse instead of buying a second query microseconds
+    later (P1). Returns None whenever a planner must query for itself — either the reading is unknown/uncomputed, OR the
     preflight just asked the host to unload models, which raises true free and makes the
     number STALE-LOW. Collapsing "unknown" and "stale" into a single None is exactly what
     the caller wants: both mean "don't trust this, re-read."
@@ -443,7 +446,7 @@ def _preflight_memory(program, bindings: dict[str, Any], device,
             # PERF-6: an unload may release bytes torch's allocator never owned, which is
             # precisely the `foreign` term the decomposition holds fixed — so void it.
             forget_free_memory(dev_t)
-            return None            # stale-low after the unload — make _tile_plan re-query
+            return None            # stale-low after the unload — make the planners re-query
         return free
     except Exception:
         return None
