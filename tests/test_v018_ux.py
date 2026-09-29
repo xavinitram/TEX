@@ -163,15 +163,18 @@ def test_dbg3_nan_overlay(r: SubTestResult):
     A = make_img(1, 8, 8, 3, seed=2)
     on = N.execute(code=nan_prog, A=A, device="cpu", debug_nan_highlight=True)[0]
     off = N.execute(code=nan_prog, A=A, device="cpu", debug_nan_highlight=False)[0]
-    if isinstance(on, torch.Tensor):
-        # at least one magenta pixel present when on
+    if not (isinstance(on, torch.Tensor) and isinstance(off, torch.Tensor)):
+        fails.append(f"node path returned non-tensors: {type(on).__name__}, {type(off).__name__}")
+    else:
+        # every pixel of this program is NaN: ON paints them all, OFF leaves the raw NaN
         is_mag = (on[..., 0] == 1.0) & (on[..., 1] == 0.0) & (on[..., 2] == 1.0)
         if not bool(is_mag.any()):
             fails.append("toggle ON produced no magenta pixels on a NaN program")
-        if isinstance(off, torch.Tensor):
-            off_mag = (off[..., 0] == 1.0) & (off[..., 1] == 0.0) & (off[..., 2] == 1.0)
-            if bool(off_mag.all()) and not bool(is_mag.all()):
-                fails.append("toggle OFF magenta-painted anyway")
+        off_mag = (off[..., 0] == 1.0) & (off[..., 1] == 0.0) & (off[..., 2] == 1.0)
+        if bool(off_mag.any()):
+            fails.append("toggle OFF magenta-painted anyway")
+        if not bool(torch.isnan(off[..., 0]).all()):
+            fails.append("toggle OFF changed the raw NaN output")
     if fails:
         r.fail("DBG-3 NaN overlay", "; ".join(fails))
     else:

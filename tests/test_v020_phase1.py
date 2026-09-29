@@ -368,11 +368,18 @@ def test_g1_compile_demotion(r: SubTestResult):
         # Plant a fake committed artifact whose verification window is already
         # full of terrible samples (the guard-churn signature), then cook once:
         # the verdict must evict it and blacklist the fingerprint.
-        fake = lambda program, bindings, type_map, device, lcc=0, out_names=None: \
+        # The fake takes the production call's keyword (`scale=`); one that raised
+        # TypeError would land in the compile-failure path instead of the verdict.
+        fake = lambda program, bindings, type_map, device, lcc=0, out_names=None, **kw: \
             torch.zeros(1, 4, 4, 4)
         C._compiled_cache[cache_key] = (fake, "inductor")
         C._verify_state[cache_key] = {"px": 16, "samples": [1000.0] * C._VERIFY_COOKS}
+        from TEX_Wrangle.tex_runtime import tier_trace
+        tier_trace.reset()
         C.execute_compiled(prog, {"A": img}, tm, "cpu", fp)
+        rec = tier_trace.last()
+        assert rec is not None and str(rec.reason).startswith("demoted:"), \
+            f"the demotion verdict was not reached (trace: {rec})"
         assert cache_key not in C._compiled_cache, "slow artifact not evicted"
         assert fp in C._compile_blacklist, "slow artifact not blacklisted"
         # And the next cook takes the honest interpreter path (values correct)

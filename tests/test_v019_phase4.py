@@ -30,9 +30,17 @@ def _interp(prog, img, dev):
 
 
 def _codegen(prog, img, dev, fp):
-    from TEX_Wrangle.tex_runtime import compiled
-    out = compiled.execute_compiled(prog.ast, {"A": img}, prog.type_map, dev, fp,
-                                    output_names=["OUT"], used_builtins=prog.used_builtins)
+    """The codegen flat function itself. `execute_compiled` would hand these 3-4 op programs
+    to the interpreter (below the compile op threshold), so the row would compare the
+    interpreter with itself."""
+    from TEX_Wrangle.tex_runtime import compiled, tier_trace
+    tier_trace.reset()
+    out = compiled._codegen_only_execute(
+        prog.ast, {"A": img}, prog.type_map, dev, output_names=["OUT"],
+        used_builtins=prog.used_builtins, fingerprint=fp, time_context=None)
+    rec = tier_trace.last()
+    assert rec is None or rec.fallback_from != "codegen", \
+        f"codegen fell back to the interpreter: {rec.reason}"
     return out["OUT"] if isinstance(out, dict) else out
 
 
