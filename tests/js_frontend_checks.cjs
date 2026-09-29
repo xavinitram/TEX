@@ -11,8 +11,9 @@ const src = fs.readFileSync(jsPath, "utf8").split("\r\n").join("\n");
 
 function cutFunction(name) {
     // Top-level functions in the file close with a brace in column 0.
-    const at = src.indexOf(`function ${name}(`);
+    let at = src.indexOf(`function ${name}(`);
     if (at < 0) return null;
+    if (src.slice(at - 6, at) === "async ") at -= 6;
     return src.slice(at, src.indexOf("\n}\n", at) + 2);
 }
 
@@ -22,23 +23,38 @@ function cutConst(name) {
 }
 
 const names = ["_parseParamMetadata", "_socketTypeForPrefix", "_texMaskSource", "parseCode",
-    "_texLinkIn", "_texNodeByPromptId", "syncOutputs", "syncParams", "_texSyncParamSchema",
-    "_texParamSchemaEntry", "_texPublishDefault"];
-let code = cutConst("RESERVED_NAMES") + "\n"
+    "_texLinkIn", "_texNodeByPromptId", "syncInputs", "syncOutputs", "syncParams",
+    "_texSyncParamSchema", "_texParamSchemaEntry", "_texPublishDefault", "_texIdBefore",
+    "applyCodeToSockets", "_escHtml", "_renderDoctorFacts", "_buildSnippetTree",
+    "_texLintTypes", "_texRequestLint", "_texCodeOf", "_texSingleWiredInput", "_texGetLink",
+    "_texParamWidgets", "_texChainSig", "_texPreflightSpec", "_texMaybePreflight"];
+let code = cutConst("RESERVED_NAMES") + "\n" + cutConst("_cmpLocale") + "\n"
+    + cutConst("_TEX_LINT_TYPES") + "\n"
     + "const _texParamRegistry = new Map(); const _texParamConflictWarned = new Set();\n"
+    + "const _lintSeq = new WeakMap(); const _texPreflight = new Map();\n"
+    + "const _texPreflightSig = new Map(); const _texPreflightBusy = new Set();\n"
+    + "const _texPreflightRetryAt = new Map(); let _texPreflightEnabled = true;\n"
+    + "const getCM6 = () => CM6;\n"
     + 'const TEX_NODE_TYPE = "TEX_Wrangle";\n';
 for (const n of names) {
     const f = cutFunction(n);
     if (f) code += f + "\n";
 }
-code += `this.api = { parseCode, syncOutputs, syncParams, _texPublishDefault: typeof _texPublishDefault === "function" ? _texPublishDefault : null,
-    _texNodeByPromptId: typeof _texNodeByPromptId === "function" ? _texNodeByPromptId : null,
-    _texParamSchemaEntry };`;
+const opt = (n) => `typeof ${n} === "function" ? ${n} : null`;
+code += `this.T = { parseCode, syncOutputs, syncParams, _texPublishDefault: ${opt("_texPublishDefault")},
+    _texNodeByPromptId: ${opt("_texNodeByPromptId")}, _texParamSchemaEntry, RESERVED_NAMES,
+    _buildSnippetTree: ${opt("_buildSnippetTree")}, _renderDoctorFacts: ${opt("_renderDoctorFacts")},
+    _texIdBefore: ${opt("_texIdBefore")}, applyCodeToSockets: ${opt("applyCodeToSockets")},
+    _texSyncParamSchema, _texLintTypes: ${opt("_texLintTypes")},
+    _texRequestLint: ${opt("_texRequestLint")}, _texMaybePreflight: ${opt("_texMaybePreflight")},
+    _texPreflightSig, _texPreflight };`;
 
-const sandbox = { console, app: { graph: null }, LiteGraph: undefined };
+// The module-level `api` (fetchApi), `CM6` and `LiteGraph` are stand-ins the checks replace.
+const sandbox = { console, app: { graph: null }, LiteGraph: undefined, CM6: null,
+    api: { fetchApi: async () => { throw new Error("no fetch"); } }, Date, setTimeout };
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
-const api = sandbox.api;
+const api = sandbox.T;
 
 let failed = 0;
 function check(label, cond, extra) {
@@ -167,4 +183,153 @@ function makeNode() {
     }
 }
 
-process.exit(failed ? 1 : 0);
+// --- system kwargs are never bindings or params -------------------------------------------
+{
+    const sys = ["code", "device", "compile_mode", "precision", "_tex_any", "_tex_chain",
+        "_tex_preview", "debug_nan_highlight", "_tex_slot_map", "_tex_time"];
+    check("reserved names mirror the backend system kwargs",
+        sys.every((n) => api.RESERVED_NAMES.has(n)) && api.RESERVED_NAMES.size === sys.length,
+        [...api.RESERVED_NAMES].join(","));
+    let r = api.parseCode("@precision = @debug_nan_highlight; @o = @i;");
+    check("a system kwarg is not a wire or output", sorted(r.outputs) === "o" && sorted(r.inputs) === "i",
+        sorted(r.outputs) + "|" + sorted(r.inputs));
+    r = api.parseCode("i$device = 3; f$code = 1.0; f$k = 0.5; @o = $k;");
+    check("an explicit $decl of a reserved name is ignored", sorted(r.params.keys()) === "k",
+        sorted(r.params.keys()));
+}
+
+// --- snippet tree: a leaf sharing a folder's name, and __proto__ segments ---------------------
+{
+    if (!api._buildSnippetTree) check("snippet tree helper exists", false);
+    else {
+        const t = api._buildSnippetTree({ "a": "leaf", "a/b": "inner", "z/__proto__/x": "p", "__proto__/y": "q" });
+        check("folder keeps its children when a leaf shares its name",
+            typeof t.a === "object" && t.a.b === "inner", JSON.stringify(t.a));
+        check("the same-named leaf is still reachable",
+            Object.values(t.a).includes("leaf"), JSON.stringify(t.a));
+        check("__proto__ segments stay in the tree", Object.prototype.x === undefined
+            && Object.prototype.y === undefined && Object.keys(t).includes("__proto__"),
+            Object.keys(t).join(","));
+        const u = api._buildSnippetTree({ "a/b": "inner", "a": "leaf" });
+        check("leaf after folder is kept too", u.a.b === "inner" && Object.values(u.a).includes("leaf"));
+    }
+}
+
+// --- doctor dialog escapes server facts ---------------------------------------------------
+{
+    const html = api._renderDoctorFacts({ arch: { note: "<img src=x onerror=1>" },
+        "k<b>": "<script>x</script>", list: ["<i>"] });
+    check("doctor facts are escaped", !/<(img|script|b|i)[ >]/.test(html) && html.includes("&lt;img")
+        && html.includes("&lt;script&gt;"), html);
+}
+
+// --- lowest-node-id tie-break is numeric -------------------------------------------------------
+{
+    check("9 sorts before 10", api._texIdBefore && api._texIdBefore(9, 10) === true
+        && api._texIdBefore(10, 9) === false);
+    const optional = {};
+    sandbox.LiteGraph = { registered_node_types: { TEX_Wrangle: { nodeData: { input: { optional } } } } };
+    const warn = console.warn; console.warn = () => {};
+    api._texSyncParamSchema({ id: 10 }, new Map([["k", { typeHint: "i" }]]));
+    api._texSyncParamSchema({ id: 9 }, new Map([["k", { typeHint: "b" }]]));
+    console.warn = warn;
+    check("the lowest numeric node id wins the shared schema", optional.k && optional.k[0] === "BOOLEAN",
+        JSON.stringify(optional.k));
+    api._texSyncParamSchema({ id: 10 }, null);
+    api._texSyncParamSchema({ id: 9 }, null);
+    check("dropping every owner clears the schema entry", !("k" in optional));
+}
+
+// --- a removed node's deferred socket sync does nothing ------------------------------------
+{
+    const optional = {};
+    sandbox.LiteGraph = { registered_node_types: { TEX_Wrangle: { nodeData: { input: { optional } } } } };
+    const node = makeNode();
+    node.graph = null;
+    api.applyCodeToSockets(node, "f$leak = 1.0; @o = @i;");
+    check("no params are registered for a removed node", !("leak" in optional) && node.widgets.length === 0,
+        JSON.stringify(Object.keys(optional)));
+    sandbox.LiteGraph = undefined;
+}
+
+// --- live lint sends the wired types and drops stale responses ----------------------------------
+{
+    const graph = { links: new Map([[5, { origin_id: 10, origin_slot: 0 }], [6, { origin_id: 11, origin_slot: 0 }],
+        [7, { origin_id: 12, origin_slot: 0 }]]),
+        getNodeById(id) { return this.nodes[id]; },
+        nodes: { 10: { outputs: [{ type: "MASK" }] }, 11: { outputs: [{ type: "IMAGE" }] },
+                 12: { outputs: [{ type: "FLOAT" }] } } };
+    const node = { graph, inputs: [{ name: "m", link: 5 }, { name: "img", link: 6 },
+        { name: "k", link: 7, _texParam: true }, { name: "free", link: null }] };
+    if (api._texLintTypes) {
+        check("lint types: a MASK wire is a float, an IMAGE wire is left to the default",
+            JSON.stringify(api._texLintTypes(node)) === '{"m":"FLOAT"}', JSON.stringify(api._texLintTypes(node)));
+    } else check("lint types helper exists", false);
+
+    let text = "a";
+    const dispatched = [];
+    const view = { state: { doc: { toString: () => text } }, dispatch: (x) => dispatched.push(x) };
+    sandbox.CM6 = { texErrorToDiagnostics: (v, e) => [e.message], setDiagnostics: (s, d) => d };
+    const pending = [];
+    const bodies = [];
+    sandbox.api = { fetchApi: (url, opts) => new Promise((res) => {
+        bodies.push(JSON.parse(opts.body));
+        pending.push((diag) => res({ ok: true, json: async () => ({ diagnostics: [diag] }) }));
+    }) };
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    (async () => {
+        const first = api._texRequestLint(view, "a", node);
+        const second = api._texRequestLint(view, "a", node);
+        check("lint request carries the binding types", bodies[0] && bodies[0].types
+            && bodies[0].types.m === "FLOAT", JSON.stringify(bodies[0]));
+        pending[1]("new"); await second;
+        pending[0]("old"); await first; await tick();
+        check("only the latest lint response is painted", dispatched.length === 1
+            && JSON.stringify(dispatched[0]).includes("new") && !JSON.stringify(dispatched).includes("old"),
+            JSON.stringify(dispatched));
+        dispatched.length = 0;
+        const third = api._texRequestLint(view, "a", node);
+        text = "ab";   // edited while the request was in flight
+        pending[2]("late"); await third; await tick();
+        check("a response for an edited document is dropped", dispatched.length === 0,
+            JSON.stringify(dispatched));
+        await preflightChecks();
+        finish();
+    })().catch((e) => { console.log("FAIL lint/preflight checks threw :: " + e.stack); failed++; finish(); });
+}
+
+// --- preflight: a failed request is retried, a stale verdict is dropped ---------------------------
+async function preflightChecks() {
+    if (!api._texMaybePreflight) { check("preflight helper exists", false); return; }
+    const codeOf = { 1: "x", 2: "y" };
+    const mk = (id, link) => ({ id, widgets: [{ name: "code", get value() { return codeOf[id]; } }],
+        inputs: [{ name: "i", link }], outputs: [] });
+    const a = mk(1, 50), b = mk(2, 51);
+    sandbox.app.graph = { links: new Map([[50, { origin_id: 99, origin_slot: 0 }], [51, { origin_id: 1, origin_slot: 0 }]]),
+        getNodeById: (id) => ({ 1: a, 2: b })[id] };
+    let now = 1000;
+    sandbox.Date = class extends Date { static now() { return now; } };
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    let calls = 0, mode = "fail", release = null;
+    sandbox.api = { fetchApi: () => { calls++;
+        if (mode === "fail") return Promise.reject(new Error("offline"));
+        if (mode === "http") return Promise.resolve({ ok: false, status: 500, json: async () => ({}) });
+        return new Promise((res) => { release = () => res({ ok: true, json: async () => ({ ok: true }) }); }); } };
+    const chain = [a, b];
+    api._texMaybePreflight(chain); await tick(); await tick();
+    check("a failed preflight leaves no recorded signature", !api._texPreflightSig.has(2));
+    api._texMaybePreflight(chain); await tick();
+    check("a failed preflight is not re-sent on the very next repaint", calls === 1, "calls=" + calls);
+    now += 6000; mode = "http";
+    api._texMaybePreflight(chain); await tick(); await tick();
+    check("a failed preflight is retried after the pause", calls === 2 && !api._texPreflightSig.has(2), "calls=" + calls);
+    now += 6000; mode = "ok";
+    api._texMaybePreflight(chain);
+    codeOf[1] = "x2";   // the chain is edited while the request is in flight
+    release(); await tick(); await tick();
+    check("the verdict of an edited chain is not kept", !api._texPreflight.has(2) && !api._texPreflightSig.has(2));
+    api._texMaybePreflight(chain); release(); await tick(); await tick();
+    check("a current verdict is kept with its signature", api._texPreflight.has(2) && api._texPreflightSig.has(2));
+}
+
+function finish() { process.exit(failed ? 1 : 0); }

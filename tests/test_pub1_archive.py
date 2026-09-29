@@ -164,16 +164,10 @@ _SURFACE_PINS = {
 #   `js/tex_extension.js` — 1 `.connect(`: a LiteGraph node-graph call,
 #     `node.connect(newIdx, targetNode, conn.targetSlot)`, restoring a canvas link after an
 #     output slot moves. No socket (also the existing `network`/SECURITY.md row's finding).
-#   `js/tex_extension.js` — 6 `fetch(`: 4 are prose — a comment about a ComfyUI helper's
-#     option-spreading ("fetchApi spreads these options into fetch()...") and the TEX stdlib
-#     `fetch()` pixel/image builtin's own help text (one comment mention, plus its `sig` and
-#     `example` strings on one `TEX_HELP_DATA` line) — and 2 are the node's own same-origin
-#     `fetch()` calls to its ComfyUI backend routes (`/tex_wrangle/detect_regions`,
-#     `/tex_wrangle/chain_preflight`: region-fusion and chain-preflight probes, each with an
-#     abort/short-timeout or a `.catch()` that treats an absent route as "unfused"/"offline").
-#   `js/tex_extension.js` — 1 `WebSocket`: a comment ("Error Cache (per-node, from WebSocket
-#     events)") naming where ComfyUI's OWN execution socket delivers node errors from; there is
-#     no `new WebSocket(` in this file.
+#   `js/tex_extension.js` — 3 `fetch(`: all prose — the TEX stdlib `fetch()` pixel/image
+#     builtin's own help text (one mention in the "Pixel Step" description, plus the `sig` and
+#     `example` strings of the "fetch" entry). Every request the node makes goes through
+#     ComfyUI's `api.fetchApi`, to its own backend routes; the file has no `WebSocket`.
 #   `js/tex_cm6_bundle.js` — 22 `.bind(`: all `Function.prototype.bind` (21 `.bind(this)`, one
 #     `.bind(e)`), each a DOM event handler (mousemove/mouseup/mouseleave/resize/scroll/print/
 #     selection-change) or an editor measure-request `read`/`write` pair, inside the vendored
@@ -191,7 +185,7 @@ _NETWORK_JS_RE = re.compile(
 # is re-pinned, and rises only as a release decision that names the new finding (PUB-1's rule,
 # unchanged here).
 _NETWORK_JS_PINS = {
-    "js/tex_extension.js": 8,    # 1 .connect( + 6 fetch( + 1 WebSocket — all accounted above
+    "js/tex_extension.js": 4,    # 1 .connect( + 3 fetch( (help text) — all accounted above
     "js/tex_cm6_bundle.js": 22,  # .bind( only — all Function.prototype.bind, see above
 }
 

@@ -31,10 +31,9 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// DBG-4: expose the `tex doctor` environment report from the browser console —
-// `await texDoctor()` fetches /tex_wrangle/doctor and logs torch/CUDA/Triton/MSVC/cache/
-// tier facts. The minimal API-accessible surface the plan called for (a full panel is a
-// live-session follow-up); the route itself is tested + never-500.
+// `await texDoctor()` in the browser console fetches /tex_wrangle/doctor and logs the
+// torch/CUDA/Triton/MSVC/cache/tier facts; the editor's "TEX Doctor" dialog renders the same
+// report. The route never returns 500.
 globalThis.texDoctor = async function () {
     try {
         const resp = await api.fetchApi("/tex_wrangle/doctor");
@@ -55,17 +54,16 @@ const TEX_FONT_URL = (() => {
         return "/extensions/TEX_Wrangle/MonaspaceNeon.woff2";
     }
 })();
-// Names reserved by the system — NOT treated as TEX wire or output bindings
-const RESERVED_NAMES = new Set(["code", "device", "compile_mode", "_tex_any"]);
+// Node inputs the backend strips as system kwargs, so they are never TEX wire, output or
+// param names. Mirrors TEXWrangleNode._SYSTEM_KWARGS in tex_node.py: keep the two in step.
+const RESERVED_NAMES = new Set(["code", "device", "compile_mode", "precision", "_tex_any",
+    "_tex_chain", "_tex_preview", "debug_nan_highlight", "_tex_slot_map", "_tex_time"]);
 const DEBOUNCE_MS = 400;
 
 // ─── Snippet System ─────────────────────────────────────────────────
-// Built-in example snippets are fetched from the backend (/tex_wrangle/snippets)
-// which reads them from the examples/ directory.  Cached after first fetch.
-// User snippets are SERVER-BACKED since v0.23 (LANG-5): the source of truth is a JSON
-// file in the host's user dir (/tex_wrangle/user_snippets), so snippets survive a browser
-// wipe and follow the user across machines. localStorage is now an OFFLINE CACHE — synced
-// from the server on menu-open, written through on save so an offline edit isn't lost.
+// Built-in example snippets come from the backend (/tex_wrangle/snippets), cached after the
+// first fetch. User snippets are server-backed (/tex_wrangle/user_snippets); localStorage is
+// an offline cache, synced from the server on menu-open and written through on save.
 
 let _builtinSnippetsCache = null;
 
@@ -83,25 +81,21 @@ async function _fetchBuiltinSnippets() {
 }
 
 const SNIPPET_STORAGE_KEY = "tex_wrangle_snippets";
-// LANG-5 (BUG 1): names whose latest local edit has NOT yet been confirmed durable by the
-// server. A save marks its changed names pending and writes the cache immediately; the
-// server POST clears them only once it confirms the write landed. Until then a sync must
-// not let server truth clobber them, and must re-push them. Persisted so an edit made
-// offline (or rejected by a read-only disk) survives a reload.
+// Names whose latest local edit the server has not yet confirmed durable. A save marks its
+// names pending; the POST clears them only once the write landed. Until then a sync must not
+// let server truth clobber them, and re-pushes them. Persisted, so an offline edit survives
+// a reload.
 const SNIPPET_PENDING_KEY = "tex_wrangle_snippets_pending";
 const _cmpLocale = (a, b) => a.localeCompare(b, undefined, { sensitivity: "base" });
 const _hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
-// Serializes the whole-map snippet POSTs: a newer write is not SENT until the previous one
-// settles, so the server never applies two whole-map replaces out of order (which would let
-// an older map clobber a newer one and drop a snippet). Rapid saves therefore land in issue
-// order, last-write-wins. (Cross-TAB writes share localStorage but not this chain — true
-// cross-tab ordering needs a server-side per-key/versioned store, out of scope here.)
+// Serializes the whole-map snippet POSTs: a newer write is not sent until the previous one
+// settles, so an older map never replaces a newer one. Rapid saves land in issue order.
+// (Cross-tab writes share localStorage but not this chain.)
 let _snipPostChain = Promise.resolve();
 
 function _loadUserSnippets() {
-    // The synchronous offline cache. Server truth is folded into it by
-    // _syncUserSnippetsFromServer (called at menu-open) so this stays current. Normalize a
-    // tampered / non-object cache to {} so the spread + Object.keys downstream never throw.
+    // The synchronous offline cache (kept current by _syncUserSnippetsFromServer). A tampered
+    // or non-object cache reads as {}.
     try {
         const v = JSON.parse(localStorage.getItem(SNIPPET_STORAGE_KEY) || "{}");
         return (v && typeof v === "object" && !Array.isArray(v)) ? v : {};
@@ -122,20 +116,14 @@ function _savePendingSnippets(set) {
     } catch (_) { /* storage unavailable */ }
 }
 
-// POST the whole cache to the server and, ONLY on a confirmed-durable write (resp.ok AND
-// body {"ok": true}), clear the just-written names from the pending set — and only those
-// whose cache value is unchanged since this POST, so a newer edit issued while this POST
-// was in flight is never wrongly marked durable. A rejected / offline POST leaves the
-// names pending so the next sync retries them (BUG 1).
+// POST the whole cache to the server. Only on a confirmed-durable write (resp.ok and body
+// {"ok": true}) are the written names cleared from the pending set, and only those whose
+// cache value is unchanged since this POST. A rejected or offline POST leaves them pending.
 function _postUserSnippets(snippets, names) {
     const snapshot = {};   // value being persisted for each pending name (undefined = absent/deleted)
     for (const n of names) snapshot[n] = _hasOwn(snippets, n) ? snippets[n] : undefined;
-    // Append to the single-flight chain so this POST is SENT only after the previous one
-    // settles — whole-map replaces then land in order (see _snipPostChain above). Each link
-    // is time-BOUNDED and aborts on timeout, so a hung / never-settling POST can't wedge the
-    // saves queued behind it (head-of-line blocking) and a late reply can't land out of order
-    // after a newer save. On any failure the names stay pending and retry on the next sync.
-    // (fetchApi spreads these options into fetch(), so the AbortSignal is honored.)
+    // Each link of the chain aborts after 15 s, so a hung POST cannot block the saves queued
+    // behind it. On any failure the names stay pending and retry on the next sync.
     _snipPostChain = _snipPostChain.then(async () => {
         const ctl = (typeof AbortController !== "undefined") ? new AbortController() : null;
         const timer = ctl ? setTimeout(() => ctl.abort(), 15000) : null;
@@ -169,11 +157,10 @@ function _postUserSnippets(snippets, names) {
 }
 
 function _saveUserSnippets(snippets, changed) {
-    // Write the offline cache immediately (so the UI is responsive and an offline edit is
-    // kept), mark the changed names pending, then write through to the server. `changed`
-    // is the affected name(s) (including a deleted name, now absent from `snippets`); it
-    // defaults to the whole map for callers that don't know their diff.
-    localStorage.setItem(SNIPPET_STORAGE_KEY, JSON.stringify(snippets));
+    // Write the cache at once, mark the changed names (a deleted name included) pending, then
+    // write through to the server. `changed` defaults to the whole map.
+    try { localStorage.setItem(SNIPPET_STORAGE_KEY, JSON.stringify(snippets)); }
+    catch (_) { /* quota / storage unavailable: the pending mark and the server write still go */ }
     const names = (changed && changed.length) ? [...new Set(changed)] : Object.keys(snippets);
     const pending = _loadPendingSnippets();
     for (const n of names) pending.add(n);
@@ -181,28 +168,16 @@ function _saveUserSnippets(snippets, changed) {
     _postUserSnippets(snippets, names);
 }
 
-// LANG-5: fold the server's user snippets into the localStorage cache. Called before the
-// snippet menu builds its tree, so the menu shows server truth. NON-DESTRUCTIVE (BUG 2):
-// the cache is overwritten ONLY on a signalled-successful read; a 503 / read_error / offline
-// leaves it untouched.
-//
-// The merge is CACHE-BASED, not GET-based, and favors PRESERVATION: it starts from the
-// local cache (so a snippet saved concurrently — present in the cache but absent from THIS
-// possibly-stale GET response — is never dropped), then adopts server values for names the
-// client is NOT locally pending on (cross-machine adds/updates propagate; pending edits win
-// per key — BUG 1). The only removal is a LOCAL pending-delete. Consequence: a delete made
-// on another machine does not passively propagate here (and a coincident re-POST may even
-// re-push the entry) — the deliberate safe direction for a store whose whole purpose is to
-// not lose snippets. Full cross-machine convergence (including delete propagation) needs a
-// versioned / per-key server store; that is out of scope for this data-loss fix.
+// Fold the server's user snippets into the localStorage cache before the snippet menu builds
+// its tree. The cache is overwritten only on a successful read (a 503, read_error or offline
+// leaves it untouched). The merge starts from the local cache, so a snippet saved concurrently
+// is never dropped, and adopts server values only for names not pending locally. The only
+// removal is a local pending delete, so a delete made on another machine does not propagate:
+// the safe direction for a store whose purpose is to not lose snippets.
 async function _syncUserSnippetsFromServer() {
-    // Snapshot pending BEFORE the GET is issued. The GET is not on the POST chain, so its
-    // response can predate an in-flight POST's landing; a name that was pending when we
-    // asked may have been confirmed-and-cleared by the time we merge, and the stale GET
-    // would then adopt the server's PRE-confirmation value — silently reverting a durable
-    // local edit (then a later whole-map save makes the loss permanent). So a name pending
-    // at issue-time OR now is not trusted from this response; it re-syncs once the GET is
-    // demonstrably newer than the last confirmed write (next menu-open, pending clear).
+    // Snapshot pending BEFORE the GET: the GET is not on the POST chain, so its response can
+    // predate an in-flight POST, and adopting that stale value would revert a durable local
+    // edit. A name pending at issue-time or now is not trusted from this response.
     const pendingAtIssue = _loadPendingSnippets();
     let resp;
     try { resp = await api.fetchApi("/tex_wrangle/user_snippets"); }
@@ -230,15 +205,32 @@ async function _syncUserSnippetsFromServer() {
 
 /** Build a nested tree from flat "folder/folder/name" → content map. */
 function _buildSnippetTree(flat) {
-    const root = {};
+    // Null-prototype nodes: a "__proto__" segment is then an ordinary own key.
+    const root = Object.create(null);
+    // A leaf and a folder can share a name ("a" and "a/b"). The folder keeps the name and the
+    // leaf moves inside it, under a name that is free there.
+    const freeName = (node, name) => {
+        while (name in node) name += " (snippet)";
+        return name;
+    };
     for (const key of Object.keys(flat).sort(_cmpLocale)) {
         const parts = key.split("/");
         let node = root;
         for (let i = 0; i < parts.length - 1; i++) {
-            if (!node[parts[i]] || typeof node[parts[i]] === "string") node[parts[i]] = {};
-            node = node[parts[i]];
+            let next = node[parts[i]];
+            if (typeof next === "string") {
+                const folder = Object.create(null);
+                folder[freeName(folder, parts[i])] = next;
+                node[parts[i]] = next = folder;
+            } else if (!next) {
+                node[parts[i]] = next = Object.create(null);
+            }
+            node = next;
         }
-        node[parts[parts.length - 1]] = flat[key];
+        const leaf = parts[parts.length - 1];
+        const clash = node[leaf];
+        if (clash !== undefined && typeof clash !== "string") node[freeName(clash, leaf)] = flat[key];
+        else node[leaf] = flat[key];
     }
     return root;
 }
@@ -478,18 +470,23 @@ function _showDoctorDialog() {
     });
 }
 
+function _escHtml(v) {
+    return String(v).replace(/[&<>"']/g,
+        (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function _renderDoctorFacts(facts) {
     const rows = [];
     const arch = facts.arch || {};
-    if (arch.note) rows.push(`<div class="tex-doctor-caveat">⚠ ${arch.note}</div>`);
+    if (arch.note) rows.push(`<div class="tex-doctor-caveat">⚠ ${_escHtml(arch.note)}</div>`);
     const fmt = (v) => typeof v === "boolean"
         ? `<span style="color:${v ? "#66BB6A" : "#FFB300"}">${v}</span>`
-        : (Array.isArray(v) ? JSON.stringify(v) : String(v));
+        : _escHtml(Array.isArray(v) ? JSON.stringify(v) : String(v));
     const walk = (obj, prefix) => {
         for (const [k, v] of Object.entries(obj || {})) {
             if (v && typeof v === "object" && !Array.isArray(v)) walk(v, prefix + k + ".");
             else rows.push(`<div class="tex-doctor-row"><span class="tex-doctor-key">`
-                + `${prefix}${k}</span><span>${fmt(v)}</span></div>`);
+                + `${_escHtml(prefix + k)}</span><span>${fmt(v)}</span></div>`);
         }
     };
     walk(facts, "");
@@ -627,10 +624,6 @@ function _parseParamMetadata(block) {
     return Object.keys(meta).length ? meta : null;
 }
 
-// The ComfyUI socket type carried by a binding's @-prefix (m@ = MASK, l@ = LATENT, and
-// everything else — img/v/v2/v3/v4/f/i/c/b/s/none — wires as IMAGE). Mirrors the prefix
-// legend in TEX_HELP_DATA ("m@ MASK, l@ LATENT") and tex_marshalling's socket families, so a
-// published tool records the true socket type instead of flattening mask/latent to IMAGE.
 // A promoted param's default in the shape the tool manifest carries: strings and hex/vector
 // text stay text (comma-separated numbers for vectors), a bool is 0/1, numbers are numbers.
 function _texPublishDefault(t, raw) {
@@ -653,6 +646,8 @@ function _texPublishDefault(t, raw) {
     return raw == null ? 0 : (Number(raw) || 0);
 }
 
+// The ComfyUI socket type of a binding's @-prefix: m@ = MASK, l@ = LATENT, everything else
+// wires as IMAGE (so a published tool records the true socket type).
 function _socketTypeForPrefix(prefix) {
     if (prefix === "m") return "MASK";
     if (prefix === "l") return "LATENT";
@@ -745,6 +740,7 @@ function parseCode(code) {
     while ((m = PARAM_DECL_RE.exec(stripped)) !== null) {
         // The default is read from the comment-free RAW text (same indices), so a string or
         // hex default survives; the masked text only decides where the declaration ends.
+        if (RESERVED_NAMES.has(m[2])) continue;
         const rawDefault = m.indices[3] ? noComments.slice(m.indices[3][0], m.indices[3][1]) : null;
         params.set(m[2], {
             typeHint: m[1] || "f",
@@ -789,11 +785,6 @@ function parseCode(code) {
         if (isCompound || total > simpleAssigns) {
             inputs.add(name);
         }
-    }
-
-    // Remove param names from outputs (defensive)
-    for (const name of params.keys()) {
-        outputs.delete(name);
     }
 
     return { inputs, outputs, params, socketTypes };
@@ -962,6 +953,12 @@ function _texParamSchemaEntry(typeHint) {
     return ["FLOAT", { default: 0.0, min: -9999, max: 9999, step: 0.1, round: 0.001 }];
 }
 
+// Node ids order numerically ("9" before "10"); a non-numeric id falls back to text order.
+function _texIdBefore(a, b) {
+    const na = Number(a), nb = Number(b);
+    return (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) ? na < nb : String(a) < String(b);
+}
+
 /**
  * Replace `node`'s declarations in the registry (params = null drops them
  * all, e.g. on node removal) and rebuild the shared schema from the union.
@@ -995,7 +992,7 @@ function _texSyncParamSchema(node, params) {
         // deterministic winner (lowest node id) and warn once on conflict.
         let winId = null;
         for (const id of owners.keys()) {
-            if (winId === null || String(id) < String(winId)) winId = id;
+            if (winId === null || _texIdBefore(id, winId)) winId = id;
         }
         const typeHint = owners.get(winId);
         if (!_texParamConflictWarned.has(name) && new Set(owners.values()).size > 1) {
@@ -1185,25 +1182,20 @@ function syncParams(node, params) {
 // Shared by the debounced editor updater and onConfigure.
 
 function applyCodeToSockets(node, code) {
+    // A deferred call can outlive its node; re-registering its params would leak them.
+    if (!node.graph) return;
     const { inputs, outputs, params } = parseCode(code);
-    node._texBindings = inputs;
-    node._texOutputs = outputs;
     node._texParams = params;
     syncInputs(node, inputs, new Set(params.keys()));
     syncOutputs(node, outputs);
     syncParams(node, params);
 }
 
-// ─── Error Cache (per-node, from WebSocket events) ───────────────────
-
-const texErrorCache = new Map(); // nodeId -> { message, type, traceback }
-
 // ─── Floating DOM Overlays ───────────────────────────────────────────
-// Error panel and ? button are positioned as fixed divs on document.body,
-// placed at the node's screen coordinates each frame via onDrawForeground.
-// This works in BOTH Nodes 1.0 and 2.0 because:
-//   - onDrawForeground fires in both (proven by TEX badge visibility)
-//   - Fixed DOM elements on document.body capture clicks in both
+// Error panel, ? button and perf badge are fixed divs on document.body, placed at the
+// node's screen coordinates. Nodes 1.0 positions them from onDrawForeground; Nodes 2.0 never
+// calls that hook per node, so a RAF loop positions them from the Vue node element instead.
+// Fixed DOM elements on document.body capture clicks in both.
 
 function showDOMErrorBanner(node, errMsg) {
     clearDOMErrorBanner(node);
@@ -1395,6 +1387,7 @@ function _texEnsurePerfBadge(node) {
     if (node._texPerfBadge) return node._texPerfBadge;
     const b = document.createElement("div");
     b.className = "tex-floating-perf-badge";
+    b.style.display = "none";   // the positioning pass shows it
     b.addEventListener("mousedown", (e) => e.stopPropagation());
     b.addEventListener("pointerdown", (e) => e.stopPropagation());
     document.body.appendChild(b);
@@ -1402,8 +1395,10 @@ function _texEnsurePerfBadge(node) {
     return b;
 }
 
+// Fills the badge text; _texPositionOverlaysFromRect decides whether it is shown and where.
 function _texUpdatePerfBadge(node) {
     const p = node._texPerf;
+    node._texOverlaySig = null;   // Nodes 2.0: reposition, since the badge may be new or changed
     if (!(_texPerfHudEnabled && p)) {
         if (node._texPerfBadge) node._texPerfBadge.style.display = "none";
         return;
@@ -1422,7 +1417,14 @@ function _texUpdatePerfBadge(node) {
     b.title = [p.reason && ("tier: " + p.reason),
                p.precision_reason && ("precision: " + p.precision_reason)]
         .filter(Boolean).join("\n") || "TEX perf";
-    b.style.display = "";
+}
+
+// Hide every floating overlay of a node that is collapsed, not drawn or has no Vue element.
+function _texHideOverlays(node) {
+    if (node._texErrorBanner) node._texErrorBanner.style.display = "none";
+    if (node._texHelpBtn) node._texHelpBtn.style.display = "none";
+    if (node._texPerfBadge) node._texPerfBadge.style.display = "none";
+    node._texOverlaySig = null;
 }
 
 function _texPositionOverlaysFromRect(node, rect, scale, titleInside) {
@@ -1441,12 +1443,18 @@ function _texPositionOverlaysFromRect(node, rect, scale, titleInside) {
         } else {
             el.style.display = "";
             // Width matches the node; CSS transform scales the content
-            el.style.width = (rect.width / scale) + "px";
+            const widthPx = (rect.width / scale) + "px";
+            if (el.style.width !== widthPx) {
+                el.style.width = widthPx;
+                el._texHeight = null;   // the wrapped height depends on the width only
+            }
             el.style.left = rect.left + "px";
             el.style.transform = `scale(${scale})`;
             el.style.transformOrigin = "bottom left";
-            // Position above the node title bar
-            el.style.top = (rect.top - el.offsetHeight * scale - 4) + "px";
+            // Position above the node title bar. offsetHeight forces a layout, so it is
+            // read once per width and not once per frame.
+            if (el._texHeight == null) el._texHeight = el.offsetHeight;
+            el.style.top = (rect.top - el._texHeight * scale - 4) + "px";
         }
     }
 
@@ -1471,10 +1479,11 @@ function _texPositionOverlaysFromRect(node, rect, scale, titleInside) {
 
     // ── C1-ux perf badge (below the node) ──
     const badge = node._texPerfBadge;
-    if (badge && badge.style.display !== "none") {
-        if (tooSmall) {
+    if (badge) {
+        if (tooSmall || !(_texPerfHudEnabled && node._texPerf)) {
             badge.style.display = "none";
         } else {
+            badge.style.display = "";
             const nodeH = (node.size ? node.size[1] : 0) * scale;
             badge.style.transform = `scale(${scale})`;
             badge.style.transformOrigin = "top left";
@@ -1543,13 +1552,16 @@ function _texOverlayRafLoop() {
             continue;
         }
 
-        if (vueMode === false) continue;
+        if (vueMode === false) {
+            // Nodes 1.0 draws only the nodes on screen: one the canvas did not draw has
+            // no overlay to show.
+            const visible = app.canvas?.visible_nodes;
+            if (Array.isArray(visible) && !visible.includes(node)) _texHideOverlays(node);
+            continue;
+        }
 
-        const collapsed = node.flags?.collapsed;
-        if (collapsed) {
-            if (node._texErrorBanner) node._texErrorBanner.style.display = "none";
-            if (node._texHelpBtn) node._texHelpBtn.style.display = "none";
-            node._texOverlaySig = null;
+        if (node.flags?.collapsed) {
+            _texHideOverlays(node);
             continue;
         }
 
@@ -1559,17 +1571,20 @@ function _texOverlayRafLoop() {
             el = document.querySelector(`[data-node-id="${node.id}"]`);
             node._texVueEl = el;
         }
-        if (!el) continue;
-
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) continue;
+        const rect = el ? el.getBoundingClientRect() : null;
+        if (!rect || (rect.width === 0 && rect.height === 0)) {
+            _texHideOverlays(node);   // not rendered (culled, off screen or hidden)
+            continue;
+        }
 
         // Estimate scale from node size vs rendered size
         const scale = node.size[0] > 0 ? rect.width / node.size[0] : 1;
 
         // Skip the style writes when nothing moved. Banner create/remove and
         // collapse reset the signature so fresh overlays position immediately.
-        const sig = rect.left + "," + rect.top + "," + rect.width + "," + scale + "," + (node._texErrorBanner ? "b" : "");
+        const badgeH = (_texPerfHudEnabled && node._texPerf) ? node.size[1] : "-";
+        const sig = rect.left + "," + rect.top + "," + rect.width + "," + scale + ","
+            + (node._texErrorBanner ? "b" : "") + "," + badgeH;
         if (sig === node._texOverlaySig) continue;
 
         _texPositionOverlaysFromRect(node, {
@@ -1598,8 +1613,6 @@ api.addEventListener("execution_error", (ev) => {
         type: d.exception_type || "",
         traceback: d.traceback || "",
     };
-
-    texErrorCache.set(String(d.node_id), errData);
 
     // Log human-readable error to browser console
     const errMsg = errData.message || "";
@@ -1640,8 +1653,6 @@ api.addEventListener("execution_error", (ev) => {
 
 api.addEventListener("execution_start", () => {
     // Clear errors at the start of a new prompt
-    texErrorCache.clear();
-
     // Clear DOM banners + inline diagnostics from all TEX nodes
     const CM6 = getCM6();
     if (app.graph?._nodes) {
@@ -1670,20 +1681,42 @@ api.addEventListener("execution_start", () => {
 // the returned diagnostics (errors + W7xxx warnings) as CM6 squiggles. Best-effort — any
 // network/parse failure leaves the existing markers untouched and never throws.
 const _lintDebouncers = new WeakMap();   // EditorView → debounced fetch
+const _lintSeq = new WeakMap();          // EditorView → number of the latest request
 
-async function _texRequestLint(view, code) {
+// Socket types that lint as something other than the checker's vec4 default for an unknown
+// binding; an IMAGE wire is left out because its channel count is not known here.
+const _TEX_LINT_TYPES = { MASK: "FLOAT", FLOAT: "FLOAT", INT: "INT", STRING: "STRING" };
+
+// {binding: type} for the node's wired inputs, from the type of the output feeding each.
+function _texLintTypes(node) {
+    const types = {};
+    for (const inp of node.inputs || []) {
+        if (inp._texParam || inp.link == null) continue;
+        const link = _texLinkIn(node.graph, inp.link);
+        const src = link && node.graph.getNodeById?.(link.origin_id);
+        const mapped = _TEX_LINT_TYPES[src?.outputs?.[link.origin_slot]?.type];
+        if (mapped) types[inp.name] = mapped;
+    }
+    return types;
+}
+
+async function _texRequestLint(view, code, node) {
+    const seq = (_lintSeq.get(view) || 0) + 1;
+    _lintSeq.set(view, seq);
     let diags;
     try {
         const resp = await api.fetchApi("/tex_wrangle/check", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source: code }),
+            body: JSON.stringify({ source: code, types: _texLintTypes(node) }),
         });
         if (!resp.ok) return;
         diags = (await resp.json()).diagnostics || [];
     } catch (_) { return; }
     const CM6 = getCM6();
     if (!CM6 || !view) return;
+    // A slower earlier request, or a document edited since, would paint stale positions.
+    if (_lintSeq.get(view) !== seq || view.state.doc.toString() !== code) return;
     try {
         // Reuse the WS-error converter by wrapping the list in its TEX_DIAG envelope; an
         // empty list clears stale squiggles once the program parses clean again.
@@ -1693,13 +1726,13 @@ async function _texRequestLint(view, code) {
     } catch (_) { /* older bundle without the converter — skip live squiggles */ }
 }
 
-function _texScheduleLint(view, code) {
+function _texScheduleLint(view, code, node) {
     let dl = _lintDebouncers.get(view);
     if (!dl) {
-        dl = debounce((v, c) => _texRequestLint(v, c), 400);
+        dl = debounce((v, c, n) => _texRequestLint(v, c, n), 400);
         _lintDebouncers.set(view, dl);
     }
-    dl(view, code);
+    dl(view, code, node);
 }
 
 function createTexEditor(node, codeWidget, updateSockets) {
@@ -1802,13 +1835,11 @@ function createTexEditor(node, codeWidget, updateSockets) {
                                 codeWidget.callback(newCode);
                             }
                             updateSockets();
-                            _texScheduleLint(update.view, newCode);   // LANG-2 live-lint
+                            _texScheduleLint(update.view, newCode, node);   // LANG-2 live-lint
 
-                            // ── Manual completion trigger (Electron compatibility) ──
-                            // CM6's activateOnTyping relies on transactions being tagged
-                            // as "input.type", which may not happen in Electron's Chromium
-                            // renderer. We manually trigger completion when the cursor is
-                            // after a word character or "@".
+                            // Manual completion trigger (Electron): activateOnTyping relies on
+                            // "input.type" transactions, which its renderer may not tag. Trigger
+                            // when the cursor follows a word character, "@" or "$".
                             try {
                                 const pos = update.state.selection.main.head;
                                 if (pos > 0) {
@@ -1962,7 +1993,7 @@ function showTexContextMenu(x, y, editorView) {
 
                     const builtins = await _fetchBuiltinSnippets();
                     await _syncUserSnippetsFromServer();   // LANG-5: fold server truth into the cache
-                    if (row._childSub) return;  // re-check after await
+                    if (row._childSub || activeContextMenu !== menu) return;  // re-check after await
                     const combined = { ...builtins, ..._loadUserSnippets() };
                     const tree = _buildSnippetTree(combined);
 
@@ -2281,7 +2312,7 @@ const TEX_HELP_DATA = [
             { name: "median", sig: "median(arr) \u2192 float", desc: "Median value of array.", example: "float mid = median(arr);" },
             { name: "arr_avg", sig: "arr_avg(arr) \u2192 float", desc: "Average of all array elements.", example: "float avg = arr_avg(arr);" },
             { name: "join", sig: "join(arr, sep) \u2192 string", desc: "Concatenate string array with separator.", example: "string csv = join(names, \", \");" },
-            { name: "len (array)", sig: "len(arr) \u2192 int", desc: "Number of elements in array.", example: "int n = len(arr);" },
+            { name: "len (array)", sig: "len(arr) \u2192 float", desc: "Number of elements in array.", example: "float n = len(arr);" },
         ]
     },
     {
@@ -2821,9 +2852,9 @@ function _texCollapseChains(result, chains) {
 // FUS-1: DAG-region fusion (fan-out / diamonds / multi-injection). Detection is the Python
 // authority (/tex_wrangle/detect_regions); the frontend serializes the graph and applies the
 // returned plans. Purely-linear regions are the route's to skip (_region_is_linear).
-// FUS-1c (v0.29): the linear pass DEFERS to any node a region will claim, so it no longer
-// deletes one out from under a region; the "all present" check below stays a safety net
-// (bypassed/muted source, route mismatch). Fail-safe — a route miss leaves nodes unfused.
+// Regions are applied first and the linear pass second: a chain whose nodes a region already
+// consumed fails _texCollapseOne's "every chain node still in the prompt" check and is skipped.
+// Fail-safe — a route miss leaves nodes unfused.
 
 // {nodes: [{id, code, params, code_wired}], edges: [{from, from_slot, to, to_binding}]}
 // for the detector. Image handoffs only (a $param / code wire is not a fusable edge);
@@ -2904,12 +2935,9 @@ function _texCollapseRegion(out, plan) {
     if (!out[termId] || !Array.isArray(srcOrigin) || delSet.has(termId)) return false;
     for (const id of delIds) if (!out[id]) return false;         // whole region present?
     if (delSet.has(String(srcOrigin[0]))) return false;          // source not in THIS delete set
-    // C1/C2: the source node must still EXIST in the prompt — ComfyUI strips bypassed/muted
-    // (mode 2/4) nodes from it, and `_texSerializeGraph`'s mode filter only skips TEX nodes, so a
-    // bypassed non-TEX source (a Load Image) still reaches the detector. Rewiring the terminal to
-    // a vanished origin would make the prompt reference a deleted node and ComfyUI would reject
-    // the WHOLE queue. Leaving the region unfused is always correct — and since v0.29 the linear
-    // pass runs AFTER this, it stays free to fuse those nodes instead.
+    // The source node must still exist in the prompt: ComfyUI strips bypassed/muted nodes, and a
+    // bypassed non-TEX source still reaches the detector. Rewiring the terminal to a vanished
+    // origin would make ComfyUI reject the whole queue; the linear pass may still fuse the nodes.
     if (!out[String(srcOrigin[0])]) return false;
 
     // Terminal input sockets currently fed by a to-be-deleted region node.
@@ -2939,11 +2967,9 @@ function _texCollapseRegion(out, plan) {
     return true;
 }
 
-// Memoize the route result by the serialized-graph signature: re-queuing an
-// unchanged graph (or auto-queue) shouldn't re-serialize + round-trip to localhost
-// every time (the sibling preflight route memoizes the same way). The signature must
-// include param VALUES — the collapse payload bakes them, so a stale plan would fuse
-// the wrong values — so a widget tweak correctly re-detects.
+// Memoize the route result by the serialized-graph signature, so re-queuing an unchanged graph
+// makes no round trip. The signature includes param VALUES (the payload bakes them), so a
+// widget tweak re-detects.
 let _texRegionSig = null;
 let _texRegionPlans = [];
 
@@ -2960,10 +2986,11 @@ async function _texDetectRegionPlans() {
         try {
             const ctrl = new AbortController();
             const timer = setTimeout(() => ctrl.abort(), 800);   // never stall the queue
-            const resp = await fetch("/tex_wrangle/detect_regions", {
+            const resp = await api.fetchApi("/tex_wrangle/detect_regions", {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: sig, signal: ctrl.signal });
             clearTimeout(timer);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             _texRegionPlans = ((await resp.json()) || {}).plans || [];
             _texRegionSig = sig;
         } catch (e) { _texRegionSig = null; return []; }   // route absent/slow → unfused; retry next queue
@@ -2987,6 +3014,7 @@ let _texPreflightEnabled = true;              // TEX.Fusion.preflight
 const _texPreflight = new Map();              // termId -> {ok, error, stage_of_error, stats}
 const _texPreflightSig = new Map();           // termId -> last-checked signature
 const _texPreflightBusy = new Set();          // termIds with an in-flight request
+const _texPreflightRetryAt = new Map();       // termId -> earliest time (ms) to retry a failed request
 
 function _texCodeOf(node) {
     const w = (node.widgets || []).find(w => w.name === "code");
@@ -2996,10 +3024,11 @@ function _texCodeOf(node) {
 // Serialize a chain's fusability-relevant shape (codes + wiring) so preflight
 // only re-runs when the structure actually changes — not on every pan/repaint.
 function _texChainSig(chain) {
+    const codes = chain.map(n => _texCodeOf(n));   // a CM6 node rebuilds its source per read
     return chain.map(n => {
         const up = _texSingleWiredInput(n);
-        return n.id + ":" + _texCodeOf(n).length + ":" + (up ? up.bindingName : "-");
-    }).join("|") + "#" + chain.map(n => _texCodeOf(n)).join("\x00");
+        return n.id + ":" + (up ? up.bindingName : "-");
+    }).join("|") + "#" + codes.join("\x00");
 }
 
 // Build the preflight spec (source-first stages + terminal code) from live node
@@ -3028,17 +3057,26 @@ function _texMaybePreflight(chain) {
     let sig;
     try { sig = _texChainSig(chain); } catch (e) { return; }
     if (_texPreflightSig.get(termId) === sig || _texPreflightBusy.has(termId)) return;
+    if ((_texPreflightRetryAt.get(termId) || 0) > Date.now()) return;
     const spec = (() => { try { return _texPreflightSpec(chain); } catch (e) { return null; } })();
     if (!spec) return;
-    _texPreflightSig.set(termId, sig);
     _texPreflightBusy.add(termId);
-    fetch("/tex_wrangle/chain_preflight", {
+    api.fetchApi("/tex_wrangle/chain_preflight", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(spec),
-    }).then(r => r.json()).then(res => {
+    }).then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+    }).then(res => {
+        // Record the signature only for a verdict that arrived, so a failed request is retried
+        // (after a pause), and drop the verdict of a chain that was edited meanwhile.
+        if (_texChainSig(chain) !== sig) return;
+        _texPreflightSig.set(termId, sig);
         _texPreflight.set(termId, res);
         app.canvas?.setDirty(true, true);   // repaint the bubble with the verdict
-    }).catch(() => { /* endpoint absent / offline → neutral bubble */ })
+    }).catch(() => {   // endpoint absent / offline → neutral bubble, retried after a pause
+        _texPreflightRetryAt.set(termId, Date.now() + 5000);
+    })
       .finally(() => _texPreflightBusy.delete(termId));
 }
 
@@ -3197,25 +3235,14 @@ function _texDrawBubbleLabels(ctx) {
 app.registerExtension({
     name: "TEX.Wrangle",
 
-    // ── Prompt hook: inject $param widget values into the execution prompt ──
-    // ComfyUI only serializes widget values for inputs defined in the schema.
-    // Since TEX params are dynamic (parsed from code), they aren't in the schema.
-    // This hook adds their widget values so accept_all_inputs passes them to execute().
+    // setup(): wraps graphToPrompt (injects $param widget values, then fuses linked chains and
+    // renames wired inputs onto the lazy slot pool), then registers the editor settings and
+    // the fusion bubble canvas hooks.
     setup() {
-        // Lazy input cooking: ComfyUI only honours `lazy` on schema-declared
-        // input names, so wired user inputs are renamed onto the schema's
-        // lazy slot pool (in_0..in_15) IN THE QUEUED PROMPT ONLY — the graph,
-        // saved workflow, slots, and labels all keep the user names. The
-        // `_tex_slot_map` constant lets the backend map values back and
-        // drives check_lazy_status. Runs AFTER fusion collapse so it maps
-        // the post-collapse wiring. Fail-safe: on any doubt (pool-name
-        // collision, >16 wires) inputs stay user-named and simply cook
-        // eagerly, exactly as before v0.18.
-        const TEX_SYS_INPUTS = new Set([
-            "code", "device", "compile_mode", "precision",
-            "debug_nan_highlight", "_tex_any", "_tex_chain",
-            "_tex_preview", "_tex_slot_map",
-        ]);
+        // Lazy input cooking: ComfyUI honours `lazy` only on schema-declared names, so wired
+        // inputs are renamed onto the lazy slot pool (in_0..in_15) in the queued prompt only.
+        // `_tex_slot_map` lets the backend map values back. Runs after fusion collapse. On any
+        // doubt (pool-name collision, >16 wires) inputs keep their names and cook eagerly.
         function _texLazyRename(result) {
             if (!app.ui.settings.getSettingValue("TEX.Lazy.enabled", true)) return;
             for (const [nodeId, nodeData] of Object.entries(result.output)) {
@@ -3231,7 +3258,7 @@ app.registerExtension({
                 for (const input of node.inputs || []) {
                     if (idx >= 16) break; // pool size; extras stay eager
                     const name = input?.name;
-                    if (!name || TEX_SYS_INPUTS.has(name)) continue;
+                    if (!name || RESERVED_NAMES.has(name)) continue;
                     const val = nodeData.inputs[name];
                     // Only wired links ([nodeId, slotIdx] arrays) move to the
                     // pool; widget constants keep their user names.
@@ -3256,6 +3283,8 @@ app.registerExtension({
         app.graphToPrompt = async function (...args) {
             const result = await origGraphToPrompt.apply(this, args);
             if (result?.output) {
+                // ComfyUI serializes only the widget values of schema-declared inputs, and
+                // TEX params are dynamic (parsed from code), so add theirs here.
                 for (const [nodeId, nodeData] of Object.entries(result.output)) {
                     if (nodeData.class_type === TEX_NODE_TYPE) {
                         const node = _texNodeByPromptId(nodeId);
@@ -3268,16 +3297,11 @@ app.registerExtension({
                         }
                     }
                 }
-                // Cross-node fusion in two coordinated passes (TEX.Fusion.enabled; fail-safe).
-                // FUS-1c: detect the linear chains NOW, while litegraph is still the graph this
-                // prompt was serialized from — the region route below can await up to 800 ms, and
-                // reading litegraph after that could see a graph the user has since edited.
-                // Then apply REGIONS FIRST and the linear pass second, so the linear pass
-                // coordinates by OBSERVATION: `_texCollapseOne`'s existing "every chain node still
-                // in the prompt" pre-check skips whatever a region already consumed. That beats a
-                // predicted skip-set — if a region plan turns out un-appliable (e.g. a bypassed
-                // non-TEX source is absent from the prompt), the linear pass is still free to fuse
-                // those nodes, where a prediction would have lost BOTH.
+                // Cross-node fusion (TEX.Fusion.enabled; fail-safe). Detect the linear chains NOW,
+                // while litegraph is still the graph this prompt was serialized from: the region
+                // route below can await up to 800 ms. Apply regions first and the linear pass
+                // second; _texCollapseOne skips whatever a region already consumed, and a region
+                // plan that cannot be applied leaves its nodes free for the linear pass.
                 let _chains = [];
                 try { _chains = _texDetectChains(); }
                 catch (e) { console.warn("[TEX] chain detect failed", e); }
@@ -3301,8 +3325,8 @@ app.registerExtension({
         dynStyle.id = "tex-dynamic-styles";
         document.head.appendChild(dynStyle);
 
-        let _texFontSize    = 14;
-        let _texLineNumbers = true;
+        let _texFontSize    = app.ui.settings.getSettingValue("TEX.Editor.fontSize",    10);
+        let _texLineNumbers = app.ui.settings.getSettingValue("TEX.Editor.lineNumbers", true);
 
         function _updateDynStyles() {
             let css = `
@@ -3323,8 +3347,6 @@ app.registerExtension({
         }
 
         // Apply saved values immediately on load
-        _texFontSize    = app.ui.settings.getSettingValue("TEX.Editor.fontSize",    10);
-        _texLineNumbers = app.ui.settings.getSettingValue("TEX.Editor.lineNumbers", true);
         _updateDynStyles();
 
         // Font size slider (4 – 20 px)
@@ -3476,7 +3498,7 @@ app.registerExtension({
             return true;
         };
         if (!_installBubble()) {
-            // Canvas not ready yet — retry on the next frames until it exists.
+            // Canvas not ready yet — poll every 200 ms (for up to 5 s) until it exists.
             const iv = setInterval(() => { if (_installBubble()) clearInterval(iv); }, 200);
             setTimeout(() => clearInterval(iv), 5000);
         }
@@ -3580,17 +3602,10 @@ app.registerExtension({
                     const { container, editor } = result;
 
                     // ── Suppress the original code textarea widget ──
-                    // Two independent mechanisms ensure the textarea is
-                    // invisible in every rendering mode:
-                    //
-                    // 1. Splice from widgets array — prevents the Vue layer
-                    //    from creating a ComponentWidget for it.
-                    // 2. Mark hidden + poll to hide/remove the DOM element
-                    //    — catches the textarea that ComfyUI's canvas
-                    //    renderer may have already inserted before onNodeCreated fires.
-                    //
-                    // The original JS object stays alive (referenced by the
-                    // CM6 updateListener closure) so value sync still works.
+                    // Splice it out of the widgets array (so the Vue layer builds no widget
+                    // for it), then hide any DOM element the canvas renderer already inserted.
+                    // The widget object stays alive in the CM6 updateListener closure, so
+                    // value sync still works.
                     const codeIdx = node.widgets.indexOf(codeWidget);
                     if (codeIdx >= 0) node.widgets.splice(codeIdx, 1);
 
@@ -3641,14 +3656,8 @@ app.registerExtension({
                                 });
                             }
                         },
-                        // Tell the layout engine this widget is "growable":
-                        // it has a small minimum and will expand to fill
-                        // remaining vertical space.  DOM widgets with
-                        // getMinHeight (fed to computeLayoutSize) participate
-                        // in LiteGraph's distributeSpace() allocation instead
-                        // of being treated as fixed-height.  This avoids the
-                        // old computeSize-based approach which either caused
-                        // infinite growth or prevented downward resizing.
+                        // Growable: a small minimum that expands into the remaining vertical
+                        // space (getMinHeight feeds LiteGraph's distributeSpace()).
                         getMinHeight() { return 100; },
                     });
                     if (domWidget) {
@@ -3657,13 +3666,10 @@ app.registerExtension({
                         // computeLayoutSize) rather than fixed-height.
                         domWidget.computeSize = null;
 
-                        // The DOM widget's parent container (.dom-widget)
-                        // has pointer-events:auto (reset by ComfyUI's draw loop
-                        // every frame) and can overlap canvas-rendered param
-                        // widgets below it.  We add a CSS class and use
-                        // !important to keep pointer events disabled on the
-                        // container while allowing the editor content to remain
-                        // interactive.
+                        // ComfyUI resets the .dom-widget container to pointer-events:auto
+                        // every frame, and it can cover the param widgets below it. A CSS
+                        // class with !important keeps the container inert while the editor
+                        // content stays interactive.
                         const markContainer = () => {
                             const el = domWidget.element;
                             const parentContainer = el?.parentElement;
@@ -3743,9 +3749,7 @@ app.registerExtension({
         nodeType.prototype.onDrawForeground = function (ctx) {
             if (origDrawForeground) origDrawForeground.apply(this, arguments);
             if (this.flags?.collapsed) {
-                // Hide floating overlays when collapsed
-                if (this._texErrorBanner) this._texErrorBanner.style.display = "none";
-                if (this._texHelpBtn) this._texHelpBtn.style.display = "none";
+                _texHideOverlays(this);
                 return;
             }
 
@@ -3794,7 +3798,6 @@ app.registerExtension({
                 _texUpdatePerfBadge(this);                     // C1-ux: DOM dual-path badge
                 _texStartV2Positioning(this);                  // ensure the RAF positions it
             } catch { /* ignore */ }
-            texErrorCache.delete(String(this.id));
             // Clear DOM error banner
             clearDOMErrorBanner(this);
             // Clear CM6 inline diagnostics
@@ -4333,8 +4336,7 @@ app.registerExtension({
         .tex-floating-error::-webkit-scrollbar-track { background: transparent; }
         .tex-floating-error::-webkit-scrollbar-thumb { background: #553333; border-radius: 2px; }
 
-        /* ── Floating Help "?" Button (top-right of node, on document.body) ── */
-        /* C1-ux — perf HUD DOM badge (dual-path with the canvas draw) */
+        /* ── Perf HUD badge (DOM copy of the canvas draw) ── */
         .tex-floating-perf-badge {
             position: fixed;
             z-index: 9998;
@@ -4352,6 +4354,7 @@ app.registerExtension({
         .tex-doctor-key { color: #9E9E9E; }
         .tex-doctor-caveat { color: #FFB300; background: rgba(255,179,0,0.1);
             padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; }
+        /* ── Floating Help "?" Button (top-right of node, on document.body) ── */
         .tex-floating-help-btn {
             position: fixed;
             z-index: 9999;
