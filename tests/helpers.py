@@ -278,12 +278,18 @@ def run_both(code, bindings, B=1, H=4, W=4):
     return interp_result, cg_result
 
 
-def assert_equiv(r, name, code, bindings, B=1, H=4, W=4):
-    """run_both() + assert outputs match within 1e-5. Reports to SubTestResult."""
+def assert_equiv(r, name, code, bindings, B=1, H=4, W=4, allow_decline=False):
+    """run_both() + assert outputs match within 1e-5. Reports to SubTestResult.
+
+    A codegen decline is a FAILURE (only one tier was measured) unless the row passes
+    `allow_decline=True`, and non-tensor outputs are compared for equality, not skipped."""
     try:
         interp_res, cg_res = run_both(code, bindings, B, H, W)
         if cg_res is None:
-            r.ok(f"codegen equiv: {name} (codegen unsupported, SKIPPED)")
+            if allow_decline:
+                r.ok(f"codegen equiv: {name} (codegen declined, allowed)")
+            else:
+                r.fail(f"codegen equiv: {name}", "codegen declined, so only one tier was measured")
             return
         for out_name in interp_res:
             interp_t = interp_res[out_name]
@@ -291,6 +297,8 @@ def assert_equiv(r, name, code, bindings, B=1, H=4, W=4):
             if isinstance(interp_t, torch.Tensor) and isinstance(cg_t, torch.Tensor):
                 max_diff = (interp_t.float() - cg_t.float()).abs().max().item()
                 assert max_diff < 1e-5, f"Max diff={max_diff} for output '{out_name}'"
+            else:
+                assert interp_t == cg_t, f"'{out_name}': {interp_t!r} != {cg_t!r}"
         r.ok(f"codegen equiv: {name}")
     except Exception as e:
         r.fail(f"codegen equiv: {name}", f"{e}")
@@ -443,6 +451,25 @@ def run_python_kv(code: str, *, timeout: int = 60, python: str | None = None) ->
     if proc.returncode != 0:
         raise RuntimeError(f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-800:]}")
     return dict(line.split(" ", 1) for line in proc.stdout.strip().splitlines() if " " in line)
+
+
+def windowed_vs_whole(code, image, roi, device="cpu", params=None, whole=False):
+    """Cook `code` on `image` twice, whole frame and with `roi` (x0, y0, w, h, W, H) as a
+    real window. Returns `(cooked_roi, windowed_out, reference)`, where `reference` is the
+    whole-frame output cropped to the window (`whole=True`: the uncropped frame instead).
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+    from TEX_Wrangle import tex_engine
+    from TEX_Wrangle import tex_roi
+    x0, y0, w, h, _W, _H = roi
+    binds = dict(params or {}, A=image.clone())
+    tex_roi.clear_roi_memo()
+    full = tex_engine.cook(code, dict(binds, A=image.clone()), device_mode=device).outputs["OUT"]
+    tex_roi.clear_roi_memo()
+    res = tex_engine.cook(code, dict(binds, A=image.clone()), device_mode=device,
+                          roi=roi, roi_exec=True)
+    ref = full if whole else full[:, y0:y0 + h, x0:x0 + w]
+    return res.cooked_roi, res.outputs["OUT"], ref
 
 
 # ── Windows Application/Smart App Control kernel-load block (V045-FIX) ──────

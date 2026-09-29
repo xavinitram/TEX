@@ -1,7 +1,7 @@
 """Mutation check — do the release's tests actually KILL the bugs they claim to pin?
 
-NOT part of `run_all.py`: it copies the tree once per mutation and runs the v0.32-v0.36 rows
-(71 of them, 28 in `tex_results.py` alone) against each, which is minutes, not seconds. Run it
+NOT part of `run_all.py`: it copies the tree once per mutation and runs every row of the
+`MUTATIONS` table against each, which is minutes, not seconds. Run it
 by hand when a fix lands:
 
     python tests/mutation_check.py
@@ -750,11 +750,24 @@ from helpers import SubTestResult
 _names = {modules}
 _mods = [(_n, __import__(_n)) for _n in _names]
 r = SubTestResult()
+import inspect
+def _rows(_name, m):
+    # The rows run_all.py would call: top-level `def test_*(r, ...)` defined in this
+    # module, in definition order.
+    out = []
+    for n in dir(m):
+        f = getattr(m, n)
+        if not n.startswith("test_") or not inspect.isfunction(f) or f.__module__ != _name:
+            continue
+        params = list(inspect.signature(f).parameters)
+        if params and params[0] == "r":
+            out.append((f.__code__.co_firstlineno, n, f))
+    return [(n, f) for _l, n, f in sorted(out, key=lambda t: (t[0], t[1]))]
 for _name, m in _mods:
     _before = r.failed
-    for n in sorted(x for x in dir(m) if x.startswith("test_")):
+    for n, f in _rows(_name, m):
         try:
-            getattr(m, n)(r)
+            f(r)
         except Exception:
             r.fail(n, "raised")
     if r.failed > _before:
@@ -906,7 +919,7 @@ def main(argv):
         print(f"{len(misattributed)} MISATTRIBUTED - killed, but not by the declared suite:")
         for label, suites, actual in misattributed:
             print(f"  - {label}: declares {list(suites)}, killed by {list(actual)}")
-    return 1 if (stale or misattributed) else 0
+    return 1 if (survived or stale or misattributed) else 0
 
 
 if __name__ == "__main__":

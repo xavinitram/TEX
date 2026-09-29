@@ -224,7 +224,7 @@ def test_gausspyr50_codegen_parity_both_paths(r: SubTestResult):
         ("pyramid path, huge sigma", "@OUT = gauss_blur(@A, 5000.0);"),
     ]
     for name, code in cases:
-        assert_equiv(r, f"gausspyr50 {name}", code, {"A": img}, B=1, H=4, W=4)
+        assert_equiv(r, f"gausspyr50 {name}", code, {"A": img})
 
 
 # ── A3 (v0.50 Phase C, R1#3): the pyramid path polls between its own passes ─

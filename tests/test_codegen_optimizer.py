@@ -316,10 +316,10 @@ c.r = 1.0;
     ]
 
     for name, code in programs:
-        assert_equiv(r, name, code, {"A": img}, B=B, H=H, W=W)
+        assert_equiv(r, name, code, {"A": img})
 
     for name, code in two_input_programs:
-        assert_equiv(r, name, code, {"A": img, "B": img_b}, B=B, H=H, W=W)
+        assert_equiv(r, name, code, {"A": img, "B": img_b})
 
 
 def test_ask4_img_size_tier_story(r: SubTestResult):
@@ -2921,7 +2921,7 @@ def test_cg2_scatter_widens_rank_below_3(r: SubTestResult):
 
     def _row(name, code, expect):
         try:
-            interp_res, cg_res = run_both(code, {"A": img.clone()}, B=B, H=H, W=W)
+            interp_res, cg_res = run_both(code, {"A": img.clone()})
             assert cg_res is not None, "codegen declined the program"
             for k in interp_res:
                 it, ct = interp_res[k], cg_res[k]

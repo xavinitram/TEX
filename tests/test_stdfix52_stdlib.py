@@ -48,7 +48,7 @@ def test_bilateral_filter_mask_is_filtered_like_a_one_channel_image():
 def test_mask_blur_program_matches_across_tiers():
     m = _mask()
     for call in ("gauss_blur(@M, 2.0)", "bilateral_filter(@M, 2.0, 0.3)"):
-        interp, cg = run_both(f"@OUT = {call};", {"M": m}, H=16, W=16)
+        interp, cg = run_both(f"@OUT = {call};", {"M": m})
         o = interp["OUT"]
         assert not torch.equal(o.reshape(m.shape), m), call
         if cg is not None:

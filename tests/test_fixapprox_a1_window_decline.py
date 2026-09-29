@@ -23,18 +23,13 @@ from __future__ import annotations
 import torch
 
 from helpers import *  # noqa: F401,F403
-from TEX_Wrangle import tex_engine
+from helpers import windowed_vs_whole
 from TEX_Wrangle.tex_runtime.stdlib_core import GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib as _Sample  # populates REGISTRY
 
 
 def _windowed_vs_whole(code, image, roi):
-    x0, y0, w, h, W, H = roi
-    full = tex_engine.cook(code, {"A": image.clone()}, device_mode="cpu").outputs["OUT"]
-    res = tex_engine.cook(code, {"A": image.clone()}, device_mode="cpu",
-                           roi=roi, roi_exec=True)
-    win = res.outputs["OUT"]
-    return res.cooked_roi, win, full
+    return windowed_vs_whole(code, image, roi, whole=True)
 
 
 def _make_frame(H, W, seed):
