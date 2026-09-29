@@ -19,10 +19,6 @@ from TEX_Wrangle import tex_engine
 from TEX_Wrangle import tex_engine_tiers as _tiers
 
 
-def _mk(seed_val=0.3):
-    return make_img(1, 8, 8, 4).fill_(seed_val) if hasattr(make_img(1, 8, 8, 4), "fill_") else None
-
-
 def test_scale47b_gauss_blur_sigma_scales(r: SubTestResult):
     print("\n--- SCALE-47b: gauss_blur's sigma is multiplied by scale (interpreter tier) ---")
     A = make_img(1, 16, 16, 4)
@@ -83,25 +79,19 @@ def test_scale47b_scale_none_is_byte_identical(r: SubTestResult):
         r.fail("invariant #7", "scale=None produced different pixels than omitting scale=")
 
 
-def test_scale47b_forces_interpreter_tier_and_records_it(r: SubTestResult):
-    """SCALECX-49 (v0.49) built SCALE-COMPILED-48: `_run_tier` no longer bounces a
-    scale-active cook to the interpreter for `compile_mode='torch_compile'` -- it dispatches
-    straight to `_run_torch_compile` (which keys its compiled artifact by an explicit
-    `scale` component; `test_scalecx49_compiled_graphed_scale.py` owns this feature's own
-    tests). This box has no torch.compile backend, so `execute_compiled` self-declines to
-    the plain interpreter for an UNRELATED, pre-existing reason (no backend, not "scale is
-    active") -- `tier_trace` genuinely has no record either way for that self-decline
-    (compiled.py's own no-backend path never calls `tier_trace.record`, see
-    test_tierq48_agreement.py's `_real_tier_and_roi_armed` docstring), so this test now
-    checks the cook still produces a correct picture instead of asserting a stale tier."""
+def test_scale47b_torch_compile_at_scale_matches_the_unscaled_equivalent(r: SubTestResult):
+    """`compile_mode='torch_compile'` at scale 0.5 must give the picture of the same program
+    with its pixel-space argument halved, cooked unscaled on the interpreter. On a box with no
+    torch.compile backend the route self-declines to the interpreter, so the row then checks
+    the scale rewrite alone; the compiled artifact's scale keying is
+    `test_scalecx49_compiled_graphed_scale.py`'s."""
     print("\n--- SCALECX-49 update: compile_mode='torch_compile' + scale=0.5 dispatches to "
           "its own tier, not the interpreter unconditionally ---")
     A = make_img(1, 8, 8, 4)
-    code = "@OUT = gauss_blur(@A, 2.0);"
-    out = tex_engine.cook(code, {"A": A.clone()}, device_mode="cpu",
+    out = tex_engine.cook("@OUT = gauss_blur(@A, 4.0);", {"A": A.clone()}, device_mode="cpu",
                           compile_mode="torch_compile", scale=0.5)
-    ref = tex_engine.cook(code, {"A": A.clone()}, device_mode="cpu",
-                         compile_mode="none", scale=0.5)
+    ref = tex_engine.cook("@OUT = gauss_blur(@A, 2.0);", {"A": A.clone()}, device_mode="cpu",
+                          compile_mode="none")
     md = (out.outputs["OUT"].float() - ref.outputs["OUT"].float()).abs().max().item()
     if md < 1e-5:
         r.ok(f"compile_mode='torch_compile' + scale=0.5 cooks correctly (maxdiff {md:.2e}) "
@@ -110,15 +100,10 @@ def test_scale47b_forces_interpreter_tier_and_records_it(r: SubTestResult):
         r.fail("scale tier bypass", f"maxdiff {md:.2e} >= 1e-5")
 
 
-def test_scale47b_never_dispatches_to_cuda_graph_tier(r: SubTestResult):
-    """SCALECX-49 (v0.49) built SCALE-COMPILED-48: `_run_tier` now DOES dispatch a
-    scale-active cook to the cuda_graph tier strategy (`run_graphed`), which keys its
-    captured graph by an explicit `scale` component so a capture at one scale can never
-    replay for a request at another (see test_scalecx49_compiled_graphed_scale.py's own
-    red-first capture-key mismatch test for the acceptance criterion this docstring used
-    to name -- "capture at 1.0, replay at 0.5 must not replay 1.0" is now proven at the
-    key-construction level, the mechanism that makes it impossible, rather than by
-    forbidding the strategy from running at all)."""
+def test_scale47b_scale_active_cook_reaches_the_cuda_graph_strategy(r: SubTestResult):
+    """`_run_tier(ctx, 'cuda_graph')` with a scale-active ctx calls the cuda_graph strategy
+    (it is not bounced to the interpreter). Its capture key carries `scale`, which
+    `test_scalecx49_compiled_graphed_scale.py` owns."""
     print("\n--- SCALECX-49 update: a scale-active cook DOES reach the cuda_graph tier "
           "strategy now ---")
     A = make_img(1, 8, 8, 4)

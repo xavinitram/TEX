@@ -521,12 +521,13 @@ def test_perf7_the_counter_is_not_inert(r: SubTestResult):
     with f:
         _ast.clone_tree(parse_and_split(src, {}))
         _roi._fold_program(src, {})
+        _roi._walk(src, {})
         _stdlib._tag_host_scalar(torch.zeros((), dtype=torch.float32), 0.5)
         _codegen.try_compile(program, type_map)
     seen = f.counts
     for row in _MUST_NOT_RUN:
-        if row in ("tex_roi:_walk", "tex_runtime/compiled:_params_on_device"):
-            continue     # driven by their own owners' suites; not reachable from here
+        if row == "tex_runtime/compiled:_params_on_device":
+            continue     # driven by its own owner's suite; not reachable from here
         n = seen.get(row, 0)
         if n > 0:
             r.ok(f"the counter sees {row} ({n}): the zero pinned above is not vacuous")

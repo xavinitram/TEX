@@ -414,15 +414,18 @@ def test_pub1_no_shipped_module_imports_an_ignored_directory(r: SubTestResult):
                                 "module that lives in one)")
             # `TEX_Wrangle.tests.x` / `from TEX_Wrangle.benchmarks import`
             for node in ast.walk(tree):
-                mod = None
+                mods = []
                 if isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                    mod = node.module
-                elif isinstance(node, ast.Import):
-                    mod = ".".join(a.name for a in node.names)
-                if mod and mod.startswith("TEX_Wrangle."):
-                    nxt = mod.split(".")[1]
-                    if nxt in ignored_dirs:
-                        hits.append(f"{rel}:{node.lineno}: imports `{mod}`")
+                    mods = [node.module]
+                    if node.module == "TEX_Wrangle":       # `from TEX_Wrangle import benchmarks`
+                        mods = [f"TEX_Wrangle.{a.name}" for a in node.names]
+                elif isinstance(node, ast.Import):         # `import os, TEX_Wrangle.benchmarks`
+                    mods = [a.name for a in node.names]
+                for mod in mods:
+                    if mod.startswith("TEX_Wrangle."):
+                        nxt = mod.split(".")[1]
+                        if nxt in ignored_dirs:
+                            hits.append(f"{rel}:{node.lineno}: imports `{mod}`")
         if hits:
             r.fail("PUB-1 ignored-directory import", "\n  ".join(hits))
         else:
