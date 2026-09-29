@@ -540,7 +540,10 @@ _NOT_AN_ESCAPE_HATCH = {
 
 def _switches_in(text: str, heading: str) -> set:
     """Every environment switch named under *heading*, to the next `## ` heading."""
-    body = text.split(heading, 1)[-1].split("\n## ", 1)[0]
+    head, sep, rest = text.partition(heading)
+    if not sep:
+        return set()                     # heading gone: let the caller's empty-set guard fire
+    body = rest.split("\n## ", 1)[0]
     return set(re.findall(r"\b(?:TEX|TORCHINDUCTOR)_[A-Z][A-Z0-9_]*", body))
 
 

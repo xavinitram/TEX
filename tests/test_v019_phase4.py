@@ -129,6 +129,7 @@ def test_p4_memo_key_is_cook_fingerprint(r: SubTestResult):
     from TEX_Wrangle.tex_memory import is_tile_safe_cached, _tile_safe_memo
     from TEX_Wrangle.tex_runtime.compiled import should_stencil_route, _stencil_route_memo
     _tile_safe_memo.clear()
+    _stencil_route_memo.clear()    # a common program text: other tests may have memoized it
     code = "@OUT = vec4(@A.rgb * 0.5, 1.0);"
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
     prog = tex_api.compile(code, bt)

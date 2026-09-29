@@ -30,7 +30,13 @@ def test_dbg1_perf_hud_payload(r: SubTestResult):
     code = "@OUT = vec4(@A.rgb * 1.1, 1.0);"
 
     # (a) tuple path unchanged when v3 is absent (additive-only: no ui leaks in)
-    tup = TN.TEXWrangleNode.execute(code=code, A=img, device="cpu")
+    # (forced absent, so an embedding host that has the v3 API does not change the shape)
+    saved_v3 = TN._V3_AVAILABLE
+    TN._V3_AVAILABLE = False
+    try:
+        tup = TN.TEXWrangleNode.execute(code=code, A=img, device="cpu")
+    finally:
+        TN._V3_AVAILABLE = saved_v3
     if not isinstance(tup, tuple):
         r.fail("DBG-1 tuple path", f"expected tuple with v3 absent, got {type(tup).__name__}")
         return
@@ -670,7 +676,11 @@ def test_lx5_json_nan_safe(r: SubTestResult):
     S.fn_debug_print("scalar_nan", float("nan"))
     S.fn_debug_print("scalar_inf", float("inf"))
     S.fn_debug_print("tensor_nan", torch.full((1, 4, 4, 3), float("nan")), 0, 0)
-    payload = {"tex_probes": tier_trace.get_probes()}
+    probes = tier_trace.get_probes()
+    if len(probes) != 3 or probes[0]["value"] is not None or probes[2]["value"] != [None] * 3:
+        r.fail("LX-5 probes recorded", f"expected 3 sanitized probes, got {probes}")
+        return
+    payload = {"tex_probes": probes}
     try:
         json.dumps(payload, allow_nan=False)  # strict JSON: raises on NaN/Infinity tokens
         r.ok("non-finite probe values sanitized to null; payload is strict-JSON valid")

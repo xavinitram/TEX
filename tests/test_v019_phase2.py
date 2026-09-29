@@ -30,17 +30,8 @@ _ANY_COMFY_RE = re.compile(
 
 def test_s1_core_no_comfy(r: SubTestResult):
     print("\n--- S-1: the core imports no ComfyUI (tex_core boundary lint) ---")
-    offenders = []
-    for path in _PKG.rglob("*.py"):
-        rel = path.relative_to(_PKG).as_posix()
-        if rel in _HOST_FILES or rel.startswith(("tests/", "benchmarks/", "tools/")):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        for m in _ANY_COMFY_RE.finditer(text):
-            offenders.append(f"{rel}:{text[:m.start()].count(chr(10)) + 1}")
+    offenders = [o for o in lint_sources(_ANY_COMFY_RE.pattern, allow=_HOST_FILES, flags=re.M)
+                 if not o.startswith(("benchmarks/", "tools/"))]
     if offenders:
         r.fail("S-1 core boundary", "ComfyUI imported in a CORE module (belongs in the "
                "host layer — tex_node/__init__/host.py): " + ", ".join(offenders))
@@ -154,7 +145,8 @@ def test_s4_validate_hw_runs(r: SubTestResult):
     from TEX_Wrangle import tex_validate_hw as vh
     if torch.cuda.is_available():
         # The heavy CUDA lanes were exercised live this session; re-running ~40s of A/B
-        # timing inside the suite every run isn't worth it. Assert the driver is callable.
+        # timing inside the suite every run isn't worth it. Only the entry point is checked.
+        assert callable(vh.run_validation_hw), "validate-hw driver is not callable"
         r.skip("S-4 validate-hw run",
                "CUDA is present, and the heavy lanes are ~40s of A/B timing per run")
         return
