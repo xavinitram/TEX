@@ -634,9 +634,6 @@ def measure(prog: BenchmarkProgram, B: int, H: int, W: int,
         n = 0
         while n < MAX_RUNS:
             gc.collect()
-            tracemalloc.start()
-            mem0 = tracemalloc.get_traced_memory()[1]
-
             t0 = time.perf_counter()
             if cache_mode == "cold":
                 tc = time.perf_counter()
@@ -653,15 +650,24 @@ def measure(prog: BenchmarkProgram, B: int, H: int, W: int,
             if sync: sync()
             interp_t.append((time.perf_counter() - ti) * 1000)
             total_t.append((time.perf_counter() - t0) * 1000)
-
-            mem_peak = tracemalloc.get_traced_memory()[1]
-            tracemalloc.stop()
             n += 1
 
             if n >= MIN_RUNS:
                 mu = statistics.mean(total_t)
                 if mu > 0 and statistics.stdev(total_t) / mu < TARGET_CV:
                     break
+
+        # Python-side allocation peak from one UNTIMED extra run: tracemalloc hooks every
+        # allocation, so it must never be active inside a timed region. Tensor storage is
+        # invisible to it; this is Python object churn only.
+        gc.collect()
+        tracemalloc.start()
+        mem0 = tracemalloc.get_traced_memory()[1]
+        run_interpreter(program, bindings, type_map, device,
+                        output_names, precision, used)
+        if sync: sync()
+        mem_peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
 
         total_t.sort(); interp_t.sort(); comp_t.sort()
         mu = statistics.mean(total_t)

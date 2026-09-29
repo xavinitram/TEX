@@ -2,11 +2,10 @@
 """
 HW-3 — Triton-present validation (self-gating).
 
-The torch.compile / auto tiers only give a GPU speedup with Triton, which is ABSENT on
-this box (and most Windows installs). This script is the CC-2 COMMIT path: on a box where
-Triton IS present it drives the compile tier through parity + timing checks and emits a
-JSON verdict artifact that feeds the v0.19 roadmap with *measured* rows. Here (no Triton)
-it SKIPs cleanly — it must never fail for lack of Triton.
+The torch.compile / auto tiers only give a GPU speedup with Triton, which most Windows
+installs lack. Without Triton this script SKIPs cleanly and must never fail for lack of it.
+With Triton it currently emits a "not-implemented" verdict: the parity and timing checks
+are not written yet, so it must not be read as a measurement.
 
     python benchmarks/triton_validation.py            # runs where Triton exists, else SKIPs
 """
@@ -28,11 +27,11 @@ def has_triton() -> bool:
 
 
 def run_validation() -> dict:
-    """Triton-present path: compile-tier parity + timing + max-autotune A/B. Structured
-    so a Triton box fills the verdict; the checks degrade to 'unmeasured' if a step is
-    unavailable, never raising."""
+    """Triton-present path. No check is executed yet: the verdict says
+    "not-implemented" (never "ran") so no consumer reads a stub as a green result."""
     import torch
-    verdict = {"triton": True, "status": "ran", "cuda": bool(torch.cuda.is_available())}
+    verdict = {"triton": True, "status": "not-implemented",
+               "cuda": bool(torch.cuda.is_available())}
     if not torch.cuda.is_available():
         verdict["status"] = "no-cuda"
         return verdict
@@ -40,10 +39,10 @@ def run_validation() -> dict:
         from run_benchmarks import (SYNTHETIC_PROGRAMS, generate_bindings,
                                     compile_program, run_interpreter)  # noqa: F401
         from TEX_Wrangle.tex_runtime.compiled import execute_compiled  # noqa: F401
-        # A Triton box would: (1) force compile_mode=torch_compile, (2) assert codegen
-        # parity vs interpreter (tol 1e-5), (3) time compile vs interpreter, (4) A/B
-        # max-autotune-no-cudagraphs (adopt only on >=1.2x). Left as the measured hook.
-        verdict["compile_parity"] = "unmeasured (fill on a Triton box)"
+        # To implement: (1) force compile_mode=torch_compile, (2) assert codegen parity
+        # vs interpreter (tol 1e-5), (3) time compile vs interpreter, (4) A/B
+        # max-autotune-no-cudagraphs (adopt only on >=1.2x).
+        verdict["compile_parity"] = "unmeasured"
         verdict["max_autotune_speedup"] = None
     except Exception as e:
         verdict["status"] = f"error: {type(e).__name__}: {e}"
