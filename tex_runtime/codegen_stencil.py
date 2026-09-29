@@ -30,6 +30,7 @@ class _StencilInfo:
     y_radius: int | ASTNode | None = None
     x_radius: int | ASTNode | None = None
     is_symmetric: bool = False
+    float_counter: bool = False  # a runtime radius must then be integer-valued (codegen)
     # For asymmetric static ranges only:
     dy_start: int | None = None
     dy_stop: int | None = None   # exclusive
@@ -639,7 +640,7 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
             dx_start=dx_start,
             dx_stop=dx_stop,
             accum_var=accum_var,
-            count_var=inner_count_var,   # outer-counter case is declined above (has_unknown)
+            count_var=inner_count_var,   # outer counters decline in the outer-body scan
         )
 
     if minmax_info is not None and not has_unknown:
@@ -717,7 +718,7 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
                     dx_start=dx_start,
                     dx_stop=dx_stop,
                     array_vars=array_chan_pairs,
-                    count_var=inner_count_var,   # outer-counter case is declined above (has_unknown)
+                    count_var=inner_count_var,   # outer counters decline in the outer-body scan
                 )
 
     return None
@@ -856,7 +857,7 @@ def _extract_linear_weights(expr: ASTNode, tap_vars: dict[str, tuple[int, int]]
                             ) -> dict[tuple[int, int], float] | None:
     """Extract linear combination weights from an expression.
 
-    tap_vars maps variable names to (dx, dy) offsets.
+    tap_vars maps variable names to (dy, dx) offsets.
     Returns {(dy, dx): weight} or None if not a linear combination.
     """
     weights: dict[tuple[int, int], float] = {}
@@ -885,7 +886,7 @@ def _extract_linear_weights(expr: ASTNode, tap_vars: dict[str, tuple[int, int]]
         if isinstance(node, UnaryOp) and node.op == "-":
             return _extract(node.operand, -scale)
 
-        # Parenthesized expression or other — not a simple linear combination
+        # Any other expression is not a simple linear combination
         return False
 
     if _extract(expr, 1.0):
@@ -919,7 +920,8 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
 
     Looks for a cluster of VarDecl/Assignment statements that fetch/sample from
     the same binding at constant offsets, followed by a VarDecl/Assignment that
-    combines them linearly. Emits a conv2d stencil.
+    combines them linearly. Returns a _StencilInfo describing the cluster; emission
+    happens in codegen.py.
 
     Returns a _StencilInfo with kind="conv2d" or None.
     """
@@ -944,9 +946,7 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
             var_name = stmt.name
             init_expr = stmt.initializer
         elif isinstance(stmt, Assignment) and isinstance(stmt.target, Identifier):
-            # Also handle `gx += luma(fetch(...)) * weight` patterns
-            # For now, only simple VarDecl fetch assignments
-            break
+            break  # only `float g = <fetch>` declarations start a cluster
         else:
             break
 

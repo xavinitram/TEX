@@ -45,13 +45,30 @@ from __future__ import annotations
 from ..tex_compiler.ast_nodes import (
     ArrayDecl, ArrayIndexAccess, Assignment, BindingIndexAccess, BindingRef, BreakStmt,
     ChannelAccess, ContinueStmt, ExprStatement, ForLoop, FunctionDef, Identifier, IfElse,
-    ParamDecl, ReturnStmt, VarDecl, WhileLoop, try_extract_static_range,
+    ParamDecl, ReturnStmt, VarDecl, WhileLoop, collect_assigned_vars, try_extract_static_range,
 )
 
 __all__ = ["MaskedEmitMixin"]
 
 #: The name the generated source binds its `masked_flow.CgFlow` to.
 _STATE = "_mf"
+
+
+def _for_header_names(stmts) -> set[str]:
+    """Env names a for-loop header (init or update) assigns, at any depth.
+
+    `collect_assigned_vars` walks loop bodies only, so a hoisted local written by a header
+    inside a shared arm closure would get no `nonlocal` and bind a closure-local instead."""
+    out: set[str] = set()
+    for s in stmts or ():
+        if isinstance(s, ForLoop):
+            out |= collect_assigned_vars([h for h in (s.init, s.update) if h is not None])[0]
+            out |= _for_header_names(s.body)
+        elif isinstance(s, WhileLoop):
+            out |= _for_header_names(s.body)
+        elif isinstance(s, IfElse):
+            out |= _for_header_names(s.then_body) | _for_header_names(s.else_body)
+    return out
 
 
 def _root_of(target):
@@ -194,10 +211,12 @@ class MaskedEmitMixin:
         are dict mutations (free variables, no declaration needed at any nesting depth),
         and a env var hoisted to a raw Python local (`self._local_vars`) needs `nonlocal`
         to write through the closure boundary — see the docstring on
-        `_mf_emit_function_def`'s new pre-declaration for why that is always resolvable."""
+        the CODEGENT6 pre-declaration comment in `_mf_emit_function_def` for why that is always
+        resolvable."""
         self._mf_cont_counter += 1
         fn_name = f"_mfc{self._mf_cont_counter}"
         env_mods, _bind_mods = self._collect_modified_vars(stmts) if stmts else (set(), set())
+        env_mods = env_mods | _for_header_names(stmts)
         nonlocal_pyvars = sorted({self._local_vars[n] for n in env_mods if n in self._local_vars})
         self._emit(f"def {fn_name}():")
         self._indent += 1
@@ -395,8 +414,9 @@ class MaskedEmitMixin:
         loop_var, start, stop, step = static_range
         # range(start, stop, step), exactly as the interpreter iterates it.
         n = len(range(start, stop, step))
-        if n > 1024:
-            self._emit("raise RuntimeError('For loop would exceed 1024 iterations')")
+        from .interpreter import MAX_LOOP_ITERATIONS
+        if n > MAX_LOOP_ITERATIONS:
+            self._emit(f"raise RuntimeError('For loop would exceed {MAX_LOOP_ITERATIONS} iterations')")
             return
         if n == 0:
             self._emit("pass")  # the body never runs; the prologue's `try:` needs a statement
@@ -417,7 +437,7 @@ class MaskedEmitMixin:
             if vname != loop_var and saved_locals[vname] is None:
                 self._emit(f"{self._local_vars[vname]} = _env.get({vname!r})")
 
-        self._setup_tensor_loop(start, stop, step)
+        self._setup_tensor_loop(start, stop, step, stmt.body, loop_var)
         vals_tmp = self._range_cache[(start, stop, step)]
 
         # M3.5: the loop-header counter is declared BY the loop, so it stays uniform —
@@ -541,7 +561,7 @@ class MaskedEmitMixin:
         params_str = ", ".join(params + ["_depth=0"])
         self._emit(f"def _uf_{stmt.name}({params_str}):")
         self._indent += 1
-        self._emit(f"if _depth > {MAX_CALL_DEPTH}: raise RuntimeError("
+        self._emit(f"if _depth >= {MAX_CALL_DEPTH}: raise RuntimeError("
                    f"'Maximum function call depth exceeded in {stmt.name}()')")
 
         saved_locals = self._local_vars
@@ -551,7 +571,7 @@ class MaskedEmitMixin:
         body_vars, _ = self._collect_modified_vars(stmt.body)
         for vname in sorted(body_vars):
             if vname not in self._local_vars:
-                self._local_vars[vname] = f"_uf_lv_{vname}"
+                self._local_vars[vname] = f"_ufl_{vname}"  # never `_uf_<x>`: that names a function
 
         saved_in_fn = self._in_user_function
         self._in_user_function = True

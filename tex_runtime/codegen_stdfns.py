@@ -7,13 +7,32 @@ from `codegen.py` as a mixin. Every handler uses only `self.*` state, so mixing
 The `@_emits` decorator + `_EMIT_DISPATCH` registry live here (co-located with the
 handlers they register); `codegen.py` imports the registry to build `_fn_dispatch`.
 """
+import math
+
+import torch
+
 from ..tex_compiler.ast_nodes import BindingRef, FunctionCall, NumberLiteral
+from .stdlib_core import ZERO_GUARD_EPS
 
 
 _IMG_REDUCE_OPS = {
     "img_sum": "sum", "img_mean": "mean",
     "img_min": "amin", "img_max": "amax",
 }
+
+
+def _num_src(value) -> str:
+    """Python source for a numeric literal: its repr, or `float('inf')`/`float('nan')`,
+    since a bare `inf`/`nan` is an undefined name in the generated module."""
+    v = float(value)
+    return repr(v) if math.isfinite(v) else f"float({repr(v)!r})"
+
+
+def _eps_src(x: str) -> str:
+    """Source for the interpreter's epsilon guard of `x`'s dtype (`stdlib_math._eps`):
+    `_SAFE_EPS`, or the fp16-representable one where 1e-8 would round to 0."""
+    fp16 = ZERO_GUARD_EPS[torch.float16]
+    return f"({fp16!r} if getattr({x}, 'dtype', None) is _torch.float16 else _SAFE_EPS)"
 
 
 _EMIT_DISPATCH: dict[str, str] = {}  # STR-6: stdlib name -> _CodeGen handler attr
@@ -57,69 +76,14 @@ class _EmitStdFnsMixin:
                 self._emit(f"{sq} = {args[0]} * {args[0]}")
                 self._emit(f"{tmp} = {sq} * {args[0]}")
                 return tmp
-            # Only x^{0,1,2,3} have a bit-exact closed form. EVERY other constant
-            # exponent must defer to the interpreter's fn_pow (the general dispatch
-            # below), never a local specialization:
-            #  - the old rsqrt(clamp)/reciprocal(+eps) forms for -0.5/-1/-2 FLIPPED
-            #    finiteness on x<=0 and diverged by up to 8e-3 (a nightly-class
-            #    interp!=codegen bug), and (x*x)*(x*x) for 4.0 lost ~8e-6;
-            #  - even a plain _torch.pow(x, <python-float exp>) diverges from fn_pow's
-            #    torch.pow(x, _to_tensor(exp)) — the scalar-exponent kernel rounds
-            #    differently (~3.7e-9 on 0.5/-0.5).
-            # (pow(x, 0.5) was already correctly deferred here; matches optimizer.py:364.)
+            # Only x^{0,1,2,3} have a bit-exact closed form; any other constant exponent
+            # defers to fn_pow, since even torch.pow with a Python-float exponent rounds
+            # differently from fn_pow's tensor exponent. Mirrors the pow folding in
+            # optimizer.py.
         # Non-{0,1,2,3} constant OR a variable exponent: fall through to the general
         # path, which calls the SAME _fns['pow'] (fn_pow) the interpreter uses — so
         # codegen stays bit-exact with the interpreter for every exponent.
         return None
-
-    @_emits("max", "min")
-    def _emit_fn_minmax(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit max/min with clamp specializations and nested-clamp detection."""
-        if len(args) != 2:
-            return None
-        name = node.name
-        # Detect min(max(x, lo), hi) or max(min(x, hi), lo) → torch.clamp
-        inner_name = "max" if name == "min" else "min"
-        for outer_const_idx in (0, 1):
-            if not isinstance(node.args[outer_const_idx], NumberLiteral):
-                continue
-            inner_idx = 1 - outer_const_idx
-            inner_node = node.args[inner_idx]
-            if (isinstance(inner_node, FunctionCall)
-                    and inner_node.name == inner_name
-                    and len(inner_node.args) == 2):
-                for inner_const_idx in (0, 1):
-                    if isinstance(inner_node.args[inner_const_idx], NumberLiteral):
-                        inner_val_idx = 1 - inner_const_idx
-                        if name == "min":
-                            lo = inner_node.args[inner_const_idx].value
-                            hi = node.args[outer_const_idx].value
-                        else:
-                            hi = inner_node.args[inner_const_idx].value
-                            lo = node.args[outer_const_idx].value
-                        # torch.clamp(x, lo, hi) only equals the nested
-                        # max(min(x,hi),lo) when lo<=hi. With inverted bounds
-                        # clamp returns hi while the nested form returns lo, so
-                        # fall through to the plain maximum/minimum composition.
-                        if lo > hi:
-                            continue
-                        inner_arg = self._emit_expr(inner_node.args[inner_val_idx])
-                        self._emit(f"{tmp} = _torch.clamp({inner_arg}, {lo}, {hi})")
-                        return tmp
-        # Single constant arg → clamp_min/clamp_max
-        clamp_fn = "clamp_min" if name == "max" else "clamp_max"
-        if isinstance(node.args[1], NumberLiteral):
-            self._emit(f"{tmp} = _torch.{clamp_fn}({args[0]}, {node.args[1].value})")
-            return tmp
-        if isinstance(node.args[0], NumberLiteral):
-            self._emit(f"{tmp} = _torch.{clamp_fn}({args[1]}, {node.args[0].value})")
-            return tmp
-        # No constant → standard torch.maximum/minimum
-        torch_fn = "maximum" if name == "max" else "minimum"
-        self._emit(f"{tmp} = _torch.{torch_fn}({args[0]}, {args[1]})")
-        return tmp
 
     @_emits("lerp")
     def _emit_fn_lerp(
@@ -161,11 +125,11 @@ class _EmitStdFnsMixin:
         if name == "sqrt":
             self._emit(f"{tmp} = _torch.sqrt(_torch.clamp({args[0]}, min=0.0))")
         elif name == "log":
-            self._emit(f"{tmp} = _torch.log(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            self._emit(f"{tmp} = _torch.log(_torch.clamp({args[0]}, min={_eps_src(args[0])}))")
         elif name == "log2":
-            self._emit(f"{tmp} = _torch.log2(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            self._emit(f"{tmp} = _torch.log2(_torch.clamp({args[0]}, min={_eps_src(args[0])}))")
         elif name == "log10":
-            self._emit(f"{tmp} = _torch.log10(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            self._emit(f"{tmp} = _torch.log10(_torch.clamp({args[0]}, min={_eps_src(args[0])}))")
         elif name == "fract":
             self._emit(f"{tmp} = {args[0]} - _torch.floor({args[0]})")
         elif name == "isnan":
@@ -210,7 +174,7 @@ class _EmitStdFnsMixin:
         elif name == "distance" and len(args) == 2:
             self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]} - {args[1]}, dim=-1)")
         elif name == "normalize" and len(args) == 1:
-            self._emit(f"{tmp} = {args[0]} / (_torch.linalg.vector_norm({args[0]}, dim=-1, keepdim=True) + _SAFE_EPS)")
+            self._emit(f"{tmp} = {args[0]} / (_torch.linalg.vector_norm({args[0]}, dim=-1, keepdim=True) + {_eps_src(args[0])})")
         elif name == "length" and len(args) == 1:
             self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]}, dim=-1)")
         elif name == "cross" and len(args) == 2:
@@ -236,27 +200,28 @@ class _EmitStdFnsMixin:
                 # Both bounds constant: the scalar torch.clamp overload (one kernel),
                 # matching fn_clamp's Python-number fast path.
                 self._emit(f"{tmp} = _torch.clamp({args[0]}, "
-                           f"{node.args[1].value}, {node.args[2].value})")
+                           f"{_num_src(node.args[1].value)}, {_num_src(node.args[2].value)})")
             else:
                 # Mixed/spatial bounds: torch.clamp rejects a (Tensor, scalar, Tensor)
                 # combo, so a program with one tensor bound used to fall back to the
                 # interpreter (correct but no codegen). clamp_min().clamp_max() accepts
                 # scalar OR tensor bounds and is BIT-IDENTICAL to fn_clamp's spatial
                 # torch.minimum(torch.maximum(x, lo), hi) (clamp == min(max(...)), exact).
-                lo = node.args[1].value if lo_const else args[1]
-                hi = node.args[2].value if hi_const else args[2]
+                lo = _num_src(node.args[1].value) if lo_const else args[1]
+                hi = _num_src(node.args[2].value) if hi_const else args[2]
                 self._emit(f"{tmp} = {args[0]}.clamp_min({lo}).clamp_max({hi})")
         elif name == "step" and len(args) == 2:
-            threshold = node.args[0].value if isinstance(node.args[0], NumberLiteral) else args[0]
+            threshold = (_num_src(node.args[0].value) if isinstance(node.args[0], NumberLiteral)
+                         else args[0])
             self._emit(f"{tmp} = ({args[1]} >= {threshold}).float()")
         elif name == "smoothstep" and len(args) == 3:
-            num, den = self._emit_bp(f"{args[2]} - {args[0]}", f"{args[1]} - {args[0]} + _SAFE_EPS")
+            num, den = self._emit_bp(f"{args[2]} - {args[0]}", f"{args[1]} - {args[0]} + {_eps_src(args[2])}")
             tt = self._tmp()
             self._emit(f"{tt} = _torch.clamp({num} / {den}, 0.0, 1.0)")
             self._emit(f"{tmp} = {tt} * {tt} * (3.0 - 2.0 * {tt})")
         elif name == "fit" and len(args) == 5:
             tt = self._tmp()
-            self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + _SAFE_EPS)")
+            self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + {_eps_src(args[0])})")
             # fused lerp (interp fn_fit uses _lerp_f32(n_min, n_max, t)) — see _cg_lerp
             self._emit(f"{tmp} = _lerp({args[3]}, {args[4]}, {tt})")
         else:
@@ -282,11 +247,12 @@ class _EmitStdFnsMixin:
             at = self._tmp()
             self._emit(f"{at} = _torch.abs({args[0]})")
             mask = self._tmp()
-            self._emit(f"{mask} = {at} < _SAFE_EPS")
-            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), _torch.sign({args[0]}) * _torch.pow(_torch.clamp({at}, min=_SAFE_EPS), {args[1]}))")
+            eps = _eps_src(args[0])
+            self._emit(f"{mask} = {at} < {eps}")
+            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), _torch.sign({args[0]}) * _torch.pow(_torch.clamp({at}, min={eps}), {args[1]}))")
         elif name == "sdiv" and len(args) == 2:
             mask = self._tmp()
-            self._emit(f"{mask} = _torch.abs({args[1]}) < _SAFE_EPS")
+            self._emit(f"{mask} = _torch.abs({args[1]}) < {_eps_src(args[1])}")
             self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), {args[0]} / _tw({mask}, _torch.ones_like({args[1]}), {args[1]}))")
         elif name == "smin" and len(args) == 3:
             h = self._tmp()
@@ -398,32 +364,9 @@ class _EmitStdFnsMixin:
             py = self._tmp()
             self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
             self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
-            # B=1 fast path: direct indexing, batch dim kept explicitly.
-            #
-            # TRK-5/FIX-4: the old form indexed the batch axis with a bare `0`
-            # (basic indexing, which REMOVES that axis) and left `px`/`py` as
-            # whatever rank the caller happened to hand in. That is only safe
-            # when both coordinates have already had their own leading batch
-            # dim stripped (the old `else` sub-case's `py[0]`/`px[0]`) — the
-            # advanced-index broadcast then rebuilds exactly the plain [H,W]
-            # grid, and reinserting one dim via a `0:1` slice (instead of the
-            # dim-removing `0`) correctly restores rank-4 [1,H,W,C], bit-exact
-            # with the interpreter's `fn_fetch`.
-            #
-            # The old `if px.dim() < 3` sub-case did NOT strip a leading dim
-            # first: when only `px` is scalar/degenerate (e.g. `sx` in a
-            # `for` loop, `iy` still `[1,H,1]`), `py` still carries its OWN
-            # leading singleton, and a `0:1` slice there would stack a
-            # SECOND leading dim on top of it (rank-5), not restore rank-4.
-            # `examples/break_search.tex` is exactly this shape.
-            #
-            # `.expand(1, H, W)` — mirroring `fn_fetch`'s own scalar-coordinate
-            # sub-case (`stdlib.py`'s `px_i.expand(1, H, W)` /
-            # `img[0, py_i[0], px_i[0]].unsqueeze(0)`) — sidesteps both
-            # failure modes at once: it is a no-op broadcast view (not a
-            # copy) on an already-correct [1,H,W]-or-narrower coordinate
-            # tensor, so it changes no value, only makes both sub-cases use
-            # the identical, always-rank-correct shape before indexing.
+            # B=1: expand both coordinates to (1, H, W) first, as stdlib_sample's fn_fetch
+            # does, so a 0-dim counter beside a [1,H,1] `iy` indexes the full grid and
+            # the result is rank-4 [1,H,W,C].
             self._emit(f"if {img_var}.shape[0] == 1:")
             self._indent += 1
             px_full = self._tmp()
@@ -434,6 +377,9 @@ class _EmitStdFnsMixin:
             self._indent -= 1
             self._emit(f"else:")
             self._indent += 1
+            # A 0-dim or [H,W] coordinate spans the frame, as fn_fetch's _expand_to_bhw does.
+            for c in (px, py):
+                self._emit(f"if {c}.dim() in (0, 2): {c} = {c}.expand(*{img_var}.shape[:3])")
             self._emit(f"{tmp} = {img_var}[_torch.arange({img_var}.shape[0], device=_dev).view(-1,1,1), {py}, {px}]")
             self._indent -= 1
             return tmp

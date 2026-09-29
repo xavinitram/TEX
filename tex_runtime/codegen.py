@@ -19,7 +19,6 @@ from __future__ import annotations
 import math
 import os
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -38,7 +37,7 @@ from ..tex_compiler.ast_nodes import (
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
 from .codegen_masked import MaskedEmitMixin
-from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin
+from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin, _num_src
 from .codegen_stencil import (
     _StencilInfo, _ast_equal, _is_ident, _try_detect_stencil, _try_detect_inline_stencil, detect_stencil_route,
 )
@@ -97,7 +96,8 @@ _CMP_OPS = {
 
 
 from .codegen_persist import (
-    _cg_filename, _register_codegen_linecache, _codegen_exec_namespace, materialize_codegen,
+    _cg_filename, _register_codegen_linecache, _codegen_exec_namespace,
+    materialize_codegen,  # re-exported: the STR-7 split keeps the old import path
 )
 
 
@@ -539,6 +539,8 @@ _INLINE_TORCH_1ARG: dict[str, str] = {
 }
 
 # 2-arg torch functions: fn(a, b) -> torch.XXX(a, b)
+# max/min emit the interpreter's own maximum/minimum, never a clamp: on a tie clamp keeps x
+# while maximum/minimum pick an operand by kernel and layout, so a signed zero would differ.
 _INLINE_TORCH_2ARG: dict[str, str] = {
     "max": "maximum", "min": "minimum",
     "atan2": "atan2", "hypot": "hypot",
@@ -692,6 +694,18 @@ def _body_has_break_continue(stmts: list[ASTNode], kinds=(BreakStmt, ContinueStm
 
 
 
+def _indexes_arrays_by(stmts: list[ASTNode], name: str) -> bool:
+    """Does an array element access in `stmts` use the bare variable `name` as its index?"""
+    stack = list(stmts)
+    while stack:
+        n = stack.pop()
+        if (isinstance(n, ArrayIndexAccess) and isinstance(n.index, Identifier)
+                and n.index.name == name):
+            return True
+        stack.extend(_ast_iter_child_nodes(n))
+    return False
+
+
 def _is_zero_literal(node: ASTNode | None) -> bool:
     """True iff `node` is the literal 0 (a counter provably entering a nest at zero)."""
     return isinstance(node, NumberLiteral) and node.value == 0
@@ -714,61 +728,6 @@ def _resolve_through_locals(expr: ASTNode, local_defs: dict[str, ASTNode]) -> AS
     return expr
 
 
-def _extract_uv_offset_expr(expr: ASTNode, base: str) -> ASTNode | bool | None:
-    """Extract the pixel-offset expression from `base + expr * px` or `base + expr / iw`.
-
-    Returns:
-      True if expr is just `base` (zero offset)
-      ASTNode for the offset expression (to be emitted as code)
-      None if pattern doesn't match
-    """
-    if _is_ident(expr, base):
-        return True  # zero offset
-    if not isinstance(expr, BinOp) or expr.op not in ("+", "-"):
-        return None
-    if not _is_ident(expr.left, base):
-        return None
-    rhs = expr.right
-    px_var = "px" if base == "u" else "py"
-    dim_var = "iw" if base == "u" else "ih"
-
-    # u + expr * px  or  u + px * expr
-    if isinstance(rhs, BinOp) and rhs.op == "*":
-        if _is_ident(rhs.right, px_var):
-            offset = rhs.left
-        elif _is_ident(rhs.left, px_var):
-            offset = rhs.right
-        else:
-            return None
-        # Handle float(expr) cast
-        if isinstance(offset, CastExpr) and offset.target_type == "float":
-            offset = offset.expr
-        if expr.op == "-":
-            return UnaryOp(op="-", operand=offset, loc=expr.loc)
-        return offset
-
-    # u + expr / iw
-    if isinstance(rhs, BinOp) and rhs.op == "/":
-        if _is_ident(rhs.right, dim_var):
-            offset = rhs.left
-            if isinstance(offset, CastExpr) and offset.target_type == "float":
-                offset = offset.expr
-            if expr.op == "-":
-                return UnaryOp(op="-", operand=offset, loc=expr.loc)
-            return offset
-
-    # u + px (offset = 1) or u - px (offset = -1)
-    if _is_ident(rhs, px_var):
-        if expr.op == "-":
-            return NumberLiteral(value=-1.0, loc=expr.loc)
-        return NumberLiteral(value=1.0, loc=expr.loc)
-
-    return None
-
-
-
-
-
 class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
     """Generates Python source code from a TEX AST."""
 
@@ -780,13 +739,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._lines: list[str] = []
         self._preamble: list[str] = []  # hoisted constant assignments
         self._indent = 1  # Start at 1 (inside function body)
-        self._const_cache: dict[float, str] = {}  # value → variable name
+        self._const_cache: dict[str, tuple] = {}  # literal source → (value, variable name)
         # PERF-2: set when the program calls a builtin that resolves an argument to a
         # host number, which is the only case where tagging the hoisted constants buys
         # anything. Every other program's emitted source stays byte-identical.
         self._tag_consts = False
-        self._vec_const_cache: dict[tuple, str] = {}  # (v1, v2, ...) → variable name
+        self._vec_const_cache: dict[str, str] = {}  # component source → variable name
         self._range_cache: dict[tuple, str] = {}  # (start, stop, step) → variable name
+        self._tagged_ranges: set[tuple] = set()  # ranges whose values carry a host tag
         self._kernel_const_cache: dict[tuple, str] = {}  # (kvals, kH, kW) → base kernel var
         # TEX local vars whose current tensor is exclusively owned (no live alias)
         # at this straight-line emission point — lets index/channel writes skip the
@@ -826,9 +786,6 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._user_functions: set[str] = set()
         # Track if we're inside a user function body (for return statements)
         self._in_user_function: bool = False
-        # Variables eligible for in-place mutation in the current loop.
-        # Maps TEX var name → operator (e.g., "acc" → "+").
-        # Set by _emit_for_loop, consumed by _emit_assignment.
         # Declared vector types per variable name (for channel coercion)
         self._var_vec_type: dict[str, TEXType] = {}
         # Hoisted BCHW images for inline sample(): binding_name → (bchw_var, grid_var).
@@ -863,12 +820,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # When True, emit Python float math instead of tensor ops.
         # Set by _emit_for_loop when the entire loop body is scalar-typed.
         self._scalar_loop: bool = False
-        # Dispatch table: function name → handler method for tensor-path
-        # specializations.  Each handler has signature
-        #   (node: FunctionCall, args: list[str], tmp: str) -> str | None
-        # STR-6: dispatch table built from the co-located @_emits decorators
-        # (see _EMIT_DISPATCH). Handler signature:
-        #   (node: FunctionCall, args: list[str], tmp: str) -> str | None
+        # Tensor-path specialization handlers, built from the @_emits registry
+        # (_EMIT_DISPATCH); signature (node, args, tmp) -> str | None.
         self._fn_dispatch: dict[str, object] = {
             name: getattr(self, attr) for name, attr in _EMIT_DISPATCH.items()
         }
@@ -946,29 +899,19 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         """
         return "ix" in self._local_vars and "iy" in self._local_vars
 
-    def _emit_direct_fetch(self, binding_name: str,
-                           dx_expr: ASTNode | bool, dy_expr: ASTNode | bool) -> str:
-        """Emit direct tensor indexing for sample-with-integer-offset patterns.
-
-        Shared by BindingSampleAccess and FunctionCall("sample") paths.
-        Callers MUST first check _direct_fetch_coords_available(); this emitter
-        references ix/iy via _var_target and assumes they are materialized.
-        """
+    def _try_direct_fetch(self, binding_name: str, u_node: ASTNode, v_node: ASTNode) -> str | None:
+        """`sample(@img, u, v)` on a hoisted binding -> the pixel's own texel, by direct
+        indexing; None for any other coordinates. Only the zero offset is exact: a nonzero
+        integer offset lands sub-pixel under the bilinear grid_sample (align_corners=True).
+        ix/iy must be materialized locals, or the fetch would name undefined variables."""
+        if not (_is_ident(u_node, "u") and _is_ident(v_node, "v")
+                and self._direct_fetch_coords_available()):
+            return None
         img_var = f"_bind[{binding_name!r}]"
-        ix_ref = self._var_target("ix")
-        iy_ref = self._var_target("iy")
-        dx_code = self._emit_expr(dx_expr) if dx_expr is not True else "0"
-        dy_code = self._emit_expr(dy_expr) if dy_expr is not True else "0"
         px_tmp = self._tmp()
         py_tmp = self._tmp()
-        if dx_code == "0":
-            self._emit(f"{px_tmp} = {ix_ref}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
-        else:
-            self._emit(f"{px_tmp} = ({ix_ref} + {dx_code}).clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
-        if dy_code == "0":
-            self._emit(f"{py_tmp} = {iy_ref}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
-        else:
-            self._emit(f"{py_tmp} = ({iy_ref} + {dy_code}).clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
+        self._emit(f"{px_tmp} = {self._var_target('ix')}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
+        self._emit(f"{py_tmp} = {self._var_target('iy')}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
         tmp = self._tmp()
         self._emit(f"{tmp} = {img_var}[:, {py_tmp}, {px_tmp}, :]"
                    f" if {px_tmp}.dim() < 3"
@@ -1043,14 +986,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         In scalar loop mode, returns a bare Python float literal instead.
         """
+        src = _num_src(value)
         if self._scalar_loop:
-            return repr(float(value))
-        cached = self._const_cache.get(value)
+            return src
+        # Keyed by the spelling: -0.0 == 0.0 as a dict key, and a signed zero keeps its sign.
+        cached = self._const_cache.get(src)
         if cached is not None:
-            return cached
+            return cached[1]
         var = self._tmp()
-        self._preamble.append(f"    {var} = _torch.scalar_tensor({value!r}, dtype=_torch.float32, device=_dev)")
-        self._const_cache[value] = var
+        self._preamble.append(f"    {var} = _torch.scalar_tensor({src}, dtype=_torch.float32, device=_dev)")
+        self._const_cache[src] = (value, var)
         return var
 
     def emit_program(self, program: Program):
@@ -1159,7 +1104,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         # No need to write locals back to _env: the caller only reads
         # bindings (outputs), not the env dict.  Loop-scoped writebacks
-        # (inside _emit_for) still happen so that subsequent statements
+        # (inside _emit_for_loop) still happen so that subsequent statements
         # can see loop-modified vars via _env when they aren't locals.
 
     def build(self, fingerprint: str | None = None) -> Any:
@@ -1179,10 +1124,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             # without a 4-byte D2H and the stream sync it implies. `_host_scalar` reads
             # the tag; an untagged operand still reads back, so a constant whose
             # rounding cannot be established simply keeps the old cost.
-            for value, var in self._const_cache.items():
+            for value, var in self._const_cache.values():
                 rounded = _dtype_rounded(value, torch.float32)
                 if rounded is not None:
-                    preamble_lines.append(f"    {var}.{_HOST_SCALAR_ATTR} = {rounded!r}")
+                    preamble_lines.append(f"    {var}.{_HOST_SCALAR_ATTR} = {_num_src(rounded)}")
         preamble = "\n".join(preamble_lines)
         body = "\n".join(self._lines)
         # Hoisted constants go before the main body so they're available
@@ -1195,7 +1140,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             f"{func_body}\n"
         )
         if fingerprint is not None:
-            filename = _cg_filename(fingerprint)
+            filename = _cg_filename(fingerprint, cancel=self._cancel_polls_on)
         else:
             _CodeGen._codegen_counter += 1
             filename = f"<tex_codegen_{_CodeGen._codegen_counter}>"
@@ -1413,6 +1358,22 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # zeros()/stack()/clone() all produce a brand-new, unaliased tensor.
         self._owned.add(stmt.name)
 
+    def _emit_host_index(self, index_node: ASTNode, idx: str):
+        """Emit `_ah`: the index's host reading, or None. A literal gives its value; a
+        hoisted constant or a static-loop counter gives the tag it carries. The access
+        then floor+clamps on the host (`interpreter_values._host_index`), no readback."""
+        if isinstance(index_node, NumberLiteral) and math.isfinite(index_node.value):
+            self._emit(f"_ah = {float(index_node.value)!r}")
+            return
+        self._emit(f"_ah = getattr({idx}, {_HOST_SCALAR_ATTR!r}, None)")
+        self._emit("if _ah is not None and not _math.isfinite(_ah): _ah = None")
+
+    @staticmethod
+    def _clamped_index(idx: str, size: str) -> str:
+        """The floor+clamped element index: a host int from `_ah`, else a device tensor."""
+        return (f"max(0, min(int(_math.floor(_ah)), {size} - 1)) if _ah is not None "
+                f"else _torch.clamp(_torch.floor({idx}).long(), 0, {size} - 1)")
+
     def _emit_array_index_read(self, node: ArrayIndexAccess) -> str:
         """Emit array[index] read with clamped bounds."""
         arr = self._emit_expr(node.array)
@@ -1429,13 +1390,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
+        self._emit_host_index(node.index, idx)
         # Tensor arrays — check dim for vec (dim 2 or 5) vs scalar (dim 1 or 4)
         self._emit(f"if {arr}.dim() in (2, 5):")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {arr}.shape[-2] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{arr}.shape[-2]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{tmp} = {arr}[..., _ai.item(), :]")
+        self._emit(f"{tmp} = {arr}[..., int(_ai), :]")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1450,10 +1412,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {arr}.shape[-1] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{arr}.shape[-1]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{tmp} = {arr}[..., _ai.item()]")
+        self._emit(f"{tmp} = {arr}[..., int(_ai)]")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1486,7 +1448,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit(f"if isinstance({arr}, list):")
         self._indent += 1
         self._emit(f"_al = list({arr})")
-        self._emit(f"_al[max(0, min(int(round({idx}.item() if _torch.is_tensor({idx}) else float({idx}))), len(_al) - 1))] = {value_expr} if isinstance({value_expr}, str) else str({value_expr})")
+        # floor+clamp, NaN -> 0: the read's rule (interpreter_values._list_index)
+        self._emit(f"_iw = float({idx}.item() if _torch.is_tensor({idx}) else {idx})")
+        self._emit(f"_al[0 if not _iw >= 0.0 else (max(len(_al) - 1, 0) if _iw >= len(_al) else int(_math.floor(_iw)))] = {value_expr} if isinstance({value_expr}, str) else str({value_expr})")
         if isinstance(target.array, Identifier):
             self._emit(f"{self._var_target(target.array.name)} = _al")
         self._indent -= 1
@@ -1498,12 +1462,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         else:
             c = "_arr_c"
             self._emit(f"{c} = {arr}.clone()")
+        self._emit_host_index(target.index, idx)
         self._emit(f"if {c}.dim() in (2, 5):")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {c}.shape[-2] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{c}.shape[-2]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{c}[..., _ai.item(), :] = _es({value_expr}, {c}.shape[:-2]) if {c}.dim() > 2 else {value_expr}")
+        self._emit(f"{c}[..., int(_ai), :] = _es({value_expr}, {c}.shape[:-2]) if {c}.dim() > 2 else {value_expr}")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1519,10 +1484,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {c}.shape[-1] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{c}.shape[-1]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{c}[..., _ai.item()] = _es({value_expr}, {c}.shape[:-1]) if {c}.dim() > 1 else {value_expr}")
+        self._emit(f"{c}[..., int(_ai)] = _es({value_expr}, {c}.shape[:-1]) if {c}.dim() > 1 else {value_expr}")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1665,6 +1630,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if masked_scatter:
             self._indent -= 1
 
+    @staticmethod
+    def _untensor_merge(cond_bool: str, tv: str, ev: str) -> str:
+        """A spatial if's merge when the branch values are not both tensors, as
+        `Interpreter._merge_branch_vars` does it: a string takes the majority branch."""
+        return (f"{tv} if {ev} is None or not (isinstance({tv}, str) or isinstance({ev}, str)) "
+                f"or {cond_bool}.float().mean().item() > 0.5 else {ev}")
+
     def _emit_function_def(self, stmt: FunctionDef):
         """Emit a user-defined function as a nested Python def."""
         self._user_functions.add(stmt.name)
@@ -1672,7 +1644,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         params_str = ", ".join(params + ["_depth=0"])
         self._emit(f"def _uf_{stmt.name}({params_str}):")
         self._indent += 1
-        self._emit(f"if _depth > {MAX_CALL_DEPTH}: raise RuntimeError('Maximum function call depth exceeded in {stmt.name}()')")
+        self._emit(f"if _depth >= {MAX_CALL_DEPTH}: raise RuntimeError('Maximum function call depth exceeded in {stmt.name}()')")
 
         # Save and swap local vars context for function body
         saved_locals = self._local_vars
@@ -1702,7 +1674,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         body_vars, _ = self._collect_modified_vars(stmt.body)
         for vname in sorted(body_vars):  # sorted → deterministic local naming order
             if vname not in self._local_vars:  # don't overwrite params
-                self._local_vars[vname] = f"_uf_lv_{vname}"
+                self._local_vars[vname] = f"_ufl_{vname}"  # never `_uf_<x>`: that names a function
 
         saved_in_fn = self._in_user_function
         self._in_user_function = True
@@ -1856,6 +1828,27 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         else:
             raise _Unsupported("Channel assign on non-variable target")
 
+    def _emit_scalar_if(self, stmt: IfElse, cond_tmp: str, hoist_snap: dict, owned_snap: set):
+        """A Python `if` on a 0-dim condition; each branch starts from the pre-if hoist and
+        ownership snapshots (see `_emit_if_else`)."""
+        self._emit(f"if float({cond_tmp}) > 0.5:")
+        self._indent += 1
+        self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
+        for s in stmt.then_body:
+            self._emit_stmt(s)
+        if not stmt.then_body:
+            self._emit("pass")
+        self._indent -= 1
+        if stmt.else_body:
+            self._emit("else:")
+            self._indent += 1
+            self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
+            for s in stmt.else_body:
+                self._emit_stmt(s)
+            self._indent -= 1
+
     def _emit_if_else(self, stmt: IfElse):
         """Emit if/else.
 
@@ -1892,24 +1885,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             # tensor) on every iteration, so the spatial merge path is provably
             # dead. Emitting only the scalar branch avoids the 2^depth body
             # duplication of nested if/else (worst inside unrolled loops).
-            self._emit(f"if float({cond_tmp}) > 0.5:")
-            self._indent += 1
-            self._hoisted_bchw = dict(hoist_snap)
-            self._owned = set(owned_snap)
-            if stmt.then_body:
-                for s in stmt.then_body:
-                    self._emit_stmt(s)
-            else:
-                self._emit("pass")
-            self._indent -= 1
-            if stmt.else_body:
-                self._emit(f"else:")
-                self._indent += 1
-                self._hoisted_bchw = dict(hoist_snap)
-                self._owned = set(owned_snap)
-                for s in stmt.else_body:
-                    self._emit_stmt(s)
-                self._indent -= 1
+            self._emit_scalar_if(stmt, cond_tmp, hoist_snap, owned_snap)
             self._hoisted_bchw = hoist_snap
             return
 
@@ -1925,29 +1901,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # We emit both paths: scalar short-circuit and spatial vectorized
         self._emit(f"if not _torch.is_tensor({cond_tmp}) or {cond_tmp}.dim() == 0:")
         self._indent += 1
-        self._emit(f"if float({cond_tmp}) > 0.5:")
-        self._indent += 1
-        self._hoisted_bchw = dict(hoist_snap)
-        self._owned = set(owned_snap)
-        if stmt.then_body:
-            for s in stmt.then_body:
-                self._emit_stmt(s)
-        else:
-            self._emit("pass")
-        self._indent -= 1
-        if stmt.else_body:
-            self._emit(f"else:")
-            self._indent += 1
-            self._hoisted_bchw = dict(hoist_snap)
-            self._owned = set(owned_snap)
-            for s in stmt.else_body:
-                self._emit_stmt(s)
-            self._indent -= 1
+        self._emit_scalar_if(stmt, cond_tmp, hoist_snap, owned_snap)
         self._indent -= 1
 
-        # Spatial path: this is complex (selective cloning + torch.where merge)
-        # Fall back to unsupported to let the interpreter handle it
-        # UNLESS there's no else body and the then body is simple
+        # Per-pixel path: the full snapshot and where-merge, emitted inline.
         self._emit(f"else:")
         self._indent += 1
 
@@ -2081,7 +2038,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._indent -= 1
             self._emit(f"elif {tv} is not None:")
             self._indent += 1
-            self._emit(f"{tgt} = {tv}")
+            self._emit(f"{tgt} = {self._untensor_merge(cond_bool, tv, ev)}")
             self._indent -= 1
 
         for k in all_bind_mods:
@@ -2095,7 +2052,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._indent -= 1
             self._emit(f"elif {tv} is not None:")
             self._indent += 1
-            self._emit(f"_bind[{k!r}] = {tv}")
+            self._emit(f"_bind[{k!r}] = {self._untensor_merge(cond_bool, tv, ev)}")
             self._indent -= 1
 
         # Post-merge, a modified var can hold a per-pixel tensor even when its
@@ -2154,7 +2111,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             return any(self._init_is_spatial(a, _seen) for a in expr.args)
         return False
 
-    def _is_scalar_body(self, stmts: list[ASTNode], loop_var: str) -> bool:
+    def _is_scalar_body(self, stmts: list[ASTNode]) -> bool:
         """Check if a loop body operates only on scalar types (no spatial tensors).
 
         Returns True when every variable declaration and assignment target in the
@@ -2163,18 +2120,18 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         have spatial types (e.g., builtins like u, v, ix, iy).
         """
         for stmt in stmts:
-            if not self._is_scalar_node(stmt, loop_var):
+            if not self._is_scalar_node(stmt):
                 return False
         return True
 
-    def _is_scalar_node(self, node: ASTNode, loop_var: str) -> bool:
+    def _is_scalar_node(self, node: ASTNode) -> bool:
         """Recursively check if a node is scalar-only."""
         if isinstance(node, VarDecl):
             t = self.type_map.get(id(node))
             if t is None or not t.is_scalar:
                 return False
             if node.initializer:
-                return self._is_scalar_node(node.initializer, loop_var)
+                return self._is_scalar_node(node.initializer)
             return True
         if isinstance(node, Assignment):
             t = node.target
@@ -2184,24 +2141,24 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 tt = self.type_map.get(id(t))
                 if tt is not None and not tt.is_scalar:
                     return False
-            return self._is_scalar_node(node.value, loop_var)
+            return self._is_scalar_node(node.value)
         if isinstance(node, ExprStatement):
-            return self._is_scalar_node(node.expr, loop_var)
+            return self._is_scalar_node(node.expr)
         if isinstance(node, IfElse):
-            if not self._is_scalar_node(node.condition, loop_var):
+            if not self._is_scalar_node(node.condition):
                 return False
             for s in node.then_body:
-                if not self._is_scalar_node(s, loop_var):
+                if not self._is_scalar_node(s):
                     return False
             if node.else_body:
                 for s in node.else_body:
-                    if not self._is_scalar_node(s, loop_var):
+                    if not self._is_scalar_node(s):
                         return False
             return True
         if isinstance(node, (ForLoop, WhileLoop)):
             # Nested loops — check their bodies too
             for s in node.body:
-                if not self._is_scalar_node(s, loop_var):
+                if not self._is_scalar_node(s):
                     return False
             return True
         if isinstance(node, (BreakStmt, ContinueStmt)):
@@ -2226,14 +2183,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 return False
             return True
         if isinstance(node, BinOp):
-            return (self._is_scalar_node(node.left, loop_var)
-                    and self._is_scalar_node(node.right, loop_var))
+            return (self._is_scalar_node(node.left)
+                    and self._is_scalar_node(node.right))
         if isinstance(node, UnaryOp):
-            return self._is_scalar_node(node.operand, loop_var)
+            return self._is_scalar_node(node.operand)
         if isinstance(node, TernaryOp):
-            return (self._is_scalar_node(node.condition, loop_var)
-                    and self._is_scalar_node(node.true_expr, loop_var)
-                    and self._is_scalar_node(node.false_expr, loop_var))
+            return (self._is_scalar_node(node.condition)
+                    and self._is_scalar_node(node.true_expr)
+                    and self._is_scalar_node(node.false_expr))
         if isinstance(node, FunctionCall):
             # Spatial functions are not scalar
             if node.name in _SPATIAL_STDLIB:
@@ -2247,9 +2204,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             # such calls in tensor mode. (Previously any all-scalar-arg call was "scalar".)
             if node.name not in _SCALAR_EMITTABLE_FNS:
                 return False
-            return all(self._is_scalar_node(a, loop_var) for a in node.args)
+            return all(self._is_scalar_node(a) for a in node.args)
         if isinstance(node, CastExpr):
-            return self._is_scalar_node(node.expr, loop_var)
+            return self._is_scalar_node(node.expr)
         if isinstance(node, (VecConstructor, MatConstructor, BindingRef,
                              BindingSampleAccess, BindingIndexAccess,
                              ArrayLiteral, ArrayIndexAccess)):
@@ -2397,6 +2354,22 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             return sq_tmp
         return tmp
 
+    def _emit_runtime_radius(self, stencil: _StencilInfo, radius: ASTNode, rad: str):
+        """`rad = int(radius)`. A float counter over a fractional radius visits fractional
+        offsets no integer kernel has, so that cook raises and runs on the interpreter."""
+        r_expr = self._emit_expr(radius)
+        # The host reading a `$param` or literal carries, else a readback (`_host_scalar`).
+        host = (f"getattr({r_expr}, {_HOST_SCALAR_ATTR!r}, None) if _torch.is_tensor({r_expr}) "
+                f"else {r_expr}")
+        read = f"({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})"
+        self._emit(f"{rad} = {host}")
+        self._emit(f"{rad} = {'float' if stencil.float_counter else 'int'}({read} if {rad} is None else {rad})")
+        if not stencil.float_counter:
+            return
+        self._emit(f"if not {rad}.is_integer(): raise RuntimeError("
+                   "'stencil lowering: a float counter over a fractional radius')")
+        self._emit(f"{rad} = int({rad})")
+
     def _stencil_pad_and_kernel_size(self, stencil: _StencilInfo, sel_tmp: str
                                      ) -> tuple[str, str, str, str | None]:
         """Emit padding + compute kernel size for a stencil.
@@ -2412,8 +2385,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             if isinstance(stencil.y_radius, int):
                 self._emit(f"{rad_y} = {stencil.y_radius}")
             else:
-                r_expr = self._emit_expr(stencil.y_radius)
-                self._emit(f"{rad_y} = int({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
+                self._emit_runtime_radius(stencil, stencil.y_radius, rad_y)
 
             same_radius = (stencil.y_radius == stencil.x_radius if isinstance(stencil.y_radius, int)
                            else _ast_equal(stencil.y_radius, stencil.x_radius))
@@ -2426,8 +2398,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 if isinstance(stencil.x_radius, int):
                     self._emit(f"{rad_x} = {stencil.x_radius}")
                 else:
-                    r_expr = self._emit_expr(stencil.x_radius)
-                    self._emit(f"{rad_x} = int({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
+                    self._emit_runtime_radius(stencil, stencil.x_radius, rad_x)
 
             self._emit(f"{kh_tmp} = 2 * {rad_y} + 1")
             if not same_radius:
@@ -2476,7 +2447,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         return False
 
     def _emit_box_stencil(self, stencil: _StencilInfo) -> bool:
-        """Emit avg_pool2d for a box blur stencil."""
+        """Emit avg_pool2d for a box blur stencil, returning True.
+
+        Returns False WITHOUT emitting anything when the lowering cannot be exact (a
+        provably non-zero constant seed); the caller then emits the loop itself."""
         accum_local = self._local_vars.get(stencil.accum_var, f"_env[{stencil.accum_var!r}]")
         count_local = None
         if stencil.count_var:
@@ -2689,6 +2663,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # fall through to the bit-exact per-sample codegen.
         if not stencil.is_fetch:
             return False
+        stencil.float_counter = any(
+            isinstance(loop.init, VarDecl) and loop.init.type_name == "float"
+            for loop in (stmt, *(s for s in stmt.body if isinstance(s, ForLoop))))
 
         if stencil.kind == "box":
             return self._emit_box_stencil(stencil)
@@ -2721,8 +2698,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # The interpreter iterates range(start, stop, step): a partial last stride still
         # runs, and a range whose step points away from the bound is empty.
         n = len(range(start, stop, step))
-        if n > 1024:
-            self._emit(f"raise RuntimeError('For loop would exceed {1024} iterations')")
+        if n > MAX_LOOP_ITERATIONS:
+            self._emit(f"raise RuntimeError('For loop would exceed {MAX_LOOP_ITERATIONS} iterations')")
             return
         if n == 0:
             self._emit("pass")  # the body never runs; keep an enclosing block non-empty
@@ -2760,13 +2737,22 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # no bindings, vec constructors, or spatial stdlib calls.
         use_scalar = (
             self._scalar_loop  # already in scalar mode from outer loop
-            or self._is_scalar_body(stmt.body, loop_var)
+            or self._is_scalar_body(stmt.body)
         )
 
+        # Scalar mode turns every local the body touches into a Python float in place. An
+        # enclosing local the loop only READS keeps its tensor: save it, restore it after.
+        read_only = {}
+        if use_scalar and not self._scalar_loop:
+            for vname in all_vars:
+                if (vname != loop_var and vname not in modified_vars
+                        and saved_locals[vname] is not None):
+                    read_only[vname] = self._tmp()
+                    self._emit(f"{read_only[vname]} = {self._local_vars[vname]}")
         if use_scalar:
             self._setup_scalar_loop(all_vars, loop_var)
         else:
-            self._setup_tensor_loop(start, stop, step)
+            self._setup_tensor_loop(start, stop, step, stmt.body, loop_var)
 
         saved_scalar = self._scalar_loop
         self._scalar_loop = use_scalar
@@ -2775,7 +2761,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit(f"for _i_idx in range({n}):")
         self._indent += 1
         if use_scalar:
-            if step == 1.0 or step == 1:
+            if step == 1:
                 self._emit(f"{loop_var_local} = {start!r} + _i_idx")
             else:
                 self._emit(f"{loop_var_local} = {start!r} + _i_idx * {step!r}")
@@ -2783,15 +2769,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             vals_tmp = self._range_cache[(start, stop, step)]
             self._emit(f"{loop_var_local} = {vals_tmp}[_i_idx]")
 
+        saved_flow = self._use_native_flow_control
         if has_flow_control:
-            saved_flow = self._use_native_flow_control
             self._use_native_flow_control = True
-            for s in stmt.body:
-                self._emit_stmt(s)
-            self._use_native_flow_control = saved_flow
-        else:
-            for s in stmt.body:
-                self._emit_stmt(s)
+        for s in stmt.body:
+            self._emit_stmt(s)
+        self._use_native_flow_control = saved_flow
 
         self._indent -= 1
         self._scalar_loop = saved_scalar
@@ -2804,6 +2787,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                     # A local declared in a branch the loop never took (or in the
                     # body of a loop that ran zero passes) is still None.
                     self._emit(f"if {local} is not None and not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
+            for vname, saved in read_only.items():
+                self._emit(f"{self._local_vars[vname]} = {saved}")
 
         # Write back modified vars to _env
         for vname in writeback_vars:
@@ -2837,7 +2822,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._var_initializers.pop(name, None)
 
     def _setup_scalar_loop(
-        self, all_vars: set[str], loop_var: str,
+        self, all_vars: list[str], loop_var: str,
     ):
         """Prepare variables for a scalar-mode for loop.
 
@@ -2848,10 +2833,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 local = self._local_vars[vname]
                 self._emit(f"if _torch.is_tensor({local}): {local} = {local}.item()")
 
-    def _setup_tensor_loop(self, start: int, stop: int, step: int):
+    def _setup_tensor_loop(self, start: int, stop: int, step: int,
+                           body: list[ASTNode] = (), loop_var: str | None = None):
         """Prepare variables for a tensor-mode for loop.
 
-        Hoists arange/unbind to preamble for zero-overhead iteration.
+        Hoists arange/unbind to preamble for zero-overhead iteration. When `body` indexes
+        an array by `loop_var`, each counter value carries its host reading, so that
+        element access reads nothing back from the device.
         """
         range_key = (start, stop, step)
         vals_tmp = self._range_cache.get(range_key)
@@ -2861,6 +2849,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 f"    {vals_tmp} = _torch.arange({start}, {stop}, {step}, dtype=_torch.float32, device=_dev).unbind(0)"
             )
             self._range_cache[range_key] = vals_tmp
+        if (range_key not in self._tagged_ranges and loop_var is not None
+                and _indexes_arrays_by(body, loop_var)):
+            self._tagged_ranges.add(range_key)
+            self._preamble.append(
+                f"    for _v, _h in zip({vals_tmp}, range({start}, {stop}, {step})): "
+                f"setattr(_v, {_HOST_SCALAR_ATTR!r}, float(_h))")
 
     def _emit_general_for_loop(self, stmt: ForLoop):
         """Emit a general for loop as init + while (dynamic bounds)."""
@@ -3060,21 +3054,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if isinstance(node, BindingSampleAccess):
             binding_name = node.binding.name if isinstance(node.binding, BindingRef) else None
 
-            # Fast path: sample with integer pixel offsets → direct tensor indexing
             if (binding_name and len(node.args) == 2
                     and binding_name in self._hoisted_bchw):
-                dx_expr = _extract_uv_offset_expr(node.args[0], "u")
-                dy_expr = _extract_uv_offset_expr(node.args[1], "v")
-                # Only direct-fetch the zero-offset case. A nonzero integer offset
-                # (dx_expr/dy_expr an ASTNode) lands sub-pixel under the interpreter's
-                # bilinear grid_sample (UV step is 1/(W-1), align_corners=True), so a
-                # nearest-neighbour pixel fetch would diverge — fall through to the
-                # inline grid_sample path to preserve bilinear semantics.
-                # Also require ix/iy to be materialized as locals; without them the
-                # direct-fetch emitter would reference undefined names (NameError).
-                if (dx_expr is True and dy_expr is True
-                        and self._direct_fetch_coords_available()):
-                    return self._emit_direct_fetch(binding_name, dx_expr, dy_expr)
+                fetched = self._try_direct_fetch(binding_name, node.args[0], node.args[1])
+                if fetched is not None:
+                    return fetched
 
             args = [self._emit_expr(a) for a in node.args]
 
@@ -3163,9 +3147,6 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 raise _Unsupported(f"Unknown operator: {op}")
             return tmp
 
-        # String concatenation check — fall back
-        # (can't easily detect at codegen time without type info on values)
-
         # Matrix operations
         lt = self.type_map.get(id(node.left))
         rt = self.type_map.get(id(node.right))
@@ -3232,7 +3213,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 needs_broadcast = True
             elif l_vec and r_vec and lt.channels != rt.channels:
                 needs_channel_pad = True
-        elif lt is None or rt is None:
+        else:
             # Type info missing (e.g., optimizer created new nodes) — use runtime broadcast
             needs_runtime_bp = True
 
@@ -3329,16 +3310,40 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             raise _Unsupported(f"Unknown unary op: {node.op}")
         return tmp
 
+    def _emit_guarded_expr(self, guard: str, node: ASTNode) -> str:
+        """Emit `node`'s code under `guard`, or bare when it needs no statement (a leaf)."""
+        self._emit(guard)
+        mark = len(self._lines)
+        self._indent += 1
+        val = self._emit_expr(node)
+        self._indent -= 1
+        if len(self._lines) == mark:
+            self._lines.pop()
+        return val
+
     def _emit_ternary(self, node: TernaryOp) -> str:
         cond = self._emit_expr(node.condition)
-        true_val = self._emit_expr(node.true_expr)
-        false_val = self._emit_expr(node.false_expr)
         tmp = self._tmp()
 
         # Scalar loop mode: simple Python ternary
         if self._scalar_loop:
+            true_val = self._emit_expr(node.true_expr)
+            false_val = self._emit_expr(node.false_expr)
             self._emit(f"{tmp} = {true_val} if float({cond}) > 0.5 else {false_val}")
             return tmp
+
+        # A 0-dim condition runs only the taken arm, as the interpreter does (a recursive
+        # base case must not evaluate its recursive arm); a per-pixel one runs both. Each
+        # arm's code is emitted once, under its own guard.
+        sc, ct = self._tmp(), self._tmp()
+        self._emit(f"{sc} = not _torch.is_tensor({cond}) or {cond}.dim() == 0")
+        self._emit(f"{ct} = {sc} and float({cond}) > 0.5")
+        true_val = self._emit_guarded_expr(f"if not {sc} or {ct}:", node.true_expr)
+        false_val = self._emit_guarded_expr(f"if not {sc} or not {ct}:", node.false_expr)
+        self._emit(f"if {sc}:")
+        self._indent += 1
+        self._emit(f"{tmp} = {true_val} if {ct} else {false_val}")
+        self._indent -= 1
 
         # Check if string handling is needed via type_map
         true_type = self.type_map.get(id(node.true_expr))
@@ -3347,19 +3352,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                         and false_type is not None and false_type != TEXType.STRING)
 
         if not both_numeric:
-            # String ternary guard (causes graph break)
-            self._emit(f"if isinstance({true_val}, str) or isinstance({false_val}, str):")
+            # String ternary guard (causes graph break); the condition is per-pixel here
+            self._emit(f"elif isinstance({true_val}, str) or isinstance({false_val}, str):")
             self._indent += 1
-            self._emit(f"_cs = {cond}.float().mean().item() if _torch.is_tensor({cond}) and {cond}.dim() > 0 else (float({cond}.item()) if _torch.is_tensor({cond}) else float({cond}))")
-            self._emit(f"{tmp} = {true_val} if _cs > 0.5 else {false_val}")
+            self._emit(f"{tmp} = {true_val} if {cond}.float().mean().item() > 0.5 else {false_val}")
             self._indent -= 1
-            self._emit(f"elif not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
-        else:
-            # Both arms are numeric — skip string guard (no graph break)
-            self._emit(f"if not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
-        self._indent += 1
-        self._emit(f"{tmp} = {true_val} if float({cond}) > 0.5 else {false_val}")
-        self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
         atv = self._tmp()
@@ -3390,26 +3387,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if self._mf_on and name in self._user_functions:
             return self._mf_emit_user_call(node)
 
-        # Fast path: convert sample(@img, u+expr*px, v+expr*py) → direct fetch
-        # Resolves through local variable definitions (e.g. off_u = float(px2) * px)
+        # sample(@img, u, v), also through locals declared `= u` / `= v`, is a direct fetch.
         if (name == "sample" and len(node.args) == 3
-                and isinstance(node.args[0], BindingRef)):
-            bname = node.args[0].name
-            if bname in self._hoisted_bchw:
-                u_arg = _resolve_through_locals(node.args[1], self._var_initializers)
-                v_arg = _resolve_through_locals(node.args[2], self._var_initializers)
-                dx_expr = _extract_uv_offset_expr(u_arg, "u")
-                dy_expr = _extract_uv_offset_expr(v_arg, "v")
-                # Only the zero-offset case is bit-equivalent to a direct pixel fetch.
-                # A nonzero integer offset lands sub-pixel under the interpreter's
-                # bilinear sample (align_corners=True), so fall through to the
-                # _fns['sample'] call to preserve bilinear semantics.
-                # Also require ix/iy to be materialized as locals; otherwise the
-                # direct-fetch emitter references undefined names (NameError) and we
-                # fall through to the inline grid_sample path (verified equivalent).
-                if (dx_expr is True and dy_expr is True
-                        and self._direct_fetch_coords_available()):
-                    return self._emit_direct_fetch(bname, dx_expr, dy_expr)
+                and isinstance(node.args[0], BindingRef)
+                and node.args[0].name in self._hoisted_bchw):
+            fetched = self._try_direct_fetch(
+                node.args[0].name,
+                _resolve_through_locals(node.args[1], self._var_initializers),
+                _resolve_through_locals(node.args[2], self._var_initializers))
+            if fetched is not None:
+                return fetched
 
         args = [self._emit_expr(a) for a in node.args]
         tmp = self._tmp()
@@ -3592,18 +3579,15 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # Optimization: hoist all-literal vec constructors to preamble.
         # vec3(0.2126, 0.7152, 0.0722) → single pre-computed tensor reused on every call.
         if len(node.args) > 1 and all(isinstance(a, NumberLiteral) for a in node.args) and len(node.args) == n:
-            values = tuple(a.value for a in node.args)
-            cached = self._vec_const_cache.get(values)
+            vals_repr = ", ".join(_num_src(a.value) for a in node.args)
+            cached = self._vec_const_cache.get(vals_repr)  # by spelling: keeps -0.0 apart
             if cached is not None:
                 return cached
             var = self._tmp()
-            vals_repr = ", ".join(repr(v) for v in values)
+            base = f"_torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
             self._preamble.append(
-                f"    {var} = _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
-                f".reshape(" + ", ".join(["1"] * 3) + f", {n}).expand(*_sp, {n})"
-                f" if _sp else _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
-            )
-            self._vec_const_cache[values] = var
+                f"    {var} = {base}.reshape(1, 1, 1, {n}).expand(*_sp, {n}) if _sp else {base}")
+            self._vec_const_cache[vals_repr] = var
             return var
 
         args = [self._emit_expr(a) for a in node.args]
@@ -3665,11 +3649,17 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
     def _emit_cast(self, node: CastExpr) -> str:
         value = self._emit_expr(node.expr)
 
-        # Fast path: float cast on already-float/int source is a no-op
+        # A numeric source: float32 passes through, anything else converts (an int64
+        # `$param`, an fp16 value), as the interpreter's cast does.
         if node.target_type == "float":
             src_type = self.type_map.get(id(node.expr))
             if src_type is not None and src_type in (TEXType.FLOAT, TEXType.INT):
-                return value
+                if self._scalar_loop:
+                    return value
+                tmp = self._tmp()
+                self._emit(f"{tmp} = {value} if not _torch.is_tensor({value}) "
+                           f"or {value}.dtype is _torch.float32 else {value}.float()")
+                return tmp
 
         # Scalar loop mode: Python float casts
         if self._scalar_loop:

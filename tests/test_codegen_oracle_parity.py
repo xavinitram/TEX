@@ -422,3 +422,290 @@ def test_array_collect_lowering_is_kept_where_exact():
         "the counter bumped before the collect": False,
         "a counter seeded at one": False,
     }
+
+
+# ── masked (0.25) if-arm closures: a for-loop header writes through to the hoisted local ──
+#
+# Each arm body is emitted once into a `def` both dispatch paths call; a name the arm's
+# for-header assigns must be declared `nonlocal` there like any other write.
+
+_ARM_HEADER_ROWS = [
+    ("for-init assignment inside a per-pixel arm",
+     "//!tex 0.25\nint k = 0; float acc = 0.0;\n"
+     "for (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; } }\n"
+     "if (u > 0.5) { for (k = 0; k < 4; k = k + 1) { acc = acc + 1.0; } }\n"
+     "@OUT = vec3(acc, float(k), 0.0);"),
+    ("the same arm inside a masked loop pass",
+     "//!tex 0.25\nint k = 0; float acc = 0.0;\n"
+     "for (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; }\n"
+     "  if (u > 0.5) { for (k = 0; k < 4; k = k + 1) { acc = acc + 1.0; } } }\n"
+     "@OUT = vec3(acc, float(k), 0.0);"),
+]
+
+
+@pytest.mark.parametrize("label,code", _ARM_HEADER_ROWS, ids=[r[0] for r in _ARM_HEADER_ROWS])
+def test_masked_arm_for_header_writes_the_outer_variable(label, code):
+    ref, _ = assert_parity(code, {"A": _img()})
+    assert ref["OUT"][..., 1].max().item() == 4.0  # the arm ran and left k at its bound
+
+
+# ── min/max: the interpreter's own maximum/minimum, operand emitted once ──────────────
+#
+# On a tie clamp keeps x while maximum/minimum pick an operand by kernel and layout, so a
+# clamp shortcut can return the other signed zero; atan2(0, ±0) turns that into 0 against pi.
+
+def _signed_zeros():
+    z = torch.zeros(1, 4, 4, 4)
+    z[..., 0] = -0.0
+    return z
+
+
+_MINMAX_ROWS = [
+    "max(0.0, @Z.r)", "max(@Z.r, 0.0)", "min(max(0.0, @Z.r), 1.0)", "min(max(@Z.r, 0.0), 1.0)",
+    "max(min(@Z.g, -0.0), -1.0)", "max(min(1.0, @Z.r), 0.0)",
+]
+
+
+@pytest.mark.parametrize("expr", _MINMAX_ROWS)
+def test_minmax_literal_keeps_the_interpreters_signed_zero(expr):
+    assert_parity(f"@OUT = vec3(atan2(0.0, {expr}));", {"Z": _signed_zeros()}, atol=0.0)
+
+
+def test_nested_min_max_emits_its_operand_once():
+    code = "@OUT = vec3(min(max(@A.r * 2.0 - 0.5, 0.0), 1.0), max(min(@A.g * 3.0, 0.8), 0.1), 0.0);"
+    bindings = {"A": _img()}
+    assert_parity(code, bindings, atol=0.0)
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+    src = try_compile(program, tm)._tex_src
+    assert "clamp" not in src and src.count("_torch.maximum(") == 2, src
+    assert src.count("_bind['A'][..., 0]") == 1 and src.count("_bind['A'][..., 1]") == 1, src
+
+
+# ── array element access by a literal or a static-loop counter reads no device value ─────
+
+_ARRAY_INDEX_ROWS = [
+    ("fill and read a float array by the counter, literal and fractional literal reads",
+     "float w[16];\nfor (int i = 0; i < 16; i++) { w[i] = float(i) * 0.5 + @A.r; }\n"
+     "float s = 0.0;\nfor (int j = 0; j < 16; j++) { s = s + w[j] * @A.g; }\n@OUT = vec3(s, w[3], w[2.7]);"),
+    ("vec array, negative and out-of-range literal reads",
+     "vec3 c[12];\nfor (int i = 0; i < 12; i++) { c[i] = @A.rgb * float(i); }\n"
+     "vec3 s = vec3(0.0);\nfor (int j = 0; j < 12; j++) { s = s + c[j]; }\n@OUT = s + c[-3.0] + c[40];"),
+    ("step 3 counter",
+     "float w[40];\nfor (int i = 0; i < 40; i += 3) { w[i] = @A.r + float(i); }\n@OUT = vec3(w[39], w[36], w[1]);"),
+    ("masked 0.25 loop",
+     "//!tex 0.25\nfloat w[16];\nfor (int i = 0; i < 16; i++) { if (@A.r > 2.0) { break; } w[i] = float(i) + @A.g; }\n"
+     "@OUT = vec3(w[5], w[15], 0.0);"),
+]
+
+
+@pytest.mark.parametrize("label,code", _ARRAY_INDEX_ROWS, ids=[r[0] for r in _ARRAY_INDEX_ROWS])
+def test_array_index_by_counter_or_literal_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img(H=6, W=6)}, atol=0.0)
+
+
+def test_array_index_by_counter_or_literal_reads_no_device_value(monkeypatch):
+    code = _ARRAY_INDEX_ROWS[0][1]
+    bindings = {"A": _img(H=6, W=6)}
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, _refs, _assigned, _params, used = get_cache().compile_ast(
+        program, bt, source=code)
+
+    def cook():
+        return _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
+                                     used_builtins=used, fingerprint=None, time_context=None)
+    cook()  # compile outside the spy
+    calls = []
+    orig = torch.Tensor.item
+
+    def spy(self):
+        calls.append(1)
+        return orig(self)
+    monkeypatch.setattr(torch.Tensor, "item", spy)
+    tier_trace.reset()
+    cook()
+    monkeypatch.undo()
+    assert tier_trace.last().tier == "codegen"
+    assert calls == [], f"{len(calls)} device reads for 32 counter and 2 literal accesses"
+
+
+# ── a non-finite literal is emitted as a value, not as an undefined name ──────────────────
+
+def test_non_finite_literal_emits_a_defined_value():
+    import math
+    from TEX_Wrangle.tex_runtime.codegen import _CodeGen
+    from TEX_Wrangle.tex_runtime.codegen_stdfns import _num_src
+    for v in (math.inf, -math.inf, 1.5, -0.0):
+        assert eval(_num_src(v)) == v
+    assert math.isnan(eval(_num_src(math.nan)))
+    cg = _CodeGen({})
+    var = cg._get_const(-math.inf)
+    ns = {"_torch": torch, "_dev": "cpu"}
+    exec(cg._preamble[-1].strip(), ns)
+    assert ns[var].item() == -math.inf
+
+
+# ── user-function call depth: the 65th nested call raises on both tiers ──────────────────
+
+def _recursion(n, masked):
+    head = "//!tex 0.25\nfor (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; } }\n" if masked else ""
+    return (head + "float f(float k) { if (k <= 1.0) { return 1.0; } return f(k - 1.0) + 1.0; }\n"
+            f"@OUT = vec3(f({n}.0) + @A.r * 0.0);")
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["0.23", "masked 0.25"])
+def test_call_depth_limit_matches_interpreter(masked):
+    ref, _ = assert_parity(_recursion(64, masked), {"A": _img()})
+    assert ref["OUT"].max().item() == 64.0
+    code = _recursion(65, masked)
+    bindings = {"A": _img()}
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, _refs, _assigned, _params, used = get_cache().compile_ast(program, bt, source=code)
+    tier_trace.reset()
+    # Codegen raises, the route hands the cook to the interpreter, which raises E6060.
+    with pytest.raises(Exception, match="call depth"):
+        _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
+                              used_builtins=used, fingerprint=None, time_context=None)
+
+
+# ── a function-body local never takes a user function's generated name ──────────────────
+
+@pytest.mark.parametrize("masked", [False, True], ids=["0.23", "masked 0.25"])
+def test_function_local_does_not_shadow_a_function_named_lv(masked):
+    head = "//!tex 0.25\nfor (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; } }\n" if masked else ""
+    code = (head + "float lv_x(float a) { return a * 2.0; }\n"
+            "float g(float b) { float x = b; return lv_x(x); }\n@OUT = vec3(g(@A.r));")
+    assert_parity(code, {"A": _img()})
+
+
+# ── a string assigned under a per-pixel if takes the majority branch, as in the interpreter ─
+
+def _mostly(on):
+    a = _img()
+    a[..., 0] = 0.9 if on else 0.1
+    a[0, 0, 0, 0] = 0.1 if on else 0.9
+    return a
+
+
+@pytest.mark.parametrize("on", [True, False], ids=["majority on", "majority off"])
+@pytest.mark.parametrize("else_arm", ["", ' else { s = "ccc"; }'], ids=["then only", "if-else"])
+def test_spatial_if_string_merge_takes_the_majority_branch(on, else_arm):
+    code = ('string s = "a";\nif (@A.r > 0.5) { s = "bb"; }' + else_arm +
+            "\n@OUT = vec3(float(len(s))) + @A.rgb * 0.0;")
+    assert_parity(code, {"A": _mostly(on)}, atol=0.0)
+
+
+# ── a float counter over a runtime radius: an integer radius lowers, a fractional one ──
+#    runs the loop (fractional offsets no integer kernel has)
+
+_FLOAT_COUNTER_BOX = (
+    "vec3 s = vec3(0.0); float n = 0.0;\n"
+    "for (float dy = -$r; dy <= $r; dy += 1.0) {\n  for (float dx = -$r; dx <= $r; dx += 1.0) {\n"
+    "    s = s + fetch(@A, ix + dx, iy + dy).rgb; n = n + 1.0; } }\n@OUT = s / n;")
+
+
+def test_float_counter_integer_runtime_radius_keeps_the_lowering():
+    assert_parity(_FLOAT_COUNTER_BOX, {"A": _img(H=10, W=10), "r": 2.0})
+
+
+@pytest.mark.parametrize("r", [2.5, 1.5])
+def test_float_counter_fractional_runtime_radius_matches_interpreter(r):
+    code, bindings = _FLOAT_COUNTER_BOX, {"A": _img(H=10, W=10), "r": r}
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, _refs, _assigned, _params, used = get_cache().compile_ast(program, bt, source=code)
+    ref = Interpreter().execute(program, _clone(bindings), tm, device="cpu", output_names=["OUT"])
+    got = _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
+                                used_builtins=used, fingerprint=None, time_context=None)
+    assert (ref["OUT"] - got["OUT"]).abs().max().item() <= 1e-5
+
+
+# ── a scalar-mode loop leaves an enclosing local it only reads as the tensor it was ──────
+
+_SCALAR_READ_ONLY_ROWS = [
+    ("read-only local, no image bound",
+     "float f0 = -1.0;\nint i0 = 0;\nfor (int k0 = 0; k0 < 4; k0++) { f0 = f0; }\n"
+     "for (int k1 = 0; k1 < 2; k1++) { if (f0 <= 0.5) { break; } i0 *= 0; }\n@OUT = vec4(f0, f0, 0.0, 0.0);", {}),
+    ("read-only local, image bound",
+     "float f0 = -1.0;\nint i0 = 0;\nfor (int k0 = 0; k0 < 4; k0++) { f0 = f0; }\n"
+     "for (int k1 = 0; k1 < 2; k1++) { if (f0 <= 0.5) { break; } i0 *= 0; }\n@OUT = vec4(f0, f0, 0.0, 0.0) + @A * 0.0;",
+     {"A": None}),
+    ("scalar loop inside a per-pixel if",
+     "float acc = 0.0; float cnt = 0.0; float x = @A.r;\n"
+     "if ($g < x) { for (int i1 = 0; i1 < 3; i1++) { acc = acc * 0.5 + cnt; } }\n@OUT = vec4(acc, cnt, 0.0, 0.0);",
+     {"A": None, "g": 0.5}),
+]
+
+
+@pytest.mark.parametrize("label,code,extra", _SCALAR_READ_ONLY_ROWS,
+                         ids=[r[0] for r in _SCALAR_READ_ONLY_ROWS])
+def test_scalar_loop_keeps_read_only_locals_tensors(label, code, extra):
+    bindings = {k: (_img() if v is None else v) for k, v in extra.items()}
+    assert_parity(code, bindings)
+
+
+# ── a ternary on a 0-dim condition runs only the taken arm, as the interpreter does ──────
+
+_TERNARY_ROWS = [
+    ("recursive base case", "float f(float n) { return n <= 1.0 ? 1.0 : n * f(n - 1.0); }\n"
+     "@OUT = vec3(f(5.0)) + @A.rgb * 0.0;"),
+    ("per-pixel condition", "@OUT = @A.r > 0.5 ? @A.rgb * 2.0 : vec3(0.1);"),
+    ("0-dim condition, leaf arms", "float c = 0.7; @OUT = c > 0.5 ? @A.rgb : vec3(0.2);"),
+    ("nested", "float c = u; @OUT = vec3(c > 0.5 ? (v > 0.5 ? 1.0 : 2.0) : (c > 0.2 ? 3.0 : 4.0));"),
+    ("string arms, per-pixel condition", 'string s = @A.r > 0.5 ? "aa" : "b"; @OUT = vec3(float(len(s)));'),
+    ("string arms, 0-dim condition",
+     'float k = 0.2; string s = k > 0.5 ? "aa" : "b"; @OUT = vec3(float(len(s))) + @A.rgb * 0.0;'),
+]
+
+
+@pytest.mark.parametrize("label,code", _TERNARY_ROWS, ids=[r[0] for r in _TERNARY_ROWS])
+def test_ternary_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img()}, atol=0.0)
+
+
+# ── float() of an int `$param` is a float32 value, as in the interpreter ─────────────────
+
+_FLOAT_CAST_ROWS = [
+    ("scatter write of float($n)",
+     "float a[4];\nfor (int i = 0; i < 4; i++) { a[i] = float(i); }\n"
+     "a[int(@A.r * 4.0) - 1] = float($n) * float($n);\n@OUT = vec3(a[0], a[1], a[2]) + @A.rgb * 0.0;"),
+    ("arithmetic on float($n)",
+     "float acc = @A.r; float x = float($n);\nacc = acc * 0.5 + (0.25 - (float($n) * x));\n@OUT = vec3(acc);"),
+]
+
+
+@pytest.mark.parametrize("label,code", _FLOAT_CAST_ROWS, ids=[r[0] for r in _FLOAT_CAST_ROWS])
+def test_float_cast_of_an_int_param_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img(), "n": 3})
+
+
+# ── a hoisted fetch at batch > 1 spans the frame for 0-dim coordinates ──────────────────
+
+def test_hoisted_fetch_batch_gt_one_scalar_coords():
+    code = "vec4 c = vec4(0.0);\nfloat t = 0.5;\nwhile (t < 3.0) { c = fetch(@A, 3, 4); t = t + 1.0; }\n@OUT = c;"
+    assert_parity(code, {"A": _img(B=3, H=5, W=5)}, atol=0.0)
+
+
+# ── linecache: a rebuild's source replaces the old one; the cancel build has its own name ─
+
+def test_codegen_linecache_follows_the_newest_source():
+    import linecache
+    from TEX_Wrangle.tex_runtime import codegen_persist as cp
+    fp = "f" * 64
+    name = cp._cg_filename(fp)
+    assert cp._cg_filename(fp, cancel=True) != name
+    try:
+        cp._register_codegen_linecache(name, "a = 1\n")
+        cp._register_codegen_linecache(name, "a = 1\nb = 2\n")
+        assert linecache.getline(name, 2) == "b = 2\n"
+        assert list(cp._LINECACHE_KEYS).count(name) == 1
+        linecache.cache.pop(name, None)   # a clearcache() between builds
+        cp._register_codegen_linecache(name, "c = 3\n")
+        assert list(cp._LINECACHE_KEYS).count(name) == 1
+    finally:
+        linecache.cache.pop(name, None)
+        if name in cp._LINECACHE_KEYS:
+            cp._LINECACHE_KEYS.remove(name)

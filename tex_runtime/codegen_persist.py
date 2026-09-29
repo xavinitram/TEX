@@ -6,7 +6,7 @@ registration so tracebacks in generated code resolve, K1's paired synthetic-modu
 registration (below) so a Dynamo graph-break resume resolves too, and marshal-based
 rematerialization of a cached code object. Free functions with their own bounded
 linecache state; zero `_CodeGen` reference => a strict leaf (codegen.py and
-tex_cache import back the three entry points). Contract unchanged: the CALLER
+tex_cache import back its entry points). Contract unchanged: the CALLER
 validates version/MAGIC/SHA before `materialize_codegen`.
 """
 from __future__ import annotations
@@ -23,10 +23,11 @@ _LINECACHE_KEYS: "_deque[str]" = _deque()
 _LINECACHE_MAX = 64
 
 
-def _cg_filename(fingerprint: str) -> str:
+def _cg_filename(fingerprint: str, cancel: bool = False) -> str:
     """The pseudo-filename for a fingerprinted codegen module — must match
-    between build() and materialize_codegen() so linecache keys line up."""
-    return f"<tex_codegen_{fingerprint[:16]}>"
+    between build() and materialize_codegen() so linecache keys line up. The
+    cancel-polling build emits different source, so it gets its own name."""
+    return f"<tex_codegen_{fingerprint[:16]}{'_ck' if cancel else ''}>"
 
 
 def _codegen_module_name(filename: str) -> str:
@@ -83,16 +84,19 @@ def _codegen_exec_namespace(filename: str, seed: dict) -> dict:
 
 def _register_codegen_linecache(filename: str, src: str) -> None:
     """Register generated source with linecache (for diagnostics / getsource),
-    pruning the oldest entry when over the cap. Deterministic filenames repeat,
-    so skip re-registering (and re-queuing) an already-present key.
+    pruning the oldest entry when over the cap. Deterministic filenames repeat: the
+    newest source wins (a rebuild can emit different text) and a key is queued once.
 
     K1: the paired sys.modules entry (`_codegen_exec_namespace`, above) is evicted
     alongside the linecache entry it shares a key with, so the two registries can
     never drift — one always outlives the other by construction, never by omission."""
-    if filename in _linecache.cache:
+    lines = src.splitlines(True)
+    entry = _linecache.cache.get(filename)
+    if entry is not None and entry[2] == lines:
         return
-    _linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
-    _LINECACHE_KEYS.append(filename)
+    _linecache.cache[filename] = (len(src), None, lines, filename)
+    if filename not in _LINECACHE_KEYS:
+        _LINECACHE_KEYS.append(filename)
     while len(_LINECACHE_KEYS) > _LINECACHE_MAX:
         evicted = _LINECACHE_KEYS.popleft()
         _linecache.cache.pop(evicted, None)
