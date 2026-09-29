@@ -700,16 +700,16 @@ session.close()                                     # then shed caches and host 
 ```
 
 Every call is real, not a sketch: `default_session` / `set_host` / `reset` / `close`
-(`tex_session.py:112-118`, `:65-68`, `:74-82`, `:100-106`), the process-wide profile setter,
+(`tex_session.default_session`, `EngineSession.set_host`, `.reset`, `.close`), the process-wide profile setter,
 `set_egress_profile` (`tex_marshalling.py:957-965`), `NullHostServices` (`tex_runtime/host.py:125-137`), and
 `submit` / `result` / `close` (`tex_cookqueue.py:292-309`, `:215-224`, `:832-865`). The lifecycle op
 runs at COMMITTED because that class is never shed and pauses for INTERACTIVE rather than tripping
 it (`tex_cookqueue.py:17-34`); the submit is fenced through the queue because `reset()` must not run
-beside a live cook (`tex_session.py:79-80`) and the queue's single worker thread is the exclusion
+beside a live cook (`EngineSession.reset`) and the queue's single worker thread is the exclusion
 (`tex_cookqueue.py:17-22`); `feeds_profile=False` because a non-cook job must not reach PROF-1's cost
 table, and that has to be said, not left to a `profile_key` the caller happened not to pass
 (the `Job` dataclass's `feeds_profile` field, `tex_cookqueue.py:179-184`). One fact `close()` does NOT undo: it leaves the egress profile exactly
-where the host last set it (`tex_session.py:100-106`).
+where the host last set it (`EngineSession.close`).
 
 **The egress profile is set once, by the host, before the first cook.** That is the normative
 shape, not merely the one the block above happens to use: the setter is process-global, so the
