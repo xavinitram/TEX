@@ -569,3 +569,13 @@ def test_call_depth_limit_matches_interpreter(masked):
     with pytest.raises(Exception, match="call depth"):
         _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
                               used_builtins=used, fingerprint=None, time_context=None)
+
+
+# ── a function-body local never takes a user function's generated name ──────────────────
+
+@pytest.mark.parametrize("masked", [False, True], ids=["0.23", "masked 0.25"])
+def test_function_local_does_not_shadow_a_function_named_lv(masked):
+    head = "//!tex 0.25\nfor (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; } }\n" if masked else ""
+    code = (head + "float lv_x(float a) { return a * 2.0; }\n"
+            "float g(float b) { float x = b; return lv_x(x); }\n@OUT = vec3(g(@A.r));")
+    assert_parity(code, {"A": _img()})

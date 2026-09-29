@@ -569,7 +569,7 @@ class MaskedEmitMixin:
         body_vars, _ = self._collect_modified_vars(stmt.body)
         for vname in sorted(body_vars):
             if vname not in self._local_vars:
-                self._local_vars[vname] = f"_uf_lv_{vname}"
+                self._local_vars[vname] = f"_ufl_{vname}"  # never `_uf_<x>`: that names a function
 
         saved_in_fn = self._in_user_function
         self._in_user_function = True
