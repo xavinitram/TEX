@@ -45,6 +45,7 @@ import json
 import os
 import subprocess
 import sys
+from subprocess import PIPE, TimeoutExpired
 
 # One prewarm batch may pay a first-ever toolchain probe plus a Dynamo/Inductor lowering per
 # program; two minutes covers a normal batch. On expiry the child is killed and the caller gets
@@ -100,12 +101,12 @@ def warm_in_subprocess(jobs, *, device: str, precision: str, compile_mode: str) 
     try:
         proc = subprocess.Popen(
             [sys.executable, "-c", _child_source(_pkg_name, _pkg_dir)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=PIPE, stdout=PIPE, stderr=PIPE,
             text=True, encoding="utf-8", errors="replace", env=env,
         )
         try:
             out, err = proc.communicate(json.dumps(payload), timeout=_WORKER_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
+        except TimeoutExpired:
             proc.kill()
             try:   # a grandchild (cl.exe, an Inductor worker) may still hold the pipes: bounded wait
                 proc.communicate(timeout=5)
