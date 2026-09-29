@@ -37,8 +37,19 @@ def arm() -> None:
     _local.mask = None
 
 
+def reset() -> None:
+    """Zero the accumulators and stay armed: call when the engine discards a cook attempt
+    and re-cooks (fp16 fallback, out-of-memory retry), so the count and mask describe only
+    the attempt that is returned."""
+    _local.count = 0
+    _local.mask = None
+
+
 def disarm() -> None:
+    """Stop recording and release the accumulated mask (the engine reads it, and holds its
+    own reference, before disarming); the count stays readable until the next `arm()`."""
     _local.armed = False
+    _local.mask = None
 
 
 def armed() -> bool:
@@ -51,14 +62,15 @@ def note(mask) -> None:
     if not getattr(_local, "armed", False):
         return
     try:
-        _local.count += int(mask.sum())
+        fired = int(mask.sum())
         # Reduce to a per-pixel [..., H, W] boolean: collapse a channel-like trailing dim.
         pix = mask
         if pix.dim() >= 4 and pix.shape[-1] <= 4:
             pix = pix.any(dim=-1)
-        if pix.dim() < 2:
-            return  # scalar/1-D guard — counted, but can't localise to pixels
-        _local.mask = pix if _local.mask is None else (_local.mask | pix)
+        if pix.dim() >= 2:   # a scalar/1-D guard is counted below but can't localise to pixels
+            old = _local.mask
+            _local.mask = pix if old is None or old.shape != pix.shape else (old | pix)
+        _local.count += fired
     except Exception:
         pass
 

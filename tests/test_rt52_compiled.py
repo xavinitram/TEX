@@ -318,3 +318,20 @@ def test_an_out_of_memory_capture_is_retried_later_but_other_failures_are_not(mo
     assert out is None and not blacklisted
     out, blacklisted = _graphed_capture_attempt(monkeypatch, RuntimeError("capture invalidated"))
     assert out is None and blacklisted
+
+
+def test_guard_trace_reset_disarm_and_shape_change():
+    from TEX_Wrangle.tex_runtime import guard_trace as GT
+    GT.arm()
+    try:
+        GT.note(torch.ones(1, 4, 4, 1, dtype=torch.bool))
+        assert GT.count() == 16 and GT.mask() is not None
+        GT.reset()                                    # the attempt was discarded
+        assert GT.count() == 0 and GT.mask() is None and GT.armed()
+        GT.note(torch.ones(1, 4, 4, 1, dtype=torch.bool))
+        GT.note(torch.ones(1, 2, 2, 1, dtype=torch.bool))   # a retry at another size
+        assert GT.count() == 20
+        assert tuple(GT.mask().shape) == (1, 2, 2)
+    finally:
+        GT.disarm()
+    assert GT.mask() is None and not GT.armed()
