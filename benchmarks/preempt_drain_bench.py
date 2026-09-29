@@ -8,7 +8,7 @@ events, waited on only when the ring is full) against the same shape of scenario
 background cook on one thread, pre-empted mid-flight by an interactive cook submitted on
 another thread.
 
-Four experiments, each host-neutral (a background "committed" render, an "interactive"
+Six experiments, each host-neutral (a background "committed" render, an "interactive"
 request — no host or vendor named):
 
   1. `cost_unpreempted`   -- background cook's OWN run time, paced (per depth) vs unpaced,
@@ -42,8 +42,9 @@ request — no host or vendor named):
                              --sweep-interactive`.
 
 Measurement rules this file follows (docs/brief-conventions.md): a fresh CUDA cache
-directory per run (set `TEX_CACHE_DIR` before invoking), the first leg of any A/B always
-discarded, GPU state and box name recorded beside every number.
+directory per run (set `TEX_CACHE_DIR` before invoking), a discarded cold leg before every
+calibration, A/B legs interleaved, inputs built and uploaded BEFORE any timed region or trip
+timer starts, GPU state and box name recorded beside every number.
 
     python_embeded/python.exe -X utf8 benchmarks/preempt_drain_bench.py --depths 1,2,3,4,8
     python_embeded/python.exe -X utf8 benchmarks/preempt_drain_bench.py --trials 100 --save results/pace462.json
@@ -220,8 +221,10 @@ def _calibrate():
     """The uncancelled full runtime of the heavy chain -- discard a cold leg, floor of two
     warm legs (docs/brief-conventions.md's measurement discipline)."""
     def once(seed):
+        bindings = _heavy_bindings(seed)
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda")
+        tex_engine.cook(_HEAVY, bindings, device_mode="cuda")
         torch.cuda.synchronize()
         return time.perf_counter() - t0
 
@@ -237,26 +240,19 @@ def cost_unpreempted(depths, trials, seed0=2000):
         for i in range(trials):
             seed = seed0 + i
             a_first = i % 2 == 0
-            if a_first:
+            # Inputs are built and uploaded before either timer starts: the fixed cost of
+            # 26M `torch.rand` floats and a 105 MB upload would shrink overhead_pct.
+            inputs = {"u": _heavy_bindings(seed), "p": _heavy_bindings(seed)}
+            torch.cuda.synchronize()
+            times = {}
+            for which in (("u", "p") if a_first else ("p", "u")):
+                tok = _UnpacedToken() if which == "u" else _PacedToken(d)
                 t0 = time.perf_counter()
-                tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=_UnpacedToken())
+                tex_engine.cook(_HEAVY, inputs[which], device_mode="cuda", cancel=tok)
                 torch.cuda.synchronize()
-                tu = time.perf_counter() - t0
-                t0 = time.perf_counter()
-                tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=_PacedToken(d))
-                torch.cuda.synchronize()
-                tp = time.perf_counter() - t0
-            else:
-                t0 = time.perf_counter()
-                tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=_PacedToken(d))
-                torch.cuda.synchronize()
-                tp = time.perf_counter() - t0
-                t0 = time.perf_counter()
-                tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=_UnpacedToken())
-                torch.cuda.synchronize()
-                tu = time.perf_counter() - t0
-            unpaced_t[d].append(tu)
-            paced_t[d].append(tp)
+                times[which] = time.perf_counter() - t0
+            unpaced_t[d].append(times["u"])
+            paced_t[d].append(times["p"])
     out = {}
     for d in depths:
         med_u, med_p = statistics.median(unpaced_t[d]), statistics.median(paced_t[d])
@@ -272,28 +268,29 @@ def drain_on_preempt(depths, trials, full_runtime, seed0=3000):
     for d in depths:
         returns_ms, drained_ms = [], []
         for i in range(trials):
-            import random
             delay = full_runtime * random.uniform(0.15, 0.85)
-            tok = _TripToken(delay, d)
             bg_seed = seed0 + i
-            bg_done = threading.Event()
+            # Both inputs are built and uploaded before the trip timer starts, so the timer
+            # counts GPU work in flight and the interactive upload is not queued behind it.
+            bg_inputs = _heavy_bindings(bg_seed)
+            ui_inputs = _interactive_bindings(bg_seed)
+            torch.cuda.synchronize()
+            tok = _TripToken(delay, d)
             bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
             def _bg():
                 try:
-                    tex_engine.cook(_HEAVY, _heavy_bindings(bg_seed), device_mode="cuda", cancel=tok)
+                    tex_engine.cook(_HEAVY, bg_inputs, device_mode="cuda", cancel=tok)
                 except CookCancelled:
                     pass
                 except Exception as exc:
                     bg_error["exc"] = exc
-                finally:
-                    bg_done.set()
 
             th = _start_background_cook(_bg)
             tok._tripped.wait(timeout=full_runtime * 2 + 2)  # wait for the timer to trip
 
             t0 = time.perf_counter()
-            res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(bg_seed), device_mode="cuda")
+            res = tex_engine.cook(_INTERACTIVE, ui_inputs, device_mode="cuda")
             t1 = time.perf_counter()
             if res.done is not None:
                 res.done.synchronize()
@@ -322,14 +319,13 @@ def host_lead(depths, trials=20, seed0=4000):
         for d in depths if label == "paced" else [None]:
             leads = []
             for i in range(trials):
-                seed = seed0 + i
-                t0 = time.perf_counter()
-                res = tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=make_tok(d))
+                inputs = _heavy_bindings(seed0 + i)
+                torch.cuda.synchronize()
+                tex_engine.cook(_HEAVY, inputs, device_mode="cuda", cancel=make_tok(d))
                 t_return = time.perf_counter()
                 torch.cuda.synchronize()
                 t_drained = time.perf_counter()
                 leads.append((t_drained - t_return) * 1000)
-                _ = t0
             key = label if d is None else f"{label}_depth{d}"
             out[key] = {"lead_p50_ms": _p(leads, 0.50), "lead_p95_ms": _p(leads, 0.95)}
     return out
@@ -342,27 +338,28 @@ def stream_priority(trials, full_runtime, seed0=5000):
     on a high-priority CUDA stream drain faster than on the default stream? Measure-only:
     this experiment intentionally does not touch tex_runtime/pacing.py or any product code
     -- it answers a question, and the answer becomes a recommendation in the hand-back."""
-    import random
     high = torch.cuda.Stream(priority=-1)
     results = {"default_stream": [], "high_priority_stream": []}
     for i in range(trials):
         use_high = (i % 2 == 0)
         delay = full_runtime * random.uniform(0.15, 0.85)
+        seed = seed0 + i
+        # Both uploads happen before the background cook starts, on the default stream, so
+        # the two arms differ only in the stream the interactive cook itself runs on.
+        bg_inputs = _heavy_bindings(seed)
+        ui_inputs = _interactive_bindings(seed)
+        torch.cuda.synchronize()
         tok = _TripToken(delay, depth=999999)  # depth irrelevant: token never asked to pace (pace stays True though)
         tok.pace = False  # this experiment is about UNPACED background cooks specifically
-        seed = seed0 + i
-        bg_done = threading.Event()
         bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
         def _bg():
             try:
-                tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=tok)
+                tex_engine.cook(_HEAVY, bg_inputs, device_mode="cuda", cancel=tok)
             except CookCancelled:
                 pass
             except Exception as exc:
                 bg_error["exc"] = exc
-            finally:
-                bg_done.set()
 
         th = _start_background_cook(_bg)
         tok._tripped.wait(timeout=full_runtime * 2 + 2)
@@ -370,10 +367,10 @@ def stream_priority(trials, full_runtime, seed0=5000):
         t0 = time.perf_counter()
         if use_high:
             with torch.cuda.stream(high):
-                res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(seed), device_mode="cuda")
+                res = tex_engine.cook(_INTERACTIVE, ui_inputs, device_mode="cuda")
             torch.cuda.current_stream().wait_stream(high)
         else:
-            res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(seed), device_mode="cuda")
+            res = tex_engine.cook(_INTERACTIVE, ui_inputs, device_mode="cuda")
         if res.done is not None:
             res.done.synchronize()
         t1 = time.perf_counter()
@@ -519,8 +516,10 @@ class _SweepTripToken:
 
 def _sweep_calibrate(code, size, trials=2):
     def once(seed):
+        bindings = _sized_bindings(size, seed)
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        tex_engine.cook(code, _sized_bindings(size, seed), device_mode="cuda")
+        tex_engine.cook(code, bindings, device_mode="cuda")
         torch.cuda.synchronize()
         return time.perf_counter() - t0
     once(9000)  # discard the cold leg (docs/brief-conventions.md's measurement discipline)
@@ -536,10 +535,12 @@ def sweep_cost_unpreempted(code, size, depth, stride_ms, trials, seed0):
         a_first = i % 2 == 0
         order = (("u", "p"), ("p", "u"))[0 if a_first else 1]
         times = {}
+        inputs = {"u": _sized_bindings(size, seed), "p": _sized_bindings(size, seed)}
+        torch.cuda.synchronize()
         for which in order:
             tok = _UnpacedToken() if which == "u" else _PacedToken(depth, stride_ms)
             t0 = time.perf_counter()
-            tex_engine.cook(code, _sized_bindings(size, seed), device_mode="cuda", cancel=tok)
+            tex_engine.cook(code, inputs[which], device_mode="cuda", cancel=tok)
             torch.cuda.synchronize()
             times[which] = time.perf_counter() - t0
         unpaced_t.append(times["u"])
@@ -550,32 +551,33 @@ def sweep_cost_unpreempted(code, size, depth, stride_ms, trials, seed0):
 
 
 def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, seed0):
-    """One cell's (b): submit -> device-drained p50/p95 after a pre-emption trips at a
-    random point in [15%, 85%] of the shape's own uncancelled full runtime."""
+    """One cell's (b): submit -> device-drained p50/p95 after a pre-emption trips once the
+    background cook has reached a random statement fraction in [15%, 85%]. `full_runtime`
+    only bounds the join and wait timeouts."""
     returns_ms, drained_ms = [], []
     for i in range(trials):
         frac = random.uniform(0.15, 0.85)
         tok = _SweepTripToken(depth, stride_ms, frac)
         bg_seed = seed0 + i
-        bg_done = threading.Event()
+        bg_inputs = _sized_bindings(size, bg_seed)
+        ui_inputs = _interactive_bindings(bg_seed)
+        torch.cuda.synchronize()
         bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
         def _bg():
             try:
-                tex_engine.cook(code, _sized_bindings(size, bg_seed), device_mode="cuda",
+                tex_engine.cook(code, bg_inputs, device_mode="cuda",
                                  cancel=tok, on_progress=tok.on_progress)
             except CookCancelled:
                 pass
             except Exception as exc:
                 bg_error["exc"] = exc
-            finally:
-                bg_done.set()
 
         th = _start_background_cook(_bg)
         tok._tripped.wait(timeout=full_runtime * 4 + 5)
 
         t0 = time.perf_counter()
-        res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(bg_seed), device_mode="cuda")
+        res = tex_engine.cook(_INTERACTIVE, ui_inputs, device_mode="cuda")
         t1 = time.perf_counter()
         if res.done is not None:
             res.done.synchronize()
@@ -645,26 +647,28 @@ def sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s, s
     code, size = shp["code"], shp["size"]
     returns_ms, drained_ms = [], []
     for i in range(trials):
-        tok = _TripToken(delay_s, depth, stride_ms)
         bg_seed = seed0 + i
-        bg_done = threading.Event()
+        # The delay is measured from the start of the background cook, not from thread
+        # start plus input build and upload.
+        bg_inputs = _sized_bindings(size, bg_seed)
+        ui_inputs = _interactive_bindings(bg_seed)
+        torch.cuda.synchronize()
+        tok = _TripToken(delay_s, depth, stride_ms)
         bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
         def _bg():
             try:
-                tex_engine.cook(code, _sized_bindings(size, bg_seed), device_mode="cuda", cancel=tok)
+                tex_engine.cook(code, bg_inputs, device_mode="cuda", cancel=tok)
             except CookCancelled:
                 pass
             except Exception as exc:
                 bg_error["exc"] = exc
-            finally:
-                bg_done.set()
 
         th = _start_background_cook(_bg)
         tok._tripped.wait(timeout=delay_s + 5)
 
         t0 = time.perf_counter()
-        res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(bg_seed), device_mode="cuda")
+        res = tex_engine.cook(_INTERACTIVE, ui_inputs, device_mode="cuda")
         t1 = time.perf_counter()
         if res.done is not None:
             res.done.synchronize()
