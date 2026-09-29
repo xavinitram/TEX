@@ -13,39 +13,19 @@ dispatch returning (result, notifications), so it is unit-testable without a liv
 pipe (the stdio loop in `main()` is a thin frame reader/writer around it). Host-agnostic:
 no comfy, no aiohttp.
 
-HOOK-2 — a per-document binding map on `didOpen`/`didChange`. `diagnostics_for` used to
-check every document against a hardcoded `{}`, so every `@input` resolved to VEC4 and a
-real three-channel input's `.a` type-checked clean here and failed only at cook (see
-`tex_api.check`'s own docstring). `didOpen`/`didChange` params may now carry an optional
-`bindingTypes` field, a sibling of `textDocument` (not `initializationOptions` — one stdio
-server serves many documents, and bindings differ per document): a JSON object
-`{name: type-string}`, the wire form of the `{name: TEXType}` map `check()`'s
-`binding_types` parameter already takes.
+Per-document bindings: `didOpen` / `didChange` params may carry an optional `bindingTypes`
+field, a sibling of `textDocument`: a JSON object `{name: type-string}`. The type strings are
+exactly `tex_compiler.types.TYPE_NAME_MAP`'s keys (`float`, `int`, `vec2`, `vec3`, `vec4`,
+`mat3`, `mat4`, `string`, `planes`), case-sensitive, so the wire adds no second vocabulary;
+the parsed map is the `{name: TEXType}` shape `tex_api.check` takes. Without a map every
+`@input` checks as VEC4.
 
-Type-string vocabulary: exactly `tex_compiler.types.TYPE_NAME_MAP`'s own keys — `float`,
-`int`, `vec2`, `vec3`, `vec4`, `mat3`, `mat4`, `string` — matched case-sensitively with no
-coercion, so the wire never grows a second type vocabulary beside the one the parser and
-type-checker already use for a declared type name. (`array` is absent on both sides: ARRAY
-needs element/size metadata `TYPE_NAME_MAP` doesn't carry.) Once parsed, the map handed to
-`check()` is the identical `{name: TEXType}` shape a host that lint-checks in process would
-build for the same call — a caller doing `tex_api.check(source, binding_types)` directly
-and this wire path now type-check against one shape rather than two.
-
-Defaults are kept byte-for-byte: a client that never sends `bindingTypes` gets today's
-behaviour exactly — `check()` against `{}`. Per open document (by uri): `didOpen` sets the
-map fresh, `{}` when the field is absent or not a JSON object; `didChange` REPLACES the
-stored map only when `bindingTypes` is present and IS a JSON object (even `{}`) — absent,
-`null`, or any other shape leaves the previously-stored map in place, and a bindings-only
-change (no accompanying text edit) still republishes diagnostics against the stored text
-rather than going stale against the old map. `didClose` discards the map with the document.
-
-An entry whose value is not one of `TYPE_NAME_MAP`'s own strings — a typo, or `array` — is
-DROPPED rather than raising; the rest of an otherwise-usable map still applies. Ignored,
-not diagnosed: `handle()`'s contract is that a bad request never tears the session down,
-dropping an unrecognised entry costs nothing a client can observe going wrong (that one
-binding just stays unresolved, exactly like an absent key), and a synthetic diagnostic for
-a wire-shape mistake would need an invented code and a source range with nothing to anchor
-it to. See `_parse_binding_types` for the exact parse.
+`didOpen` sets the map fresh (`{}` when absent or not an object); `didChange` replaces it only
+when `bindingTypes` is present and is an object, and a bindings-only change republishes
+against the stored text. `didClose` discards the map with the document. An entry with an
+unknown type string is dropped, not diagnosed: a bad request never tears the session down.
+Diagnostics are pushed on open/change and also served on request (`textDocument/diagnostic`);
+positions are UTF-16 code units, as LSP requires. See `_parse_binding_types`.
 """
 from __future__ import annotations
 
@@ -66,6 +46,21 @@ def _registry():
     return R
 
 
+def _to_utf16(text: str, col: int) -> int:
+    """A code-point column in `text` -> the UTF-16 code-unit column LSP positions use."""
+    return col + sum(1 for ch in text[:col] if ord(ch) > 0xFFFF)
+
+
+def _from_utf16(text: str, units: int) -> int:
+    """The inverse of `_to_utf16`: a UTF-16 column -> a code-point index into `text`."""
+    n = 0
+    for i, ch in enumerate(text):
+        if n >= units:
+            return i
+        n += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
 def diagnostics_for(source: str, binding_types: dict | None = None) -> list[dict]:
     """Run LANG-2 check() and convert each TEXDiagnostic to an LSP Diagnostic. check() never
     raises, so this never raises. LSP positions are 0-based; TEXDiagnostic is 1-based.
@@ -76,6 +71,11 @@ def diagnostics_for(source: str, binding_types: dict | None = None) -> list[dict
     behaviour: every `@input` resolves to VEC4."""
     from .tex_api import check
     out = []
+    src_lines = source.split("\n")
+
+    def utf16(line_no: int, col: int) -> int:
+        return _to_utf16(src_lines[line_no], col) if line_no < len(src_lines) else col
+
     for d in check(source, binding_types if binding_types is not None else {}):
         dd = d.to_dict()
         line = max(0, (dd.get("line") or 1) - 1)
@@ -84,8 +84,8 @@ def diagnostics_for(source: str, binding_types: dict | None = None) -> list[dict
         end_col = dd.get("end_col")
         end_col = col + 1 if end_col is None else max(0, end_col - 1)
         item = {
-            "range": {"start": {"line": line, "character": col},
-                      "end": {"line": end_line, "character": end_col}},
+            "range": {"start": {"line": line, "character": utf16(line, col)},
+                      "end": {"line": end_line, "character": utf16(end_line, end_col)}},
             "severity": _SEVERITY.get(dd.get("severity", "error"), 1),
             "code": dd.get("code", ""),
             "source": "tex",
@@ -121,6 +121,7 @@ def hover_for(source: str, line: int, character: int) -> dict | None:
     if line < 0 or line >= len(lines):
         return None
     text = lines[line]
+    character = _from_utf16(text, character)
     word = None
     for m in _WORD_RE.finditer(text):
         if m.start() <= character <= m.end():
@@ -237,6 +238,12 @@ class LSPServer:
                            "params": {"uri": uri, "diagnostics": []}}]
         if method == "textDocument/completion":
             return {"isIncomplete": False, "items": completion_items()}, []
+        if method == "textDocument/diagnostic":
+            # Pull diagnostics: the same list `publishDiagnostics` pushes, as a full report.
+            uri = params.get("textDocument", {}).get("uri")
+            items = (diagnostics_for(self.docs[uri], self.binding_types.get(uri, {}))
+                     if uri in self.docs else [])
+            return {"kind": "full", "items": items}, []
         if method == "textDocument/hover":
             uri = params.get("textDocument", {}).get("uri")
             pos = params.get("position", {})
@@ -321,9 +328,9 @@ def main(argv=None) -> None:
         try:
             msg = _read_message(stdin)
         except _BadFrame:
-            continue                           # malformed frame must not kill the server (#12)
+            continue                           # a malformed frame must not kill the server
         except Exception:
-            break                              # dead/closed stream — stop, don't busy-spin (#11)
+            break                              # dead/closed stream: stop, don't busy-spin
         if msg is None:
             break                              # clean EOF
         method = msg.get("method")

@@ -86,7 +86,7 @@ def plate_night(H: int, W: int, device: torch.device, seed: int = 2) -> torch.Te
     base[:, 2] *= 1.6
     pos = torch.rand(40, 2, device=device, generator=g)
     for i in range(40):
-        y, x = int(pos[i, 0] * (H - 8)), int(pos[i, 1] * (W - 8))
+        y, x = int(pos[i, 0] * max(H - 8, 0)), int(pos[i, 1] * max(W - 8, 0))
         base[:, :, y:y + 6, x:x + 6] = torch.tensor((20.0, 12.0, 5.0), device=device).view(1, 3, 1, 1)
     return base.contiguous()
 
@@ -95,9 +95,9 @@ def code_diff_stats(a: torch.Tensor, b: torch.Tensor) -> dict:
     """Summarize a pixel-wise 8-bit-code difference between two `aces_srgb8`
     outputs (worst channel per pixel), both overall and restricted to the
     centre half of the frame (`centre_*`, excluding a border margin where
-    boundary handling can dominate). `a`/`b` are [H, W, 3] int16. On frames
-    with H or W < 4 the centre half is empty, so the centre stats fall back
-    to the full frame (every pixel there is border anyway)."""
+    boundary handling can dominate). `a`/`b` are [H, W, 3] int16. When H or W
+    is 1 the centre-half slice is empty, so the centre stats fall back to the
+    full frame."""
     sd = (a - b).double()
     d = sd.abs().amax(dim=-1)
     n = d.numel()

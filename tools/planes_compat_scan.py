@@ -1,14 +1,9 @@
-"""DATA-6 compat scan, run in PHASE 1 rather than phase 2 — because if it comes back dirty the
-DESIGN changes, not the implementation.
-
-The claim the design rests on: making the lexer greedy over one dotted segment cannot move a
-frozen golden, because no frozen program contains a dotted `@` form at all. If any does, it is
-an ordinary swizzle and the splitback must be shown bit-exact on that program specifically.
-
-Scans the frozen corpus AND every shipped example, since freeze #2 will draw from both.
+"""DATA-6 tripwire over the frozen corpus and every shipped example: lists each dotted `@` form
+(`@wire.segment`) and classifies the segment as a swizzle (the pre-0.24 meaning), a plane read
+on a `p@`-hinted wire, or neither. A form that is neither would change meaning under the greedy
+lexer, so the scan exits 1 on one. Run as a script; the scan happens at import time.
 """
 import os
-import re
 import sys
 
 # Portable: the package root is derived from this file, so the scan runs from any checkout
@@ -41,9 +36,6 @@ for fn in sorted(os.listdir(exdir)):
 print(f"scanning {len(sources)} programs "
       f"({sum(1 for n, _ in sources if n.startswith('corpus'))} corpus, "
       f"{sum(1 for n, _ in sources if n.startswith('example'))} examples)\n")
-
-# A dotted `@` form is `@ident . ident` with no intervening space, per the greedy lexer's rule.
-DOTTED = re.compile(r"@[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_][A-Za-z_0-9]*")
 
 
 
@@ -112,7 +104,7 @@ if odd:
 elif hits:
     planes = sum(1 for h in hits if h[3] == "PLANE")
     print("VERDICT: CLEAN-WITH-SWIZZLES — every dotted form is an ordinary swizzle, so the")
-    print("  splitback rule's row 2/4 covers them all. Phase 2 must show these bit-exact."
+    print("  splitback rule's row 2/4 covers them all."
           + (f" ({planes} plane read(s) on p@-hinted wires, legal since 0.24, counted apart.)"
              if planes else ""))
 else:

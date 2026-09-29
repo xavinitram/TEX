@@ -46,10 +46,11 @@ _UNIT_SEP = "\x1f"
 
 
 def _git_log_messages(rev_range: str, cwd: Path = _PKG) -> list[tuple[str, str]]:
-    """`[(full sha, subject+body)]` for every commit in `rev_range`, oldest first."""
+    """`[(full sha, subject+body)]` for every commit in `rev_range`, newest first."""
     fmt = f"%H{_UNIT_SEP}%B{_REC_SEP}"
-    out = subprocess.run(["git", "log", rev_range, f"--format={fmt}"],
-                         cwd=str(cwd), capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["git", "log", rev_range, f"--format={fmt}"], cwd=str(cwd),
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         check=True).stdout
     commits = []
     for rec in out.split(_REC_SEP):
         rec = rec.strip("\n")
@@ -105,7 +106,11 @@ def main(argv: list | None = None) -> int:
     else:
         print(__doc__)
         return 2
-    hits = scan_range(rev_range)
+    try:
+        hits = scan_range(rev_range)
+    except subprocess.CalledProcessError as e:
+        print(f"could not read {rev_range}: {(e.stderr or '').strip() or e}")
+        return 2                                    # a bad range is not "leaks found"
     if hits:
         print(f"{len(hits)} commit message leak(s) found in {rev_range}:")
         for h in hits:

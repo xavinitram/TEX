@@ -4,21 +4,21 @@ S-4 — `tex validate-hw`: a shareable hardware-validation report.
 Every perf gate in TEX was calibrated on ONE GPU (RTX 2080 SUPER, sm_75). This command
 lets any user *measure* whether those Turing-calibrated constants hold on their card and
 paste a structured verdict back (the "Hardware validation report" issue template). It runs
-five lanes, each self-gating and defensive — a lane that can't run SKIPs with a clear
+six lanes, each self-gating and defensive — a lane that can't run SKIPs with a clear
 reason, and NOTHING here ever raises past `run_validation_hw` (so "runs to completion"
 holds on every box):
 
   1. env      — GPU name/cc, torch, Triton, the S-5 arch verdict
-  2. fp16     — measure where fp16 starts beating fp32 vs `_MIN_FP16_PX` (1024²)
+  2. fp16     — measure where fp16 starts beating fp32 vs the arch profile's `_MIN_FP16_PX`
   3. graph    — PF-1 crossover: at the gate corners, does the measured winner match
                 `_graph_capture_worthwhile`'s prediction?
   4. tf32     — sm_80+ only: TF32 on/off A/B (SKIP on Turing)
   5. triton   — delegate to benchmarks/triton_validation (SKIP when Triton absent)
-  6. det      — the CUDA scatter determinism pin (bitwise across repeats)
+  6. determinism — the CUDA scatter determinism pin (bitwise across repeats)
 
 Output is a JSON blob (round-trips `json.loads`) + a markdown report, both written under
-benchmarks/results/. Accumulated community reports either confirm the constants or feed a
-per-arch recalibration in v0.20 — the decision log lives in the repo.
+benchmarks/results/. Accumulated community reports confirm the constants or feed the per-arch
+profiles in tex_runtime/arch_support.py.
 """
 import json
 import statistics
@@ -33,6 +33,19 @@ _BINDING = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
 
 # Programs at the two op-count regimes the PF-1 gate distinguishes (low vs kernel-heavy).
 _LOW_OPS = "@OUT = vec4(@A.rgb * 0.5 + 0.2, 1.0);"
+
+# The determinism lane's probes: scatter-adds (index_put accumulate, whose atomic ordering is
+# what can vary run to run on CUDA), one with spread targets and one with heavy collisions.
+_DETERMINISM_PROGRAMS = (
+    ("scatter", "@OUT[ix, iy] = vec3(0.0);"
+                "float dx = simplex(u * 3.0, v * 3.0) * 8.0;"
+                "float dy = simplex(u * 3.0 + 5.3, v * 3.0 + 7.1) * 8.0;"
+                "int tx = int(ix + dx); int ty = int(iy + dy);"
+                "@OUT[tx, ty] += vec3(0.1);"),
+    ("collide", "@OUT[ix, iy] = vec3(0.0);"
+                "int tx = int(u * 4.0); int ty = int(v * 4.0);"
+                "@OUT[tx, ty] += vec3(0.01);"),
+)
 
 
 def _high_ops_program(n: int = 22) -> str:
@@ -181,7 +194,9 @@ def _lane_tf32(torch, device) -> dict:
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
     return {"status": "ran", "tf32_off_ms": round(off, 4), "tf32_on_ms": round(on, 4),
-            "tf32_speedup": round(off / on, 3) if on else 0.0}
+            "tf32_speedup": round(off / on, 3) if on else 0.0,
+            "note": "the probe is elementwise (no matmul or conv), so TF32 has no surface "
+                    "here: about 1.0x is expected and any difference is timing noise"}
 
 
 def _lane_triton() -> dict:
@@ -193,28 +208,35 @@ def _lane_triton() -> dict:
         # error — the same SKIP shape the GPU-only lanes use.
         return {"status": "skipped",
                 "reason": "benchmarks/ is not part of an installed node (development checkout only)"}
+    saved = list(sys.path)          # the benchmark module also edits sys.path on import
     sys.path.insert(0, str(bench_dir))
-    import triton_validation   # self-gating: SKIPs cleanly when Triton is absent
-    return triton_validation.main()
+    try:
+        import triton_validation   # self-gating: SKIPs cleanly when Triton is absent
+        return triton_validation.main()
+    finally:
+        sys.path[:] = saved
 
 
 def _lane_determinism(torch, device) -> dict:
-    """The CUDA scatter determinism pin (A1-4), inline so validate-hw is self-contained."""
+    """The CUDA scatter determinism pin (A1-4), inline so validate-hw is self-contained: each
+    scatter-add probe is run five times and the worst run-to-run difference is reported."""
     if device != "cuda":
         return {"status": "skipped", "reason": "run-to-run scatter determinism is a CUDA pin"}
     from . import tex_api
-    code = ("vec2 d = vec2(sin(u * 40.0) * 8.0, cos(v * 40.0) * 8.0);\n"
-            "@OUT = vec4(sample(@A, u + d.x / iw, v + d.y / ih).rgb, 1.0);")
-    prog = tex_api.compile(code, _BINDING)
     img = _img(torch, 256, device)
-    # No inner guard: run_validation_hw's per-lane try/except is the single "never raises"
-    # boundary and yields the same {"status": "error: ..."} shape.
-    ref = tex_api.execute(prog, {"A": img}, device=device)["OUT"]
-    worst = 0.0
-    for _ in range(4):
-        cur = tex_api.execute(prog, {"A": img}, device=device)["OUT"]
-        worst = max(worst, float((cur - ref).abs().max()))
-    return {"status": "ran", "worst_run_to_run": worst, "band": 1e-9,
+    worst, per = 0.0, {}
+    for label, code in _DETERMINISM_PROGRAMS:
+        prog = tex_api.compile(code, _BINDING)
+        # No inner guard: run_validation_hw's per-lane try/except is the single "never raises"
+        # boundary and yields the same {"status": "error: ..."} shape.
+        ref = tex_api.execute(prog, {"A": img}, device=device)["OUT"]
+        w = 0.0
+        for _ in range(4):
+            cur = tex_api.execute(prog, {"A": img}, device=device)["OUT"]
+            w = max(w, float((cur - ref).abs().max()))
+        per[f"worst_{label}"] = w
+        worst = max(worst, w)
+    return {"status": "ran", "worst_run_to_run": worst, **per, "band": 1e-9,
             "deterministic": worst <= 1e-9}
 
 

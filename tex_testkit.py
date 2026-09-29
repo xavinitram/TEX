@@ -53,7 +53,7 @@ def make_img(B=1, H=8, W=8, C=3, seed=42) -> torch.Tensor:
 
 class cold_engine_state:
     """A scratch `TEX_CACHE_DIR` + a clean warm-state/verdict table for the duration of a block,
-    restored exactly on the way out.
+    left as it found it on the way out (see below for what is reset rather than restored).
 
     Four v0.31 tests needed this and three had hand-rolled it, which is a real hazard rather
     than a tidiness one: `run_all.py` runs the whole suite in ONE process, in order, so a single
@@ -67,8 +67,11 @@ class cold_engine_state:
         with cold_engine_state():
             ...                       # a fresh cache dir; warm state and memo start empty
 
-    `warm=True` (the default) also clears `graphed._capturable_memo`, `profile._STATE` and
-    `warm_state`'s load latch + path/tag memos; pass False when only the program cache matters.
+    `warm=True` (the default) also clears `graphed._capturable_memo`, `profile._STATE`, the
+    `autotier` tables and `warm_state`'s load latch + path/tag memos, and drains background warm
+    jobs on exit; pass False when only the program cache matters. On exit `TEX_CACHE_DIR`, the
+    cache singleton and the capturable memo are RESTORED; `warm_state`, the profiler table and
+    the autotier tables are RESET to empty, not put back to what an enclosing scope held.
 
     PROF-1's cost table belongs in that list even though it is not "warm state" in the CACHE-3
     sense: it is process-global engine state this release adds, it is keyed by fingerprints that

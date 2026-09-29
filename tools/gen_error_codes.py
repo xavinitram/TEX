@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""C3-ux — generate wiki/Error-Codes.md from the error codes used across the source.
+"""C3-ux — generate Error-Codes.md (package root, and wiki/ when that checkout exists) from the
+error codes used across the source.
 
 Every rendered diagnostic links to `wiki/Error-Codes#e<NNNN>` (diagnostics.wiki_url_for_code).
-Before v0.19 that page did not exist, so every error linked to a 404. This harvests every
-`code="ENNNN"` used in the compiler/runtime, groups by family, and emits one anchored
-`### ENNNN` subsection per code so the link always resolves. Messages are runtime f-strings
+This harvests every `ENNNN`/`WNNNN` token in the shipped `.py` sources, groups by family, and
+emits one anchored `### ENNNN` subsection per code so the link always resolves. Messages are runtime f-strings
 (not centrally tabled), so per-code prose is a short curated line by family; the value is a
 complete, never-404 reference. Run: python tools/gen_error_codes.py [--check].
 
@@ -83,13 +83,16 @@ _UNREACHABLE_FROM_SOURCE = {
 }
 
 
+_HARVEST_SKIP = frozenset({"tests", "benchmarks", "__pycache__", ".tex_cache", "tools", "wiki",
+                           ".git", "node_modules", "editor_build"})
+
+
 def harvest_codes():
     """Return the sorted set of ENNNN/WNNNN codes used across the source (excluding tests)."""
     codes = set()
     pat = re.compile(r"\b[EW]\d{4}\b")
-    for root, _dirs, files in os.walk(_PKG):
-        if any(s in root for s in ("tests", "benchmarks", "__pycache__", ".tex_cache", "tools", "wiki")):
-            continue
+    for root, dirs, files in os.walk(_PKG):
+        dirs[:] = [d for d in dirs if d not in _HARVEST_SKIP]   # by exact name, not by path substring
         for fn in files:
             if not fn.endswith(".py"):
                 continue
@@ -113,6 +116,10 @@ def render(codes):
     by_family = {fam: [] for fam, _, _ in _FAMILIES}
     for c in codes:
         by_family.setdefault(c[:2], []).append(c)
+    unknown = sorted(f for f in by_family if f not in {fam for fam, _, _ in _FAMILIES})
+    if unknown:
+        raise SystemExit(f"Error-Codes: codes in unknown families {unknown}; add the family to "
+                         f"_FAMILIES so its anchor exists")
     for fam, name, desc in _FAMILIES:
         fam_codes = by_family.get(fam, [])
         if not fam_codes:

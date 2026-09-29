@@ -295,6 +295,18 @@ def resolve(index, cited):
 
 
 _SPAN_CACHE = {}
+_LINES_CACHE = {}
+
+
+def source_lines(root, rel):
+    """A target file's lines, numbered as `ast` and editors number them (split on `\n` only:
+    `str.splitlines` also breaks on form feed, NEL and U+2028), cached per file."""
+    if rel not in _LINES_CACHE:
+        lines = read_text(os.path.join(root, rel)).split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()                      # the text ended with a newline
+        _LINES_CACHE[rel] = lines
+    return _LINES_CACHE[rel]
 
 
 def symbol_spans(root, rel):
@@ -314,8 +326,10 @@ def symbol_spans(root, rel):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 stack.append(child.name)
+                # A decorator line belongs to the symbol it decorates.
+                first = min([child.lineno] + [d.lineno for d in child.decorator_list])
                 spans.append(
-                    (child.lineno, child.end_lineno or child.lineno, child.name, tuple(stack))
+                    (first, child.end_lineno or child.lineno, child.name, tuple(stack))
                 )
                 walk(child)
                 stack.pop()
@@ -448,7 +462,9 @@ def check(root):
     out = []
     stats = {"total": 0, "ok": 0, "error": 0, "warning": 0, "module-level": 0,
              "source": "git" if tracked is not None else "walk"}
-    for rel_doc in document_set(root, tracked):
+    docs = document_set(root, tracked)
+    stats["docs"] = len(docs)
+    for rel_doc in docs:
         for cit, text, match in iter_citations(root, rel_doc):
             stats["total"] += 1
             out.append(cit)
@@ -459,7 +475,13 @@ def check(root):
                 stats["error"] += 1
                 continue
 
-            source = read_text(os.path.join(root, target)).splitlines()
+            if cit.start < 1 or cit.end < cit.start:
+                cit.verdict = "error"
+                cit.detail = (f"line numbers are 1-based and a range runs forward "
+                              f"(got {cit.start}-{cit.end})")
+                stats["error"] += 1
+                continue
+            source = source_lines(root, target)
             n = len(source)
             if cit.start > n:
                 cit.verdict = "error"
@@ -541,7 +563,7 @@ def main(argv=None):
         print()
 
     print(
-        f"CITATIONS {stats['total']} in {len(document_set(root))} docs "
+        f"CITATIONS {stats['total']} in {stats['docs']} docs "
         f"({stats['source']}) | anchored {stats['ok']} | "
         f"module-level {stats['module-level']} | "
         f"warnings {len(warnings)}/{args.budget} | dead {len(errors)}"

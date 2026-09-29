@@ -48,8 +48,7 @@ def write_png16(path, u16: torch.Tensor) -> None:
     scan[:, 1:] = be.reshape(H, W * C * 2)
     idat = zlib.compress(_raw_bytes(scan), 6)
 
-    with open(path, "wb") as f:
-        f.write(_SIG)
-        f.write(_chunk(b"IHDR", ihdr))
-        f.write(_chunk(b"IDAT", idat))
-        f.write(_chunk(b"IEND", b""))
+    from ..tex_recovery import atomic_write          # lazy, like exr.py's writer
+    blob = _SIG + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+    if not atomic_write(path, blob):
+        raise OSError(f"could not write PNG to {path!r}")

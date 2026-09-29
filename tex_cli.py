@@ -59,8 +59,8 @@ def load_image(path: str, device: str = "cpu") -> torch.Tensor:
     from torchvision.io import read_file, decode_image
     from .tex_io import BufferDesc, decode_to_fp32
     img = decode_image(read_file(path))          # [C, H, W], uint8 or uint16
-    if img.shape[0] == 1:
-        img = img.expand(3, -1, -1)              # grayscale -> RGB
+    if img.shape[0] < 3:                         # gray (1) or gray+alpha (2) -> RGB, alpha dropped
+        img = img[:1].expand(3, -1, -1)
     img = img[:3]                                # drop alpha
     storage = {torch.uint8: "uint8", torch.uint16: "uint16"}.get(img.dtype)
     if storage is None:
@@ -152,21 +152,32 @@ def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
     # that flipped the profile can't change `tex run`. A PNG sink pins 'comfy' (the clamp +
     # alpha-drop + gray-expand save_image's quantisation assumes); an EXR sink pins 'engine'
     # so the float format actually carries the scene-linear values TEX cooked (DATA-2).
-    results = [prepare_output(res.outputs[n],
-                              map_inferred_type(res.assigned[n], False), profile=profile)
-               for n in res.output_names]
-
-    idx = next((i for i, n in enumerate(res.output_names)
-                if prog.assigned[n] in (TEXType.VEC3, TEXType.VEC4)), 0)
-    return results[idx]
+    if not res.output_names:
+        raise ValueError("tex run: the program assigns no output")
+    # Only the primary output is egress-formatted: a secondary ARRAY/STRING output must not
+    # abort a run whose image output is fine.
+    name = next((n for n in res.output_names
+                 if prog.assigned[n] in (TEXType.VEC3, TEXType.VEC4)), res.output_names[0])
+    out = prepare_output(res.outputs[name], map_inferred_type(res.assigned[name], False),
+                         profile=profile)
+    if not isinstance(out, torch.Tensor):
+        raise ValueError(f"tex run: the primary output '{name}' is not an image "
+                         f"(a {type(out).__name__}); assign an image output such as @OUT")
+    return out
 
 
 def run(args) -> None:
     _require_torchvision()
-    with open(args.program, encoding="utf-8") as f:
+    with open(args.program, encoding="utf-8-sig") as f:      # a BOM-prefixed file is fine
         code = f.read()
-    image = load_image(args.in_path, args.device)
+    # Load on the CPU unless CUDA was asked for and exists; the engine moves the input, and
+    # refuses a CUDA request on a CPU-only build with its own message.
+    load_dev = "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
+    image = load_image(args.in_path, load_dev)
     is_exr = args.out_path.lower().endswith(".exr")
+    if not is_exr and not args.out_path.lower().endswith(".png"):
+        print(f"tex run: note: '{args.out_path}' is not .png or .exr; writing PNG data to it",
+              file=sys.stderr)
     # EXR is the value-preserving sink → cook under the 'engine' profile (raw fp32, alpha kept,
     # unclamped); a PNG sink stays 'comfy' (clamped, the quantiser's contract) (DATA-2, ENG-3).
     result = run_program(code, image, device=args.device, precision=args.precision,
@@ -193,7 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--out", dest="out_path", required=True,
                     help="output image — .exr writes a float/half EXR (HDR, value-preserving), "
                          "otherwise a PNG (DATA-2)")
-    rp.add_argument("--device", default="cpu", help="cpu | cuda")
+    rp.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"],
+                    help="cpu | cuda | auto (auto follows where the input lives: the CPU here)")
     rp.add_argument("--precision", default="fp32", choices=["fp32", "auto", "fp16"])
     rp.add_argument("--compile-mode", dest="compile_mode", default="none",
                     choices=["none", "auto", "torch_compile", "cuda_graph"])

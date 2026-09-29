@@ -14,7 +14,6 @@ stay isolated).
 """
 import json
 import os
-import tempfile
 
 _FILE = "user_snippets.json"
 

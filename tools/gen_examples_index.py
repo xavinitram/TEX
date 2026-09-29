@@ -16,6 +16,8 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(ROOT))
 
 from TEX_Wrangle.tex_runtime import stdlib_registry as R  # noqa: E402
+# The registry is filled as a side effect of importing the stdlib, not by stdlib_registry itself.
+from TEX_Wrangle.tex_runtime import stdlib as _stdlib  # noqa: E402,F401
 
 _HEADER = re.compile(r"^//\s*(.+?)\s*—\s*(.+?)\s*$")  # em-dash separator (enforced)
 
@@ -44,6 +46,7 @@ def coverage():
         if fn.endswith(".tex"):
             blob += open(os.path.join(ex_dir, fn), encoding="utf-8").read() + "\n"
     reg = {n for e in R.REGISTRY for n in e.names}
+    assert reg, "stdlib registry is empty: refusing to report coverage against nothing"
     covered = {n for n in reg if re.search(rf"\b{re.escape(n)}\(", blob)}
     return covered, reg - covered
 
@@ -76,7 +79,6 @@ def generate():
 
 
 if __name__ == "__main__":
-    import sys
     # See gen_function_reference.py: `--check` was accepted and ignored (P0-9).
     _out = os.path.join(ROOT, "examples", "INDEX.md")
     md, rows, covered, uncovered = generate()

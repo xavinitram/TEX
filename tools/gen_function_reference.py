@@ -1,9 +1,9 @@
 """
 DOC-4 — generate `Function-Reference.md` from the single sources of truth.
 
-The reference is a *view*: function names/tags come from the REG-1 registry, arg
-counts + return rules from `FUNCTION_SIGNATURES`, and prose (sig string / desc /
-example) from the editor's `TEX_HELP_DATA`. Regenerating it (and the drift test in
+The reference is a *view*: function names, descriptions and tags come from the REG-1
+registry, and the signature strings and category order from the editor's `TEX_HELP_DATA`
+(a drift-pinned mirror of the registry). Regenerating it (and the drift test in
 tests/test_v017_phase2.py) keeps the human reference from drifting off the code —
 the "docs one click away, always current" contract. Run:  python tools/gen_function_reference.py
 """
@@ -23,7 +23,6 @@ from TEX_Wrangle.tex_runtime import stdlib_registry as R  # noqa: E402
 # already imported `stdlib` first (pytest's own collection happens to do that, which is why
 # this was invisible in-suite) -- trigger the same side effect here explicitly.
 from TEX_Wrangle.tex_runtime import stdlib as _stdlib  # noqa: E402,F401
-from TEX_Wrangle.tex_compiler.stdlib_signatures import FUNCTION_SIGNATURES  # noqa: E402
 
 _FIELD = lambda k, line: (re.search(rf'\b{k}:\s*"((?:[^"\\]|\\.)*)"', line) or [None, None])[1]
 
@@ -68,13 +67,13 @@ def generate():
     tag = {n: e for e in R.REGISTRY for n in e.names}
     out = ["# TEX Function Reference",
            "",
-           "> **Generated** by `tools/gen_function_reference.py` from `TEX_HELP_DATA` +",
-           "> the REG-1 registry + `FUNCTION_SIGNATURES`. Do not edit by hand — edit the",
+           "> **Generated** by `tools/gen_function_reference.py` from the REG-1 registry +",
+           "> `TEX_HELP_DATA` (signatures, category order). Do not edit by hand — edit the",
            "> source and regenerate. The drift test (`test_doc4_reference`) keeps it current.",
            ""]
     documented = set()
     for cat, catnames in cats:
-        fn_rows = [n for n in catnames if n in reg_names]
+        fn_rows = [n for n in catnames if n in reg_names and n not in documented]
         if not fn_rows:
             continue
         out.append(f"## {cat}")
@@ -86,9 +85,8 @@ def generate():
             e = entries[n]
             tags = [t for t, on in (("spatial", tag[n].spatial), ("sync", tag[n].sync),
                                     ("non-local", tag[n].non_local)) if on]
-            # REG-1b: the description is now sourced from the registry `doc=` (the
-            # single source), not re-parsed from TEX_HELP_DATA. sig still comes from
-            # the editor help (not migrated to the registry).
+            # The description is the registry `doc=`; the sig is the editor help's decoded
+            # string, which the drift test pins equal to the registry's own sig.
             out.append(f"| `{n}` | `{_unescape(e['sig'])}` | {_cell(tag[n].doc)} | "
                        f"{', '.join(tags) or '—'} |")
         out.append("")
@@ -107,7 +105,6 @@ def generate():
 
 
 if __name__ == "__main__":
-    import sys
     # `--check` used to be accepted and SILENTLY IGNORED — the flag rewrote the file and
     # reported success, so a CI drift gate built on it would have passed on stale output. Drift
     # is separately guarded by the DOC-4 suite test, which is why nothing broke; a CLI that

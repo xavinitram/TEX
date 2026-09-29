@@ -146,7 +146,7 @@ def test_gateverdict_run_leaves_a_normal_green_leg_untouched(r: SubTestResult):
 def test_gateverdict_refuses_when_not_importable_as_tex_wrangle(r: SubTestResult):
     """A checkout with no `TEX_Wrangle`-named sibling anywhere can't import a single test,
     not just the ones a gate leg is meant to catch -- every test dies at collection with a
-    bare `ModuleNotFoundError`. gate.py refuses up front instead: rc 2 and a one-line
+    bare `ModuleNotFoundError`. gate.py refuses up front instead: rc 1 and a one-line
     message, before any leg's process is spawned."""
     print("\n--- GATE-VERDICT: gate.py refuses up front with no TEX_Wrangle-named sibling ---")
     g = _gate()
@@ -160,13 +160,13 @@ def test_gateverdict_refuses_when_not_importable_as_tex_wrangle(r: SubTestResult
         finally:
             g._PARENT = original
         out = buf.getvalue()
-        if rc != 2:
-            r.fail("GATE-VERDICT refusal", f"expected rc 2, got {rc}")
+        if rc != 1:
+            r.fail("GATE-VERDICT refusal", f"expected rc 1 (RED, never GREEN+STALE), got {rc}")
         elif "TEX_Wrangle" not in out or "run from a directory" not in out:
             r.fail("GATE-VERDICT refusal", f"expected the naming-convention refusal message, "
                                             f"got {out!r}")
         else:
-            r.ok("no TEX_Wrangle-reachable sibling refuses up front with rc 2, no leg spawned")
+            r.ok("no TEX_Wrangle-reachable sibling refuses up front with rc 1 (RED), no leg spawned")
 
     # And the ordinary case (this suite's own tree) must NOT refuse.
     if not g._importable_as_tex_wrangle():
