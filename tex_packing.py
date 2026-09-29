@@ -113,9 +113,8 @@ REDUCED = (FP16, UINT16)
 FP16_MAX = 65504.0
 
 #: The 8-bit display quantum, and the code a viewer would show. This is the DECISION METRIC of
-#: the whole item — the number `benchmarks/storage_precision_bench.py` and
-#: `tests/test_v033_precision.py` are supposed to agree on — so it lives here rather than being
-#: retyped correctly in both.
+#: the whole item; `q8` is the definition the tests import (the benchmark keeps its own copy of
+#: the constant in `_q8`).
 Q8_QUANTUM = 1.0 / 255.0
 
 #: How a caller may spell each representation. Anything not in here is refused rather than
