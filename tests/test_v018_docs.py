@@ -357,6 +357,19 @@ _NOT_A_CACHE = {
                                 "it settles) -- coordination state so a fingerprint is never "
                                 "granted a second fall-through, not a cache of any value "
                                 "(the verdict itself lives in the registered _memo above)",
+    "autotier._NON_DURABLE": "CACHE-52: a marker set over autotier._STATE's keys (registered "
+                             "above) naming the verdicts recorded with persist=False, so "
+                             "_persist leaves them out of the file -- a filter on a "
+                             "registered store, not a store of any value",
+    "compiled_promotion._transient_failed": "CACHE-52: a marker set of cache keys whose last "
+                                            "failure looked transient (out of memory, a dead "
+                                            "worker), so the verdict is not persisted -- "
+                                            "coordination state beside compiled._compiled_"
+                                            "cache, not a cache of any value",
+    "tex_results_keys._RESULT_EPOCH": "CACHE-52: a one-slot cell (a list) memoising the "
+                                      "digest of the cook pipeline's source files, the "
+                                      "result-key sibling of tex_cache's epochs; no key, "
+                                      "never evicted",
 }
 
 

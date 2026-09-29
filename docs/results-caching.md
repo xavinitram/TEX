@@ -185,11 +185,12 @@ reuse; see `docs/compressed-cache-tiers.md`. Neither changes anything for a call
 neither, which is every caller written before v0.33.
 
 **RAM tier** — an `OrderedDict` LRU with its own byte budget (`TEX_RESULTS_BUDGET_MB`, default
-a modest slice of VRAM), accounted with the same `untyped_storage().nbytes()` primitive the
+512 MiB on CPU; `min(2 GiB, 25 % of VRAM)` on CUDA), accounted with the same `untyped_storage().nbytes()` primitive the
 tex_memory governor uses. Kept **separate** from the stdlib tensor budget: frames are large and
-long-lived, and evicting a mip pyramid to hold a frame (or vice-versa) would thrash. CACHE-5
-(future) is the governor that arbitrates the two pools under one budget; until then the frame
-budget self-evicts and exposes its byte total so CACHE-5 can fold it in.
+long-lived, and evicting a mip pyramid to hold a frame (or vice-versa) would thrash. The
+CACHE-5 governor arbitrates the pools under one budget once a host registers the frame cache
+(`tex_memory.register_result_cache`); until then, and always when no host does, the frame
+budget self-evicts and exposes its byte total.
 
 **Freeze on insert + copy-on-read (ENG-12).** `put` stores `freeze(tensor)` (the frozen master) and
 records `frame_version`. `get` returns an **owned copy by default** — a consumer's in-place write
@@ -231,9 +232,10 @@ cooked one, bit-exact; a spill→restore round-trip must be bit-exact; eviction 
 budget; a canvas/ROI change must miss. These are pinned in `test_v025_phase1.py`.
 
 `tex_results` is the **19th** module-level cache (ARCHITECTURE.md / AGENTS.md counts bumped). It
-self-evicts against its own byte budget; folding it into the global governor (so `free_tensor_caches`
-and memory-pressure eviction see frames too) is **CACHE-5**'s job — until then a host arming it must
-size `TEX_RESULTS_BUDGET_MB` conservatively against VRAM.
+self-evicts against its own byte budget. Folding it into the global governor (so memory-pressure
+eviction sees frames too) is **CACHE-5**'s job, and it happens only when a host registers the cache
+with `tex_memory.register_result_cache`; a host that does not register it must size
+`TEX_RESULTS_BUDGET_MB` conservatively against VRAM.
 
 ---
 

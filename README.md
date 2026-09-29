@@ -10,7 +10,7 @@
   <img src="TEX_node.webp" alt="TEX Wrangle node" width="500">
 </p>
 
-A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 156 stdlib functions.
+A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 157 stdlib functions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
@@ -72,14 +72,14 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **GPU acceleration** | CPU or GPU with auto device detection |
 | **Acceleration tiers** | `compile_mode`: `none` (default), `auto` (experimental measured auto-tier — trials `torch.compile` in the background and commits only on a measured win; always falls back to a correct path), `torch_compile`, `cuda_graph` (GPU replay for small launch-bound programs) |
 | **Precision** | `precision`: `fp32` (default), **`auto`** (experimental — runs fp16 only where a condition-number gate proves it accurate: CUDA, ≥1024², smooth pointwise; verified 0 accuracy violations across 225 adversarial programs. A per-cook finiteness net makes it ~perf-neutral, so it's an accuracy-safe convenience, not a speedup), `fp16` (force half-precision, expert — the raw ~1.35–1.45× win, no safety net) |
-| **Debug HUD** | A per-node badge shows the tier, cook time, and precision after each run (amber on a tier fallback); toggle in Settings → TEX Debug. Renders on the classic canvas today; Nodes-2.0 render lands in v0.19 |
-| **`tex doctor`** | An environment report (torch/CUDA, Triton, MSVC, cache, tier routing) via the `/tex_wrangle/doctor` route for troubleshooting why a tier isn't engaging (one-click UI panel lands in v0.19); `python -m TEX_Wrangle.tex_cli doctor` additionally reports per-tier **availability** — works / unknown / unavailable, with the reason |
+| **Debug HUD** | A per-node badge shows the tier, cook time, and precision after each run (amber on a tier fallback); toggle in Settings → TEX Debug. Renders on both the classic canvas (Nodes 1.0) and Nodes 2.0 |
+| **`tex doctor`** | An environment report (torch/CUDA, Triton, MSVC, cache, tier routing) via the `/tex_wrangle/doctor` route for troubleshooting why a tier isn't engaging (the **TEX Doctor** entry in the code editor's right-click menu shows the same report); `python -m TEX_Wrangle.tex_cli doctor` additionally reports per-tier **availability** — works / unknown / unavailable, with the reason |
 | **Standalone CLI** | `python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png` — run a program on an image file with **no ComfyUI** (torchvision-only I/O) |
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution — compiled objects and fused chains persist across restarts |
 | **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
 | **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion). A live **preflight** flags an unfusable chain (red bubble) before you queue |
 | **Lazy input cooking** | Wired inputs the code can't use are **never cooked upstream** — including branches disabled by a `$param` (`if ($mode > 0.5) { @OUT = @B; } else { @OUT = @A; }` cooks only the taken side). Build cheap switches that prune dead branches from the workflow. Default on (Settings → TEX Lazy) |
-| **156 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
+| **157 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
 | **Snippets** | Right-click → Snippets for 118 built-in examples; save your own with folder organization |
@@ -112,7 +112,7 @@ f$strength = 0.5;    // FLOAT slider
 i$radius = 2;        // INT slider
 s$label = "hello";   // STRING text input
 b$enabled = 1;       // BOOLEAN toggle
-c$tint = "#FF8800";  // COLOR picker
+c$tint = vec3(1.0, 0.53, 0.0);  // COLOR picker (the widget edits it as a hex colour)
 v3$offset = vec3(1.0, 0.5, 0.0);  // VEC3 (X/Y/Z float inputs)
 
 @OUT = @image * $strength;
@@ -126,7 +126,7 @@ f$gain = 1.0 [min: 0, max: 4, step: 0.05, label: "Gain"];
 ```c
 float red = @A.r;       // single channel
 vec3 rgb = @A.rgb;      // 3-channel swizzle
-vec4 bgra = @A.bgra;    // reorder channels
+vec3 bgr = @A.bgr;      // reorder channels
 ```
 
 ### Operators
@@ -174,7 +174,7 @@ while (val < 100.0) { val = val * 2.0; }
 | `frame`, `fps`, `time` | The **host timeline** (v0.22). ComfyUI has no playhead, so these read `0` there — use `fi`/`fn` for batch position. A standalone host feeds its own. Reserved names. |
 | `PI`, `TAU`, `E` | Math constants (`TAU` = 2·PI) |
 
-### Standard Library (156 functions)
+### Standard Library (157 functions)
 
 **Math:** `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `sqrt` `pow` `pow2` `pow10` `exp` `log` `log2` `log10` `abs` `sign` `floor` `ceil` `round` `fract` `mod` `hypot` `degrees` `radians` `spow` `sdiv` `isnan` `isinf`
 
@@ -215,7 +215,7 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Array:** `sort` `reverse` `arr_sum` `arr_min` `arr_max` `median` `arr_avg` `len` `join`
 
-**Debugging:** `debug_print(label, value[, x, y])` — probe a value at a pixel (returned in the node's `ui` payload; on-node display lands in v0.19; returns the value unchanged)
+**Debugging:** `debug_print(label, value[, x, y])` — probe a value at a pixel (returned in the node's `ui` payload; shown on the node; returns the value unchanged)
 
 ## Examples
 
@@ -281,13 +281,13 @@ and a warning is logged, so a typo can never turn a cache off silently.
 
 | Switch | What it does | Default when unset |
 |--------|--------------|--------------------|
-| `TEX_CACHE_DIR` | Where the compiled-program / codegen / spill caches live | A per-user cache directory, else a folder inside the package |
+| `TEX_CACHE_DIR` | Where the compiled-program / codegen / spill caches live | `.tex_cache` inside the package folder |
 | `TEX_CACHE_BUDGET_MB` | Byte budget for the stdlib tensor caches (mip pyramids, grid buffers) | min(1 GiB, 12.5 % VRAM) on CUDA; 512 MiB on CPU |
 | `TEX_GOVERNOR_BUDGET_MB` | The single coordinated budget the cache governor holds the stdlib / graph / frame pools under | ~40 % of free VRAM on CUDA; 1 GiB on CPU |
 | `TEX_RESULTS_BUDGET_MB` | RAM budget for the engine's frame cache | Derived from device memory |
 | `TEX_RESULTS_DISK_MB` | Disk budget for that cache's spill tier | 4 GiB |
 | `TEX_CPU_THREADS` | Torch intra-op thread count for a cook | Torch's own default |
-| `TEX_NO_POOL_TRIM` | Set to skip trimming the CUDA reserved pool after a cook | Trimming is on |
+| `TEX_NO_POOL_TRIM` | Set to `1` to skip trimming the CUDA reserved pool after a cook | Trimming is on |
 | `TEX_ROI_EXEC` | Arm the ROI sub-window cook from the environment (the `roi_exec=` host argument is the real arm) | Off |
 | `TEX_ROI_CODEGEN` | Run an ROI cook through the codegen tier — an A/B lever | Off |
 | `TEX_CODEGEN_NO_OUT_REUSE` | Disable codegen's `out=` buffer reuse — an A/B lever | Reuse is on |

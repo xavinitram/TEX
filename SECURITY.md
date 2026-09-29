@@ -34,14 +34,21 @@ quoting the call it matches, which is not evasion: the code sites themselves sta
 
 ## The HTTP routes
 
-Twelve, under `/tex_wrangle/`, unauthenticated as every node's are. None accepts a URL, spawns
-a process, or reaches the codegen tier. The three that write do so only under the user
-directory: `user_snippets` to one fixed JSON file (snippet names are keys, never paths);
-`publish_tool` to a filename sanitised to `[A-Za-z0-9_.-]` in the tool store, with the
-destination not settable from the request and a different-tool collision refused;
-`free_caches` drops TEX's own caches. `docs/{page}` resolves through a whitelist of three
-shipped files. `check`, `chain_preflight` and `detect_regions` lex/parse/type-check or splice
-ASTs and never emit or execute code.
+Eleven handlers on ten paths, under `/tex_wrangle/` (`user_snippets` takes both GET and
+POST), unauthenticated as every node's are. None accepts a URL, spawns a process, or reaches
+the codegen tier. Two write under the user directory: `user_snippets` (POST) to one fixed
+JSON file (snippet names are keys, never paths), and `publish_tool` to a filename sanitised
+to `[A-Za-z0-9_.-]` in the tool store, with the destination not settable from the request and
+a different-tool collision refused. `chain_preflight` and `detect_regions` also write, to the
+program cache under `TEX_CACHE_DIR`: a fused chain that compiles is persisted there like any
+other program (HMAC-tagged, see below). `free_caches` deletes rather than writes, and is
+broader than the name suggests: it empties TEX's in-memory tensor caches and the on-disk
+program and codegen caches, removes the persisted `autotier.json` and `xfer.json` verdicts
+and the whole `torch_compile` (Inductor) tree under the cache directory, and asks the host
+to empty the shared CUDA allocator. `doctor` only reads, but it walks the Inductor cache
+directory on each request. `docs/{page}` resolves through a whitelist of three shipped files.
+`check`, `chain_preflight` and `detect_regions` lex/parse/type-check or splice ASTs and never
+emit or execute code.
 
 ## Persisted state and deserialization
 

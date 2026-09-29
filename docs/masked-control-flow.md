@@ -1,6 +1,8 @@
 # LANG-1 — masked per-pixel control flow (language `0.25`): the design
 
-*The decisions, made once, before any code. **Design only — nothing here is built.** Written
+*Status: shipped in language `0.25`. What follows is the design as it was decided, and its measurements
+are the pre-`0.25` record; the `TRK-28` example below, a `break` in a function nested in a loop,
+is now rejected by `check()` with E3015. The decisions, made once, before any code. Written
 against `main` at base sha `af3e8ae` (`LANGUAGE_VERSION` `0.24`). Every count below was
 **measured at that head** with the command named beside it, not recalled from an earlier note;
 every pointer was re-resolved, because the two design notes this one supersedes

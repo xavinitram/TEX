@@ -39,7 +39,7 @@ screenshots into the build log. Re-run each release — the JS is version-sensit
 - [ ] Close via the button, backdrop click, and Escape.
 
 ## C6-ux — snippet discoverability
-- [ ] A fresh node's default code shows `// Right-click → TEX Snippets for 114 examples`.
+- [ ] A fresh node's default code shows `// Right-click → TEX Snippets for 118 examples`.
 - [ ] Right-click → **Snippets** opens the browser with the examples.
 
 ## S-2 — example workflows

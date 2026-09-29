@@ -54,7 +54,7 @@ TEX_Wrangle/
   benchmarks/
     run_benchmarks.py      # Reproducible performance benchmarks
     README.md              # Benchmark usage and result format docs
-  examples/                # Example TEX snippets (114 files)
+  examples/                # Example TEX snippets (118 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
 
@@ -258,7 +258,7 @@ Validated by `benchmarks/fusion_splice_test.py` and `benchmarks/fusion_regressio
 
 **Example: adding `saturate(x)` that clamps to [0, 1].**
 
-1. **`tex_runtime/stdlib.py`** -- implement the function (or `tex_runtime/noise.py` for noise functions) and register it with the co-located `@stdlib(...)` decorator (REG-1 — there is no central `get_functions()` dict; it derives from the decorators). `sig=`/`category=` carry the help data (LANG-4), `doc=`/`ex=` the description/example:
+1. **`tex_runtime/stdlib_<domain>.py`** -- implement the function in the leaf whose domain it belongs to (`stdlib_math`, `stdlib_color`, `stdlib_sample`, `stdlib_noise`, `stdlib_sdf`, `stdlib_string` or `stdlib_array`; `tex_runtime/stdlib.py` is only the facade that composes them, and a new leaf is composed there and added to `tex_cache._CODEGEN_FILES`) and register it with the co-located `@stdlib(...)` decorator (REG-1 — there is no central `get_functions()` dict; it derives from the decorators). `sig=`/`category=` carry the help data (LANG-4), `doc=`/`ex=` the description/example:
 ```python
 @stdlib("saturate", doc="Clamp value to [0,1].", ex="@OUT = vec4(saturate(@A.rgb), 1.0);",
         sig="saturate(x) → float", category="Math")
@@ -320,47 +320,47 @@ except Exception as e:
 
 **Example: adding `aspect` (image aspect ratio `iw / ih`).**
 
-1. **`tex_runtime/interpreter.py`** -- add in `_create_builtins()`:
+1. **`tex_runtime/interpreter_spatial.py`** -- in `Interpreter._create_builtins()`, next to the `iw`/`ih` block, allocate it when the program reads it (always fp32, never `self._dtype`; invariant #4):
 ```python
-self.env["aspect"] = torch.tensor(float(W) / float(H), dtype=torch.float32, device=self.device)
+if "aspect" in used:
+    self.env["aspect"] = torch.scalar_tensor(float(W_full) / float(H_full), dtype=cdt, device=self.device)
 ```
+Also add a default to `_SCALAR_BUILTIN_DEFAULTS` in `tex_runtime/interpreter.py` (the value with no spatial context).
 
-2. **`tex_compiler/type_checker.py`** -- add to the `builtins` dict:
-```python
-builtins = {
-    ...,
-    "aspect": TEXType.FLOAT,
-}
-```
+2. **`tex_runtime/interpreter.py`** -- add the name to `_BUILTIN_NAMES`. Codegen imports that set, so it is what makes a codegen local start from the interpreter's value; the interpreter and codegen must agree (invariant #2). A host-timeline name (like `time`) also goes in `_TIME_BUILTIN_NAMES`, which keeps it out of the cached builtins.
 
-3. **`js/tex_extension.js`** -- add to `TEX_COORD_VARS` for syntax highlighting:
-```javascript
-const TEX_COORD_VARS = new Set([..., "aspect"]);
-```
-Update `TEX_HELP_HTML` to document it.
+3. **`tex_compiler/type_checker.py`** -- add the name to `_BUILTIN_VAR_NAMES`. That frozenset seeds the top scope (every built-in is `FLOAT`) and feeds the W7003 shadow warning. Optionally add a one-line explanation to `_BUILTIN_VAR_HINTS` in `tex_compiler/diagnostics.py`, so declaring the name gets a specific message.
+
+4. **`js/tex_extension.js`** -- add the name to the "Built-in Variables" entry of `TEX_HELP_DATA` (its `sig` and `desc`), then run `python tools/gen_help_data.py` to regenerate `tex_help.json`. Add a row to `LANGUAGE.md` §6.
+
+A new built-in name is reserved, so a program that declared its own variable of that name stops compiling: that is a minor, breaking change, and the CHANGELOG has to say so (see "API stability tiers").
 
 ### Adding a New Type
 
 Adding a new TEX type requires changes across the entire pipeline:
 
-1. **`tex_compiler/type_checker.py`** -- add to `TEXType` enum. Add promotion rules in `_promote()` and compatibility in `_is_compatible()`.
-2. **`tex_compiler/parser.py`** -- add to `TYPE_NAME_MAP` dict if it can be used in declarations.
-3. **`tex_runtime/interpreter.py`** -- handle the new type in `_eval()`, `_exec_assignment()`, and any type-specific evaluation paths.
-4. **`tex_marshalling.py`** -- add input/output handling in `infer_binding_type()`, `prepare_output()`, and `map_inferred_type()`.
+1. **`tex_compiler/types.py`** -- add to the `TEXType` enum (and its `is_vector` / `is_scalar` predicates) and to `TYPE_NAME_MAP`.
+2. **`tex_compiler/type_checker.py`** -- add promotion rules in `TypeChecker._promote()`, and check where a value of the type is accepted: `_check_var_decl`, `_check_assignment`, `_check_binop`, `_check_cast`.
+3. **`tex_compiler/lexer.py` / `tex_compiler/parser.py`** -- if the type can be declared, add its keyword token and put it in `TYPE_KEYWORDS`.
+4. **`tex_runtime/interpreter.py`** (and `interpreter_binding.py` for `_exec_assignment`) -- handle the new type in `_eval_binop()`, `_eval_cast()`, assignment, and any type-specific evaluation path; then mirror it in `tex_runtime/codegen.py` (`_emit_binop`, `_emit_cast`), which must match the interpreter (invariant #2).
+5. **`tex_marshalling.py`** -- add input/output handling in `infer_binding_type()`, `prepare_output()`, and `map_inferred_type()`.
 
 ### Adding a New AST Node
 
 1. **`tex_compiler/ast_nodes.py`** -- define the dataclass with `__slots__`.
 2. **`tex_compiler/parser.py`** -- add parsing logic that creates the node. Use `self._loc()` to capture source location.
-3. **`tex_compiler/type_checker.py`** -- add a check method and dispatch from `_check_statement()` or `_check_expression()`.
-4. **`tex_runtime/interpreter.py`** -- add an exec/eval method and dispatch from `_exec_stmt()` or `_eval()`.
+3. **`tex_compiler/type_checker.py`** -- add a check method (`_check_stmt` / `_check_expr` dispatch through the `_STMT_HANDLERS` / `_EXPR_HANDLERS` tables at the bottom of the file, so register it there).
+4. **`tex_runtime/interpreter.py`** -- add an exec/eval method and register it in the `_stmt_dispatch` / `_eval_dispatch` tables built in `Interpreter.__init__` (`_exec_stmt` / `_eval` look them up).
+5. **`tex_runtime/codegen.py`** -- emit it (`_emit_stmt` and its `_stmt_dispatch` for a statement, `_emit_expr` for an expression).
+6. Any pass that walks the tree (the optimizer, the lazy and ROI analyses) subclasses `NodeVisitor` in `tex_compiler/ast_nodes.py`, whose `generic_visit` reaches new child fields automatically. Check that a selective `visit_X` does not skip your node.
 
 ### Adding a New Operator
 
 1. **`tex_compiler/lexer.py`** -- add the token type and recognition logic.
 2. **`tex_compiler/parser.py`** -- add to the appropriate precedence level in the expression parser.
-3. **`tex_compiler/type_checker.py`** -- add type checking in `_check_binary_op()` or `_check_unary_op()`.
-4. **`tex_runtime/interpreter.py`** -- add evaluation in `_eval_binary_op()` or `_eval_unary_op()`.
+3. **`tex_compiler/type_checker.py`** -- add type checking in `_check_binop()` or `_check_unary()`.
+4. **`tex_runtime/interpreter.py`** -- add evaluation in `_eval_binop()` or `_eval_unary()`, and the matching emission in `tex_runtime/codegen.py` (`_emit_binop` / `_emit_unary`).
+5. Update the precedence line in `LANGUAGE.md` §7.
 
 ## Running Tests
 
@@ -412,7 +412,7 @@ python -m TEX_Wrangle.tex_cli validate-hw
 
 These are measured, non-obvious behaviours a maintainer will otherwise rediscover the hard way:
 
-- **Codegen is NOT a universal win.** A forced-codegen sweep across the 116 examples regresses
+- **Codegen is NOT a universal win.** A forced-codegen sweep across the 118 examples regresses
   ~61/100 (median 0.94×) — widening the codegen route naively is *slower* on most programs
   (color_grade is 0.43–0.57× vs the interpreter). So the default cook stays on the interpreter
   and only routes to codegen where a measured win exists (the UC-2 stencil gate). The honest fix
@@ -446,7 +446,7 @@ TEX uses structured diagnostics (`tex_compiler/diagnostics.py`) to produce clear
 | `E3xxx` | Type checker — names, scope, types & coercions | Undefined variables, duplicate declarations, type mismatches, failed promotions |
 | `E4xxx` | Type checker — unrecognized construct (catch-all) | A construct the type checker doesn't recognize |
 | `E5xxx` | Type checker — function signatures | Wrong argument count, argument type errors |
-| `E6xxx` | Runtime (interpreter) | Loop limit, division by zero, out-of-bounds; `E6050` unknown function, `E6051` a function's runtime failure |
+| `E6xxx` | Runtime (interpreter) | Loop limit (`E6010`), an input that isn't connected (`E6003`), a value gone non-finite, fused-chain and lazy-input problems; `E6050` unknown function, `E6051` a function's runtime failure. There is no division-by-zero or out-of-bounds error: `x / 0` is epsilon-guarded and an array index clamps to the ends |
 | `E7xxx` | Host I/O | A host `FrameProvider` binding TEX cannot type: no provider registered, a provider that raised, a time that varies per pixel, a frame of the wrong shape, a promised binding that has not landed |
 | `E9xxx` | Tools | Building or preflighting a `.textool` bundle failed — a fused-tool graphspec is malformed, or its stages don't compile together |
 | `W7xxx` | Warnings (reserved range) | Non-fatal advisories |
@@ -667,10 +667,10 @@ __init__.py                               tex_extension.js
 
 ComfyUI stays the first-class host; everything in this section runs with it absent, and nothing
 here moves a default or changes a call path for ComfyUI (invariant #7). `tex_api`'s own docstring
-argues which entry point to cook through (`tex_api.py:17-35`) — this section is the bring-up a
+argues which entry point to cook through (the `tex_api` module docstring) — this section is the bring-up a
 second host runs before it gets there. **`import TEX_Wrangle` alone loads neither `comfy` nor
 `torch`** (PORT-6): the package root defers the ComfyUI adapter to a lazy attribute and imports
-nothing beyond `os`/`sys` at module scope (`__init__.py:13-30`), so a host pays only for the
+nothing beyond `os`/`sys` at module scope (the package root's module-scope imports), so a host pays only for the
 submodules it actually names — an ENGINE name, once touched, is what pulls torch in, never the bare
 package import.
 
@@ -699,16 +699,15 @@ queue.close()                                       # shutdown: stop cooking fir
 session.close()                                     # then shed caches and host services
 ```
 
-Every call is real, not a sketch: `default_session` / `set_host` / `reset` / `close`
-(`tex_session.default_session`, `EngineSession.set_host`, `.reset`, `.close`), the process-wide profile setter,
-`set_egress_profile` (`tex_marshalling.py:957-965`), `NullHostServices` (`tex_runtime/host.py:125-137`), and
-`submit` / `result` / `close` (`tex_cookqueue.py:292-309`, `:215-224`, `:832-865`). The lifecycle op
+Every call is real, not a sketch: `tex_session.default_session` and `EngineSession.set_host` / `reset` / `close`, the
+process-wide profile setter `tex_marshalling.set_egress_profile`,
+`tex_runtime.host.NullHostServices`, and `CookQueue.submit` / `Job.result` / `CookQueue.close`. The lifecycle op
 runs at COMMITTED because that class is never shed and pauses for INTERACTIVE rather than tripping
-it (`tex_cookqueue.py:17-34`); the submit is fenced through the queue because `reset()` must not run
-beside a live cook (`EngineSession.reset`) and the queue's single worker thread is the exclusion
-(`tex_cookqueue.py:17-22`); `feeds_profile=False` because a non-cook job must not reach PROF-1's cost
+it (the `tex_cookqueue` module docstring); the submit is fenced through the queue because `reset()` must not run
+beside a live cook (`EngineSession.reset`'s docstring) and the queue's single worker thread is the exclusion
+(same docstring); `feeds_profile=False` because a non-cook job must not reach PROF-1's cost
 table, and that has to be said, not left to a `profile_key` the caller happened not to pass
-(the `Job` dataclass's `feeds_profile` field, `tex_cookqueue.py:179-184`). One fact `close()` does NOT undo: it leaves the egress profile exactly
+(the `Job` dataclass's `feeds_profile` field). One fact `close()` does NOT undo: it leaves the egress profile exactly
 where the host last set it (`EngineSession.close`).
 
 **The egress profile is set once, by the host, before the first cook.** That is the normative
@@ -722,31 +721,31 @@ throws away the memo, and a flip between cooks is not a shape any canary covers.
 
 **The queue's token, four rules** (`docs/cook-queue-scheduling.md` §3-§6 has the argument): a
 submitted cook must take the queue's OWN token — chained with a host's own reason to abort, never
-substituted for it (the `_Chain` example, `examples/host_demo.py:61-73`, `:503-507`), because that
+substituted for it (the `_Chain` example in `examples/host_demo.py`), because that
 token is the only channel preemption, shedding and `close()` travel down. Preempt returns a job to
 the HEAD of its class, transient and never reported to the host; shed is terminal
-(`tex_cookqueue.py:36-40`; `test_v031_sched4_priority_and_preemption`, `tests/test_v031_phase1.py:127`, `:390`). A cancellation the queue did not
+(the `tex_cookqueue` module docstring; `test_v031_sched4_priority_and_preemption` in `tests/test_v031_phase1.py`). A cancellation the queue did not
 itself raise — a shed, a host's own supersede latch, a global Stop — is terminal by the same rule,
-never retried, inside `CookQueue._run_one` (`tex_cookqueue.py:703-707`). A cook that already returned is never discarded for a
-flag raised while it ran (`tex_cookqueue.py:42-47`, `:754-760`).
+never retried, inside `CookQueue._run_one`. A cook that already returned is never discarded for a
+flag raised while it ran (the module docstring, and `CookQueue._run_one`).
 
 **Process-global, all of it** (one tenant per process today): host services
-(`tex_runtime/host.py:267-288`), the egress profile and ARRAY wires, read inside
-`infer_binding_type` (`tex_marshalling.py:710-720`),
+(`tex_runtime.host.get_host_services` / `set_host_services`), the egress profile and ARRAY wires, read inside
+`tex_marshalling.infer_binding_type`,
 the program/codegen cache under `TEX_CACHE_DIR`, the CACHE-5 governor, and the per-thread interpreter
 pool (ENG-9 above). The tiered noise caches are the one exception to `reset()`'s reach: a key's
-compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`) and STAYS promoted —
+compiled tier is promoted starting its 4th call (`tex_runtime.noise._TieredCache`) and STAYS promoted —
 `session.reset()` clears only the worley-offset caches, not that promotion table
-(`free_tensor_caches`, `tex_memory.py:1435-1439`). An isolated, per-tenant session is phase 2 and unbuilt today
-(`tex_session.py:18-21`).
+(`tex_memory.free_tensor_caches`). An isolated, per-tenant session is phase 2 and unbuilt today
+(the `tex_session` module docstring).
 
-A host reads a cook back through `CookResult` (`tex_engine.py:343-371`, Tier 1 below): `cooked_roi`,
+A host reads a cook back through `CookResult` (`tex_engine.CookResult`, Tier 1 below): `cooked_roi`,
 `lineage` under `prepare(want_lineage=True)`, and `out_meta` always ride along; the rest are opt-in,
 and everything below is a pointer, one sentence each, to what exists on this tree today:
 
 - `CookResult.noise_tiers`, filled by `prepare`/`cook(want_noise_tiers=True)`, names which tier
   served each tiered noise builtin so a host can decline to composite frames cooked across a
-  promotion (`tex_engine.py:371`, `:1189-1191`) — Tier 1, the same row as `CookResult` itself.
+  promotion — Tier 1, the same row as `CookResult` itself.
   `tier_trace.noise_tiers_compatible(a, b)` (ENG-16, arrived after v0.38.0) is that compositing
   decision as one callable — `True` only when both records are dicts and equal (including both
   `{}`), `False` for `None` on either side, a disagreeing or asymmetric label set, or an
@@ -757,10 +756,10 @@ and everything below is a pointer, one sentence each, to what exists on this tre
 - `tex_doctor.capabilities()`, also `tex doctor --json` (the CLI's own `doctor_fn`), is a
   read-only per-tier report: did this
   process's box actually run each execution tier, is it known unavailable and why, or simply
-  unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.
+  unmeasured (`tex_doctor.capabilities`, `tex_cli.doctor_fn`) — Tier 2, its own row below.
 - `tex_fusion.collapse_linear(stages)` rewrites a DAG-shaped fused region to the legacy linear shape
-  when the region genuinely is one, or returns `None` rather than force a mis-wired collapse
-  (`tex_fusion.py:1019-1039`); `tex_checkpoint.gate_refusal(...)`, returning a `GateRefusal`,
+  when the region genuinely is one, or returns `None` rather than force a mis-wired collapse;
+  `tex_checkpoint.gate_refusal(...)`, returning a `GateRefusal`,
   is the structured reason — a stable
   code, the offending stage, a human message — that a checkpointed cook ran whole instead of
   incrementally (`tex_checkpoint.gate_refusal`). Neither is a row below; both are `tex_fusion`
@@ -771,22 +770,21 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   the caller supplies. Also not a row below; `tex_roi` internals, Tier 3.
 - The language server accepts a per-document `bindingTypes` map on `didOpen`/`didChange` — the wire
   form of the `{name: TEXType}` map `tex_api.check` already takes — so diagnostics check against the
-  bindings a host actually wired, not an empty guess (`tex_lsp.py:16-23`, `:195-210`). Not a row
+  bindings a host actually wired, not an empty guess (the `tex_lsp` module docstring and its `didOpen`/`didChange` handlers). Not a row
   below; Tier 3.
 - `TEX_Wrangle.tex_testkit` hands a host the suite's own state-isolation kit (`make_img`,
   `cold_engine_state`, `armed_profiler`) without it having to path-load `tests/helpers.py`
-  (`tex_testkit.py:1-38`). Deliberately not a row below; its own docstring pins it at Tier 2 anyway
-  (`tex_testkit.py:15-22`).
+  (the `tex_testkit` module docstring). Deliberately not a row below; its own docstring pins it at Tier 2 anyway.
 - `ResultCache.put(..., mask_eligible=True)` opts a MASK output into half-precision preview storage
-  (LATENT stays refused regardless, `tex_results.py:419-420`); `ResultCache.touch(key)` and
+  (LATENT stays refused regardless, `ResultCache.put`); `ResultCache.touch(key)` and
   `key in cache` are non-read residency operations — a hint that reorders the eviction walk, and a
   resident-now check — and neither counts as a hit or promotes a demoted frame
-  (`tex_results.py:1292-1352`, the `touch`/`__contains__` docstrings). Not a row below; `touch`/`in`
+  (the `ResultCache.touch` / `__contains__` docstrings). Not a row below; `touch`/`in`
   pin their own Tier 2 in their docstrings, and `put`'s new keyword travels with them. **RULED**
   (the author, 2026-09-21, CACHE-11): the narrowed ask beside them was granted, not the wider one —
   reorder-plus-promote-if-demoted, nothing else, no keep-set, no pinning, no restore of a
-  spilled-only frame. It shipped as its own call, `ResultCache.touch_promote(key)`
-  (`tex_results.py:1354-1387`), rather than as a new default for `touch`: a product test
+  spilled-only frame. It shipped as its own call, `ResultCache.touch_promote(key)`,
+  rather than as a new default for `touch`: a product test
   (`test_v033_cache8_touch_never_moves_a_frame_between_devices`) already depended on the bare
   `touch(key)` call never promoting, so `touch` keeps its exact contract and its docstring's "does
   NOT promote" stays unconditionally true. `touch_promote` reuses `_promote` verbatim — the same
@@ -796,7 +794,7 @@ and everything below is a pointer, one sentence each, to what exists on this tre
 - A `.textool` manifest's `inputs[]` entries may carry `feeds` (routes an extra input of a fused tool
   into named stage bindings) and `optional` (host UI advice only); `promoted_params[i].metadata` may
   carry `tooltip` and `options` (a labelled-choice list) — all four validated, all four opt-in, under
-  the manifest's EXISTING Tier 1 row below (TOOL-1) (`tex_tool.py:61-62`, `:254-268`).
+  the manifest's EXISTING Tier 1 row below (TOOL-1) (`tex_tool`'s manifest validation).
 - `tex_engine._infer_binding_type` is an import alias for `tex_marshalling.infer_binding_type` —
   the same function object under its public name, not a second copy. A reader who finds the
   underscored name off `tex_engine` should read the public one off `tex_marshalling` instead;
@@ -927,8 +925,8 @@ branch-parallel executor (GRAPH-2) will cook on more than one thread, and findin
 where that races during the engine build is the expensive way.
 
 **Today's model is single-cook-thread.** Under ComfyUI's one-cook-at-a-time executor
-(and the engine's own default), exactly one thread cooks; the compile worker pool is
-`max_workers=1`. Everything below is written so the single-threaded fast path stays
+(and the engine's own default), exactly one thread cooks; each compile pool
+(`_COMPILE_POOL`, `_WARM_POOL`) is `max_workers=1`. Everything below is written so the single-threaded fast path stays
 **lock-free** — locks guard *inserts*, never reads.
 
 **The interpreter is per-thread, not a process singleton (ENG-9).** `tex_engine._get_interpreter()`
@@ -958,16 +956,17 @@ concurrency lens on it):
   `_compiled_cache`, `_graph_cache` (keys include `dev.index`), the noise tiered caches,
   `xfer._MODEL`.
 - **Per-worker / lifecycle-coupled** — the per-thread interpreters above, and the
-  `_COMPILE_POOL` background-compile futures (`_bg_futures`) which are owned by the single
-  compile worker.
+  `_COMPILE_POOL` / `_WARM_POOL` background-compile futures (`_bg_futures`), each pool a
+  single worker.
 - **Mutable-after-insert (MUT) — still single-cook-thread only.** The compile/graph-tier
   state machines mutate their entries in place and are *not* yet safe for a parallel
   executor: `autotier._STATE`, `graphed._graph_cache`/`_blacklist`/`_CAPTURING`/`_graph_bytes`,
   `compiled._verify_state`, `compiled._deferred_ev`. A pure-interpreter CPU cook never
   touches these; a branch-parallel executor that drives the compile tiers must serialize
   or shard them (GRAPH-2's work). The single genuine multi-writer today —
-  `_compiled_cache`, written by both the foreground and background compile — is race-free
-  *only* because both run on the one `max_workers=1` worker.
+  `_compiled_cache`, written from both single-worker compile pools (`_COMPILE_POOL` and
+  `_WARM_POOL`) and popped on the cook thread — has individually GIL-atomic operations, so
+  a compound get-then-touch sequence on it must tolerate a concurrent eviction.
 
 The single existing data lock (`noise._TieredCache._lock`) predates ENG-9 and stays.
 

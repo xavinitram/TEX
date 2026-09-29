@@ -120,20 +120,31 @@ Two consequences worth stating outright:
 | `vec2`, `vec3`, `vec4` | fixed-width float vectors; `.xyzw` / `.rgba` swizzles |
 | `mat3`, `mat4` | matrices; `m * v` transforms a vector |
 | `string` | a separate domain — no numeric promotion to/from it |
-| `float[N]` | fixed-size arrays of any element type |
+| `float name[N]` | fixed-size arrays of any element type; the size follows the name (`float[3] a;` is E2006) |
 | `IMAGE`/`MASK`/`LATENT` | wire (`@`) binding types at the host boundary |
 | `PLANES` | a wire-only binding type (engine hosts): one `@` wire carrying named planes, each read as `@wire.plane` (§5.3); never an expression type |
 
 Swizzles read components by name (`c.x`, `c.rgb`, `p.xy`); a component set must use one
-naming family. Reverse/arbitrary reorders are not all supported — read components you
-need and rebuild.
+naming family. Only these patterns exist: any two distinct components (`.rg`, `.xz`, `.wx`
+…), `.rgb`/`.xyz`, `.rgba`/`.xyzw`, and the reorders `.bgr` and `.abgr`. Anything else
+(`.bgra`, `.ww`, `.bbr`) is E3302 — read the components you need and rebuild.
+
+Array reads clamp the index: on `float a[3]`, `a[7]` reads the last element and `a[-1]` the
+first. There is no out-of-bounds error.
 
 ## 4. Type-promotion rules
 
 * `int` → `float` wherever a float is expected.
 * A scalar combined with a vector **broadcasts** to every component
   (`vec3 * 2.0`, `1.0 - vec4`).
-* Two vectors must share width; the result keeps that width.
+* Vectors of different widths are not an error. In a binary operator the narrower operand
+  is padded with **zeros** and the result has the wider width, so `vec4 * vec3` has `w = 0`
+  and `vec3 + vec4` keeps the `vec4`'s `w`. Assignment differs: `vec4 c = <vec3>` fills
+  alpha with `1`, and `vec3 c = <vec4>` drops the fourth component. Build the vector you
+  mean with `vec4(rgb, a)` and `.rgb` instead of leaning on either rule.
+* `int(x)` **floors** (`int(-3.99)` is `-4`; `trunc(x)` rounds toward zero). `int / int` is
+  a float division, so `int(7/2)` is `3` and `int j = i / 2;` fails with E3200. `%` follows
+  `fmod`: the result takes the sign of the dividend (`-7 % 3` is `-1`).
 * `mat3 * vec3` / `mat4 * vec4` transform; `mat * mat` composes.
 * `string` never promotes to or from a numeric type; string operations stay in the
   string domain.
@@ -144,8 +155,8 @@ need and rebuild.
 ## 5. Bindings & parameters
 
 ```tex
+f$strength = 0.5;                        // a float parameter with a default (declare it before use)
 @OUT = vec4(@A.rgb * $strength, 1.0);   // @A wire in, @OUT wire out, $strength param
-f$strength = 0.5;                        // a float parameter with a default
 ```
 
 **Parameter UI metadata (v0.23, LANG-1).** A declaration may carry an optional,
@@ -306,7 +317,7 @@ reopens it:
 **Keywords** (cannot name a variable): `float int vec2 vec3 vec4 string mat3 mat4 if
 else for while break continue return const`.
 
-**Built-in variables** (read-only; declaring one is an error or a W7003 shadow advisory):
+**Built-in variables** (read-only; declaring one is always an error, E3001):
 
 | Group | Names |
 |-------|-------|
@@ -326,7 +337,8 @@ pixel index.
 `frame`, `fps`, and `time` are **hard-reserved**: a program declaring its own
 `float time = …;` fails to compile. The `$` parameter namespace is separate — `$time`
 (a param) does not collide with the `time` builtin, though `check()` warns (W7003) that
-the shared name is easy to confuse. Some words (e.g. `pass`, `stage`) are reserved for
+the shared name is easy to confuse. W7003 is only that advisory about a `$` parameter that
+reuses a built-in's name. Some words (e.g. `pass`, `stage`) are reserved for
 future features and error in block position.
 
 ---
@@ -341,6 +353,7 @@ var_decl    = ['const'] type IDENT ['=' expr] ';'
 param_decl  = ('$'|prefix'$') IDENT ['=' expr] [ '[' meta_kv (',' meta_kv)* ']' ] ';'
 meta_kv     = IDENT ':' literal
 assignment  = ('@'|'$'|IDENT) ['.' swizzle] ('='|'+='|'-='|'*='|'/=') expr ';'
+            | IDENT ('++'|'--') ';'                    // postfix only; `++i` and `%=` do not exist
 if_else     = 'if' '(' expr ')' block ['else' (block | if_else)]
 for_loop    = 'for' '(' [var_decl|expr] ';' expr ';' expr ')' block
 while_loop  = 'while' '(' expr ')' block
@@ -348,7 +361,15 @@ function_def= type IDENT '(' [param (',' param)*] ')' block   // 'return' expr;
 ```
 
 Operators, in decreasing precedence: postfix (`.`, `[]`, calls) · unary (`- !`) ·
-`* / %` · `+ -` · comparisons · `&& ||` · ternary `?:` · assignment. Every loop is capped
+`* / %` · `+ -` · `< > <= >=` · `== !=` · `&&` · `||` · ternary `?:` · assignment. So
+`a || b && c` reads `a || (b && c)`, and `a == b < c` reads `a == (b < c)`.
+
+**Truthiness.** A condition is true when its value is **greater than 0.5**: `if`, `while`,
+the `for` test, `?:`, `&&`, `||` and `!` all use that one rule, and comparisons produce
+`1.0` or `0.0`. So `if (0.4)` is false, so is `if (-3)`, and `!0.5` is `1`. This is not the
+C rule that any non-zero value is true.
+
+Every loop is capped
 at 1024 iterations; a loop that needs more fails the cook with E6010, so a cook always
 terminates.
 
