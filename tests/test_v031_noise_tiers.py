@@ -249,7 +249,7 @@ def _run_child(script, args, stdin=None):
     exact shape of compile a Windows Application/Smart App Control policy can block a
     freshly-produced native artifact from loading (V045-FIX; TRK-182 is product code's own
     fallback for the noise TIER, this is the test process's fallback for the CHILD it spawned
-    to force one). Retried once, here, rather than in each of the six callers: one shared
+    to force one). Retried once, here, rather than in each caller: one shared
     subprocess boundary, one shared retry. A timeout is never retried here (doubling a 600s
     wait buys nothing for a genuine hang) and never matches the OS-policy text either."""
     out, rc, stderr = _run_child_once(script, args, stdin)
@@ -517,6 +517,7 @@ def test_v031_noise_cold_equals_warm(r: SubTestResult):
             scale = 8.0 if name == "worley" else 800.0
             x, y = (xx / W) * scale, (yy / H) * scale
             cache.cache.clear()
+            cache._settled.clear()
             cache._compile_attempted.clear()
             cache._call_count.clear()
             cold = fn(x, y)
@@ -551,6 +552,9 @@ def test_v031_noise_stride_signature(r: SubTestResult):
 
     c = noise._simplex_cache
     key = torch.device("cuda", torch.cuda.current_device())
+    # The row promotes the process-wide simplex cache; put it back so later CUDA rows do
+    # not run on a tier that depends on whether this one ran.
+    snapshot = (dict(c.cache), set(c._settled), set(c._compile_attempted), dict(c._call_count))
     c.cache.clear(); c._settled.clear()
     c._compile_attempted.clear(); c._call_count.clear()
 
@@ -582,13 +586,11 @@ def test_v031_noise_stride_signature(r: SubTestResult):
             r.ok(f"{tier}: contiguous / transposed / expanded layouts each settle independently")
         return settled
 
-    held = True
     c._compile_attempted.add(key)          # hold at jit.trace: the cache's own mark
     try:
         traced = leg("trace")
         c._compile_attempted.discard(key)
         c._call_count.pop(key, None)
-        held = False
         if noise._can_inductor_compile(key):
             probe = torch.rand(8, 8, device="cuda")    # an unrelated signature takes the swap
             for _ in range(_COMPILE_AFTER):
@@ -608,8 +610,10 @@ def test_v031_noise_stride_signature(r: SubTestResult):
                    ", ".join(f"{label} {md:.3e}" for label, md in moved.items()) +
                    f" — past the recorded {band:.0e}")
     finally:
-        if held:                           # never leak the hold into a later row
-            c._compile_attempted.discard(key)
+        c.cache.clear(); c.cache.update(snapshot[0])
+        c._settled.clear(); c._settled.update(snapshot[1])
+        c._compile_attempted.clear(); c._compile_attempted.update(snapshot[2])
+        c._call_count.clear(); c._call_count.update(snapshot[3])
 
 
 def test_v031_noise_cold_path_shape(r: SubTestResult):
