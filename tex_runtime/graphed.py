@@ -16,8 +16,8 @@ Safety is layered:
   * a failed capture triggers RNG-poison recovery, blacklists the key, and the
     caller falls back to the plain interpreter — execution never fails because
     of this feature;
-  * keepalive refs to every module-level tensor cache keep captured addresses
-    stable; the graph cache is bytes-aware and frees under memory pressure.
+  * each graph pins the module-level cache tensors it may have baked (`pinned_entries`), so
+    their addresses stay stable; the graph cache is bytes-aware and frees under memory pressure.
 
 Entry point: run_graphed(...). Returns the output, or None to signal "not
 graphable — run the interpreter".
@@ -38,6 +38,7 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
+from .compiled_exec_support import _is_transient_failure
 from .interpreter import Interpreter, _collect_identifiers
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 from . import profile as _profile  # thread-local stage-sink suspend around nested execute()
@@ -178,8 +179,8 @@ _graph_bytes = 0
 # still-poisoned generator is a hazard beyond TEX.
 _graph_mode_disabled = False
 
-# Strong refs to every module-level tensor cache, so a captured graph's baked-in
-# reads never point at freed/reallocated storage (verifier fix 3).
+# The module-level tensor caches whose entries a capture snapshots into `pinned_entries`
+# (that snapshot, not this list, is what keeps a baked address alive).
 _keepalive: list = []
 
 # Last capture error message (diagnostics only).
@@ -387,8 +388,9 @@ def _spatial_px(bindings, program=None) -> int:
 def _graph_capture_worthwhile(est_ops: int, px: int) -> bool:
     """PF-1/PF-2 crossover gate: True only inside the measured win region.
     Near-zero-kernel programs never win (empty-graph overhead); low-kernel
-    programs win only up to ~512²; kernel-heavy programs up to ~1024²; nothing
-    tested wins above 1024². px==0 means no spatial input to size against (a
+    programs win only up to `_GRAPH_BASE_PX_CEIL`; kernel-heavy ones (`_GRAPH_HIGH_OPS`
+    or more) up to `_GRAPH_HIGH_PX_CEIL`; both are per-arch (512²/1024² on the measured
+    Turing card) and nothing tested wins above the higher one. px==0 means no spatial input to size against (a
     pure-scalar program) — tiny either way, and the _GRAPH_MIN_OPS floor already
     rejected the trivial 0/1-op case, so allow rather than forgo a possible win."""
     if est_ops < _GRAPH_MIN_OPS:
@@ -485,13 +487,11 @@ class GraphedProgram:
             if src is None:
                 continue
             if isinstance(src, list):
-                src = _list_to_static(src, getattr(buf, "device", None),
-                                      getattr(buf, "dtype", None))
-            if isinstance(buf, torch.Tensor):
-                if isinstance(src, torch.Tensor):
-                    buf.copy_(src, non_blocking=True)
-                else:
-                    buf.fill_(float(src))
+                src = _list_to_static(src, buf.device, buf.dtype)
+            if isinstance(src, torch.Tensor):
+                buf.copy_(src, non_blocking=True)
+            else:
+                buf.fill_(float(src))
 
     @staticmethod
     def _make_static(value, device, dtype):
@@ -559,8 +559,7 @@ class GraphedProgram:
 
     def _capture_inner(self, program, bindings, type_map, device, latent_channel_count,
                        output_names, precision, used_builtins, scale=None) -> bool:
-        dtype = self.interp._PRECISION_DTYPES.get(precision, torch.float32) \
-            if hasattr(self.interp, "_PRECISION_DTYPES") else torch.float32
+        dtype = Interpreter._PRECISION_DTYPES.get(precision, torch.float32)
         # Build static staging buffers for every binding.
         self.static_bindings = {}
         for name, val in bindings.items():
@@ -624,7 +623,6 @@ def _list_to_static(value, device, dtype):
     A vec/color param (list of numbers) becomes a `[1,1,1,C]` channel-last tensor
     (len 2/3/4) so all channels are staged — NOT collapsed to component 0. A
     ComfyUI batch list (of tensors, unwrapped upstream) falls back to element 0."""
-    dtype = dtype or torch.float32
     if not value:
         return torch.scalar_tensor(0.0, dtype=dtype, device=device)
     if isinstance(value[0], torch.Tensor):
@@ -642,8 +640,8 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
     that is baked as a fixed SHAPE into the capture (see `capture`'s own docstring) — canvas
     shape alone does not distinguish two different `scale` values on the SAME canvas, so without
     this component a capture taken at one scale would be looked up and REPLAYED for a request at
-    a different scale, silently wrong (the bug `test_scalecx49_capture_mismatch_before_fix`
-    below proves). Bounded: the number of distinct captures grows with the number of DISTINCT
+    a different scale, silently wrong (the bug `test_scalecx49_capture_key_mismatch_before_fix`
+    in tests/test_scalecx49_compiled_graphed_scale.py proves). Bounded: the number of distinct captures grows with the number of DISTINCT
     scale values a session actually requests (like a distinct canvas shape already does today),
     never per call — a repeated request at an already-seen scale is a cache hit, not a recapture.
 
@@ -661,7 +659,6 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
     total captured memory crosses the budget, the same bound every other distinct canvas shape
     already lives under — a scale sweep is not a new unbounded-growth axis, it is more values
     sharing the SAME existing bound."""
-    dev = torch.device(device)
     tensor_sig = []
     scalar_names = []
     for name, v in bindings.items():
@@ -677,7 +674,7 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
             tensor_sig.append((name, tuple(v.shape), str(v.dtype)))
         else:
             scalar_names.append(name)
-    base = (fingerprint, dev.index if dev.index is not None else torch.cuda.current_device(),
+    base = (fingerprint, _dev_index(device),
             precision, tuple(sorted(tensor_sig)), tuple(sorted(scalar_names)),
             tuple(output_names) if output_names else (), latent_channel_count)
     return base if scale is None or scale == 1.0 else base + (float(scale),)
@@ -793,17 +790,20 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         _free_all_graphs()
     _build_keepalive()
     gp = GraphedProgram(key)
+    transient = False
     try:
         ok = gp.capture(program, bindings, type_map, dev, latent_channel_count,
                         output_names, precision, used_builtins, scale=scale)
     except Exception as e:
         ok = False
+        transient = _is_transient_failure(e)
         logger.info("[TEX] CUDA-graph capture failed (%s); using interpreter.", e)
         _last_capture_error[0] = f"{type(e).__name__}: {e}"
         if not _recover_from_capture_failure(dev_index):
             _disable_graph_mode()
     if not ok:
-        _blacklist_add(key)
+        if not transient:   # an out-of-memory capture may succeed once memory frees up
+            _blacklist_add(key)
         return None
 
     _graph_cache[key] = gp

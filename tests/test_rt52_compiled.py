@@ -284,3 +284,37 @@ def test_a_callback_that_raises_a_base_exception_does_not_silence_later_cooks():
     finally:
         CO.unregister(handle)
     assert seen == ["run"]
+
+
+def _graphed_capture_attempt(monkeypatch, exc):
+    """Drive graphed.run_graphed to its capture step on a CPU box with a capture that raises `exc`."""
+    from TEX_Wrangle.tex_runtime import graphed as G
+    key_holder = {}
+
+    class BoomProgram:
+        def __init__(self, key):
+            key_holder["key"] = key
+            self.bytes = 0
+
+        def capture(self, *a, **k):
+            raise exc
+
+    monkeypatch.setattr(G, "_capturable_memo", {"rt52_fp": (True, 50)})
+    monkeypatch.setattr(G, "_graph_capture_worthwhile", lambda ops, px: True)
+    monkeypatch.setattr(G, "_under_memory_pressure", lambda dev: False)
+    monkeypatch.setattr(G, "_recover_from_capture_failure", lambda idx: True)
+    monkeypatch.setattr(G, "GraphedProgram", BoomProgram)
+    monkeypatch.setattr(G, "_graph_cache", OrderedDict())
+    monkeypatch.setattr(G, "_blacklist", OrderedDict())
+    monkeypatch.setattr(G, "_graph_mode_disabled", False)
+    out = G.run_graphed(None, {"A": torch.zeros(1, 4, 4, 3)}, {}, "cuda:0", "rt52_fp",
+                        output_names=["OUT"], used_builtins=frozenset())
+    return out, key_holder["key"] in G._blacklist
+
+
+def test_an_out_of_memory_capture_is_retried_later_but_other_failures_are_not(monkeypatch):
+    oom = torch.cuda.OutOfMemoryError("CUDA out of memory")
+    out, blacklisted = _graphed_capture_attempt(monkeypatch, oom)
+    assert out is None and not blacklisted
+    out, blacklisted = _graphed_capture_attempt(monkeypatch, RuntimeError("capture invalidated"))
+    assert out is None and blacklisted
