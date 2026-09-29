@@ -146,34 +146,30 @@ def _cuda_unavailable() -> dict:
 
 
 def _inductor_prereq(dev_type: str):
-    """Static, side-effect-free: does the inductor backend's PREREQUISITE hold for
-    `dev_type`? Mirrors `noise._can_inductor_compile`'s own gate exactly, without ever
-    calling it (that function compiles a probe kernel and mutates env). Returns
-    `(ok, why_not)`: `ok` is `True` (holds), `False` (fails — `why_not` names what's
-    missing), or `None` (Windows CPU, before any inductor-CPU attempt this process —
-    not knowable without running the vcvarsall search this call must not perform).
+    """Static, side-effect-free: does the inductor backend's PREREQUISITE hold for `dev_type`?
+    Returns `(ok, why_not)`: `ok` is `True` (holds), `False` (fails; `why_not` names what is
+    missing), or `None` (Windows CPU, before any inductor-CPU attempt this process: not knowable
+    without running the vcvarsall search, which a report must never trigger).
 
-    C8 (v0.46 Phase C, R1#3): the CUDA case is DELEGATED to `compiled._probe_cuda_inductor`
-    rather than reimplemented here — the two were byte-for-byte the same probe (CUDA
-    availability + `find_spec("triton")`), just copied into two modules, so a change to one
-    could silently drift from the other. `_probe_cuda_inductor` is itself read-only/static
-    (no `_setup_msvc_env`, no compile), so delegating costs this function nothing and keeps
-    its own read-only contract. The CPU case stays here: it is genuinely doctor-specific
-    (the `None` "haven't looked yet" reading, and the explicit refusal to call
-    `_setup_msvc_env` a report must never trigger), with no counterpart in `compiled.py`."""
+    This approximates `noise._can_inductor_compile` without its side effects. It differs from it
+    in two ways: it ignores the `TEX_GATE_NO_INDUCTOR` test knob, and it never runs
+    `_setup_msvc_env`. CUDA is delegated to `compiled._probe_cuda_inductor` (CUDA availability
+    plus Triton), which is itself read-only."""
     if dev_type == "cuda":
         from .tex_runtime import compiled as _compiled
         return _compiled._probe_cuda_inductor()
     # cpu
     import sys
     if sys.platform != "win32":
-        return True, None
-    if shutil.which("cl") is not None or os.environ.get("INCLUDE"):
+        if shutil.which("cc") or shutil.which("gcc") or shutil.which("clang"):
+            return True, None
+        return False, "no C compiler (cc/gcc/clang) found on PATH"
+    if shutil.which("cl") is not None:
         return True, None
     from .tex_runtime import compiled as _compiled
     if _compiled._msvc_env_initialized:
-        return False, ("no MSVC (cl.exe) found on PATH and no INCLUDE set; the vcvarsall "
-                       "search already ran this process and found nothing")
+        return False, ("no MSVC (cl.exe) found on PATH; the vcvarsall search already ran "
+                       "this process and found nothing")
     return None, None
 
 
