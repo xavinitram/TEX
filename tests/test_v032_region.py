@@ -41,10 +41,6 @@ _CHAIN = [
 _PARAMS = [{"knob": 0.8}, {}, {}, {}]
 
 
-def _devices():
-    return ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-
-
 def _cook_stage(code, params, src, roi=None, device="cpu"):
     """One unfused engine cook, optionally over a window. Returns (tensor, cooked_roi)."""
     res = tex_engine.cook(code, {"IN": src, **params}, device_mode=device, precision="fp32",
@@ -73,7 +69,7 @@ def test_v032_cache9_region_recook_oracle(r: SubTestResult):
     recompute nothing) because an ROI cook genuinely re-dispatches convolutions at a different
     extent."""
     print("\n--- v0.32 CACHE-9: region recook oracle (patched == whole) ---")
-    for device in _devices():
+    for device in devices():
         torch.manual_seed(3)
         src = torch.rand(1, 96, 96, 3, device=device)
         halos = [tex_roi.stage_halo(c, p) for c, p in zip(_CHAIN, _PARAMS)]
@@ -199,12 +195,12 @@ def test_v032_cache9_unbounded_reach_inverts_to_whole_frame(r: SubTestResult):
         h = tex_roi.stage_halo(code, {})
         if not plan.executable and h == tex_roi.WHOLE_FRAME:
             r.ok(f"CACHE-9 stage_halo: {label} -> WHOLE_FRAME (plan.halo was {plan.halo})")
-        elif plan.executable:
-            r.ok(f"CACHE-9 stage_halo: {label} is ROI-executable here (halo={h}) — no inversion "
-                 "needed")
         else:
+            # An unbounded read (a gather or a reduction) must never be windowed: a plan that
+            # calls it executable with a finite halo would hand back an under-grown window.
             r.fail("CACHE-9 halo inversion",
-                   f"{label}: non-executable but stage_halo returned {h}")
+                   f"{label}: executable={plan.executable}, stage_halo returned {h} "
+                   f"(expected non-executable and WHOLE_FRAME)")
 
     # Saturation: an unbounded stage 2 must make windows 0..1 the whole frame.
     halos = [1, 2, tex_roi.WHOLE_FRAME, 1]

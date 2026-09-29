@@ -59,10 +59,6 @@ def _stages(src, n, pool=None, tap_at=()):
     return out
 
 
-def _devices():
-    return ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-
-
 # ── the ship gate: a checkpointed cook == the straight-through cook ──────────────────────
 
 def test_v032_cache7_differential_oracle(r: SubTestResult):
@@ -73,7 +69,7 @@ def test_v032_cache7_differential_oracle(r: SubTestResult):
     starts later. A tolerance here would hide a real divergence as rounding."""
     print("\n--- v0.32 CACHE-7: differential oracle (checkpointed == full) ---")
     N = 6
-    for device in _devices():
+    for device in devices():
         torch.manual_seed(0)
         src = torch.rand(1, 96, 96, 3, device=device)
         up = ("oracle-src",)
@@ -133,7 +129,7 @@ def test_v032_cache7_fp16_taps_are_refused(r: SubTestResult):
     HAZARD = "@OUT = vec4(vec3(u * 1000.0 + 0.123) + @IN.rgb, 1.0);"
     SENSITIVE = "@OUT = vec4(fract(@IN.rgb), 1.0);"
 
-    for device in _devices():
+    for device in devices():
         torch.manual_seed(1)
         src = torch.rand(1, 128, 128, 3, device=device)
         stages = [{"code": HAZARD, "chain_input": None, "bindings": {"IN": src}},
@@ -322,7 +318,7 @@ def test_v032_cache7_one_cook_harvests_every_boundary(r: SubTestResult):
     cook, and `@OUT` is unchanged by asking for them."""
     print("\n--- v0.32 CACHE-7: one cook harvests every boundary ---")
     N, cuts = 6, [2, 4]
-    for device in _devices():
+    for device in devices():
         torch.manual_seed(2)
         src = torch.rand(1, 96, 96, 3, device=device)
         plain = tex_engine.cook_stage_list(_stages(src, N), device=device, precision="fp32")
