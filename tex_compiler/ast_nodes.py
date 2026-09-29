@@ -15,7 +15,7 @@ from typing import Optional
 class SourceLoc:
     """A source location in the original TEX source (1-based line/col).
 
-    CT-2: the lexer builds these lazily from a byte offset — `line`/`col` are
+    CT-2: the lexer builds these lazily from a character offset (a `str` index) — `line`/`col` are
     resolved on first access (only when a diagnostic actually surfaces), so the
     hot tokenization path allocates no line/col bookkeeping. The eager
     `SourceLoc(line, col)` constructor is retained for direct construction
@@ -41,7 +41,7 @@ class SourceLoc:
     def from_offset(cls, offset: int, source: str,
                     stage: Optional[int] = None,
                     end_line: Optional[int] = None) -> "SourceLoc":
-        """Lazy location: store the byte offset; resolve line/col on demand."""
+        """Lazy location: store the character offset; resolve line/col on demand."""
         o = cls.__new__(cls)
         o._line = None
         o._col = None
@@ -109,9 +109,9 @@ class Program(ASTNode):
     # once, by `Parser.parse`, from the raw source text (`tex_compiler.parser.language_pragma`)
     # — nothing else re-derives it from a buried comment. A request, not a capability: the
     # level a program is actually COOKED under is `min(language, tex_api.LANGUAGE_VERSION)`
-    # (see `tex_roi._language_tuple`), never this field alone. Purely additive — nothing
-    # reads this field yet, and Tier 3 (`DEVELOPMENT.md` §"API stability tiers"): this AST
-    # node carries no external contract, unlike the pinned `tex_api.Program` facade.
+    # (see `tex_roi._language_tuple`), never this field alone. Tier 3 (`DEVELOPMENT.md`
+    # §"API stability tiers"): this AST node carries no external contract, unlike the
+    # pinned `tex_api.Program` facade.
     language: str | None = None
 
 
@@ -180,7 +180,7 @@ class BreakStmt(ASTNode):
 
 @dataclass(slots=True)
 class ContinueStmt(ASTNode):
-    """Continue statement: skips to the next iteration of the innermost for loop."""
+    """Continue statement: skips to the next iteration of the innermost loop (for or while)."""
     pass
 
 
@@ -389,14 +389,17 @@ class ErrorNode(ASTNode):
 _CHILD_FIELDS: dict[type, tuple] = {}
 
 
-def iter_child_nodes(node):
-    """Yield the direct AST children of `node` (descending into list fields)."""
-    cls = type(node)
+def _field_names(cls) -> tuple:
+    """The dataclass field names of an AST node type, memoized (child walks and clones)."""
     names = _CHILD_FIELDS.get(cls)
     if names is None:
-        names = tuple(f.name for f in _fields(cls))
-        _CHILD_FIELDS[cls] = names
-    for name in names:
+        names = _CHILD_FIELDS[cls] = tuple(f.name for f in _fields(cls))
+    return names
+
+
+def iter_child_nodes(node):
+    """Yield the direct AST children of `node` (descending into list fields)."""
+    for name in _field_names(type(node)):
         v = getattr(node, name)
         if isinstance(v, ASTNode):
             yield v
@@ -413,7 +416,7 @@ def clone_tree(node):
     optimizer's fold behind `tex_roi`'s spatial analysis — can work from a source parsed
     ONCE instead of re-lexing and re-parsing for every parameter value. `copy.deepcopy`
     reaches every object through `__reduce_ex__`; this walk is field-driven off
-    `dataclasses.fields` and memoized per node type exactly like `iter_child_nodes`, so a
+    `dataclasses.fields` and memoized per node type (`_field_names`, as `iter_child_nodes`), so a
     node type that grows a field is copied without an edit here.
 
     Faithful, not clever — each rule is a thing a cheaper copy would get wrong:
@@ -431,22 +434,14 @@ def clone_tree(node):
     return _clone_node(node, {})
 
 
-# Per-node-type field names for `clone_tree`, memoized like `_CHILD_FIELDS`.
-_CLONE_FIELDS: dict[type, tuple] = {}
-
-
 def _clone_node(node, memo: dict):
     hit = memo.get(id(node))
     if hit is not None:
         return hit
     cls = type(node)
-    names = _CLONE_FIELDS.get(cls)
-    if names is None:
-        names = tuple(f.name for f in _fields(cls))
-        _CLONE_FIELDS[cls] = names
     new = cls.__new__(cls)
     memo[id(node)] = new
-    for name in names:
+    for name in _field_names(cls):
         v = getattr(node, name)
         vc = v.__class__
         if isinstance(v, ASTNode):
