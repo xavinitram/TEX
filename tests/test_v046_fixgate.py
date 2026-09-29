@@ -181,21 +181,25 @@ def test_g2_enumerate_paths_sees_an_untracked_not_ignored_file(r: SubTestResult)
     g = _gate()
     import shutil
     import subprocess as _subprocess
-    if shutil.which("git") is None:
-        r.skip("G2 untracked probe", "no git binary on this box; cannot build a scratch repo")
-        return
     with tempfile.TemporaryDirectory(prefix="tex-g2-") as repo:
-        try:
-            _subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True,
-                            timeout=60)
-            for name, body in (("staged.py", "# staged\n"), ("untracked.py", "# untracked\n"),
-                               ("ignored.tmp", "x\n"), (".gitignore", "*.tmp\n")):
-                with open(os.path.join(repo, name), "w", encoding="utf-8") as f:
-                    f.write(body)
-            _subprocess.run(["git", "-C", repo, "add", "staged.py"], check=True,
-                            capture_output=True, timeout=60)
-        except (OSError, _subprocess.SubprocessError) as e:
-            r.skip("G2 untracked probe", f"could not build a scratch repo ({e})")
+        unbuilt = None
+        if shutil.which("git") is None:
+            unbuilt = "no git binary on this box"
+        else:
+            try:
+                _subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True,
+                                timeout=60)
+                for name, body in (("staged.py", "# staged\n"),
+                                   ("untracked.py", "# untracked\n"),
+                                   ("ignored.tmp", "x\n"), (".gitignore", "*.tmp\n")):
+                    with open(os.path.join(repo, name), "w", encoding="utf-8") as f:
+                        f.write(body)
+                _subprocess.run(["git", "-C", repo, "add", "staged.py"], check=True,
+                                capture_output=True, timeout=60)
+            except (OSError, _subprocess.SubprocessError) as e:
+                unbuilt = f"could not build a scratch repo ({e})"
+        if unbuilt is not None:
+            r.skip("G2 untracked probe", f"{unbuilt}; nothing to enumerate")
             return
         paths = g.enumerate_paths(repo)
         if paths is None:
