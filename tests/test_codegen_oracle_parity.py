@@ -579,3 +579,20 @@ def test_function_local_does_not_shadow_a_function_named_lv(masked):
     code = (head + "float lv_x(float a) { return a * 2.0; }\n"
             "float g(float b) { float x = b; return lv_x(x); }\n@OUT = vec3(g(@A.r));")
     assert_parity(code, {"A": _img()})
+
+
+# ── a string assigned under a per-pixel if takes the majority branch, as in the interpreter ─
+
+def _mostly(on):
+    a = _img()
+    a[..., 0] = 0.9 if on else 0.1
+    a[0, 0, 0, 0] = 0.1 if on else 0.9
+    return a
+
+
+@pytest.mark.parametrize("on", [True, False], ids=["majority on", "majority off"])
+@pytest.mark.parametrize("else_arm", ["", ' else { s = "ccc"; }'], ids=["then only", "if-else"])
+def test_spatial_if_string_merge_takes_the_majority_branch(on, else_arm):
+    code = ('string s = "a";\nif (@A.r > 0.5) { s = "bb"; }' + else_arm +
+            "\n@OUT = vec3(float(len(s))) + @A.rgb * 0.0;")
+    assert_parity(code, {"A": _mostly(on)}, atol=0.0)

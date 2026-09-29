@@ -1701,6 +1701,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if masked_scatter:
             self._indent -= 1
 
+    @staticmethod
+    def _untensor_merge(cond_bool: str, tv: str, ev: str) -> str:
+        """A spatial if's merge when the branch values are not both tensors, as
+        `Interpreter._merge_branch_vars` does it: a string takes the majority branch."""
+        return (f"{tv} if {ev} is None or not (isinstance({tv}, str) or isinstance({ev}, str)) "
+                f"or {cond_bool}.float().mean().item() > 0.5 else {ev}")
+
     def _emit_function_def(self, stmt: FunctionDef):
         """Emit a user-defined function as a nested Python def."""
         self._user_functions.add(stmt.name)
@@ -2117,7 +2124,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._indent -= 1
             self._emit(f"elif {tv} is not None:")
             self._indent += 1
-            self._emit(f"{tgt} = {tv}")
+            self._emit(f"{tgt} = {self._untensor_merge(cond_bool, tv, ev)}")
             self._indent -= 1
 
         for k in all_bind_mods:
@@ -2131,7 +2138,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._indent -= 1
             self._emit(f"elif {tv} is not None:")
             self._indent += 1
-            self._emit(f"_bind[{k!r}] = {tv}")
+            self._emit(f"_bind[{k!r}] = {self._untensor_merge(cond_bool, tv, ev)}")
             self._indent -= 1
 
         # Post-merge, a modified var can hold a per-pixel tensor even when its
