@@ -187,7 +187,7 @@ _TIER1_SPEC = {
     'tex_provider:stats': ('function', ()),
     'tex_provider:bump_source_version': ('function', (('source_key', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_provider:set_provider': ('function', (('provider', 'POSITIONAL_OR_KEYWORD', False),)),
-    'tex_provider:declare_window': ('function', (('queue', 'POSITIONAL_OR_KEYWORD', False), ('source_key', 'POSITIONAL_OR_KEYWORD', False), ('t0', 'POSITIONAL_OR_KEYWORD', False), ('t1', 'POSITIONAL_OR_KEYWORD', False), ('confidence', 'KEYWORD_ONLY', True), ('mode', 'KEYWORD_ONLY', True), ('max_frames', 'KEYWORD_ONLY', True))),
+    'tex_provider:declare_window': ('function', (('queue', 'POSITIONAL_OR_KEYWORD', False), ('source_key', 'POSITIONAL_OR_KEYWORD', False), ('t0', 'POSITIONAL_OR_KEYWORD', False), ('t1', 'POSITIONAL_OR_KEYWORD', False), ('confidence', 'KEYWORD_ONLY', True), ('mode', 'KEYWORD_ONLY', True), ('max_frames', 'KEYWORD_ONLY', True), ('step', 'KEYWORD_ONLY', True))),
     'tex_provider:set_media_budget_mb': ('function', (('mb', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_provider:source_flags': ('function', (('source_keys', 'VAR_POSITIONAL', False),)),
     'tex_recovery:atomic_write': ('function', (('path', 'POSITIONAL_OR_KEYWORD', False), ('write', 'POSITIONAL_OR_KEYWORD', False), ('fsync', 'KEYWORD_ONLY', True))),
