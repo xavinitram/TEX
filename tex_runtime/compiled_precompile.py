@@ -1,37 +1,15 @@
-"""COMPILE-51b precompile-scoping helpers — SPLIT (v0.51 Phase C, FIX-COMPILE51 C0).
+"""Precompile-cache scoping for the compiled tier (split out of `compiled.py`).
 
-Split mechanically out of `compiled.py` (the SPLIT-47/K0 pattern: every body below is
-byte-identical to the code it replaced there at the moment of the move — AGENTS.md
-§"Trades to REFUSE", mechanical moves only, never an "improvement" mid-move).
-`compiled.py` was at 1999/2000 lines with no headroom floor (REG-2, B4#3, R4#2) and
-COMPILE-51b's own fix (see below) was about to touch this exact code, so it moves out
-FIRST, unchanged, before the fix lands — following the same shape this module's siblings
-(`compiled_capability.py`, `compiled_exec_support.py`, `compiled_promotion.py`) already
-document.
+Owns the scoping of dynamo's persistent precompile cache (PC-2): the process-global lock
+(`_precompile_flag_lock`), the context managers that flip `caching_precompile` for a scope
+(`_precompile_off_ctx`, `_precompile_ctx`), the per-fingerprint probe that decides which
+scope a program wants (`_wants_precompile_off`), and the attach-failure recovery pair
+(`_is_precompile_attach_failure`, `_clear_dynamo_precompile_store`). `compiled.py` re-exports
+every name here.
 
-This is C0's move only: every body below is unchanged from `compiled.py` at `365fdb4`
-(the base this fix lane starts from) -- C1 (the next commit) is where the lock's actual
-coverage changes.
-
-This module owns dynamo's persistent precompile cache (PC-2) scoping: the process-global
-lock (`_precompile_flag_lock`), the two context-manager shapes that flip
-`caching_precompile` for a scope (`_precompile_off_ctx`, `_precompile_ctx`), the
-per-fingerprint probe that decides which scope a program wants
-(`_wants_precompile_off`), and the attach-failure recovery pair
-(`_is_precompile_attach_failure`, `_clear_dynamo_precompile_store`). `compiled.py` imports
-this module at its own top level and re-exports every name below, so `compiled.NAME` and
-`from .compiled import NAME` keep resolving unchanged for every external caller (tests
-included) — the ROUTE-45 shape SPLIT-E used.
-
-This module reaches back into `compiled.py` for the one name that stays there
-(`_get_or_make_codegen_fn`) lazily, inside the one function that needs it
-(`_wants_precompile_off`) — the same posture `compiled_capability.py` already uses for
-`compiled._backend_status`/`compiled._setup_msvc_env` — so this module never imports
-`compiled.py` at its own module scope (there is no load-time cycle) AND a test that
-monkeypatches `compiled._get_or_make_codegen_fn` (see
-`tests/test_compile51b_precompile_disable.py`) still observes its own patched value: the
-`from .compiled import _get_or_make_codegen_fn` below is re-evaluated on every call, not
-bound once at import time."""
+`_wants_precompile_off` reaches back into `compiled.py` lazily, inside the function, so this
+module never imports `compiled.py` at module scope and a test that monkeypatches
+`compiled._get_or_make_codegen_fn` still sees its own value."""
 from __future__ import annotations
 
 import contextlib
@@ -49,34 +27,49 @@ from typing import Any
 # compiled program keeps disk-persisted `caching_precompile` (PC-2) unchanged.
 # `_COMPILE_POOL`/`_WARM_POOL` (both defined in `compiled.py`) run concurrently.
 # On torch 2.12 a dynamo config patch is a per-thread override (a ContextVar), so
-# a patch on one pool's thread is invisible to the other (measured: a second
-# thread never saw the patched value); TEX sets no torch floor, though, and on a
-# build where the patch writes a shared module global the two pools' windows race.
-# `_precompile_flag_lock` keeps both correct by serializing EVERY
-# scoped window against every other one, whichever value it sets -- FIX-COMPILE51
-# C1 (B3#1): the pre-fix code took this lock ONLY for the `disable=True` branch
-# (`_precompile_off_ctx`); the `disable=False` (default) branch called
-# `_dc.patch(caching_precompile=True)` directly, with no lock at all, so an
-# off-scoped compile on one pool and a concurrently running default-scoped compile
-# on the other were never actually serialized against each other despite this
-# comment's own claim (confirmed missing directly: entering the default branch
-# while another caller held this lock returned immediately instead of blocking --
-# see `tests/test_compile51b_precompile_disable.py`). Routing BOTH branches
-# through the SAME lock-wrapped helper (`_precompile_scoped`) closes that: the
-# cost is that an ON-scoped compile on one pool can now wait, briefly, behind an
-# OFF-scoped compile finishing on the other pool, and vice versa -- one compile's
-# own wrap window, not the whole cook -- and correctness costs more than that
-# pause.
+# a patch on one pool's thread is invisible to the other and the two compiles need
+# no serialisation. TEX sets no torch floor, though, and on a build where the patch
+# writes a shared module global the two pools' windows would race, so
+# `_patch_is_thread_local` checks once which kind of build this is. Only on a shared-global
+# build does `_precompile_flag_lock` serialise EVERY scoped window (whichever value it sets)
+# against every other one, and it is then held for the whole compile, which can be long.
 _precompile_flag_lock = threading.Lock()
+_patch_thread_local: bool | None = None
+
+
+def _patch_is_thread_local(_dc) -> bool:
+    """True when `_dc.patch(...)` on one thread is invisible to every other thread.
+    Measured once, under `_precompile_flag_lock` so no other scoped window can be open
+    while the flag is briefly flipped."""
+    global _patch_thread_local
+    if _patch_thread_local is None:
+        with _precompile_flag_lock:
+            if _patch_thread_local is None:
+                seen: list = []
+                try:
+                    original = _dc.caching_precompile
+                    with _dc.patch(caching_precompile=not original):
+                        probe = threading.Thread(
+                            target=lambda: seen.append(_dc.caching_precompile))
+                        probe.start()
+                        probe.join()
+                        _patch_thread_local = (_dc.caching_precompile == (not original)
+                                               and bool(seen) and seen[0] == original)
+                except Exception:
+                    _patch_thread_local = False
+    return _patch_thread_local
 
 
 @contextlib.contextmanager
 def _precompile_scoped(_dc, *, caching_precompile: bool):
-    """Shared body for both scoped values (FIX-COMPILE51 C1) -- see the module
-    comment above `_precompile_flag_lock` for why every caller, whichever value it
-    sets, must share this one lock."""
-    with _precompile_flag_lock, _dc.patch(caching_precompile=caching_precompile):
-        yield
+    """Shared body for both scoped values: the patch, under `_precompile_flag_lock` unless
+    the patch is per-thread (see the comment above `_precompile_flag_lock`)."""
+    if _patch_is_thread_local(_dc):
+        with _dc.patch(caching_precompile=caching_precompile):
+            yield
+    else:
+        with _precompile_flag_lock, _dc.patch(caching_precompile=caching_precompile):
+            yield
 
 
 def _precompile_off_ctx(_dc):
