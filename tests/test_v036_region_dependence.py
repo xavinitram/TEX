@@ -1056,9 +1056,9 @@ def test_t13_scalar_cast_is_region_dependent(r: SubTestResult):
     try:
         _p, whole = _cook(CAST_REPRO)
         _p2, tiled = _cook(CAST_REPRO, tiles=2)
-        assert whole["TXT"] == "4.761904716491699", whole["TXT"]
-        assert tiled["TXT"] == "2.222222328186035", tiled["TXT"]
-        r.ok("string(x): pinned to TRK-32's own two numbers")
+        assert whole["TXT"] == "4.7619", whole["TXT"]
+        assert tiled["TXT"] == "2.22222", tiled["TXT"]
+        r.ok("string(x): TRK-32's own two numbers, as the 6-significant-digit text")
     except Exception as e:
         r.fail("T13 pinned numbers", f"{type(e).__name__}: {e}")
 
