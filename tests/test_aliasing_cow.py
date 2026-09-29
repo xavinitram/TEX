@@ -6,17 +6,8 @@ array-element assignment, the persistent literal cache, the per-execution
 scatter-buffer ownership model, and the stdlib clamp / grid-buffer fixes.
 """
 from helpers import *
+from failure_harness import compile_program as _compile   # (program, type_map, output_names)
 from TEX_Wrangle.tex_runtime import stdlib as _stdlib_mod
-
-
-def _compile(code: str, bindings: dict):
-    """Lex/parse/typecheck; returns (program, type_map, output_names)."""
-    tokens = Lexer(code).tokenize()
-    program = Parser(tokens, source=code).parse()
-    binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
-    checker = TypeChecker(binding_types=binding_types, source=code)
-    type_map = checker.check(program)
-    return program, type_map, sorted(checker.assigned_bindings.keys())
 
 
 def test_cow_channel_array_writes(r: SubTestResult):

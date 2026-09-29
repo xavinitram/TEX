@@ -11,9 +11,9 @@ an n-arm chain cost O(2^n) emitted text, not O(n).
 
 This file uses its OWN synthetic n-arm chain (never the host's program or file name) on its
 own uniform `$sel` parameter, so the size law and the parity rows are provable without the
-host's tree.  It is entirely new coverage: nothing above this docstring exists elsewhere in
-the suite, so removing the fix should turn every row below red on its own (no shared fixture
-masks a regression here)."""
+host's tree.  Only the size-law and timing rows go red without the fix (the pre-fix
+emission was bigger, not wrong); the parity and no-`if` rows pin that the closure sharing
+does not change values or text for programs it does not concern."""
 import builtins
 import time
 
@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from helpers import *   # noqa: F403
+from failure_harness import compile_program as _compile
 
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import codegen as cg_mod
@@ -55,14 +56,6 @@ def _make_perpixel_chain(n_arms: int) -> str:
         lines.append(f"else if (sel == {float(i)}) {{ op = {float(i)} * 2.0 + 1.0; }}")
     lines.append("@OUT = vec4(op, op, op, 1.0);")
     return PRAGMA + "\n".join(lines) + "\n"
-
-
-def _compile(src, bindings):
-    bt = {name: _infer_binding_type(v) for name, v in bindings.items()}
-    program = parse_and_split(src, bt)
-    checker = TypeChecker(binding_types=bt, source=src)
-    type_map = checker.check(program)
-    return program, type_map, sorted(checker.assigned_bindings.keys())
 
 
 def _emit(src, bindings):
