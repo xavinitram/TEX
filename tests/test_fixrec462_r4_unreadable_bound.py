@@ -13,6 +13,7 @@ already takes for "give up on this file" (delete + its own accounting) — while
 sees even one successful open resets to zero, so the transient case never comes close.
 """
 from helpers import *
+from helpers import scratch_dir
 
 import builtins
 
@@ -62,7 +63,7 @@ def test_r4_permanently_unreadable_frame_is_deleted_after_the_bound(r: SubTestRe
     print("\n--- FIX-REC R4: a permanently-unreadable .frame is bounded, then deleted ---")
     real_open = builtins.open
     try:
-        d = Path(tempfile.mkdtemp())
+        d = scratch_dir()
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         f = _frame()
         c.put("k", f)
@@ -116,7 +117,7 @@ def test_r4_transient_failures_below_the_bound_never_delete(r: SubTestResult):
     print("\n--- FIX-REC R4: repeated transient (non-consecutive) failures never delete ---")
     real_open = builtins.open
     try:
-        d = Path(tempfile.mkdtemp())
+        d = scratch_dir()
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         f = _frame()
         c.put("k", f)

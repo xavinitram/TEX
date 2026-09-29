@@ -133,6 +133,9 @@ def test_k1_module_is_bounded_and_evicted_with_its_linecache_entry(r: SubTestRes
     import sys as _sys
     saved_keys = list(CP._LINECACHE_KEYS)
     saved_max = CP._LINECACHE_MAX
+    # Start from an empty deque: with real keys queued, the eviction below would pop THEIR
+    # linecache and sys.modules entries, which the finally block cannot put back.
+    CP._LINECACHE_KEYS.clear()
     CP._LINECACHE_MAX = 2
     names = [f"<tex_codegen_k1bound{i}>" for i in range(4)]
     try:

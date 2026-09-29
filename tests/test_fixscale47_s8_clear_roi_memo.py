@@ -35,6 +35,13 @@ def test_s8_clear_roi_memo_still_empties_the_other_three_stores(r: SubTestResult
     print("\n--- FIX-SCALE S8: clear_roi_memo() still empties _walk_memo/_region_dep_memo/_parse_memo ---")
     R.scale_safe(_CODE)          # walks _fold_program, populates _walk_memo/_parse_memo
     R.roi_plan(_CODE, {})        # populates _region_dep_memo (region_dependent_cached)
+    unpopulated = [k for k, store in (("_walk_memo", R._walk_memo),
+                                      ("_region_dep_memo", R._region_dep_memo),
+                                      ("_parse_memo", R._parse_memo)) if not len(store)]
+    if unpopulated:
+        r.fail("setup broken", f"{unpopulated} not populated before the clear, so an empty "
+               f"store afterwards proves nothing")
+        return
     R.clear_roi_memo()
     empties = {
         "_walk_memo": len(R._walk_memo),

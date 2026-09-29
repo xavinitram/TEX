@@ -121,16 +121,18 @@ def test_p1_restore_without_nesting_is_unaffected(r):
         snapshot = _pace.save_state()
         _pace.restore_state(snapshot)    # no nested cook ran in between
 
-        query_calls_before = _FakeEvent._live  # no NEW event should be built by a skip
+        events_before = _FakeEvent._live  # no NEW event should be built by a skip
         outstanding_before = _outstanding_len()
         _pace.paced_check(tok, "cuda")   # device still reports done
         outstanding_after = _outstanding_len()
+        events_after = _FakeEvent._live
 
-    if outstanding_after == outstanding_before:
+    if outstanding_after == outstanding_before and events_after == events_before:
         r.ok("a restore with no intervening nested cook still economized correctly "
              "(query() answers True, poll skips, no new event built)")
     else:
         r.fail("P1 restore regression",
-               f"outstanding grew ({outstanding_before} -> {outstanding_after}) on a "
+               f"outstanding {outstanding_before} -> {outstanding_after}, events built "
+               f"{events_before} -> {events_after} on a "
                f"restore with no nested activity -- P1's fix must not force a record on "
                f"every restore, only refuse to TRUST a stale identity match")

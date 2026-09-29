@@ -453,6 +453,17 @@ def run_python_kv(code: str, *, timeout: int = 60, python: str | None = None) ->
     return dict(line.split(" ", 1) for line in proc.stdout.strip().splitlines() if " " in line)
 
 
+def scratch_dir(prefix="tex_test_"):
+    """A fresh scratch directory (`Path`) that is removed when the interpreter exits, so a
+    row that fails before its own cleanup cannot leak it.
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+    import atexit
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    atexit.register(shutil.rmtree, str(d), ignore_errors=True)
+    return d
+
+
 def windowed_vs_whole(code, image, roi, device="cpu", params=None, whole=False):
     """Cook `code` on `image` twice, whole frame and with `roi` (x0, y0, w, h, W, H) as a
     real window. Returns `(cooked_roi, windowed_out, reference)`, where `reference` is the

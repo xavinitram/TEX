@@ -18,8 +18,8 @@ any deserialise, at all three sites. These rows pin it RED-FIRST:
     re-cooks, never an error and never served. On the base tree it is a HIT.
 """
 from helpers import *
+from helpers import scratch_dir
 
-import atexit
 import pickle as _pickle
 
 import torch
@@ -27,14 +27,6 @@ import torch
 from TEX_Wrangle.tex_cache import TEXCache
 from TEX_Wrangle import tex_results
 from TEX_Wrangle.tex_runtime import compiled as _C
-
-
-def _tmp() -> Path:
-    """A scratch dir that is removed at interpreter exit even when its row fails before its own
-    `rmtree` (a failing row otherwise leaks it)."""
-    p = Path(tempfile.mkdtemp())
-    atexit.register(shutil.rmtree, str(p), ignore_errors=True)
-    return p
 
 
 class _ExecOnLoad:
@@ -76,7 +68,7 @@ def _frame(res=32):
 def test_brief10_pkl_site_never_executes_crafted_reduce(r: SubTestResult):
     print("\n--- BRIEF-10: _load_from_disk authenticates before pickle.load ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         marker = d / "PWNED_pkl"
         cache = TEXCache(cache_dir=d)
         bt = {"A": TEXType.VEC4}
@@ -95,7 +87,7 @@ def test_brief10_pkl_site_never_executes_crafted_reduce(r: SubTestResult):
 def test_brief10_cg_site_never_executes_crafted_reduce(r: SubTestResult):
     print("\n--- BRIEF-10: _load_codegen_from_disk authenticates before pickle.load ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         marker = d / "PWNED_cg"
         cache = TEXCache(cache_dir=d)
         fp = "deadbeef" * 8
@@ -113,7 +105,7 @@ def test_brief10_cg_site_never_executes_crafted_reduce(r: SubTestResult):
 def test_brief10_frame_site_never_executes_crafted_reduce(r: SubTestResult):
     print("\n--- BRIEF-10: _restore authenticates before pickle.load ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         marker = d / "PWNED_frame"
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         key = "k"
@@ -135,7 +127,7 @@ def test_brief10_frame_site_never_executes_crafted_reduce(r: SubTestResult):
 def test_brief10_pkl_site_rejects_a_forged_trailer(r: SubTestResult):
     print("\n--- BRIEF-10: a forged .pkl trailer (bad tag) is refused by the MAC ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         marker = d / "FORGED_pkl"
         cache = TEXCache(cache_dir=d)
         bt = {"A": TEXType.VEC4}
@@ -154,7 +146,7 @@ def test_brief10_pkl_site_rejects_a_forged_trailer(r: SubTestResult):
 def test_brief10_cg_site_rejects_a_forged_trailer(r: SubTestResult):
     print("\n--- BRIEF-10: a forged .cg trailer (bad tag) is refused by the MAC ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         marker = d / "FORGED_cg"
         cache = TEXCache(cache_dir=d)
         fp = "feedface" * 8
@@ -172,7 +164,7 @@ def test_brief10_cg_site_rejects_a_forged_trailer(r: SubTestResult):
 def test_brief10_frame_site_rejects_a_forged_trailer(r: SubTestResult):
     print("\n--- BRIEF-10: a forged .frame trailer (bad tag) is refused by the MAC ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         marker = d / "FORGED_frame"
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         Path(c._disk_path("k")).write_bytes(_forged(str(marker)))
@@ -193,7 +185,7 @@ def test_brief10_frame_site_rejects_a_forged_trailer(r: SubTestResult):
 def test_brief10_signed_entries_still_load(r: SubTestResult):
     print("\n--- BRIEF-10: signed .pkl/.cg/.frame still load (no over-rejection) ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         cache = TEXCache(cache_dir=d)
         bt = {"A": TEXType.VEC4}
         prog, tm, *_ = cache.compile_tex(_CODE, bt)     # writes a signed .pkl
@@ -236,7 +228,7 @@ def test_brief10_signed_entries_still_load(r: SubTestResult):
 def test_brief10_unsigned_pkl_is_a_silent_miss_then_recompiles(r: SubTestResult):
     print("\n--- BRIEF-10: an unsigned .pkl is a miss that recompiles (not served) ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         cache = TEXCache(cache_dir=d)
         bt = {"A": TEXType.VEC4}
         cache.compile_tex(_CODE, bt)
@@ -267,7 +259,7 @@ def test_brief10_unsigned_pkl_is_a_silent_miss_then_recompiles(r: SubTestResult)
 def test_brief10_unsigned_frame_is_a_silent_miss(r: SubTestResult):
     print("\n--- BRIEF-10: an unsigned .frame is a miss (not served) ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         f = _frame()
         # A fully valid v2 record, written UNSIGNED — a HIT on the base tree, a miss on the fix.
@@ -302,7 +294,7 @@ def test_brief10_key_repair_spares_a_peers_republished_key(r: SubTestResult):
     `os.stat`, and the repair must then LEAVE it and converge to it."""
     import TEX_Wrangle.tex_recovery as R
     try:
-        home = _tmp()
+        home = scratch_dir()
         keypath = home / R._MAC_KEY_FILE
         keypath.write_bytes(b"\x01\x02\x03")            # a malformed 3-byte key
         K_B = b"B" * R._MAC_KEY_LEN                      # the peer's good, published key
@@ -358,7 +350,7 @@ def test_brief10_key_repair_spares_a_peers_republished_key(r: SubTestResult):
 def test_restore462_transient_open_failure_is_a_miss_not_a_deletion(r: SubTestResult):
     print("\n--- RESTORE-462: a transient open() OSError must not delete a valid .frame ---")
     try:
-        d = _tmp()
+        d = scratch_dir()
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         f = _frame()
         c.put("k", f)
@@ -427,7 +419,7 @@ def test_restore462_probe_key_reads_the_key_file_in_binary_mode(r: SubTestResult
     print("\n--- RESTORE-462: _probe_key must not read the MAC key in text mode ---")
     import TEX_Wrangle.tex_recovery as R
     try:
-        home = _tmp()
+        home = scratch_dir()
         keypath = home / R._MAC_KEY_FILE
 
         # Two independent byte patterns, each well inside the ~11.8%-per-mint natural rate, not

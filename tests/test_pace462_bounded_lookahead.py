@@ -20,6 +20,7 @@ previous event exists (an unconditional one-poll-interval wait, not a depth-gate
 so `_pace._resolve_depth` does not exist at all (AttributeError) and the ring/ construction-
 count assertions below have nothing matching to read.
 """
+import types
 import functools
 import inspect
 
@@ -458,8 +459,8 @@ def test_stride_gates_the_ring_not_the_token_check(r):
     `torch.cuda` beyond `token.check()`; a poll 20ms after must record."""
     print("\n--- PACE-462 stride: polls inside the window record nothing ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy() as spy:
             tok = _Token(pace=True, pace_depth=8)
@@ -479,7 +480,7 @@ def test_stride_gates_the_ring_not_the_token_check(r):
             _pace.paced_check(tok, "cuda")               # past the stride -> records
             count_after_past = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
 
     checks_total = tok.checks
     ok = (count_after_first == 1 and constructed_after_first == 1
@@ -536,8 +537,8 @@ def test_pace47_stride_skip_falls_through_when_device_is_behind(r):
     print("\n--- PACE-47: a poll inside the stride window still records/waits when the "
           "device is behind ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy():
             _FakeEvent.DONE = False   # the device never finishes a recorded event: "behind"
@@ -559,7 +560,7 @@ def test_pace47_stride_skip_falls_through_when_device_is_behind(r):
             _pace.paced_check(tok, "cuda")         # pool full at depth 2 -> must wait on oldest
             waits_after_3 = sum(ev.sync_calls for ev in _pool_events())
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
         _FakeEvent.DONE = True
 
     ok = (outstanding_after_1 == 1 and constructed_after_1 == 1
@@ -584,8 +585,8 @@ def test_pace47_stride_skip_still_fires_once_device_catches_up(r):
     it conditions the skip on the device's own state."""
     print("\n--- PACE-47: the stride skip still fires once the device has caught up ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy():
             _FakeEvent.DONE = True    # the device always reports the last event done: "caught up"
@@ -601,7 +602,7 @@ def test_pace47_stride_skip_still_fires_once_device_catches_up(r):
             constructed_after_2 = _FakeEvent._live
             outstanding_after_2 = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
 
     if constructed_after_1 == 1 and constructed_after_2 == 1 and outstanding_after_2 == 1:
         r.ok("device-caught-up poll inside the stride window skipped: still 1 event "
@@ -629,8 +630,8 @@ def test_pace47b_repeated_skip_reuses_one_query_call(r):
     every one of the 10 polls called `query()` again on the identical, unchanged event."""
     print("\n--- PACE-47b: repeated economizing polls reuse one query() call ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     query_calls = {"n": 0}
     real_query = _FakeEvent.query
 
@@ -649,7 +650,7 @@ def test_pace47b_repeated_skip_reuses_one_query_call(r):
                 clock.advance(0.0001)         # still well inside the 10ms window
                 _pace.paced_check(tok, "cuda")
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
         _FakeEvent.query = real_query
 
     if query_calls["n"] == 1:
@@ -666,8 +667,8 @@ def test_pace47b_query_cache_invalidates_on_a_real_record(r):
     freshly re-armed) event and must be peeked again, not answered from the stale cache."""
     print("\n--- PACE-47b: the query() cache is invalidated by a real record ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     query_calls = {"n": 0}
     real_query = _FakeEvent.query
 
@@ -689,7 +690,7 @@ def test_pace47b_query_cache_invalidates_on_a_real_record(r):
             clock.advance(0.0001)
             _pace.paced_check(tok, "cuda")   # inside window again: must peek #2 fresh
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
         _FakeEvent.query = real_query
 
     if query_calls["n"] == 2:
@@ -719,8 +720,8 @@ def test_pace47c_completed_tail_blind_spot_is_real_without_heavy(r):
     proving the backlog these 20 represent is invisible to the depth bound."""
     print("\n--- PACE-47c: the completed-tail blind spot is real without `heavy` ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy():
             _FakeEvent.DONE = True
@@ -740,7 +741,7 @@ def test_pace47c_completed_tail_blind_spot_is_real_without_heavy(r):
             constructed_after = _FakeEvent._live
             outstanding_after = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
         _FakeEvent.DONE = True
 
     if (constructed_before == 1 and outstanding_before == 1
@@ -764,8 +765,8 @@ def test_pace47c_heavy_true_forces_the_bound_regardless_of_the_tail(r):
     keyword at all (TypeError)."""
     print("\n--- PACE-47c: heavy=True forces the depth bound regardless of the tail ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy():
             _FakeEvent.DONE = True
@@ -785,7 +786,7 @@ def test_pace47c_heavy_true_forces_the_bound_regardless_of_the_tail(r):
             waits_after = sum(ev.sync_calls for ev in _pool_events())
             outstanding_after = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
         _FakeEvent.DONE = True
 
     if waits_before == 0 and waits_after - waits_before == 20 and outstanding_after == 2:
@@ -846,8 +847,8 @@ def test_pace47e_large_resolution_forces_record_despite_caller_heavy_false(r):
     depth bound must still be enforced from the cook's own resolution alone."""
     print("\n--- PACE-47e: a large cook's resolution forces the bound even at heavy=False ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy():
             _FakeEvent.DONE = True
@@ -867,7 +868,7 @@ def test_pace47e_large_resolution_forces_record_despite_caller_heavy_false(r):
             waits_after = sum(ev.sync_calls for ev in _pool_events())
             outstanding_after = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
         _FakeEvent.DONE = True
 
     if waits_before == 0 and waits_after - waits_before == 20 and outstanding_after == 2:
@@ -885,8 +886,8 @@ def test_pace47e_small_resolution_still_economizes(r):
     proved -- the resolution check must not make every cook heavy by accident."""
     print("\n--- PACE-47e: a small-resolution cook still economizes at heavy=False ---")
     clock = _FakeClock(0.0)
-    real_perf_counter = _pace._time.perf_counter
-    _pace._time.perf_counter = clock
+    real_perf_counter = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
         with _DeviceSpy():
             _FakeEvent.DONE = True
@@ -899,7 +900,7 @@ def test_pace47e_small_resolution_still_economizes(r):
             constructed = _FakeEvent._live
             outstanding = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
-        _pace._time.perf_counter = real_perf_counter
+        _pace._time = real_perf_counter
 
     if constructed == 1 and outstanding == 1:
         r.ok("small-resolution cook still skipped inside the stride window (1 event, "

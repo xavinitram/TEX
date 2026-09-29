@@ -14,6 +14,7 @@ Every row here is RED against base `7477a93` (v0.48.0): that `pacing.py` has no
 `_COST_TABLE`, no `pace_budget_ms`, and `paced_check` takes no `call_site_id` keyword at all
 (TypeError) -- so every assertion below has nothing matching to read.
 """
+import types
 import functools
 import inspect
 
@@ -68,10 +69,10 @@ class _FakeClock:
 @pytest.fixture
 def clock():
     c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
     yield c
-    _pace._time.perf_counter = real
+    _pace._time = real
 
 
 # ── §4: the default (unpaced) path touches nothing this ask adds ─────────────────
@@ -144,12 +145,12 @@ import contextlib  # noqa: E402
 @contextlib.contextmanager
 def _clock_ctx():
     c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
     try:
         yield c
     finally:
-        _pace._time.perf_counter = real
+        _pace._time = real
 
 
 # ── §6.1: the table updates only at a fresh peek-confirm or a wait, never a cache hit ──

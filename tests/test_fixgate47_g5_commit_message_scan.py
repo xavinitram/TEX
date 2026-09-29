@@ -14,19 +14,21 @@ import tempfile
 from pathlib import Path
 
 from helpers import SubTestResult
+from helpers import scratch_dir
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import scan_commit_messages as SCM   # noqa: E402
 
 
 def _git(repo: Path, *args):
-    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True,
-                          check=True)
+    # The throwaway repo must not inherit the developer's global git config (commit signing).
+    return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=str(repo),
+                          capture_output=True, text=True, check=True)
 
 
 def _mini_repo() -> Path:
-    d = Path(tempfile.mkdtemp(prefix="tex_g5_commitscan_"))
-    _git(d, "init", "-q")
+    d = scratch_dir("tex_g5_commitscan_")
+    _git(d, "init", "-q", "--template=")
     _git(d, "config", "user.email", "test@example.invalid")
     _git(d, "config", "user.name", "test")
     (d / "a.txt").write_text("hello\n", encoding="utf-8")

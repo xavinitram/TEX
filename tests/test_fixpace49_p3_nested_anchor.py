@@ -18,6 +18,7 @@ credited to the outer) -- matching this fix's own confirmed-by-running repro exa
 ("`OUTER_STMT_A`'s own entry never received anything" / the inner's entry absorbed the
 outer's real interval).
 """
+import types
 import contextlib
 
 import pytest
@@ -59,12 +60,12 @@ class _FakeClock:
 @contextlib.contextmanager
 def _clock_ctx():
     c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
     try:
         yield c
     finally:
-        _pace._time.perf_counter = real
+        _pace._time = real
 
 
 def test_nested_same_device_cook_never_lets_the_outer_credit_the_inners_call_site(r):
