@@ -3,6 +3,29 @@ from helpers import *
 from TEX_Wrangle.tex_cache import parse_and_split
 
 
+def _compile_and_run_optimized(code, bindings, device="cpu", latent_channel_count=0,
+                               out_type=None):
+    """`compile_and_run`'s twin through the REAL optimizing path (`cache.compile_tex`: parse,
+    type-check, optimize, re-type-check), in a fresh temp cache dir. `compile_and_run` itself
+    never calls `optimize()`, so a row that pins an optimizer pass must use this one.
+    `out_type` is accepted for call-compatibility with `compile_and_run`."""
+    binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
+    tmp = tempfile.mkdtemp()
+    try:
+        cache = TEXCache(cache_dir=Path(tmp))
+        program, type_map, _refs, assigned, _params, _bi = cache.compile_tex(
+            code, binding_types)
+        output_names = sorted(assigned.keys())
+        if not output_names:
+            raise InterpreterError("TEX program has no outputs. Assign to @OUT or another @name.")
+        result = Interpreter().execute(program, bindings, type_map, device=device,
+                                       latent_channel_count=latent_channel_count,
+                                       output_names=output_names)
+        return result["OUT"] if output_names == ["OUT"] else result
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_codegen_equivalence(r: SubTestResult):
     """Verify codegen and interpreter produce the same results."""
     print("\n--- Codegen Equivalence Tests ---")
@@ -369,6 +392,9 @@ def test_ask4_img_size_tier_story(r: SubTestResult):
 def test_optimization_regressions(r: SubTestResult):
     """Targeted regression tests for all optimization paths introduced in Phases 1-7."""
     print("\n--- Optimization Regression Tests ---")
+    # These rows pin optimizer passes (CSE, unrolling, folding, DCE), so they must run
+    # the program AFTER optimize(); the bare interpreter path never sees the passes.
+    compile_and_run = _compile_and_run_optimized
     img = torch.rand(1, 8, 8, 3)
     img4 = torch.rand(1, 8, 8, 4)
     mask = torch.rand(1, 8, 8)
@@ -410,6 +436,7 @@ def test_optimization_regressions(r: SubTestResult):
         # Division (with safe epsilon)
         result = compile_and_run("@OUT = @A / @B;", bindings, out_type=TEXType.VEC3)
         assert result.shape == a.shape, f"/ shape mismatch"
+        assert torch.allclose(result, a / b, atol=1e-4), f"/ value wrong: {result[0, 0, 0].tolist()}"
         # Comparison operators
         result = compile_and_run("@OUT = vec3(@A.r < @B.r);", bindings, out_type=TEXType.VEC3)
         assert (result[..., 0] == 0.0).all(), "< failed (0.7 < 0.3 should be false)"
@@ -429,6 +456,8 @@ def test_optimization_regressions(r: SubTestResult):
         # Modulo
         result = compile_and_run("@OUT = vec3(mod(@A.r, @B.r));", bindings, out_type=TEXType.VEC3)
         assert result.shape == a.shape, "mod shape mismatch"
+        assert torch.allclose(result[..., 0], torch.full_like(result[..., 0], math.fmod(0.7, 0.3)),
+                              atol=1e-5), f"mod value wrong: {result[0, 0, 0].tolist()}"
         r.ok("inlined binop: all operators correct")
     except Exception as e:
         r.fail("inlined binop: all operators correct", f"{e}\n{traceback.format_exc()}")
@@ -768,14 +797,16 @@ for (int i = 0; i < 10; i = i + 1) {
     # Non-static loop still works (runtime-dependent bound)
     try:
         code = """
-float limit = @A.r * 10.0;
+int limit = int(@A.r * 10.0);
 float sum = 0.0;
-for (int i = 0; i < 5; i = i + 1) {
+for (int i = 0; i < limit; i = i + 1) {
     sum = sum + 1.0;
 }
 @OUT = vec3(sum);
 """
-        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        # A uniform 0.5 frame: the bound depends on the wire (so it cannot unroll) yet
+        # every pixel agrees on 5 iterations.
+        result = compile_and_run(code, {"A": torch.full((1, 8, 8, 3), 0.5)}, out_type=TEXType.VEC3)
         assert abs(result[0, 0, 0, 0].item() - 5.0) < 1e-5
         r.ok("static for-loop: non-static bound falls to general path")
     except Exception as e:
@@ -1244,6 +1275,7 @@ for (int dy = -1; dy <= 1; dy = dy + 1) {
 def test_licm(r: SubTestResult):
     """Test Loop-Invariant Code Motion optimizer pass."""
     from TEX_Wrangle.tex_compiler.optimizer import optimize
+    compile_and_run = _compile_and_run_optimized  # rows pin an optimizer pass: run after optimize()
     img = torch.rand(1, 8, 8, 3)
 
     # 1. LICM hoists invariant expression out of for loop
@@ -1594,21 +1626,7 @@ def test_optimizer_type_consistency(r: SubTestResult):
     torch.manual_seed(7)
     img3 = torch.rand(1, 8, 8, 3)
 
-    def _run_optimized(code, bindings):
-        # Mirror the real ComfyUI node path. Fresh temp cache dir per call so the
-        # disk tier never collides with other tests.
-        binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
-        tmp = tempfile.mkdtemp()
-        try:
-            cache = TEXCache(cache_dir=Path(tmp))
-            program, type_map, _refs, assigned, _params, _bi = cache.compile_tex(
-                code, binding_types)
-            interp = Interpreter()
-            result = interp.execute(program, bindings, type_map, device="cpu",
-                                    output_names=sorted(assigned.keys()))
-            return result["OUT"]
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    _run_optimized = _run_optimized_pipeline
 
     def _check(name, code):
         try:
@@ -1773,18 +1791,7 @@ for (int dy = -2; dy <= 2; dy = dy + 1) {
 def _run_optimized_pipeline(code, bindings):
     """Mirror the real ComfyUI node path (cache.compile_tex: optimize + the
     post-optimization re-type-check) with a fresh temp cache dir."""
-    binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
-    tmp = tempfile.mkdtemp()
-    try:
-        cache = TEXCache(cache_dir=Path(tmp))
-        program, type_map, _refs, assigned, _params, _bi = cache.compile_tex(
-            code, binding_types)
-        interp = Interpreter()
-        result = interp.execute(program, bindings, type_map, device="cpu",
-                                output_names=sorted(assigned.keys()))
-        return result["OUT"]
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    return _compile_and_run_optimized(code, bindings)
 
 
 def test_optimizer_isint_unary(r: SubTestResult):
