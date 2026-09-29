@@ -68,10 +68,11 @@ def test_trk81_pairing_rows_geomean_and_range(b):
     rows = b._pairing_rows(a, c)
     s = rows["cpu_off_warm"]
     assert s["n"] == 2
-    # a/c per program: 1.0/0.5=2.0, 2.0/1.0=2.0 -> geomean 2.0, range 2.00-2.00
-    assert abs(s["geomean"] - 2.0) < 1e-9
-    assert abs(s["min"] - 2.0) < 1e-9
-    assert abs(s["max"] - 2.0) < 1e-9
+    # a speedup is b_time / a_time (>1 means a is faster, like compare()):
+    # 0.5/1.0=0.5, 1.0/2.0=0.5 -> geomean 0.5, range 0.50-0.50 (a is 2x slower)
+    assert abs(s["geomean"] - 0.5) < 1e-9
+    assert abs(s["min"] - 0.5) < 1e-9
+    assert abs(s["max"] - 0.5) < 1e-9
 
 
 def test_trk81_pairing_rows_only_counts_shared_programs(b):
@@ -105,7 +106,7 @@ def test_trk81_compare_multi_labels_null_pairing(b, capsys):
 
 def test_trk81_compare_multi_refuses_sub_threshold_without_a_null_leg(b, capsys):
     fast = _results({"cpu_off_warm": {"p1": 1.0}})
-    slow = _results({"cpu_off_warm": {"p1": 0.5}})   # current/baseline = 0.5x -> sub-threshold
+    slow = _results({"cpu_off_warm": {"p1": 2.0}})   # baseline/current = 0.5x -> sub-threshold
     legs = [
         ("current", _leg("aaa111", False, slow)),
         ("baseline", _leg("bbb222", False, fast)),      # different tree -- no NULL anywhere
@@ -120,7 +121,7 @@ def test_trk81_compare_multi_refuses_sub_threshold_without_a_null_leg(b, capsys)
 def test_trk81_compare_multi_flags_regression_when_a_null_leg_exists(b, capsys):
     same = _results({"cpu_off_warm": {"p1": 1.0}})
     fast = _results({"cpu_off_warm": {"p1": 1.0}})
-    slow = _results({"cpu_off_warm": {"p1": 0.5}})
+    slow = _results({"cpu_off_warm": {"p1": 2.0}})
     legs = [
         ("current", _leg("aaa111", False, slow)),
         ("baseline_fast", _leg("bbb222", False, fast)),   # sub-threshold pairing
@@ -139,7 +140,7 @@ def test_trk81_compare_multi_without_require_null_leg_still_flags_regression(b, 
     a plain multi-leg compare with no null leg still reports the numbers and flags a
     sub-threshold geomean, exactly like the existing 2-leg `compare()` always has."""
     fast = _results({"cpu_off_warm": {"p1": 1.0}})
-    slow = _results({"cpu_off_warm": {"p1": 0.5}})
+    slow = _results({"cpu_off_warm": {"p1": 2.0}})
     legs = [
         ("current", _leg("aaa111", False, slow)),
         ("baseline_a", _leg("bbb222", False, fast)),
@@ -149,3 +150,22 @@ def test_trk81_compare_multi_without_require_null_leg_still_flags_regression(b, 
     out = capsys.readouterr().out
     assert "REGRESSION" in out
     assert "REFUSED" not in out
+
+
+def test_a0003_faster_current_is_not_a_regression(b, capsys):
+    """Direction pin: a current tree 20% FASTER than the baseline (time ratio 0.8) must
+    print clean, and one 30% SLOWER must be flagged. The multi-leg verdict reads
+    baseline_time / current_time, the same orientation as the 2-leg `compare()`."""
+    base = _results({"cpu_off_warm": {"p1": 10.0}})
+    faster = _results({"cpu_off_warm": {"p1": 8.0}})
+    slower = _results({"cpu_off_warm": {"p1": 13.0}})
+    null = _results({"cpu_off_warm": {"p1": 10.0}})
+    for cur, expect in ((faster, False), (slower, True)):
+        legs = [("current", _leg("aaa111", False, cur)),
+                ("baseline_a", _leg("bbb222", False, base)),
+                ("baseline_b", _leg("bbb222", False, null))]
+        b.compare_multi(legs, require_null_leg=False)
+        out = capsys.readouterr().out
+        # header + rows of the first pairing (current vs baseline_a)
+        first = out.split("current (aaa111) vs baseline_b")[0]
+        assert ("REGRESSION" in first) is expect, out
