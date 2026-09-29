@@ -1,15 +1,21 @@
 """
-M-1/M-2 — memory cooperation for TEX.
+Memory cooperation for TEX: keeping a cook and TEX's caches inside the device's memory.
 
-`estimate_peak_bytes` gives a cheap, static upper-ish estimate of a cook's peak
-transient VRAM so the node can preflight `comfy.model_management.free_memory`
-and retry once on OOM instead of failing while GBs sit locked in resident
-models. `free_tensor_caches` drops every module-level tensor cache TEX holds.
+  * M-1: `estimate_peak_bytes` gives a cheap, static estimate of a cook's peak transient
+    VRAM so the engine can preflight and free resident models, and `tex_engine` retries once
+    on OOM. `free_tensor_caches` drops every module-level tensor cache TEX holds.
+  * M-2: byte-budgeted eviction of the stdlib tensor caches (`enforce_cache_budget`).
+  * CACHE-5 / GOV-1: the cache governor (`CacheRegistry`, `governor_budget`) that arbitrates
+    the stdlib pools, the CUDA-graph pool, the media pool and armed frame caches against one
+    budget, and the named memory profiles that set it.
+  * M-4 / ROI-4 / ROI-5: strip, halo-strip, ROI and batch-strip cooks (`run_tiled`,
+    `run_tiled_halo`, `run_roi`, `run_batch_strips`) and their tile-safety memos.
 """
 from __future__ import annotations
 
 import logging
 import os
+import weakref
 from collections import OrderedDict
 
 import torch
@@ -17,7 +23,7 @@ import torch
 from .tex_runtime.host import (_report_progress as _progress,  # SCHED-3 best-effort progress sink
                                _cancel_check)                  # SCHED-3 yield-point poll (None-safe)
 from .tex_compiler.ast_nodes import (
-    ForLoop, WhileLoop, FunctionCall, ArrayDecl,
+    ForLoop, WhileLoop, FunctionCall, ArrayDecl, ArrayLiteral,
     BindingIndexAccess, BindingSampleAccess,
     iter_child_nodes as _iter_children,
 )
@@ -95,7 +101,10 @@ def is_tile_safe_cached(program, fingerprint) -> bool:
         while len(_tile_safe_memo) > _TILE_SAFE_MEMO_MAX:
             _tile_safe_memo.popitem(last=False)
     else:
-        _tile_safe_memo.move_to_end(fingerprint)
+        try:
+            _tile_safe_memo.move_to_end(fingerprint)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; v stands
     return v
 
 # stdlib calls whose peak is dominated by extra full-frame allocations.
@@ -146,8 +155,11 @@ def _estimate_peak_statics(program) -> tuple:
                 has_mip = True
         elif cls is ArrayDecl:
             pointwise = False
+            size = node.size
+            if size is None and node.initializer.__class__ is ArrayLiteral:
+                size = len(node.initializer.elements)      # `float a[] = {...}`: size is inferred
             try:
-                array_floats += int(node.size) * _array_element_floats(node)
+                array_floats += int(size) * _array_element_floats(node)
             except Exception:
                 pass
         elif cls in (ForLoop, WhileLoop):
@@ -173,7 +185,10 @@ def _estimate_peak_statics_cached(program, fingerprint) -> tuple:
         while len(_peak_static_memo) > _PEAK_STATIC_MEMO_MAX:
             _peak_static_memo.popitem(last=False)
     else:
-        _peak_static_memo.move_to_end(fingerprint)
+        try:
+            _peak_static_memo.move_to_end(fingerprint)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; v stands
     return v
 
 
@@ -261,12 +276,10 @@ def _total_cache_bytes(dev_type=None) -> int:
     """MEM-4: total tensor-cache bytes, optionally restricted to entries on `dev_type`,
     by a FULL WALK of every entry in every budget-tracked cache.
 
-    CACHESEAM-46: this is now the DEBUG-ONLY full recount (kept per the ask's own bar —
-    a drift check needs a ground truth to check against) — `enforce_cache_budget`'s
-    per-cook hot path reads `_running_cache_bytes` instead, an O(1) running total the
-    `_CacheBudget` seam maintains incrementally. Same arithmetic as before this ask
-    (`_entry_bytes`/`_entry_dev_type` over `budget.extract`), so it stays the ground
-    truth `test_cacheseam46_drift_free` recomputes after every scripted mutation.
+    DEBUG-ONLY full recount, the ground truth `test_cacheseam46_drift_free` recomputes after
+    every scripted mutation. The per-cook path (`enforce_cache_budget`) and the governor's
+    'stdlib' pool read `_running_cache_bytes`, the O(1) running total the `_CacheBudget`
+    seam maintains incrementally.
 
     A CPU cook's 512 MB budget must not count (or evict) CUDA-resident mip entries, and
     a CUDA cook must not be throttled by CPU-resident ones — each device is accounted
@@ -315,34 +328,38 @@ def _as_device(device):
     return cached
 
 
+def _positive_mib_env(name: str, what: str) -> int | None:
+    """Bytes for a whole-MiB environment override, or None when it is unset or refused.
+
+    Strictly positive: `int()` alone accepts "0" and "-8" as happily as "512", and a
+    non-positive budget reads like "no limit" while meaning "evict everything on every
+    check", a silent cache-off. So a value that does not parse, or is not above zero, is
+    refused with a warning and the computed default (`what`) stands."""
+    override = os.environ.get(name)
+    if not override:
+        return None
+    try:
+        mb = int(override)
+    except ValueError:
+        mb = 0
+    if mb > 0:
+        return mb * 1024 * 1024
+    logger.warning("[TEX] %s=%r is not a positive whole number of MiB; ignoring it and "
+                   "using the computed %s.", name, override, what)
+    return None
+
+
 def cache_budget_bytes(device) -> int:
-    """VRAM/CPU byte budget for TEX's tensor caches. Env override
-    TEX_CACHE_BUDGET_MB (whole MiB, strictly positive — anything else is refused, same floor
-    NEG-3 gave `governor_budget`); else min(1 GB, 12.5% VRAM) on CUDA, 512 MB on CPU."""
-    override = os.environ.get("TEX_CACHE_BUDGET_MB")
-    if override:
-        # TRK-95: `int(override)` alone accepts "0" and "-8" as happily as "512", and this
-        # is the stdlib tensor-cache budget `enforce_cache_budget` compares live usage
-        # against every cook — a non-positive value reads like "no limit" and instead means
-        # "evict every entry on every cook", the same silent cache-off NEG-3 closed for
-        # `governor_budget` and `tex_results._budget_bytes`. Refuse it and fall through to
-        # the computed default, exactly as those two do.
-        try:
-            mb = int(override)
-        except ValueError:
-            mb = 0
-        if mb > 0:
-            return mb * 1024 * 1024
-        logger.warning(
-            "[TEX] TEX_CACHE_BUDGET_MB=%r is not a positive whole number of MiB; "
-            "ignoring it and using the computed cache budget.", override)
+    """VRAM/CPU byte budget for TEX's tensor caches. Env override TEX_CACHE_BUDGET_MB (whole
+    MiB, strictly positive, see `_positive_mib_env`); else min(1 GB, 12.5% VRAM) on CUDA,
+    512 MB on CPU."""
+    override = _positive_mib_env("TEX_CACHE_BUDGET_MB", "cache budget")
+    if override is not None:
+        return override
     dev = _as_device(device)
     if dev.type == "cuda":
-        try:
-            total = torch.cuda.get_device_properties(dev.index or 0).total_memory
-            return min(1024 * 1024 * 1024, total // 8)
-        except Exception:
-            return 1024 * 1024 * 1024
+        total = device_total_mem(dev)          # cached per device: this runs every cook
+        return min(1024 * 1024 * 1024, total // 8) if total else 1024 * 1024 * 1024
     return 512 * 1024 * 1024
 
 
@@ -455,28 +472,14 @@ def cache_budget_status(device) -> dict:
 def governor_budget(device) -> int:
     """The ONE coordinated VRAM/RAM budget the governor holds all arbitrated pools under — set
     BELOW the sum of the pools' independent caps (the point of CACHE-5). Env override
-    TEX_GOVERNOR_BUDGET_MB (whole MiB, strictly positive — anything else is refused, see below);
+    TEX_GOVERNOR_BUDGET_MB (whole MiB, strictly positive, see `_positive_mib_env`);
     else ~40% of free VRAM on CUDA (a single pressure-responsive cap the stdlib/graph/frame
     pools share), 1 GB on CPU."""
-    override = os.environ.get("TEX_GOVERNOR_BUDGET_MB")
-    if override:
-        # A FLOOR, not just a parse guard. `int(override)` accepts "0" and "-8" as happily as
-        # "512", and this is THE coordinated budget: a non-positive value tells the governor
-        # every arbitrated pool is over budget on every check, so the stdlib cache, the graph
-        # pool and the frame cache are evicted to nothing on the next cook — a knob that reads
-        # like "no limit" and means "keep nothing". A value that does not parse, or that is not
-        # strictly positive, is REFUSED (the computed default below stands) and said out loud.
-        # A profile's `governor_frac=0.0` stays the in-process way to say "arbitrate nothing to
-        # this pool"; a typo in an environment variable is not the same statement.
-        try:
-            mb = int(override)
-        except ValueError:
-            mb = 0
-        if mb > 0:
-            return mb * 1024 * 1024
-        logger.warning(
-            "[TEX] TEX_GOVERNOR_BUDGET_MB=%r is not a positive whole number of MiB; "
-            "ignoring it and using the computed governor budget.", override)
+    override = _positive_mib_env("TEX_GOVERNOR_BUDGET_MB", "governor budget")
+    if override is not None:
+        return override
+    # A profile's `governor_frac=0.0` stays the in-process way to say "arbitrate nothing to
+    # this pool"; a typo in an environment variable is not the same statement.
     # GOV-1: the profile's fraction, or the shipped 0.4. An explicit env override still wins —
     # a preset is a convenience, not a way to stop a host saying exactly what it wants.
     # `is None`, not `or`: a future preset declaring governor_frac=0.0 ("arbitrate nothing to
@@ -644,8 +647,7 @@ def get_cache_registry() -> CacheRegistry:
     global _registry
     if _registry is None:
         reg = CacheRegistry()
-        reg.register("stdlib", lambda dt: _total_cache_bytes(dt), _evict_stdlib_bytes,
-                     evict_order=10)
+        reg.register("stdlib", _running_cache_bytes, _evict_stdlib_bytes, evict_order=10)
         # DATA-7: the host-source pool. Registered here (not by a host `register_*` call)
         # for the same reason the graph pool is: it is process-wide, and an unarmed one
         # reports 0 bytes forever, so an engine nobody wired a provider into pays a dict
@@ -697,18 +699,13 @@ def register_result_cache(cache, *, name: str = "results", evict_order: int = 50
 # and reportable — `active_profile()` is what `tex doctor` prints — so two users' numbers stay
 # comparable. Nothing selects one automatically; the default is exactly today's behaviour.
 
-#: name -> the knobs a preset bundles. `frame_mb`/`governor_mb` are None = "leave the existing
-#: default alone", which is what makes BALANCED a true no-op rather than a re-statement of
-#: numbers that would then drift from their real defaults.
-#
-# v0.33 adds `vram_mb`, CACHE-8's residency ceiling. It is the knob the v0.32 item text
-# reserved as "compression aggressiveness (from v0.33)" — and it is NOT that, because the
-# measured Pareto said so. `benchmarks/cache_capacity_bench.py` found a general-purpose codec
-# costs 1765-6685 ms to encode and 403-920 ms to DECODE a 4K frame, against 332 ms to write the
-# frame to disk uncompressed and 59 ms to read it back: an aggressiveness dial would only have
-# selected degrees of loss. What actually buys capacity is width (PREC-1's fp16, exactly 2x)
-# and residency (a cold CUDA frame moved to host RAM for 10.8 ms instead of spilled for 204),
-# so the profile carries the knob that exists rather than the one that was predicted.
+#: name -> the knobs a preset bundles. A `None` means "the shipped default", not "skip":
+#: `governor_frac` falls back to 0.4, and `frame_mb` / `vram_mb` are restored to the value the
+#: governor remembered when it first saw the cache (`_apply_profile_to_cache`). `balanced` is
+#: all-None, so it is a true no-op rather than a restatement of numbers that would drift from
+#: their real defaults. `vram_mb` is CACHE-8's residency ceiling: benchmarks showed a codec
+#: costs far more than a disk write, so capacity comes from width (fp16) and residency (a cold
+#: CUDA frame moved to host RAM), not a compression dial.
 _PROFILES = {
     # Hold more, evict later: the interactive editing session the Memory report describes,
     # where a frame you scrubbed past is one the user is about to scrub back to.
@@ -735,7 +732,7 @@ _active_profile: str = "balanced"
 #: second restorable knob. Remembering one default per cache would have let `balanced` restore
 #: the frame budget and silently leave the residency ceiling wherever `efficient` put it —
 #: the same bug, one knob over.
-_armed_caches: "dict" = {}
+_armed_caches: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 #: How a profile knob reaches a `ResultCache`:
 #:   knob name -> (setter method, attribute holding the current value, restorable-as-None,
@@ -806,12 +803,20 @@ def _apply_profile_to_cache(cache) -> None:
     """Push every profile knob the active preset names into one `ResultCache`, and remember the
     shipped defaults so a later `set_profile` can put them back. Best-effort: a host may arm
     something that only duck-types the governor hooks."""
-    if cache not in _armed_caches:
+    try:
+        defaults = _armed_caches.get(cache)
+    except TypeError:                # a duck-typed cache that cannot be weakly referenced
+        defaults = None
+    if defaults is None:
         # Remember the shipped defaults the FIRST time we see this cache, before any preset has
-        # touched it — that is the only moment they are still knowable.
-        _armed_caches[cache] = {knob: getattr(cache, attr, None)
-                                for knob, (_setter, attr, _n, _bs) in _CACHE_KNOBS.items()}
-    defaults = _armed_caches[cache]
+        # touched it — that is the only moment they are still knowable. Weakly keyed, so a
+        # cache the host has dropped is not kept alive (with its frames) by the governor.
+        defaults = {knob: getattr(cache, attr, None)
+                    for knob, (_setter, attr, _n, _bs) in _CACHE_KNOBS.items()}
+        try:
+            _armed_caches[cache] = defaults
+        except TypeError:
+            pass
     knobs = _PROFILES[_active_profile]
     for knob, (setter_name, _attr, none_restorable, bytes_setter_name) in _CACHE_KNOBS.items():
         setter = getattr(cache, setter_name, None)
@@ -900,10 +905,9 @@ def trim_reserved_pool(device, spatial_px: int = 0) -> None:
     try:
         reserved = torch.cuda.memory_reserved(idx)
         allocated = torch.cuda.memory_allocated(idx)
-        total = _total_mem_cache.get(idx)
+        total = device_total_mem(dev)
         if total is None:
-            total = torch.cuda.get_device_properties(idx).total_memory
-            _total_mem_cache[idx] = total
+            return
         if reserved - allocated > max(1024 * 1024 * 1024, total // 8):
             torch.cuda.empty_cache()
     except Exception:
