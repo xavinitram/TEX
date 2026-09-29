@@ -82,7 +82,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from dataclasses import dataclass, replace
 from typing import Any
@@ -92,8 +91,7 @@ import torch
 logger = logging.getLogger("TEX")
 
 from .tex_compiler.ast_nodes import SourceLoc
-from .tex_runtime.interpreter import Interpreter, InterpreterError, _consensus_extent
-from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
+from .tex_runtime.interpreter import InterpreterError, _consensus_extent
 from .tex_cache import get_cache
 from .tex_runtime.compiled import (
     execute_compiled,
@@ -110,10 +108,8 @@ from .tex_marshalling import (
     infer_binding_type as _infer_binding_type,
     egress_meta as _egress_meta,
     resolve_promise_bindings as _resolve_promise_bindings,
-    Promise as _Promise,
     expand_plane_bindings as _expand_plane_bindings,
     _expand_plane_meta,
-    PlanesValue as _PlanesValue,
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress,
@@ -128,9 +124,6 @@ from .tex_runtime import profile as _profile, pacing as _pace
 # `run()`/`cook()`'s whole added cost, unregistered, is the one `if _cook_observer._callbacks:`
 # check each takes below.
 from .tex_runtime import cook_observer as _cook_observer
-# ENG-4: the shared compile-error taxonomy + translator (lives beside TEXCompileError so the
-# per-phase tuple is spelled once, not once per compile implementation).
-from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
 from . import tex_lazy as _tex_lazy
 # ── ENG-14: two leaves, re-exported ──────────────────────────────────────────
 # The ENG-6/ENG-12 frame-handoff contract and the cook-fit planners now live in
@@ -256,7 +249,8 @@ def _drop_tex_caches_on_oom() -> None:
 # the resolve_auto AST walk. Keyed by (fingerprint, resolution-bucket, device). NOTE: the
 # per-cook fp16 finiteness net is NOT memoized (doc 32 C2) — trusting a first-cook verdict
 # shipped NaN silently when the same program met a new input; the net runs every fp16 cook.
-_AUTO_DECISION: dict = {}          # (fp, px>=min, dev_type) -> (precision, reason)
+_AUTO_DECISION: dict = {}          # (fp, px>=_MIN_FP16_PX, dev_type, compiled?) -> (precision, reason)
+#                                    written by prepare(), pinned to fp32 by the finiteness net
 # _MIN_FP16_PX (the fp16 resolution floor) is single-sourced in precision_policy (F5, doc
 # 32) — imported function-locally in prepare() so the decision-cache resolution bucket can
 # never drift from the gate's actual threshold.
@@ -488,7 +482,7 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
     if auto_ckey is not None:
         _AUTO_DECISION[auto_ckey] = ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
     _cancel_check(ctx.cancel)   # SCHED-3 yield D: don't climb into an fp32 re-cook if abandoned
-    return _run_tier(replace(ctx, eff_precision="fp32"), tier_id), "fp32"
+    return _dispatch_ctx(replace(ctx, eff_precision="fp32"), tier_id), "fp32"
 
 
 def resolve_device(device_mode: str, bindings: dict[str, Any]) -> str:
@@ -804,16 +798,12 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         if pname in bindings:
             bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
 
-    # STR-2/STR-3: bundle every arg the tiers need once (fp hoisted here so no
-    # strategy re-touches prepare()'s locals), select the tier (pure), dispatch
-    # to its strategy, and normalize the output shape in ONE place.
-    # PR-LP2: resolve precision="auto" now that the program + resolution are
-    # known — fp16 only in the measured win region (CUDA, >=1024^2, pointwise,
-    # no image-derived threshold); fp32 otherwise. Record the decision + reason
-    # (tier_trace) so it's never silent. fp16 stays out of the compiled/graph
-    # tiers this cycle (mirrors the compile-mode fp32 force in the host).
-    # DBG-1: clear the tier/precision trace so the HUD payload reflects
-    # THIS cook (the trace is thread-local and persists across cooks).
+    # PR-LP2: resolve precision="auto" now that the program + resolution are known: fp16 only
+    # in the measured win region (CUDA, >=1024^2, pointwise, no image-derived threshold), fp32
+    # otherwise, and record the decision + reason (tier_trace) so it is never silent. fp16
+    # stays out of the compiled/graph tiers (the clamp is above).
+    # DBG-1: clear the tier/precision trace so the HUD payload reflects THIS cook (the trace
+    # is thread-local and persists across cooks).
     from .tex_runtime import tier_trace, guard_trace
     tier_trace.reset()
     # C4-ux: arm the near-singularity trace ONLY with the debug toggle (guard hooks
@@ -857,8 +847,9 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             # without it whichever compile_mode cooked this program FIRST would decide the
             # precision for every later mode. A torch_compile cook would pin fp32 and the
             # next compile_mode="none" cook would silently lose fp16 (and vice versa).
-            auto_ckey = ((fp, cook_px >= _MIN_FP16_PX, dev_type,
-                          compile_mode != "none") if fp is not None else None)
+            _decision_fp = fp if fp is not None else fused_fp     # a fused chain's own identity
+            auto_ckey = ((_decision_fp, cook_px >= _MIN_FP16_PX, dev_type,
+                          compile_mode != "none") if _decision_fp is not None else None)
             cached = _AUTO_DECISION.get(auto_ckey) if auto_ckey is not None else None
             if cached is not None:
                 precision, auto_reason = cached
@@ -1007,8 +998,6 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
         # strip count — take the deepest split the >=64-row floor allows and let the
         # launch tax buy a picture. Capped, so a pathological program still terminates.
         n_strips = max(2, min(H // 64, 16))
-        if n_strips < 2:
-            return None
         _cancel_check(ctx.cancel)   # SCHED-3 yield E: don't start a tiled OOM re-cook if abandoned
         from . import tex_roi
         # TRK-25: a region-dependent program falls through both rungs (the halo rung below is
@@ -1026,13 +1015,12 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
         if (rplan.executable and rplan.halo > 0 and rplan.narrow
                 and shared_tile_width(ctx.bindings) is not None):
             n_h = max(2, min(H // max(64, 4 * rplan.halo), 16))
-            if n_h >= 2:
-                logger.warning("[TEX] retrying the cook in %d halo strips.", n_h)
-                return run_tiled_halo(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
-                                      ctx.device, ctx.latent_channel_count, ctx.output_names,
-                                      ctx.used_builtins, ctx.eff_precision, n_h, rplan.narrow,
-                                      rplan.halo, ctx.time_context,
-                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
+            logger.warning("[TEX] retrying the cook in %d halo strips.", n_h)
+            return run_tiled_halo(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
+                                  ctx.device, ctx.latent_channel_count, ctx.output_names,
+                                  ctx.used_builtins, ctx.eff_precision, n_h, rplan.narrow,
+                                  rplan.halo, ctx.time_context,
+                                  cancel=ctx.cancel, on_progress=ctx.on_progress)
         return None
     except CookCancelled:
         raise                       # SCHED-3: a cancel at yield E (or inside the tiled/halo OOM
@@ -1048,6 +1036,11 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
 
 
 def _dispatch_tier(plan: CookPlan):
+    """Execute `plan`: `_dispatch_ctx` on its context and tier."""
+    return _dispatch_ctx(plan.ctx, plan.tier_id)
+
+
+def _dispatch_ctx(ctx: ExecContext, tier_id: str):
     """Everything that EXECUTES the program — the tier dispatch and the ENG-2 OOM ladder —
     and nothing that prepares or formats it.
 
@@ -1058,10 +1051,12 @@ def _dispatch_tier(plan: CookPlan):
 
     A CookCancelled raised inside the tier propagates straight out, never mistaken for a
     recoverable OOM and silently retried (GOTCHA: `_oom_in_chain` returns None for it today,
-    but the explicit guard makes the intent load-bearing rather than incidental)."""
-    ctx = plan.ctx
+    but the explicit guard makes the intent load-bearing rather than incidental).
+
+    The fp16 finiteness net's fp32 re-cook comes through here too, so it gets the same OOM
+    ladder and refusal attachment as the cook it replaces."""
     try:
-        return _run_tier(ctx, plan.tier_id)
+        return _run_tier(ctx, tier_id)
     except BaseException as e:                       # ENG-2: the OOM ladder
         if isinstance(e, CookCancelled):
             raise
