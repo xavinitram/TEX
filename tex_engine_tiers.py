@@ -393,12 +393,10 @@ def _run_default(ctx):
         # time cap, cook it in halo strips (an 8K gauss_blur that could not tile at all before).
         # `_halo_tile_plan` cheap-gates so a small default cook returns before any real work.
         #
-        # TRK-83: `n_strips` above is also falsy on a program `is_tile_safe_cached` — the same
-        # memo `_halo_tile_plan` itself would consult FIRST — already answered True on: no
-        # pressure, not a halo case. `_tile_plan` just warmed that exact fingerprint's entry
-        # (it is the first thing it checks), so this is a memo hit, not a second AST walk, and
-        # it skips a call guaranteed to no-op on every unpressured tile-safe stage — the "10
-        # calls/cook" residue named in `docs/host-path-counts.md` §6 item 6 / TRK-83.
+        # TRK-83: a tile-safe program needs no halo plan, and `is_tile_safe_cached` answers that
+        # from a per-fingerprint memo. On a CUDA non-latent cook `_tile_plan` has just warmed
+        # the entry; elsewhere this call is the first to compute it (one AST walk per
+        # fingerprint), and every later cook hits it.
         from .tex_memory import is_tile_safe_cached
         halo_plan = (None if is_tile_safe_cached(ctx.program, ctx.fp) else
                     _tex_engine._halo_tile_plan(ctx.program, ctx.code, ctx.bindings, ctx.device,

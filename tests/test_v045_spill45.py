@@ -27,19 +27,8 @@ import time
 
 import torch
 
-from helpers import make_gradient_frame as _frame
+from helpers import make_gradient_frame as _frame, recount_bytes
 from TEX_Wrangle import tex_results
-
-
-def _recount(c):
-    """The per-device byte buckets recomputed from the live entries, vs. as maintained —
-    the same cross-check `test_v033_cache8.py`'s race test uses to catch a lost/duplicated
-    accounting update under contention."""
-    with c._lock:
-        recount = {"cuda": 0, "cpu": 0}
-        for e in c._ram.values():
-            recount[tex_results._dev_bucket(e.device)] += e.nbytes
-        return recount, dict(c._bytes_by_dev)
 
 
 def test_spill45_reaches_the_newest_put_and_round_trips_bit_exact(r):
@@ -193,7 +182,7 @@ def test_spill45_races_get_and_put(r):
             hung = [t.name for t in threads if t.is_alive()]
 
             c._drain_spills()                  # settle any write still queued by the storm
-            recount, buckets = _recount(c)
+            recount, buckets = recount_bytes(c)
             with c._lock:
                 idle = len(c._pending_spills)
 

@@ -243,15 +243,7 @@ def test_gausspyr50_a3_pyramid_polls_between_passes(r: SubTestResult):
         def check(self):
             self.calls += 1
 
-    class _TripToken:
-        def __init__(self, n):
-            self.n = n
-            self.calls = 0
-
-        def check(self):
-            self.calls += 1
-            if self.calls >= self.n:
-                raise CookCancelled("test: tripped")
+    from helpers import TripToken
 
     code = f"@OUT = gauss_blur(@A, {THRESHOLD + 50.0});"
     img = make_img(1, 32, 32, 4, seed=31)
@@ -269,7 +261,7 @@ def test_gausspyr50_a3_pyramid_polls_between_passes(r: SubTestResult):
         return
     r.ok(f"{total} total polls for one pyramid-path gauss_blur cook")
 
-    tok = _TripToken(total)
+    tok = TripToken(total)
     try:
         tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=tok)
         r.fail("gausspyr50 a3 mid-pyramid cancel", "did not raise on the last recorded poll")

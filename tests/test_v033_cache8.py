@@ -38,7 +38,7 @@ from collections import OrderedDict
 
 import torch
 
-from helpers import devices as _devices, make_gradient_frame as _frame
+from helpers import devices as _devices, make_gradient_frame as _frame, recount_bytes
 from TEX_Wrangle import tex_engine, tex_memory, tex_packing, tex_results
 
 
@@ -429,15 +429,6 @@ def _spill_oldest(c):
     spills = c.spills
     c.evict_bytes(c._ram[key].nbytes, dev_type=tex_results._dev_bucket(c._ram[key].device))
     return key not in c._ram and c.spills == spills + 1
-
-
-def _recount(c):
-    """(the per-device byte buckets recomputed from the entries, the buckets as maintained)."""
-    with c._lock:
-        recount = {"cuda": 0, "cpu": 0}
-        for e in c._ram.values():
-            recount[tex_results._dev_bucket(e.device)] += e.nbytes
-        return recount, dict(c._bytes_by_dev)
 
 
 def test_v033_cache8_touch_is_not_a_read(r):
@@ -906,7 +897,7 @@ def test_v033_cache8_touch_and_in_survive_a_threaded_race(r):
                 t.join(timeout=30.0)
             hung = [t.name for t in threads if t.is_alive()]
 
-            recount, buckets = _recount(c)
+            recount, buckets = recount_bytes(c)
             with c._lock:
                 idle = (len(c._pending_spills), len(c._pending_demotes), len(c._demoting))
                 homes = {e.home for e in c._ram.values()}
@@ -1077,7 +1068,7 @@ def test_v033_cache8_hints_never_wait_on_or_undo_in_flight_work(r):
             demoter.join(20)
             streams.egress = real_egress
         entry = c._ram["a"]
-        recount, buckets = _recount(c)
+        recount, buckets = recount_bytes(c)
         gpu = (parked and answered and midway and in_flight == {"a"} and touched is True
                and resident is True and not calls and on_gpu and order == ["b", "a", "c"]
                and entry.device == "cpu" and entry.home.startswith("cuda")

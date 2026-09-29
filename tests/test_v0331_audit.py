@@ -23,17 +23,8 @@ import threading
 
 import torch
 
-from helpers import devices as _devices, make_gradient_frame as _frame
+from helpers import devices as _devices, make_gradient_frame as _frame, recount_bytes
 from TEX_Wrangle import tex_packing, tex_results
-
-
-def _recount(c):
-    """The per-device totals recomputed from the entries themselves — the ground truth
-    `_bytes_by_dev` is supposed to be a maintained view of."""
-    out = {"cuda": 0, "cpu": 0}
-    for e in c._ram.values():
-        out[tex_results._dev_bucket(e.device)] += e.nbytes
-    return out
 
 
 # ── A1 ────────────────────────────────────────────────────────────────────────
@@ -101,7 +92,7 @@ def test_v0331_a1_double_demotion_cannot_skew_the_byte_totals(r):
                    f"still alive={t.is_alive()}, errors={worker_errors!r}")
             return
         with c._lock:
-            got, truth = dict(c._bytes_by_dev), _recount(c)
+            truth, got = recount_bytes(c)
             demotions = c.demotions
         negative = any(v < 0 for v in got.values())
         ok = got == truth and not negative
@@ -451,7 +442,7 @@ def test_v0331_a1_a_duplicate_queue_entry_commits_once(r):
             c._pending_demotes.append(("a", entry))
         c._drain_demotes()
         with c._lock:
-            got, truth = dict(c._bytes_by_dev), _recount(c)
+            truth, got = recount_bytes(c)
             n = c.demotions
         ok = got == truth and n == 1 and all(v >= 0 for v in got.values())
         r.ok(f"A1: a doubly-queued victim commits exactly once ({n}), totals {got}") if ok \

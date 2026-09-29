@@ -600,9 +600,8 @@ def region_dependent_cached(program, fingerprint, binding_types=None, code=None)
     v = _region_dep_memo.get(key)
     if v is None:
         v = region_dependent(program, binding_types, code)
-        _region_dep_memo[key] = v
-        while len(_region_dep_memo) > _REGION_DEP_MEMO_MAX:
-            _region_dep_memo.popitem(last=False)
+        from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+        lru_put(_region_dep_memo, key, v, _REGION_DEP_MEMO_MAX)
     else:
         try:
             _region_dep_memo.move_to_end(key)
@@ -962,9 +961,8 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
                   region_dep)
     except Exception:
         result = None
-    _walk_memo[key] = result
-    if len(_walk_memo) > _MEMO_MAX:
-        _walk_memo.popitem(last=False)
+    from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+    lru_put(_walk_memo, key, result, _MEMO_MAX)
     return result
 
 
@@ -1286,9 +1284,8 @@ def scale_verdict(code: str, param_values: dict | None = None) -> ScaleVerdict:
     v = _scale_verdict_memo.get(key)
     if v is None:
         v = _scale_verdict_uncached(code, param_values)
-        _scale_verdict_memo[key] = v
-        while len(_scale_verdict_memo) > _SCALE_VERDICT_MEMO_MAX:
-            _scale_verdict_memo.popitem(last=False)
+        from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+        lru_put(_scale_verdict_memo, key, v, _SCALE_VERDICT_MEMO_MAX)
     else:
         try:
             _scale_verdict_memo.move_to_end(key)

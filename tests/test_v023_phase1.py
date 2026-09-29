@@ -699,7 +699,7 @@ def test_lang4_registry_help(r: SubTestResult):
     # (2) help_lookup resolves by primary name AND alias, decoding the sig for display.
     try:
         e = R.help_lookup("sin")
-        assert e and e["sig"] == "sin(x) → float", e
+        assert e and e["sig"] == "sin(x) → float|vec", e
         assert "→" in e["sig"], "sig was not decoded"
         m = R.help_lookup("mix")   # alias of lerp
         assert m and m["name"] == "lerp" and "mix" in m["aliases"], m

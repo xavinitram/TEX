@@ -28,6 +28,7 @@ from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img)
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib  # noqa: F401  (populates REGISTRY)
 from TEX_Wrangle import tex_engine, tex_api, tex_fusion, tex_scheduler, tex_memory, tex_roi
 from TEX_Wrangle.tex_runtime.host import CookCancelled
+from helpers import TripToken   # the shared trip-on-Nth-check token
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 from TEX_Wrangle.tex_results import ResultCache, lineage_key
 
@@ -42,18 +43,6 @@ from TEX_Wrangle.tex_compiler.types import TEXType
 
 _CUDA = torch.cuda.is_available()
 _DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]
-
-
-class _TripToken:
-    """A CancelToken that raises CookCancelled on its Nth check()."""
-    def __init__(self, n):
-        self.n = n
-        self.calls = 0
-
-    def check(self):
-        self.calls += 1
-        if self.calls >= self.n:
-            raise CookCancelled("stop")
 
 
 # ── SCHED-3 ───────────────────────────────────────────────────────────────────
@@ -79,7 +68,7 @@ def test_sched3_cancellation(r: SubTestResult):
 
     # cancel at yield A -> CookCancelled out of cook()
     try:
-        tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=_TripToken(1))
+        tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=TripToken(1))
         r.fail("SCHED-3 cancel", "cook did not raise CookCancelled")
     except CookCancelled:
         r.ok("cook aborts at yield A (CookCancelled)")
@@ -87,7 +76,7 @@ def test_sched3_cancellation(r: SubTestResult):
     # per-statement cancel via tex_api.execute (3 statements, trip on 2nd)
     prog = tex_api.compile("float a = @A.r; float b = a*2.0; @OUT = vec4(b,b,b,1.0);",
                            {"A": TEXType.VEC3})
-    tok = _TripToken(2)
+    tok = TripToken(2)
     try:
         tex_api.execute(prog, {"A": img.clone()}, device="cpu", cancel=tok)
         r.fail("SCHED-3 per-stmt", "execute did not raise")
@@ -101,7 +90,7 @@ def test_sched3_cancellation(r: SubTestResult):
     try:
         tex_memory.run_tiled(interp, prog2.ast, {"A": img.clone()}, prog2.type_map, "cpu", 0,
                              ["OUT"], prog2.used_builtins, "fp32", 4,
-                             cancel=_TripToken(3), on_progress=lambda p, f: sp.append((p, f)))
+                             cancel=TripToken(3), on_progress=lambda p, f: sp.append((p, f)))
         r.fail("SCHED-3 per-strip", "run_tiled did not raise")
     except CookCancelled:
         r.ok("per-strip cancel after 1 strip") if sp == [("strip", 0.25)] \

@@ -114,12 +114,14 @@ def _pristine_parse(code: str, memo: "OrderedDict", cap: int):
     hit = memo.get(key)
     if hit is None:
         from .tex_cache import parse_and_split
+        from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
         hit = parse_and_split(code, {})
-        memo[key] = hit
-        while len(memo) > cap:
-            memo.popitem(last=False)
+        lru_put(memo, key, hit, cap)
     else:
-        memo.move_to_end(key)
+        try:
+            memo.move_to_end(key)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; the value stands
     return hit
 
 
@@ -423,7 +425,10 @@ def lazy_required_bindings(code: str,
     key = (code_digest(code), _param_key(param_values), _profile_key())
     hit = _memo.get(key)
     if hit is not None or key in _memo:
-        _memo.move_to_end(key)
+        try:
+            _memo.move_to_end(key)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; the value stands
         return hit
     try:
         # A private copy of the source's ONE parse: the analysis mutates its AST, and no
@@ -470,9 +475,8 @@ def lazy_required_bindings(code: str,
         result: frozenset | None = _collect_binding_refs(stmts)
     except Exception:
         result = None
-    _memo[key] = result
-    if len(_memo) > _MEMO_MAX:
-        _memo.popitem(last=False)
+    from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+    lru_put(_memo, key, result, _MEMO_MAX)
     return result
 
 

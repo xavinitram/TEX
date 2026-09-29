@@ -290,19 +290,17 @@ def _get_or_make_cancel_codegen_fn(program: Any, type_map: dict | None,
     only at the one poll `_codegen_only_execute` makes at entry. `None` when codegen
     cannot express the program at all (the caller falls back to the plain cg_fn, which
     still gets the entry poll — never to the interpreter on THIS account alone)."""
-    key = fingerprint if fingerprint is not None else id(program)
-    cg_fn = _cancel_codegen_memo.get(key)
+    from .lru_util import lru_get, lru_put   # lazy: keeps the cold-import closure unchanged
+    key = fingerprint
+    cg_fn = None if key is None else lru_get(_cancel_codegen_memo, key)
     if cg_fn is None:
         try:
             cg_fn = _try_codegen(program, type_map, fingerprint, emit_cancel_polls=True)
         except Exception:
             cg_fn = None
-        _cancel_codegen_memo[key] = (cg_fn if cg_fn is not None
-                                     else _CANCEL_CG_UNSUPPORTED)
-        while len(_cancel_codegen_memo) > _ROUTE_MEMO_MAX:
-            _cancel_codegen_memo.popitem(last=False)
-    else:
-        _cancel_codegen_memo.move_to_end(key)
+        if key is not None:     # an unfingerprinted program has no stable identity to key on
+            lru_put(_cancel_codegen_memo, key,
+                    cg_fn if cg_fn is not None else _CANCEL_CG_UNSUPPORTED, _ROUTE_MEMO_MAX)
     return None if cg_fn is _CANCEL_CG_UNSUPPORTED else cg_fn
 
 
@@ -322,11 +320,13 @@ def should_stencil_route(fingerprint: str, program: Any) -> bool:
             v = bool(detect_stencil_route(program))
         except Exception:
             v = False
-        _stencil_route_memo[fingerprint] = v
-        while len(_stencil_route_memo) > _ROUTE_MEMO_MAX:
-            _stencil_route_memo.popitem(last=False)
+        from .lru_util import lru_put   # lazy: keeps the cold-import closure unchanged
+        lru_put(_stencil_route_memo, fingerprint, v, _ROUTE_MEMO_MAX)
     else:
-        _stencil_route_memo.move_to_end(fingerprint)
+        try:
+            _stencil_route_memo.move_to_end(fingerprint)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; the value stands
     return v
 
 
@@ -481,6 +481,18 @@ _COMPILE_MAX_LOOP_DEPTH = 2
 
 # ── Public API ────────────────────────────────────────────────────────
 
+def _served_tier(backend) -> str:
+    """The `tier_trace` word for a cached compiled entry: a real backend is `torch_compile`;
+    the codegen-only adapter (backend None) is `codegen`."""
+    return "torch_compile" if backend else "codegen"
+
+
+def _record_served(cache_key) -> None:
+    """Record the success tier of an auto-tier cook served by the cached artifact."""
+    entry = _compiled_cache.get(cache_key)
+    tier_trace.record(_served_tier(entry[1]) if entry else "torch_compile")
+
+
 def execute_compiled(
     program: Any,
     bindings: dict[str, Any],
@@ -556,11 +568,13 @@ def execute_compiled(
         route = _route_memo.get(fingerprint)
         if route is None:
             route = (_count_tensor_ops(program), _max_loop_depth(program))
-            _route_memo[fingerprint] = route
-            while len(_route_memo) > _ROUTE_MEMO_MAX:
-                _route_memo.popitem(last=False)
+            from .lru_util import lru_put   # lazy: keeps the cold-import closure unchanged
+            lru_put(_route_memo, fingerprint, route, _ROUTE_MEMO_MAX)
         else:
-            _route_memo.move_to_end(fingerprint)
+            try:
+                _route_memo.move_to_end(fingerprint)
+            except KeyError:
+                pass          # a concurrent insert evicted it between the get and here; the value stands
         op_count, loop_depth = route
         # Skip torch.compile for trivial programs (tracing overhead > benefit)
         if op_count < _COMPILE_OP_THRESHOLD:
@@ -607,10 +621,11 @@ def execute_compiled(
     # By running everything in a disposable thread, any TLS corruption
     # stays contained.  The main thread never touches dynamo at all.
     compile_error = None
+    served = None      # the tier that produced `result`; recorded below on THIS thread
 
     def _compile_and_run():
         """Compile (if needed) and execute — all on this worker thread."""
-        nonlocal compile_error
+        nonlocal compile_error, served
         try:
             # caching_precompile persists dynamo entries under
             # TORCHINDUCTOR_CACHE_DIR so a warm restart skips most of the compile
@@ -621,7 +636,7 @@ def execute_compiled(
                     program, type_map, fingerprint)), torch.inference_mode():
                 # Get or create the compiled callable (on THIS thread). A background job may
                 # evict the entry at any moment, so the lookup and the LRU touch are one step.
-                from .lru_util import lru_get
+                from .lru_util import lru_get, lru_put
                 cached = lru_get(_compiled_cache, cache_key)
                 if cached is None:
                     entry = _try_compile(device_type, program, type_map,
@@ -647,9 +662,8 @@ def execute_compiled(
                     # entry (backend None) has no dynamo to guard-churn, and its
                     # baseline cook would be pure waste.
                     if entry[1] is not None:
-                        _verify_state[cache_key] = {"px": cook_px, "samples": []}
-                        while len(_verify_state) > _VERIFY_STATE_MAX:
-                            _verify_state.popitem(last=False)
+                        lru_put(_verify_state, cache_key, {"px": cook_px, "samples": []},
+                                _VERIFY_STATE_MAX)
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         # Evict the oldest. Do NOT torch._dynamo.reset() here:
                         # this runs on the disposable worker thread, and dynamo
@@ -658,6 +672,7 @@ def execute_compiled(
                         # calling thread). The bounded cache already caps growth.
                         _compiled_cache.popitem(last=False)
                     compiled_fn, entry_backend = entry
+                    served = _served_tier(entry_backend)
                     # K2 (v0.50.0 Phase C, B3#2): resolve the fncalls_compile verdict
                     # only AFTER this compiled callable's FIRST REAL INVOCATION
                     # completes (or raises) -- never right after torch.compile()
@@ -683,6 +698,7 @@ def execute_compiled(
                     return result
 
                 compiled_fn, _entry_backend = cached
+                served = _served_tier(_entry_backend)
                 verify = _verify_state.get(cache_key)
                 if verify is not None and len(verify["samples"]) < _VERIFY_COOKS:
                     # G: verification window — time this warm compiled cook.
@@ -786,6 +802,11 @@ def execute_compiled(
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
                               time_context=time_context, scale=scale)
+
+    # `tier_trace` is thread-local and the compiled fn ran on the pool thread, so the
+    # success tier is recorded here; a demotion below overwrites it with its own record.
+    if served is not None:
+        tier_trace.record(served)
 
     # G (v0.20): post-commit verification verdict. Once the window is full,
     # time ONE interpreter cook of the same program and demote the compiled
@@ -1168,6 +1189,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         if res is None:
             autotier.record_trial(key, None, persist=_durable_failure(cache_key))  # demote
             return _codegen(bindings)
+        _record_served(cache_key)
         return res
     # Committed but artifact gone (restart w/o PC-2 persistence, or evicted):
     # measure and compile it again (mark_ready cannot: the state is not COMPILING).
@@ -1219,7 +1241,10 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         autotier.record_trial(key, ms)
         # The job's output belongs to the cook that submitted it (its bindings, its size):
         # a later cook may take the timing but must be served from its OWN inputs.
-        return res if own_job else _codegen(bindings)
+        if not own_job:
+            return _codegen(bindings)
+        _record_served(cache_key)
+        return res
 
     # CC-6: bounded trial convergence. A key that has been ELIGIBLE to compile (enough
     # interpreter samples — should_submit_compile's own bar) for too long without reaching

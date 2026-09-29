@@ -334,10 +334,9 @@ def test_v034_io1_backpressure_refuses_rather_than_evicting(r):
 def test_v034_io1_cancellation_drops_on_landing(r):
     """A prefetch cancelled while still QUEUED never runs, so it installs nothing.
 
-    Only the queued half is pinned here: the tail of the window is cancelled behind the single
-    worker, so the pool must hold exactly the frames of the jobs that were not cancelled. A
-    cancel that lands while the provider's read is already in flight is not covered (that
-    frame is pooled by `materialize` before the job's cancel check runs)."""
+    The tail of the window is cancelled behind the single worker, so the pool must hold
+    exactly the frames of the jobs that were not cancelled. The in-flight half (a cancel that
+    lands while the provider's read is already running) is the next row."""
     q = Q.CookQueue(name="io1-cancel")
     tex_provider.reset_provider()
     tex_provider.set_provider(tex_provider.SyntheticFrameProvider(res=16, rate=1.0,
@@ -359,6 +358,46 @@ def test_v034_io1_cancellation_drops_on_landing(r):
     except Exception as e:
         r.fail("IO-1 cancellation", f"{type(e).__name__}: {e}")
     finally:
+        q.close()
+        tex_provider.reset_provider()
+
+
+def test_v034_io1_inflight_cancel_installs_nothing(r):
+    """A prefetch cancelled INSIDE the provider's read never installs its frame.
+
+    The provider is gated on an Event so the cancel deterministically lands while the read is
+    in flight; the pool must then hold the other jobs' frames and not the cancelled one's."""
+    entered, gate = threading.Event(), threading.Event()
+
+    class _Gated(tex_provider.SyntheticFrameProvider):
+        def _frame(self, source_key, t, bias):
+            if not entered.is_set():
+                entered.set()
+                assert gate.wait(10), "the gate was never released"
+            return super()._frame(source_key, t, bias)
+
+    q = Q.CookQueue(name="io1-cancel-inflight")
+    tex_provider.reset_provider()
+    tex_provider.set_provider(_Gated(res=16, rate=1.0))
+    try:
+        q.install_policy(Q.SpeculativePolicy(min_confidence=0.0, min_value_ms=0.0,
+                                             unknown_min_confidence=0.0, max_pending=16))
+        jobs = tex_provider.declare_window(q, "plate", 0.0, 2.0, confidence=0.9)
+        assert len(jobs) == 3
+        assert entered.wait(10), "the first prefetch never reached the provider"
+        assert q.cancel(jobs[0]), "the in-flight job was not cancellable"
+        gate.set()
+        q.drain(20)
+        assert jobs[0].state == Q.CANCELLED, [j.state for j in jobs]
+        assert [j.state for j in jobs[1:]] == [Q.DONE, Q.DONE], [j.state for j in jobs]
+        # Frame 0's key would be its quantized time 0.0; the pool holds only frames 1 and 2.
+        frames = tex_provider.get_media_cache().stats()["frames"]
+        assert frames == 2, f"{frames} frames pooled; the cancelled in-flight one was installed"
+        r.ok("IO-1: an in-flight cancelled prefetch installed nothing (pool=2 of 3)")
+    except Exception as e:
+        r.fail("IO-1 in-flight cancellation", f"{type(e).__name__}: {e}")
+    finally:
+        gate.set()
         q.close()
         tex_provider.reset_provider()
 

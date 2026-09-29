@@ -127,10 +127,14 @@ def _get(key: tuple) -> _KeyState:
     if st is None:
         st = _KeyState()
         _STATE[key] = st
+        # Not `lru_put`: an evicted key also leaves the non-durable set, which needs the key.
         while len(_STATE) > _STATE_MAX:
             _NON_DURABLE.discard(_STATE.popitem(last=False)[0])
     else:
-        _STATE.move_to_end(key)
+        try:
+            _STATE.move_to_end(key)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; st stands
     return st
 
 
