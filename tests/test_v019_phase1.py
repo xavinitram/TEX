@@ -171,11 +171,10 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     # DECLINED (falls to fp32) — "convolve" in FP16_FRAGILE is what makes this so; the
     # gate itself is exercised end to end here (not just the taxonomy membership above).
     try:
-        from TEX_Wrangle.tex_runtime import precision_policy as pp
         bt = {"A": TEXType.VEC3, "K": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "@OUT = vec4(convolve(@A, @K), 1.0);"
         prog = parse_and_split(code, bt)
-        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        TypeChecker(binding_types=bt, source=code).check(prog)
         got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
         assert got == "fp32", f"convolve under precision='auto' resolved {got!r}, want 'fp32'"
         r.ok("ASK-1: convolve declines precision='auto' (resolves fp32)")
@@ -189,7 +188,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "@OUT = vec4(patch_dist(@A, 3, -2, 1), 0.0, 0.0, 1.0);"
         prog = parse_and_split(code, bt)
-        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        TypeChecker(binding_types=bt, source=code).check(prog)
         got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
         assert got == "fp32", f"patch_dist under precision='auto' resolved {got!r}, want 'fp32'"
         r.ok("ASK-13: patch_dist declines precision='auto' (resolves fp32)")
@@ -206,7 +205,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
         bt = {"A": TEXType.VEC3, "K": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "@OUT = vec4(@A.rgb * img_width(@K), 1.0);"
         prog = parse_and_split(code, bt)
-        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        TypeChecker(binding_types=bt, source=code).check(prog)
         got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
         assert got == "fp32", f"img_width under precision='auto' resolved {got!r}, want 'fp32'"
         r.ok("ASK-4: img_width declines precision='auto' (resolves fp32)")

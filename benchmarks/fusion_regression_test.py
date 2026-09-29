@@ -77,8 +77,11 @@ spec = {"stages": [{"code": "f$amt = 0.7; @OUT = @A * vec4($amt,$amt,$amt,1.0);"
 prog, tm, referenced, asg, par, used, merged = prepare_fused(
     spec, "@OUT = @X;", {"X": torch.rand(1, 8, 8, 4)}, infer_binding_type)
 has_ref = isinstance(referenced, (set, frozenset))
-print(f"  prepare_fused returns referenced set: {has_ref}  param decl _s0_amt in info: {'_s0_amt' in par}")
-ok &= has_ref
+# the stage-0 `$amt` is declared under a stage-scoped name, carrying its 0.7 default
+amt = [v for k, v in par.items() if k.startswith("_s0_") and k.endswith("amt")]
+has_par = len(amt) == 1 and abs(amt[0]["default_value"] - 0.7) < 1e-9
+print(f"  prepare_fused returns referenced set: {has_ref}  stage-0 amt declared with default 0.7: {has_par}")
+ok &= has_ref and has_par
 
 print("\nRESULT:", "ALL PASS" if ok else "FAILURES")
 sys.exit(0 if ok else 1)

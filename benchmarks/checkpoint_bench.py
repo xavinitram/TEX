@@ -6,7 +6,7 @@ stage j. Fusion has spliced the chain into ONE program, so today that recooks st
 including everything UPSTREAM of the edit, which cannot have changed. What does a checkpoint
 at a cumulative-cost boundary buy, and what does maintaining it cost?
 
-Four rows per (device, chain length, edit position):
+Rows per (device, chain length, edit position):
 
   full          the whole fused chain, every tick — today's default, the number to beat
   cache6        the shipped SINGLE-tap suffix splice (`cook_fused_cached`) at the best legal
@@ -14,10 +14,14 @@ Four rows per (device, chain length, edit position):
   cache7        the MULTI-tap path (`cook_checkpointed`), taps placed by measured stage cost
   phase2        what materializing those taps costs once, on idle — CACHE-7's own overhead,
                 the number that decides whether the win is real
+  scrub_cache6 / scrub_cache7
+                the same two paths over a walk across edit positions, where CACHE-6's single
+                cut is invalidated by every move and CACHE-7's taps stand
 
-Run BEFORE any v0.32 change to fix the baseline (`--save results/cache7_baseline.json`),
-then again after (`--compare`). CUDA is synced around every timed region (the standing
-benchmark discipline — without it these measure kernel-launch time, not work).
+The profiler is armed only while the taps are being placed; every timed row runs unarmed.
+Save a baseline with `--save` and diff a later run against it with `--compare`. CUDA is synced
+around every timed region (the standing benchmark discipline — without it these measure
+kernel-launch time, not work).
 """
 from __future__ import annotations
 
@@ -41,7 +45,7 @@ os.environ.setdefault(
 
 import torch                                                          # noqa: E402
 from run_benchmarks import system_info                                # noqa: E402
-from TEX_Wrangle import tex_engine, tex_fusion, tex_results           # noqa: E402
+from TEX_Wrangle import tex_checkpoint, tex_engine, tex_fusion, tex_results  # noqa: E402
 from TEX_Wrangle.tex_runtime import profile as _profile               # noqa: E402
 
 # A chain of real compositing stages with DELIBERATELY uneven cost — the blurs dominate,
@@ -99,15 +103,8 @@ def _median_ms(fn, reps: int, warmup: int = 2) -> float:
     return round(statistics.median(samples), 4)
 
 
-_THRESHOLD_MS = 100.0
-
-
-def args_threshold() -> float:
-    """The placement threshold this run is measuring at (GOV-1 will own it)."""
-    return _THRESHOLD_MS
-
-
-def measure(device: str, res: int, n: int, edit_at: int, reps: int) -> dict:
+def measure(device: str, res: int, n: int, edit_at: int, reps: int,
+            threshold_ms: float = 100.0) -> dict:
     src = torch.rand(1, res, res, 3, device=device)
     cache = tex_results.ResultCache()
     up = ("bench-src-v1",)            # the host's content-sensitive source identity (CACHE-1)
@@ -138,116 +135,111 @@ def measure(device: str, res: int, n: int, edit_at: int, reps: int) -> dict:
 
     # ── rows 3-4: CACHE-7 multi-tap ──────────────────────────────────────────────
     try:
-        from TEX_Wrangle import tex_checkpoint
-    except ImportError:
-        tex_checkpoint = None                       # pre-implementation baseline run
-    if tex_checkpoint is not None:
-        try:
-            # Placement, from MEASURED per-stage cost — the item's whole thesis. Profile the
-            # chain until PROF-1 has settled samples, then let the policy choose the cuts;
-            # a hand-picked `cuts=` here would benchmark a benchmark, not the mechanism.
-            _profile.reset()
-            _profile.enable()
-            pkey = _profile.make_key(f"bench-n{n}-{edit_at}", device, "fp32")
-            spatial = (1, res, res)
-            # Cook until PROF-1's estimate SETTLES. It measures the first 3 cooks of a key and
-            # then 1 in 16, so this is ~150 cooks — the honest cost of "effort-based", and a
-            # number worth reporting rather than hiding behind a hand-fed cost table. Capped so
-            # a profiler change cannot turn the benchmark into an infinite loop.
-            warm = 0
-            while warm < 400 and not _profile.settled(pkey, spatial,
-                                                      need=tex_checkpoint.MIN_SAMPLES):
-                with _profile.measure(pkey, spatial, device=device, stages=True):
-                    tex_engine.cook_stage_list(_stages(0), device=device, precision="fp32")
+        # Placement, from MEASURED per-stage cost — the item's whole thesis. Profile the
+        # chain until PROF-1 has settled samples, then let the policy choose the cuts;
+        # a hand-picked `cuts=` here would benchmark a benchmark, not the mechanism.
+        _profile.reset()
+        _profile.enable()
+        pkey = _profile.make_key(f"bench-n{n}-{edit_at}", device, "fp32")
+        spatial = (1, res, res)
+        # Cook until PROF-1's estimate SETTLES. It measures the first 3 cooks of a key and
+        # then 1 in 16, so this is ~150 cooks — the honest cost of "effort-based", and a
+        # number worth reporting rather than hiding behind a hand-fed cost table. Capped so
+        # a profiler change cannot turn the benchmark into an infinite loop.
+        warm = 0
+        while warm < 400 and not _profile.settled(pkey, spatial,
+                                                  need=tex_checkpoint.MIN_SAMPLES):
+            with _profile.measure(pkey, spatial, device=device, stages=True):
+                tex_engine.cook_stage_list(_stages(0), device=device, precision="fp32")
+            _sync(device)
+            warm += 1
+        row["cooks_to_settle"] = warm
+        costs = _profile.stage_costs(pkey, spatial)
+        cuts = tex_checkpoint.plan_checkpoints(
+            _stages(0), costs=costs, threshold_ms=threshold_ms, px=res * res,
+            settled=_profile.settled(pkey, spatial,
+                                     need=tex_checkpoint.MIN_SAMPLES),
+            device=device)
+        row["stage_costs"] = {str(k): round(v, 3) for k, v in sorted(costs.items())}
+        row["taps"] = cuts
+        # Placement is done: every row below is timed unarmed, like full and cache6.
+        _profile.disable()
+        if not cuts:
+            row["cache7"] = None                # policy declined — an honest row, not a gap
+            row["cache7_why"] = "no cut cleared the threshold + materialization floor"
+        else:
+            # Phase 2 cost: materialize the taps ONCE, on idle, and time exactly that.
+            cache.clear()
+            _sync(device)
+            t0 = time.perf_counter()
+            tex_checkpoint.materialize(_stages(0), cache, device=device,
+                                       precision="fp32", upstream=up, cuts=cuts)
+            _sync(device)
+            row["phase2"] = round((time.perf_counter() - t0) * 1000.0, 4)
+
+            def _c7(i):
+                tex_checkpoint.cook_checkpointed(
+                    _stages(i), cache, device=device, precision="fp32",
+                    upstream=up, cuts=cuts)
                 _sync(device)
-                warm += 1
-            row["cooks_to_settle"] = warm
-            costs = _profile.stage_costs(pkey, spatial)
-            cuts = tex_checkpoint.plan_checkpoints(
-                _stages(0), costs=costs, threshold_ms=args_threshold(), px=res * res,
-                settled=_profile.settled(pkey, spatial,
-                                         need=tex_checkpoint.MIN_SAMPLES),
-                device=device)
-            row["stage_costs"] = {str(k): round(v, 3) for k, v in sorted(costs.items())}
-            row["taps"] = cuts
-            if not cuts:
-                row["cache7"] = None                # policy declined — an honest row, not a gap
-                row["cache7_why"] = "no cut cleared the threshold + materialization floor"
+
+            # PROVE a checkpoint is actually being SERVED before timing anything. A total
+            # fallback returns normally and is indistinguishable from "the feature is
+            # slower": measured, a populated cache runs 7.5 ms/cook and a wiped one 41.4,
+            # and both look like a successful row. Spy on the splice.
+            served = []
+            _real_suffix = tex_fusion.suffix_stage_list
+
+            def _spy(stages_, k_, boundary_):
+                served.append(k_)
+                return _real_suffix(stages_, k_, boundary_)
+
+            tex_fusion.suffix_stage_list = _spy
+            try:
+                _c7(0)
+            finally:
+                tex_fusion.suffix_stage_list = _real_suffix
+            row["served_from_cut"] = served[-1] if served else None
+            if not served:
+                row["cache7"] = None
+                row["cache7_why"] = ("NO CHECKPOINT SERVED — every cut missed and the cook "
+                                     "fell back to the whole chain")
             else:
-                # Phase 2 cost: materialize the taps ONCE, on idle, and time exactly that.
-                cache.clear()
+                row["cache7"] = _median_ms(_c7, reps)
+
+            # ── the row the item actually exists for ────────────────────────────
+            # Everything above holds the edit at ONE stage, where `cache6`'s cut is an
+            # ORACLE: the bench hands it k = edit_at, i.e. the perfect cut for this exact
+            # edit. A real host does not know that, and a grading session does not hold
+            # still — the user moves up and down the chain. CACHE-6 has ONE cut, so every
+            # move invalidates it and re-materializes a prefix; CACHE-7's taps are
+            # edit-agnostic and stand. Measured over a walk across edit positions, which
+            # is the comparison that is not rigged for either side.
+            positions = list(range(1, n))
+
+            def _scrub_c6(i):
+                p = positions[i % len(positions)]
+                st = build_stages(n, p, src, 0.5 + (i % 17) * 0.01)
+                tex_engine.cook_fused_cached(st, max(1, min(p, n - 1)), c6_cache,
+                                             device=device, precision="fp32", upstream=up)
                 _sync(device)
-                t0 = time.perf_counter()
-                tex_checkpoint.materialize(_stages(0), cache, device=device,
-                                           precision="fp32", upstream=up, cuts=cuts)
+
+            def _scrub_c7(i):
+                p = positions[i % len(positions)]
+                st = build_stages(n, p, src, 0.5 + (i % 17) * 0.01)
+                tex_checkpoint.cook_checkpointed(st, cache, device=device,
+                                                 precision="fp32", upstream=up, cuts=cuts)
                 _sync(device)
-                row["phase2"] = round((time.perf_counter() - t0) * 1000.0, 4)
 
-                def _c7(i):
-                    tex_checkpoint.cook_checkpointed(
-                        _stages(i), cache, device=device, precision="fp32",
-                        upstream=up, cuts=cuts)
-                    _sync(device)
-
-                # PROVE a checkpoint is actually being SERVED before timing anything. A total
-                # fallback returns normally and is indistinguishable from "the feature is
-                # slower": measured, a populated cache runs 7.5 ms/cook and a wiped one 41.4,
-                # and both look like a successful row. Spy on the splice.
-                served = []
-                _real_suffix = tex_fusion.suffix_stage_list
-
-                def _spy(stages_, k_, boundary_):
-                    served.append(k_)
-                    return _real_suffix(stages_, k_, boundary_)
-
-                tex_fusion.suffix_stage_list = _spy
-                try:
-                    _c7(0)
-                finally:
-                    tex_fusion.suffix_stage_list = _real_suffix
-                row["served_from_cut"] = served[-1] if served else None
-                if not served:
-                    row["cache7"] = None
-                    row["cache7_why"] = ("NO CHECKPOINT SERVED — every cut missed and the cook "
-                                         "fell back to the whole chain")
-                else:
-                    row["cache7"] = _median_ms(_c7, reps)
-
-                # ── the row the item actually exists for ────────────────────────────
-                # Everything above holds the edit at ONE stage, where `cache6`'s cut is an
-                # ORACLE: the bench hands it k = edit_at, i.e. the perfect cut for this exact
-                # edit. A real host does not know that, and a grading session does not hold
-                # still — the user moves up and down the chain. CACHE-6 has ONE cut, so every
-                # move invalidates it and re-materializes a prefix; CACHE-7's taps are
-                # edit-agnostic and stand. Measured over a walk across edit positions, which
-                # is the comparison that is not rigged for either side.
-                positions = [p for p in range(1, n) if p != 0]
-
-                def _scrub_c6(i):
-                    p = positions[i % len(positions)]
-                    st = build_stages(n, p, src, 0.5 + (i % 17) * 0.01)
-                    tex_engine.cook_fused_cached(st, max(1, min(p, n - 1)), c6_cache,
-                                                 device=device, precision="fp32", upstream=up)
-                    _sync(device)
-
-                def _scrub_c7(i):
-                    p = positions[i % len(positions)]
-                    st = build_stages(n, p, src, 0.5 + (i % 17) * 0.01)
-                    tex_checkpoint.cook_checkpointed(st, cache, device=device,
-                                                     precision="fp32", upstream=up, cuts=cuts)
-                    _sync(device)
-
-                c6_cache = tex_results.ResultCache()
-                row["scrub_cache6"] = _median_ms(_scrub_c6, max(reps, len(positions) * 2))
-                row["scrub_cache7"] = _median_ms(_scrub_c7, max(reps, len(positions) * 2))
-                if row["scrub_cache6"]:
-                    row["scrub_speedup"] = round(row["scrub_cache6"] / row["scrub_cache7"], 3)
-        except Exception as exc:                    # a bench must not hide a broken mechanism
-            row["cache7_error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            _profile.disable()
-    else:
-        row["cache7"] = None                        # not implemented yet (baseline run)
+            c6_cache = tex_results.ResultCache()
+            row["scrub_cache6"] = _median_ms(_scrub_c6, max(reps, len(positions) * 2))
+            row["scrub_cache7"] = _median_ms(_scrub_c7, max(reps, len(positions) * 2))
+            if row["scrub_cache6"]:
+                row["scrub_speedup"] = round(row["scrub_cache6"] / row["scrub_cache7"], 3)
+    except Exception as exc:                    # a bench must not hide a broken mechanism
+        row["cache7_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _profile.disable()
 
     for name in ("cache6", "cache7"):
         v = row.get(name)
@@ -268,8 +260,6 @@ def main() -> int:
     ap.add_argument("--threshold-ms", type=float, default=100.0,
                     help="CACHE-7 placement threshold (GOV-1 profile knob)")
     args = ap.parse_args()
-    global _THRESHOLD_MS
-    _THRESHOLD_MS = args.threshold_ms
 
     devices = ["cpu"]
     if torch.cuda.is_available() and not args.cpu_only:
@@ -290,7 +280,8 @@ def main() -> int:
             # clean prefix sits above the edit).
             for label, edit_at in (("late", n - 1), ("mid", n // 2)):
                 key = f"{device}/n{n}/{label}"
-                r = measure(device, args.resolution, n, edit_at, args.reps)
+                r = measure(device, args.resolution, n, edit_at, args.reps,
+                             args.threshold_ms)
                 out["rows"][key] = r
                 c7 = r.get("cache7")
                 c7s = (f"{c7:8.3f}ms ({r.get('cache7_speedup')}x, taps={r.get('taps')})"

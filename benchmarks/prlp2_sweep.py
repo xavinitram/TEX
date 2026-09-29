@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PR-LP2 differential sweep (doc 28 success test): resolve `precision="auto"` for all 114
-examples at 2048^2 CUDA; every ACCEPTED (fp16) program must match its fp32 cook within
+PR-LP2 differential sweep (doc 28 success test): resolve `precision="auto"` for every
+example at 2048^2 CUDA; every ACCEPTED (fp16) program must match its fp32 cook within
 the 8-bit quantum (3.9e-3) and stay finite; the 4 named programs must be DECLINED.
 
 Accuracy is measured at 512^2 (per-pixel fp16 error is resolution-independent; the
@@ -17,6 +17,7 @@ sys.path.insert(0, str(_bench))
 import torch
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
+from TEX_Wrangle.tex_marshalling import infer_binding_type
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 from TEX_Wrangle.tex_runtime.precision_policy import resolve_auto_precision
 from four_scenario_bench import generate_bindings
@@ -52,7 +53,10 @@ def main():
         # accepted -> verify fp16 within the 8-bit quantum of fp32, and finite
         try:
             binds = generate_bindings(code, 1, 512, 512, device="cuda")
-            tm = TypeChecker(binding_types={}, source=code).check(prog)
+            # Type the program from the tensors it will run on, as a real cook does.
+            bt = {k: infer_binding_type(v) for k, v in binds.items()}
+            prog = parse_and_split(code, bt)
+            tm = TypeChecker(binding_types=bt, source=code).check(prog)
             outs = list(tm.keys()) if hasattr(tm, "keys") else ["OUT"]
             o32 = Interpreter().execute(prog, binds, tm, device="cuda",
                                         output_names=["OUT"], precision="fp32")
@@ -78,7 +82,7 @@ def main():
     print(f"accuracy violations (finite but >{BAR:.1e}): {len(acc_fail)}")
     for f in acc_fail:
         print("  ACCFAIL", f)
-    print(f"run/binding failures (skipped, not a gate issue): {len(run_fail)}")
+    print(f"run/binding failures (accepted but not verified): {len(run_fail)}")
     for f in run_fail[:10]:
         print("  skip", f)
     # the 4 named must be declined
@@ -86,7 +90,13 @@ def main():
                if not any(d.startswith(n) for d in declined_names)]
     print(f"\nMUST-DECLINE check: {'PASS' if not missing else 'FAIL ' + str(missing)}")
     print(f"accepted sample: {accepted[:12]}")
-    verdict = "PASS" if not acc_fail and not missing else "FAIL"
+    verified = len(accepted) - len(fallback) - len(run_fail)
+    if run_fail:
+        print(f"WARNING: {len(run_fail)} accepted example(s) could not be verified; "
+              f"{verified} of {len(accepted)} accepted were actually compared")
+    # A sweep that could verify (almost) nothing must not read as a pass.
+    unverified = bool(accepted) and verified < len(accepted) // 2
+    verdict = "PASS" if not acc_fail and not missing and not unverified else "FAIL"
     print(f"\nOVERALL: {verdict}")
 
 

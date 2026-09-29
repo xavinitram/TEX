@@ -223,18 +223,42 @@ def test_ask5_matches_worley_f1_winner(r: SubTestResult):
         r.fail("ASK-5 id is per-cell", f"{type(e).__name__}: {e}")
 
     try:
-        # 3D twin: worley_id and worley_f1 must agree on the SAME winning cell —
-        # if worley_id ever won a different cell than F1's argmin, the id would
-        # describe a cell that ISN'T the nearest one, silently.
-        x3 = torch.tensor([2.3, 5.7, 0.1])
-        y3 = torch.tensor([1.1, 5.7, 9.9])
-        z3 = torch.tensor([0.5, 2.2, 3.3])
+        # 3D twin: worley_id and worley_f1 must agree on the SAME winning cell — if worley_id
+        # ever won a different cell than F1's argmin, the id would describe a cell that ISN'T
+        # the nearest one, silently. The winner is derived here, off the same hashed feature
+        # points, and both outputs are checked against it: F1's distance is the distance to
+        # that winner, and the id is constant across every point that winner claims.
+        gen = torch.Generator().manual_seed(11)
+        x3, y3, z3 = (torch.rand(4000, generator=gen) * 6.0 for _ in range(3))
+        dx3, dy3, dz3 = noise._get_worley3d_offsets(x3.device, x3.dim())
+        cx = torch.floor(x3).to(torch.int32).unsqueeze(0) + dx3
+        cy = torch.floor(y3).to(torch.int32).unsqueeze(0) + dy3
+        cz = torch.floor(z3).to(torch.int32).unsqueeze(0) + dz3
+        base_hash = cx * 0x1B873593 ^ cy * 0x27D4EB2D ^ cz * 0x165667B1
+        fx = cx.float() + (noise._lowbias32(base_hash) & 0x7FFFFF).float() / 8388607.0
+        fy = cy.float() + (noise._lowbias32(base_hash + 0x165667B1) & 0x7FFFFF).float() / 8388607.0
+        fz = cz.float() + (noise._lowbias32(base_hash + 0x2B873593) & 0x7FFFFF).float() / 8388607.0
+        dist3 = ((x3.unsqueeze(0) - fx).square() + (y3.unsqueeze(0) - fy).square()
+                 + (z3.unsqueeze(0) - fz).square())
+        win3 = dist3.min(dim=0).indices.unsqueeze(0)
         f1_3d = noise._worley3d(x3, y3, z3, return_f2=False)
-        id_3d = noise._worley3d_id(x3, y3, z3)
-        assert f1_3d.shape == id_3d.shape
-        r.ok(f"3D worley_f1/worley_id both resolve on the same {tuple(x3.shape)} coordinates")
+        at_winner = torch.sqrt(torch.gather(dist3, 0, win3).squeeze(0))
+        assert torch.allclose(f1_3d, at_winner, rtol=0, atol=1e-6), \
+            f"maxdiff {(f1_3d - at_winner).abs().max().item()}"
+        cell3 = ((torch.gather(cx, 0, win3).squeeze(0).long() * 1000003
+                  + torch.gather(cy, 0, win3).squeeze(0).long()) * 1000033
+                 + torch.gather(cz, 0, win3).squeeze(0).long()).tolist()
+        id_3d = noise._worley3d_id(x3, y3, z3).tolist()
+        per_cell3, drift3 = {}, 0
+        for c, i in zip(cell3, id_3d):
+            if per_cell3.setdefault(c, i) != i:
+                drift3 += 1
+        assert not drift3, f"{drift3} points carry an id their own winning cell does not"
+        assert len(per_cell3) > 1, "the probe resolved to one cell - this row is vacuous"
+        r.ok(f"3D: worley_f1 is the distance to the winner and worley_id is constant per "
+             f"winning cell ({len(per_cell3)} cells over {len(id_3d)} points)")
     except Exception as e:
-        r.fail("ASK-5 3D shape parity", f"{type(e).__name__}: {e}")
+        r.fail("ASK-5 3D winner parity", f"{type(e).__name__}: {e}")
 
 
 def test_ask5_worley_f1_tier_envelope(r: SubTestResult):
@@ -417,12 +441,12 @@ def test_ask5_eager_only_no_promotion(r: SubTestResult):
     from TEX_Wrangle.tex_runtime import tier_trace
 
     try:
-        missing_cache_call = [
+        routes_through_cache = [
             name for name, fn in (("_worley2d_id", noise._worley2d_id),
                                   ("_worley3d_id", noise._worley3d_id))
             if "_cache.call(" in inspect.getsource(fn)]
-        assert not missing_cache_call, (
-            f"{', '.join(missing_cache_call)}: now routes through a _TieredCache — "
+        assert not routes_through_cache, (
+            f"{', '.join(routes_through_cache)}: now routes through a _TieredCache — "
             f"worley_id must stay eager on every tier (BRIEF-6: a fused compile's "
             f"argmin can flip at a near-tie ULP, relocating a whole id)")
         r.ok("_worley2d_id / _worley3d_id never call a _TieredCache's .call(...) entry point")

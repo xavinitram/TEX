@@ -17,7 +17,8 @@ Quick start
 
 All flags
 ---------
-    --full              All resolutions (256-4096) x batch (1,4) x cache (warm,cold)
+    --full              All resolutions (256-4096) x batch (1,4); warm only unless --cold
+                        (--resolution / --batch are ignored under --full and --quick)
     --quick             512x512 B=1 warm only (fast sanity check, ~2 min)
     --resolution N      Single resolution (default: 256,512,1024)
     --batch N           Single batch size   (default: 1)
@@ -568,19 +569,13 @@ def run_interpreter(program, bindings, type_map, device="cpu",
     global _interp
     if _interp is None:
         _interp = Interpreter()
-    # Build kwargs compatible with both old and new interpreter versions
-    import inspect
-    sig = inspect.signature(_interp.execute)
-    kwargs: dict = dict(device=device, output_names=output_names)
-    if "precision" in sig.parameters:
-        kwargs["precision"] = precision
-    if "used_builtins" in sig.parameters:
-        kwargs["used_builtins"] = used_builtins
+    kwargs: dict = dict(device=device, output_names=output_names,
+                        precision=precision, used_builtins=used_builtins)
     # REG-1d: the production seam (tex_engine.py) always passes `source=` (the ComfyUI-
     # invisible fast path in `interpreter._consensus_extent` reads it), so a harness that
     # never does measures a path no real cook takes. `source=None` (the default) keeps
     # every existing caller of this function byte-identical.
-    if source is not None and "source" in sig.parameters:
+    if source is not None:
         kwargs["source"] = source
     return _interp.execute(program, bindings, type_map, **kwargs)
 
@@ -634,9 +629,6 @@ def measure(prog: BenchmarkProgram, B: int, H: int, W: int,
         n = 0
         while n < MAX_RUNS:
             gc.collect()
-            tracemalloc.start()
-            mem0 = tracemalloc.get_traced_memory()[1]
-
             t0 = time.perf_counter()
             if cache_mode == "cold":
                 tc = time.perf_counter()
@@ -653,15 +645,24 @@ def measure(prog: BenchmarkProgram, B: int, H: int, W: int,
             if sync: sync()
             interp_t.append((time.perf_counter() - ti) * 1000)
             total_t.append((time.perf_counter() - t0) * 1000)
-
-            mem_peak = tracemalloc.get_traced_memory()[1]
-            tracemalloc.stop()
             n += 1
 
             if n >= MIN_RUNS:
                 mu = statistics.mean(total_t)
                 if mu > 0 and statistics.stdev(total_t) / mu < TARGET_CV:
                     break
+
+        # Python-side allocation peak from one UNTIMED extra run: tracemalloc hooks every
+        # allocation, so it must never be active inside a timed region. Tensor storage is
+        # invisible to it; this is Python object churn only.
+        gc.collect()
+        tracemalloc.start()
+        mem0 = tracemalloc.get_traced_memory()[1]
+        run_interpreter(program, bindings, type_map, device,
+                        output_names, precision, used)
+        if sync: sync()
+        mem_peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
 
         total_t.sort(); interp_t.sort(); comp_t.sort()
         mu = statistics.mean(total_t)
@@ -711,8 +712,8 @@ def system_info(device: str) -> dict:
     # TEX version
     try:
         ver_file = _pkg_dir / "__init__.py"
-        for line in ver_file.read_text().splitlines():
-            if "VERSION" in line and "=" in line:
+        for line in ver_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("__version__") and "=" in line:
                 info["tex_version"] = line.split("=")[1].strip().strip("\"'")
                 break
     except Exception:
@@ -784,9 +785,18 @@ def print_results(results: list[BenchResult], show_compile: bool = True):
     print(f"  Average CV            : {avg_cv:.1f}%  (target <{TARGET_CV*100:.0f}%)")
 
 
-def compare_results(current: list[BenchResult], baseline_path: str):
+def compare_results(current: list[BenchResult], baseline_path: str,
+                    current_info: dict | None = None):
     with open(baseline_path) as f:
         base = json.load(f)
+    # Device and precision key nothing in the baseline map, so a cuda or fp16 run against a
+    # cpu/fp32 baseline would print 50x "speedups". Refuse instead.
+    for field in ("device", "precision"):
+        b, c = base.get("system", {}).get(field), (current_info or {}).get(field)
+        if b is not None and c is not None and b != c:
+            print(f"\n  REFUSED: {field} differs (baseline={b!r}, current={c!r}); "
+                  f"no row is comparable.")
+            return
     bmap = {(e["program"], e["resolution"], e["batch"], e["cache_mode"]): e
             for e in base["results"]}
 
@@ -806,7 +816,7 @@ def compare_results(current: list[BenchResult], baseline_path: str):
         if key not in bmap:
             continue
         bms = bmap[key]["interp_ms"]
-        if bms <= 0:
+        if bms <= 0 or r.interp_ms <= 0:
             continue
         sp = bms / r.interp_ms
         speedups.append(sp)
@@ -848,7 +858,8 @@ def main():
         epilog=__doc__,
     )
     ap.add_argument("--full", action="store_true",
-                    help="Full matrix: res 256-4096, batch 1+4, warm+cold")
+                    help="Full matrix: res 256-4096, batch 1+4 (warm; add --cold "
+                         "for cold too)")
     ap.add_argument("--quick", action="store_true",
                     help="Quick sanity check: 512x512 B=1 warm only")
     ap.add_argument("--resolution", type=int, default=None)
@@ -892,6 +903,7 @@ def main():
         print("No programs."); return
 
     info = system_info(args.device)
+    info["precision"] = args.precision
     print_header(info)
     print(f"  Programs    : {len(programs)}")
     print(f"  Resolutions : {resolutions}")
@@ -940,7 +952,7 @@ def main():
 
     # -- Compare --
     if args.compare:
-        compare_results(results, args.compare)
+        compare_results(results, args.compare, info)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@ What it demonstrates (the roadmap's PM-2 acceptance):
 
 Run it:  python examples/host_demo.py            (then open http://127.0.0.1:8760)
          python examples/host_demo.py --bench     (just the PM-2 benchmark, no server)
+         python examples/host_demo.py --bench-pm6 (the 10-stage ROI comp, `RoiComp`)
+         python examples/host_demo.py --bench-pm7 (a slider scrub through the cook queue, `QueuedHost`)
+
+The viewer cooks through `QueuedHost` (the SCHED-4 queue); `RoiComp` is the ten-stage comp the
+PM-6 bench drives.
 
 An http.server viewer is used because the Windows embedded CPython ships no tkinter; the browser
 is the display surface, and its transport (a raw-RGBA blit to a <canvas>) is deliberately kept
@@ -415,7 +420,7 @@ class Host:
         supersede (read `_current`, cancel it, store the new one) is atomic under `_req_lock`, so a
         newer request never fails to cancel an older one. Honest limit: 'newer' is call order, which
         under a threading server can differ from slider-arrival order for near-simultaneous requests
-        — a benign display nit given ~1 ms cooks, not a lost/stale-forever frame."""
+        — a benign display nit, not a lost/stale-forever frame."""
         tok = _Cancel()
         with self._req_lock:
             if self._current is not None:
@@ -467,8 +472,10 @@ class Host:
         wrap itself in a handle to say so."""
         if hasattr(frame, "tensor") and hasattr(frame, "is_ready"):
             frame = frame.tensor()
-        u8 = (frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8).cpu()
-        return bytes(u8.reshape(-1).tolist())
+        u8 = (frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().contiguous().reshape(-1)
+        buf = bytearray(u8.numel())                    # one copy, no Python int per byte
+        torch.frombuffer(buf, dtype=torch.uint8).copy_(u8)
+        return bytes(buf)
 
 
 class QueuedHost:
@@ -544,7 +551,9 @@ def bench_pm7(res: int = DISPLAY_RES, frames: int = 12) -> dict:
     host = Host(res)
     qh = QueuedHost(host)
     try:
-        qh.frame(0.5)                                  # prime: compile, warm the tiers
+        # Prime OUTSIDE the scrub range below (0.10..0.65): the prime prefetches its own
+        # neighbours (0.90, 1.0), so none of the scrubbed values is a cache hit it did not earn.
+        qh.frame(0.95)                                 # prime: compile, warm the tiers
         qh.queue.drain(timeout=60)
 
         # A COMMITTED render started while the user keeps scrubbing — the workload the
@@ -598,6 +607,11 @@ def run_benchmark() -> bool:
     ok = med < 50.0
     print(f"PM-2 benchmark: {med:.2f} ms/frame warm at {BENCH_RES}^2 on {DEVICE} "
           f"(<50 ms target: {'PASS' if ok else 'FAIL'})")
+    if torch.cuda.is_available():
+        cap = "sm_" + "".join(map(str, torch.cuda.get_device_capability(0)))
+        print(f"  NOTE: measured on {cap} — PM-2 names the sm_120 box.")
+    else:
+        print("  NOTE: measured on CPU — PM-2 names the sm_120 box, so a FAIL here is not a regression.")
     return ok
 
 

@@ -183,7 +183,7 @@ def capacity(budget_mb: int) -> list:
     return out
 
 
-def residency(res: int, budget_mb: int) -> list:
+def residency(res: int) -> list:
     """The ladder, driven through the shipped ResultCache rather than a mock — so what is
     measured is the code that runs, including the lock discipline and the drain path."""
     if not torch.cuda.is_available():
@@ -193,19 +193,21 @@ def residency(res: int, budget_mb: int) -> list:
         f = frame(res, res, device="cuda")
         per_mb = f.numel() * 4 / (1 << 20)
 
-        # Demote: hold two frames, ceiling of one.
+        # Demote: the VRAM ceiling is about one frame, so put("b") already demotes "a"; the
+        # timed put("c") demotes "b". `demotions` reports the delta across the timed put.
         c = tex_results.ResultCache(cache_dir=d)
         c.set_vram_budget(int(per_mb) + 1)
         c.put("a", f)
         c.put("b", f)
         torch.cuda.synchronize()
+        demotions_before = c.stats()["demotions"]
         t0 = time.perf_counter()
         c.put("c", f)                       # pushes the coldest out of VRAM
         torch.cuda.synchronize()
         demote_ms = (time.perf_counter() - t0) * 1e3
         st = c.stats()
         rows.append({"row": "put that triggers a demotion", "ms": demote_ms,
-                     "demotions": st["demotions"], "demoted_now": st["demoted"],
+                     "demotions": st["demotions"] - demotions_before, "demoted_now": st["demoted"],
                      "vram_mb": round(st["vram_bytes"] / (1 << 20), 1)})
 
         # Promote: hit the demoted frame.
@@ -316,7 +318,7 @@ def main() -> int:
 
     par = pareto(args.resolution)
     cap = capacity(args.budget_mb)
-    resi = residency(min(args.resolution, 2048), args.budget_mb)
+    resi = residency(min(args.resolution, 2048))
 
     print(f"\nCACHE-8 Pareto @ {args.resolution}^2 x4 fp32 "
           f"({args.resolution**2*16/(1<<20):.0f} MB/frame)")

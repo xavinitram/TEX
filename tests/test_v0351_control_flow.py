@@ -493,13 +493,13 @@ def test_control_flow_language_md_states_the_loop_bound(r: SubTestResult):
     try:
         lang = _read("LANGUAGE.md")
         assert "static ranges for" not in lang, "LANGUAGE.md still claims static `for` ranges"
-        assert "Every loop is capped\nat 1024 iterations" in lang.replace("\r\n", "\n")
+        assert "Every loop is capped\nat 1024 iterations" in lang
         sec = lang[lang.index("### 7.1 Uniform and per-pixel conditions"):]
         sec = sec[:sec.index("\n---")]
         for needle in ("whose condition is per-pixel runs **every** pixel for as many passes as",
                        "does not mask the body",
                        "for (int i = 0; i < $max; i++) { if (i < n) { sum += tap; } }"):
-            assert needle in sec.replace("\r\n", "\n").replace("\n  ", " "), f"§7.1 lacks {needle!r}"
+            assert needle in sec.replace("\n  ", " "), f"§7.1 lacks {needle!r}"
         dev = _read("DEVELOPMENT.md")
         assert "keeps the loop running while any pixel's condition holds" in dev
         r.ok("LANGUAGE.md states the 1024 cap and the per-pixel loop bullet; DEVELOPMENT.md agrees")

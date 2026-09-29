@@ -1,9 +1,9 @@
-"""v0.33.1 — the v0.33.0 release-audit findings, each pinned by a row that fails pre-fix.
+"""v0.33.1 — the v0.33.0 release-audit findings, pinned by rows that fail pre-fix.
 
 All eight live behind ARMED paths (residency via `set_vram_budget`/GOV-1, the spill tier, or
 opt-in `storage="uint16"`); none is reachable from the default ComfyUI cook. That is why this
 is a patch release and not a recall — but "unreachable today" is a property of the wiring, not
-of the code, so each one is closed and pinned rather than documented as unlikely.
+of the code, so each one is closed, and all but A6 are pinned by a row that fails pre-fix.
 
   A1  a doubly-demoted frame drove `_bytes_by_dev["cuda"]` NEGATIVE and permanently disabled
       residency (the governor was then reading garbage)
@@ -12,7 +12,8 @@ of the code, so each one is closed and pinned rather than documented as unlikely
       frame that spilled during `reindex_disk`'s scan
   A4  uint16 frames were destroyed by the spill tier: written, indexed, and unloadable
   A5  `clear(disk=True)` lost to an in-flight spill, resurrecting a cleared frame
-  A6  `_restore`'s stale-epoch cleanup mutated the index unlocked
+  A6  `_restore`'s stale-epoch cleanup mutated the index unlocked (closed by moving it under
+      the lock; NO row pins it - a stale artifact needs a moved environment epoch)
   A7  the "never demote the MRU" guard was dead code — the just-cooked frame was demoted
   A8  fp64-cooked packed frames restored as raw fp16
 """
@@ -70,12 +71,21 @@ def test_v0331_a1_double_demotion_cannot_skew_the_byte_totals(r):
             return real_egress(src, **kw)
 
         streams.egress = blocking_egress
-        t = threading.Thread(target=c._drain_demotes, daemon=True)
+        worker_errors = []
+
+        def first_drain():
+            try:
+                c._drain_demotes()
+            except BaseException as exc:              # noqa: BLE001 — surfaced below
+                worker_errors.append(exc)
+
+        t = threading.Thread(target=first_drain, daemon=True)
+        reached = False
         try:
             with c._lock:
                 c._queue_demotions(1 << 30)
             t.start()
-            inside.wait(5)
+            reached = inside.wait(5)
             streams.egress = real_egress              # the second drain runs unblocked
             with c._lock:
                 c._queue_demotions(1 << 30)           # the re-queue the fix must prevent
@@ -83,7 +93,13 @@ def test_v0331_a1_double_demotion_cannot_skew_the_byte_totals(r):
             release.set()
             t.join(timeout=5)
         finally:
+            release.set()
             streams.egress = real_egress
+        if not reached or t.is_alive() or worker_errors:
+            r.fail("A1 byte skew",
+                   f"the race did not run: first drain reached egress={reached}, "
+                   f"still alive={t.is_alive()}, errors={worker_errors!r}")
+            return
         with c._lock:
             got, truth = dict(c._bytes_by_dev), _recount(c)
             demotions = c.demotions
@@ -152,8 +168,9 @@ def test_v0331_a2_restore_returns_the_representation_atomically(r):
 
 
 def test_v0331_a2_a_racing_clear_never_serves_storage_dtype(r):
-    """The behaviour, raced deliberately with a widened switch interval. `get` must return fp32
-    or nothing — never the fp16 bytes."""
+    """The behaviour. `get` must return fp32 or nothing — never the fp16 bytes. The racing
+    `clear()` is fired by a hook on the re-admit (deterministic, no switch interval), and the
+    row fails if the hook never fired."""
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d, budget_mb=0)
         f = _frame(res=64)
@@ -165,10 +182,12 @@ def test_v0331_a2_a_racing_clear_never_serves_storage_dtype(r):
         # acquisition — by blocking inside the last thing `_restore` does. A sleep-and-hope race
         # proves nothing on a fast box; this fires every run.
         real_admit = tex_results.ResultCache._admit
+        fired = []
 
         def clearing_admit(self, *a, **kw):
             entry = real_admit(self, *a, **kw)
             if kw.get("home") is not None or len(a) >= 4:
+                fired.append(True)
                 self.clear()                           # the entry vanishes right here
             return entry
 
@@ -178,9 +197,14 @@ def test_v0331_a2_a_racing_clear_never_serves_storage_dtype(r):
         finally:
             tex_results.ResultCache._admit = real_admit
         leaked = out is not None and out.dtype is not torch.float32
-        r.ok(f"A2: a clear() landing mid-restore yields "
-             f"{'a miss' if out is None else 'float32'}, never storage dtype") if not leaked \
-            else r.fail("A2 dtype leak", f"served {out.dtype} to a caller owed float32")
+        if not fired:
+            r.fail("A2 dtype leak", "the racing clear() never fired (the re-admit's call shape "
+                                    "changed), so nothing was raced")
+        elif leaked:
+            r.fail("A2 dtype leak", f"served {out.dtype} to a caller owed float32")
+        else:
+            r.ok(f"A2: a clear() landing mid-restore yields "
+                 f"{'a miss' if out is None else 'float32'}, never storage dtype")
         c.clear(disk=True)
 
 
@@ -203,8 +227,11 @@ def test_v0331_a3_reindex_never_rebinds_over_a_racing_spill(r):
             c._spilled = None                          # the fresh/reattach state
         real_scandir = os.scandir
         calls = {"n": 0}
+        rdir = os.path.realpath(c._spill_dir())
 
         def racing_scandir(path):
+            if os.path.realpath(str(path)) != rdir:    # another thread or directory: not ours
+                return real_scandir(path)
             # FIRE ON THE MEMBERSHIP WALK, NOT THE SWEEP. `reindex_disk` calls `sweep_temps()`
             # first, which scandirs the same directory — a first draft of this row injected
             # there, so the spill landed BEFORE the walk, the walk saw it, and the row passed
@@ -445,8 +472,11 @@ def test_v0331_a3_a_learned_membership_set_also_survives_the_scan(r):
         assert c._spilled is not None
         real_scandir = os.scandir
         calls = {"n": 0}
+        rdir = os.path.realpath(c._spill_dir())
 
         def racing_scandir(path):
+            if os.path.realpath(str(path)) != rdir:    # another thread or directory: not ours
+                return real_scandir(path)
             calls["n"] += 1
             it = real_scandir(path)
             if calls["n"] == 2:                        # the membership walk, not sweep_temps

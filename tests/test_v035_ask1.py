@@ -19,7 +19,7 @@ also consumes a grid-sized builtin alongside convolve's result (e.g.
 add a guard inside fn_convolve that this ask does not call for.
 """
 from helpers import *
-from failure_harness import run_tier, max_diff
+from failure_harness import run_tier
 
 
 def _raises(code, bindings, tier, needle):

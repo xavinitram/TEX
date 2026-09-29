@@ -8,7 +8,10 @@ Measures cook time across the full matrix:
 
   - compile OFF = tree-walking interpreter
   - compile ON  = execute_compiled() (torch.compile, falls back to interpreter)
-  - cold        = first run, includes (re)compilation
+  - cold        = first run with the in-memory compiled cache cleared. The on-disk
+                  TEX/Inductor cache in TEX_CACHE_DIR is NOT cleared, so a compile-ON cold
+                  figure is "cold memory, warm disk" and depends on earlier invocations
+                  that shared the cache dir.
   - warm        = subsequent run, caches primed
 
 Key differences vs the older bench scripts:
@@ -425,7 +428,8 @@ def _same_tree(sys_a: dict, sys_b: dict) -> bool:
 
 
 def _pairing_rows(a_results: dict, b_results: dict) -> dict:
-    """Per-config geomean speedup (a/b) and the row range, for one pairing."""
+    """Per-config geomean speedup of `a` over `b` (b_time / a_time, so >1 means `a` is
+    faster, the orientation `compare()` uses) and the row range, for one pairing."""
     out = {}
     for cfg in CONFIGS:
         amap = _valid_medians(a_results.get(cfg, {}))
@@ -435,7 +439,7 @@ def _pairing_rows(a_results: dict, b_results: dict) -> dict:
             bcur = bmap.get(name)
             if not bcur or bcur <= 0 or acur <= 0:
                 continue
-            speedups.append(acur / bcur)
+            speedups.append(bcur / acur)
         out[cfg] = {
             "geomean": _geomean(speedups),
             "min": min(speedups) if speedups else None,
@@ -453,10 +457,11 @@ def _leg_label(name: str, info: dict) -> str:
 
 def compare_multi(legs: list, require_null_leg: bool = False) -> None:
     """`legs`: `[(name, {"system": ..., "results": ...}), ...]`, 3 or more (the current
-    run plus 2+ `--compare` files). Prints every pairing's per-config geomean and row
-    range, labels a same-tree pairing NULL, and — with `require_null_leg` — REFUSES to
-    flag a sub-threshold geomean as a verdict (reports it instead) unless at least one
-    NULL pairing exists somewhere in this sitting to calibrate the threshold against."""
+    run plus 2+ `--compare` files). Prints every pairing's per-config geomean speedup
+    (left leg over right leg; below 0.95x = the left leg is slower) and row range,
+    labels a same-tree pairing NULL, and — with `require_null_leg` — REFUSES to flag a
+    sub-threshold geomean as a verdict (reports it instead) unless at least one NULL
+    pairing exists somewhere in this sitting to calibrate the threshold against."""
     n = len(legs)
     pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
     null_pairs = {(i, j) for i, j in pairs

@@ -166,6 +166,14 @@ def main() -> int:
         base_path = args.compare if os.path.isabs(args.compare) else os.path.join(_HERE, args.compare)
         with open(base_path, encoding="utf-8") as f:
             base = json.load(f)
+        bmeta = base.get("meta", {})
+        mismatched = [f for f in ("resolution", "roi", "frames", "gpu")
+                      if bmeta.get(f) is not None and bmeta.get(f) != out["meta"].get(f)]
+        if mismatched:
+            print(f"\n=== compare vs {args.compare}: REFUSED, the measurement setup differs ===")
+            for f in mismatched:
+                print(f"  {f}: baseline={bmeta.get(f)!r}  current={out['meta'].get(f)!r}")
+            return 1
         print(f"\n=== compare vs {args.compare} (>1.00 = faster now) ===")
         for dev, rows in out["rows"].items():
             brows = base.get("rows", {}).get(dev)

@@ -22,18 +22,7 @@ _ADAPTER_FILES = frozenset(("tex_runtime/host.py", "tex_node.py"))
 
 def test_port1_import_lint(r: SubTestResult):
     print("\n--- PORT-1: comfy / comfy_api imports are pinned to the two adapter files ---")
-    offenders = []
-    for path in _PKG.rglob("*.py"):
-        rel = path.relative_to(_PKG).as_posix()
-        if rel in _ADAPTER_FILES or "/tests/" in f"/{rel}" or rel.startswith("tests/"):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        for m in _IMPORT_RE.finditer(text):
-            line = text[:m.start()].count("\n") + 1
-            offenders.append(f"{rel}:{line}")
+    offenders = lint_sources(_IMPORT_RE.pattern, allow=_ADAPTER_FILES, flags=re.M)
     if offenders:
         r.fail("PORT-1 import lint",
                "comfy/comfy_api imported outside the two adapter files (re-scatter): "

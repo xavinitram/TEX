@@ -424,10 +424,6 @@ def test_fus1_hardening(r: SubTestResult):
         assert all("B" not in rg["order"] for rg in regs), "C4: param_wired B folded"
 
         # C5: wired-code terminal -> no region
-        assert _plans({"A": "@OUT=@in*1.1;", "B": "@OUT=@in+vec4(0.1);", "T": ""},
-                      [_E("S", 0, "A", "in"), _E("A", 0, "B", "in"),
-                       _E("A", 0, "T", "x"), _E("B", 0, "T", "y")],
-                      ) == [] or True  # (T code_wired via flag below)
         nodes5 = [{"id": "A", "code": "@OUT=@in*1.1;", "params": {}, "code_wired": False, "param_wired": False},
                   {"id": "B", "code": "@OUT=@in+vec4(0.1);", "params": {}, "code_wired": False, "param_wired": False},
                   {"id": "T", "code": "", "params": {}, "code_wired": True, "param_wired": False}]
@@ -491,15 +487,10 @@ def test_fus1_hardening(r: SubTestResult):
         def _fanout(n):
             ids = [f"n{i}" for i in range(n)]
             head, term, middles = ids[0], ids[-1], ids[1:-1]
-            code = {head: "@OUT=@in*1.1;"}
             edges = [_E("S", 0, head, "in")]
-            reads = []
             for i, m in enumerate(middles):
-                code[m] = "@OUT=@in+vec4(0.01,0,0,0);"
                 edges.append(_E(head, 0, m, "in"))          # head -> each middle
                 edges.append(_E(m, 0, term, f"b{i}"))        # each middle -> terminal
-                reads.append(f"@b{i}")
-            code[term] = "@OUT = (" + " + ".join(reads) + f") / {len(middles)}.0;"
             return F.detect_fusable_regions({k: _N() for k in ids}, edges)
         assert len(_fanout(16)) == 1, "C16: 16-stage region rejected"
         assert _fanout(17) == [], "C16: 17-stage region not capped"
@@ -528,9 +519,9 @@ def test_cache0_orphan_cg_census(r: SubTestResult):
         from TEX_Wrangle.tex_cache import TEXCache
         import TEX_Wrangle.tex_cache as tc
         d = Path(tempfile.mkdtemp(prefix="tex_c0t_"))
+        _max, _grace = tc._CG_DISK_MAX_ENTRIES, tc._CG_ORPHAN_GRACE_SEC
         try:
             c = TEXCache(cache_dir=d)
-            _max, _grace = tc._CG_DISK_MAX_ENTRIES, tc._CG_ORPHAN_GRACE_SEC
             tc._CG_DISK_MAX_ENTRIES, tc._CG_ORPHAN_GRACE_SEC = 10, 3600
             now = time.time()
             for i in range(25):   # aged orphans (no sibling .pkl) -> evictable

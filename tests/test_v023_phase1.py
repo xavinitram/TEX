@@ -77,13 +77,14 @@ def test_roi1_derivation_matches_historical(r: SubTestResult):
     except Exception as e:
         r.fail("ROI-1 public attribute", f"{type(e).__name__}: {e}")
 
-    # (3) The derived non_local property agrees with footprint != 'point' for EVERY
-    #     entry — the invariant that keeps every `.non_local` reader (TST-3,
-    #     gen_function_reference) correct without a stored boolean.
+    # (3) The derived non_local property agrees with the hand-classified set for EVERY
+    #     entry (all of an entry's names on the same side) — the invariant that keeps every
+    #     `.non_local` reader (TST-3, gen_function_reference) correct without a stored boolean.
     try:
-        bad = [e.name for e in R.REGISTRY if e.non_local != (e.footprint != "point")]
-        assert not bad, f"non_local property disagrees with footprint for: {bad}"
-        r.ok("StdlibEntry.non_local == (footprint != 'point') for all entries")
+        bad = [e.name for e in R.REGISTRY
+               if {n in _EXPECTED_NON_LOCAL for n in e.names} != {e.non_local}]
+        assert not bad, f"non_local property disagrees with the classified set for: {bad}"
+        r.ok("StdlibEntry.non_local matches the classified non-local set for all entries")
     except Exception as e:
         r.fail("ROI-1 property", f"{type(e).__name__}: {e}")
 
@@ -479,9 +480,8 @@ def test_lang3_compat_corpus(r: SubTestResult):
     import compat_corpus
 
     # R2-archive (v0.34): the goldens are a per-version append-only ARCHIVE, and current
-    # behavior is checked against EVERY frozen version, not just the latest. Today there is
-    # exactly one (0.23), so this loop runs once and asserts precisely what the single-file
-    # version asserted — which is the proof the mechanism is neutral.
+    # behavior is checked against EVERY frozen version, not just the latest: the loop runs
+    # once per version in the archive (0.23, 0.24 and 0.25 at present).
     try:
         archive = compat_corpus.load_archive()
     except Exception as e:

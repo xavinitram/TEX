@@ -22,7 +22,6 @@ Shapes (roadmap §10.4): CANARY for the disarmed default and the class exemption
 for the admission arithmetic (explicit numbers in → explicit verdict out, autotier's
 discipline), NEVER-SEVER ROWS for the shed order.
 """
-import contextlib
 import threading
 
 import pytest
@@ -33,19 +32,6 @@ from TEX_Wrangle import tex_engine, tex_cookqueue as Q
 from TEX_Wrangle.tex_runtime import profile as P
 
 _WAIT = 10.0
-
-
-@contextlib.contextmanager
-def _armed():
-    """Arm the profiler on a clean table, and always disarm — a leaked `enable()` would put a
-    CUDA sync into every later test in the suite."""
-    P.reset()
-    P.enable()
-    try:
-        yield P
-    finally:
-        P.disable()
-        P.reset()
 
 
 # ── PROF-1 ────────────────────────────────────────────────────────────────────
@@ -69,7 +55,7 @@ def test_v031_prof1_disarmed_by_default(r: SubTestResult):
 
 def test_v031_prof1_records_and_predicts(r: SubTestResult):
     print("\n--- v0.31 PROF-1: an armed cook is measured and predicted ---")
-    with _armed():
+    with armed_profiler():
         A = make_img(1, 128, 128, 4, seed=31)
         code = "@OUT = vec4(@A.rgb * 1.1 + vec3(0.01), 1.0);"
         for _ in range(4):
@@ -97,7 +83,7 @@ def test_v031_prof1_records_and_predicts(r: SubTestResult):
 def test_v031_prof1_sampling_gate(r: SubTestResult):
     """The rate limiter is the reason a CUDA-syncing profiler can be left armed at all."""
     print("\n--- v0.31 PROF-1: warmup then 1-in-N sampling ---")
-    with _armed():
+    with armed_profiler():
         key = P.make_key("gate-probe", "cpu", "fp32")
         px = 512 * 512
         warm = [P.should_sample(key, px) for _ in range(P._WARMUP_SAMPLES)]
@@ -129,10 +115,10 @@ def test_v031_prof1_per_stage_breakdown(r: SubTestResult):
     readings against each other -- a genuine wall-clock magnitude claim (`hms > 2.0 * sms`),
     not a fakeable count or ordering, so there is no structural rewrite that preserves the
     intent. Marked `timing` rather than restructured; GATE-47's scanner (`test_gate47_wallclock_
-    ratchet.py`) is taught this exact shape below so a FUTURE unmarked instance of it is
+    ratchet.py`) is taught this exact shape, so a FUTURE unmarked instance of it is
     caught before it ships, the way `test_r3_microbenchmark_...` was in CI-461."""
     print("\n--- v0.31 PROF-1: per-stage cost in a fused chain ---")
-    with _armed():
+    with armed_profiler():
         A = make_img(1, 256, 256, 4, seed=31)
         heavy_code = "@OUT = gauss_blur(gauss_blur(gauss_blur(gauss_blur(@IN, 8.0), 8.0), 8.0), 8.0);"
         payload = {"schema": 1,
@@ -172,7 +158,7 @@ def test_v031_prof1_per_stage_breakdown(r: SubTestResult):
 
 def test_v031_prof1_predicts_an_unseen_resolution(r: SubTestResult):
     print("\n--- v0.31 PROF-1: an unmeasured resolution scales from a measured one ---")
-    with _armed():
+    with armed_profiler():
         key = P.make_key("scale-probe", "cpu", "fp32")
         P.record(key, 10.0, 256 * 256)
         got = P.predict(key, 512 * 512)
@@ -186,7 +172,7 @@ def test_v031_prof1_predicts_an_unseen_resolution(r: SubTestResult):
 
 def test_v031_prof1_ignores_a_failed_cook(r: SubTestResult):
     print("\n--- v0.31 PROF-1: a cook that raised is not recorded ---")
-    with _armed():
+    with armed_profiler():
         key = P.make_key("raise-probe", "cpu", "fp32")
         try:
             with P.measure(key, 4096, device="cpu"):
@@ -211,20 +197,24 @@ def test_v031_pred1_admission_arithmetic(r: SubTestResult):
     print("\n--- v0.31 PRED-1: admission by confidence x predicted cost ---")
     # A 10 ms floor, so the rows straddle it rather than all clearing the 2 ms default.
     _FLOOR = 10.0
+    # The verdicts are literals, not recomputed from the product. Every confidence here clears
+    # the per-factor confidence bound and every cost the cost bound (those have their own row
+    # below), so each refusal is the saving floor alone.
     rows = [
-        # (confidence, cost_ms, why this row exists)
-        (0.9, 40.0, "likely and expensive — the case speculation exists for"),
-        (0.02, 400.0, "a long render nobody will probably want (0.02 x 400 = 8)"),
-        (1.0, 0.3, "certain but trivial — there is no latency to hide"),
-        (0.4, 30.0, "12 ms of expected saving — over the floor on both terms"),
+        # (confidence, cost_ms, admitted, why this row exists)
+        (0.9, 40.0, True, "likely and expensive — the case speculation exists for"),
+        (0.5, 10.0, False, "5 ms of expected saving — under the floor on the product alone"),
+        (1.0, 0.3, False, "certain but trivial — there is no latency to hide"),
+        (0.4, 30.0, True, "12 ms of expected saving — over the floor on both terms"),
+        (0.5, 20.0, True, "exactly on the floor (10 ms) — admitted"),
+        (0.5, 19.9, False, "just under the floor (9.95 ms) — refused"),
     ]
     policy = _pol(min_value_ms=_FLOOR, max_pending=99)
-    for conf, cost, why in rows:
+    for conf, cost, expect, why in rows:
         job = Q.Job(id=0, klass=Q.SPECULATIVE, fn=lambda c: None,
                     confidence=conf, cost_ms=cost)
         got = policy.admit(job)
-        expect = (conf * cost) >= _FLOOR
-        r.ok(f"conf {conf} x {cost} ms = {job.score:.1f} -> "
+        r.ok(f"conf {conf} x {cost} ms = {job.score:.2f} -> "
              f"{'admit' if got else 'refuse'}  ({why})") if got == expect else \
             r.fail("PRED-1 arithmetic",
                    f"conf={conf} cost={cost} score={job.score} admitted={got}, expected {expect}")
@@ -275,7 +265,7 @@ def test_v031_prof1_fused_chains_key_apart(r: SubTestResult):
     chain — so the key degenerated to `None|device|precision` and two structurally different
     chains collapsed onto ONE entry, inverting the per-stage ranking CACHE-7 reads in v0.32."""
     print("\n--- v0.31 PROF-1: two different fused chains are two keys ---")
-    with _armed():
+    with armed_profiler():
         A = make_img(1, 96, 96, 4, seed=31)
         term = "@OUT = vec4(@IN.rgb + vec3(0.01), 1.0);"
         for tail in ("@OUT = gauss_blur(@IN, 3.0);", "@OUT = vec4(@IN.rgb * 0.5, 1.0);"):

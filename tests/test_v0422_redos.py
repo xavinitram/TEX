@@ -279,7 +279,7 @@ import json, re, time
 sched4_pattern = {sched4_pattern!r}
 sched4_flags = {sched4_flags!r}
 sched4_rx = re.compile(sched4_pattern, sched4_flags)
-bad = "from " + "." * 20000
+bad = "from " + "." * 100000   # the old pattern is quadratic: ~1 s at 20k, ~28 s here
 
 t0 = time.perf_counter()
 sched4_rx.match(bad)
@@ -321,7 +321,7 @@ def test_v0422_sched4_pattern_redos_guard(r: SubTestResult):
         return
     elapsed = payload["elapsed"]
     if elapsed < _HARD_BOUND_S:
-        r.ok(f"\"from \" + \".\" * 20000 matched in {elapsed:.6f}s (bound {_HARD_BOUND_S}s)")
+        r.ok(f"\"from \" + \".\" * 100000 matched in {elapsed:.6f}s (bound {_HARD_BOUND_S}s)")
     else:
         r.fail("v0422 sched4 ReDoS guard",
                f"took {elapsed:.3f}s, over the {_HARD_BOUND_S}s hard bound")

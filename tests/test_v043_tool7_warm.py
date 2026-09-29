@@ -119,8 +119,9 @@ def test_tool7_warm_cancel_never_raises(r: SubTestResult):
 
     try:
         warm_state._reset_for_test()
-        info = tex_tool.install_tool(_stock("blur"), tempfile.mkdtemp(), warm=True, device="cpu",
-                                     cancel=_CancelAfter(trips=0))
+        with tempfile.TemporaryDirectory() as d:
+            info = tex_tool.install_tool(_stock("blur"), d, warm=True, device="cpu",
+                                         cancel=_CancelAfter(trips=0))
         if info["ok"] and info.get("warmed", {}).get("cancelled", 0) >= 1:
             r.ok(f"install_tool(warm=True, cancel=...) never raises; warmed={info.get('warmed')}")
         else:
@@ -135,18 +136,28 @@ def test_tool7_warm_cancel_never_raises(r: SubTestResult):
 def test_tool7_warm_cancel_keeps_persisted_verdicts(r: SubTestResult):
     print("\n--- TOOL-7a: a cancelled warm keeps codegen already persisted for earlier variants ---")
     try:
+        from TEX_Wrangle.tex_cache import get_cache, _CG_UNSUPPORTED
         warm_state._reset_for_test()
-        m = _stock("grade")
+        m = _fresh_image_tool()                   # a never-warmed fingerprint (RGB + RGBA keys)
+        keys = tex_tool.tool_warm_keys(m)
+        assert len(keys) == 2, f"an IMAGE tool must key an RGB and an RGBA variant: {keys}"
         token = _CancelAfter(trips=2)             # same grain as the mid-variant test above
         tex_tool.warm_tool(m, device="cpu", cancel=token)
-        # the fp actually warmed (variant 0) should now show up as codegen-warm on a fresh,
-        # side-effect-free status read -- proving the cancel did not undo/skip what had
-        # already been persisted before it fired.
+        # variant 0 was warmed before the cancel fired and must still be there; variant 1 was
+        # cancelled, so it is not, and the status read (True only when EVERY key is warm) is False.
+        cache = get_cache()
+        cg0, cg1 = cache.get_codegen_fn(keys[0]), cache.get_codegen_fn(keys[1])
         status = tex_tool.tool_warm_status(m)
-        if isinstance(status["codegen"], bool):
-            r.ok(f"tool_warm_status readable after a cancelled warm: {status}")
+        if cg0 is None or cg0 is _CG_UNSUPPORTED:
+            r.fail("tool7 cancel keeps persisted verdicts",
+                   "variant 0's codegen was lost by the cancel")
+        elif cg1 is not None and cg1 is not _CG_UNSUPPORTED:
+            r.fail("tool7 cancel keeps persisted verdicts",
+                   "variant 1 was warmed although the cancel fired before it")
+        elif status["codegen"] is not False:
+            r.fail("tool7 cancel keeps persisted verdicts", f"partial warm read as warm: {status}")
         else:
-            r.fail("tool7 cancel keeps persisted verdicts", f"bad status shape: {status}")
+            r.ok(f"cancelled warm kept variant 0's codegen; status reads not-fully-warm: {status}")
     except Exception as e:
         r.fail("tool7 cancel keeps persisted verdicts", f"{type(e).__name__}: {e}")
 
@@ -163,7 +174,8 @@ def test_tool7_warm_without_cancel_is_unchanged(r: SubTestResult):
         else:
             r.fail("tool7 default-path regression", f"expected {len(variants)} variants, got {summary}")
 
-        info = tex_tool.install_tool(_stock("blur"), tempfile.mkdtemp(), warm=True, device="cpu")
+        with tempfile.TemporaryDirectory() as d:
+            info = tex_tool.install_tool(_stock("blur"), d, warm=True, device="cpu")
         if info["ok"] and info.get("warmed", {}).get("cancelled", -1) == 0:
             r.ok("install_tool(warm=True) with no cancel= is unchanged")
         else:

@@ -300,6 +300,13 @@ def _cg_and_inductor_bytes() -> dict:
             "cg_dir": str(cache._cache_dir), "inductor_dir": inductor_dir}
 
 
+def _disk_delta(before: dict, after: dict) -> dict:
+    """The bytes THIS leg added: every leg of a run shares one cache dir, so the totals alone
+    would charge each leg with the artifacts of all the legs before it."""
+    return {**after, "cg_bytes": after["cg_bytes"] - before["cg_bytes"],
+            "inductor_bytes": after["inductor_bytes"] - before["inductor_bytes"]}
+
+
 def _vram_snapshot(device: str) -> dict:
     if device != "cuda" or not torch.cuda.is_available():
         return {"allocated": None, "reserved": None}
@@ -343,6 +350,7 @@ def run_leg(shape: str, device: str, res: int, compile_mode: str, ticks: int,
             autotier.reset()          # a fresh verdict table — see the module docstring
         fx = Fixture(shape, res, device)
         vram_before = _vram_snapshot(device)
+        disk_before = _cg_and_inductor_bytes()
 
         # -- adoption tracking (auto only): the (fp, autotier key) for every stage this shape
         # cooks, and the first tick index at which EVERY one of them reads COMMITTED.
@@ -399,7 +407,7 @@ def run_leg(shape: str, device: str, res: int, compile_mode: str, ticks: int,
 
         vram_after = _vram_snapshot(device)
         out["vram"] = _vram_delta(vram_before, vram_after)
-        out["disk"] = _cg_and_inductor_bytes()
+        out["disk"] = _disk_delta(disk_before, _cg_and_inductor_bytes())
         out["_output"] = last_out
         out["_fixture"] = fx
         return out
@@ -449,6 +457,7 @@ def run_fused_leg(device: str, res: int, compile_mode: str, ticks: int, warmup: 
             tex_compiled.clear_compiled_cache()
         fx = Fixture(shape, res, device)
         vram_before = _vram_snapshot(device)
+        disk_before = _cg_and_inductor_bytes()
         device_type = torch.device(device).type
 
         spec0, term_code0, bind0 = fx.build_fused_spec()
@@ -544,9 +553,11 @@ def run_fused_leg(device: str, res: int, compile_mode: str, ticks: int, warmup: 
                 out["verdict"] = "compiled"
                 out["verdict_reason"] = "the forced tier's compiled artifact is cached and serving"
                 if baseline_first_ms is not None:
-                    # First-tick delta vs the fused/"none" leg's own first tick — both pay the
-                    # same splice+codegen setup, so the delta is dominated by the compile
-                    # itself. Labelled an ESTIMATE, not a measured compile-only span.
+                    # First-tick delta vs the fused/"none" leg's own first tick. Legs share
+                    # one process and run in a fixed order, so the earlier leg populates the
+                    # front-end and fuse caches the later one reuses: the delta is ORDER-
+                    # DEPENDENT and understates setup the later leg did not pay. An ESTIMATE,
+                    # not a measured compile-only span.
                     out["compile_time_ms_estimate"] = round(
                         out["first_cook_ms"] - baseline_first_ms, 4)
             elif fused_fp in tex_compiled._compile_blacklist:
@@ -562,7 +573,7 @@ def run_fused_leg(device: str, res: int, compile_mode: str, ticks: int, warmup: 
 
         vram_after = _vram_snapshot(device)
         out["vram"] = _vram_delta(vram_before, vram_after)
-        out["disk"] = _cg_and_inductor_bytes()
+        out["disk"] = _disk_delta(disk_before, _cg_and_inductor_bytes())
         out["_output"] = last_out
         return out
     except Exception as e:

@@ -54,7 +54,7 @@ from TEX_Wrangle.tex_marshalling import infer_binding_type as _ibt
 
 # Programs chosen along doc-22's decision axes. Codegen/graph WIN on the first
 # three (pointwise/vector/math), LOSE on sample/noise, and passthrough is the
-# 0-kernel trivial case (PF-2). Sources match run_benchmarks' synthetic set.
+# 0-kernel trivial case (PF-2). Sources match run_benchmarks' synthetic set except noise_fbm (no `@ref` read here).
 PROGRAMS = {
     "passthrough":    "@OUT = @A;",
     "math_chain":     "@OUT = vec4(sin(u) * cos(v) + 0.5);",
@@ -115,10 +115,10 @@ def bench_one(name, code, H, W, device, iters):
     sync = torch.cuda.synchronize if str(device).startswith("cuda") else None
     interp = Interpreter()
 
+    # Every leg gets a fresh dict (cheap) and none clones the tensors, so the legs are
+    # charged identically and the times are execution only.
     def run_interp():
-        interp.execute(prog, {k: (v.clone() if isinstance(v, torch.Tensor) else v)
-                               for k, v in bindings.items()},
-                       tm, device=device, output_names=outs)
+        interp.execute(prog, dict(bindings), tm, device=device, output_names=outs)
     ms_interp = timeit(run_interp, iters, sync)
 
     row = {"program": name, "res": max(H, W), "interp_ms": round(ms_interp, 3)}
@@ -126,9 +126,8 @@ def bench_one(name, code, H, W, device, iters):
     fp = f"bench_{name}_{H}x{W}"
 
     def run_codegen():
-        _codegen_only_execute(prog, {k: (v.clone() if isinstance(v, torch.Tensor) else v)
-                                     for k, v in bindings.items()},
-                              tm, device, output_names=outs, fingerprint=fp, time_context=None)
+        _codegen_only_execute(prog, dict(bindings), tm, device, output_names=outs,
+                              fingerprint=fp, time_context=None)
     ms_cg = timeit(run_codegen, iters, sync)
     row["codegen_ms"] = round(ms_cg, 3)
     row["cg_speedup"] = round(ms_interp / ms_cg, 2) if ms_cg > 0 else None
@@ -144,7 +143,7 @@ def bench_one(name, code, H, W, device, iters):
             row["graph_speedup"] = "declined"
         else:
             def run_graph():
-                run_graphed(prog, bindings, tm, device, gfp, output_names=outs)
+                run_graphed(prog, dict(bindings), tm, device, gfp, output_names=outs)
             ms_g = timeit(run_graph, iters, sync)
             row["graph_ms"] = round(ms_g, 3)
             row["graph_speedup"] = round(ms_interp / ms_g, 2) if ms_g > 0 else None

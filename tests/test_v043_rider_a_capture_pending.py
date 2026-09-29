@@ -99,3 +99,31 @@ def test_rt_a_capture_pending_no_side_effect(r: SubTestResult):
         r.ok("_capturable_memo untouched by an unmemoized peek")
     finally:
         _clean_memo()
+
+
+def test_rt_a_capture_pending_never_adopts_a_persisted_verdict_or_walks(r: SubTestResult):
+    print("\n--- RT-a: a persisted verdict is not adopted and the AST walk is not run ---")
+    from TEX_Wrangle.tex_runtime import warm_state as W
+    _clean_memo()
+    real_capturable = graphed._capturable
+    walks = []
+    try:
+        with cold_engine_state():
+            # The verdict is on DISK for this fingerprint but not in the memo, and the load
+            # latch is open: a peek that called `ensure_loaded()`/`load()` would adopt it.
+            graphed._capturable_memo[_FP_UNKNOWN] = (True, 7)
+            W.note_update(_FP_UNKNOWN)
+            W.persist(force=True)
+            graphed._capturable_memo.pop(_FP_UNKNOWN)
+            W._reset_for_test()
+            graphed._capturable = lambda *a, **k: (walks.append(a), real_capturable(*a, **k))[1]
+            got = graphed.capture_pending(_FP_UNKNOWN, "cuda")
+            adopted = _FP_UNKNOWN in graphed._capturable_memo
+        if got is not None or adopted or walks:
+            r.fail("RT-a no pre-trigger",
+                   f"peek returned {got!r}, adopted={adopted}, AST walks={len(walks)}")
+            return
+        r.ok("a persisted verdict is invisible to the peek (None, memo untouched, no AST walk)")
+    finally:
+        graphed._capturable = real_capturable
+        _clean_memo()

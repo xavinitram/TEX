@@ -10,7 +10,8 @@ sys.path.insert(0, str(_b.parent.parent)); sys.path.insert(0, str(_b))
 import torch
 from run_benchmarks import (SYNTHETIC_PROGRAMS, load_example_programs, generate_bindings,
                             compile_program, run_interpreter, _infer_types, gpu_time_ms)
-from TEX_Wrangle.tex_runtime.codegen import try_compile as try_codegen, _CgBreak, _CgContinue
+from TEX_Wrangle.tex_runtime.codegen import (
+    try_compile as try_codegen, _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON
 from TEX_Wrangle.tex_runtime.interpreter import _broadcast_pair, _ensure_spatial
 from TEX_Wrangle.tex_runtime.compiled import _build_codegen_env, _MAX_LOOP_ITERATIONS
@@ -26,7 +27,7 @@ STD = TEXStdlib.get_functions()
 def call_cg(cg_fn, env, bindings, sp):
     cg_fn(env, bindings, STD, DEV, sp, torch, _broadcast_pair, _ensure_spatial,
           torch.where, math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
-          _CgBreak, _CgContinue)
+          _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
     return bindings.get("OUT")
 
 
@@ -55,6 +56,8 @@ def bench(name, H=1024, W=1024):
     try:
         cg_ms = gpu_time_ms(run_cg)
         cg_out = run_cg(); torch.cuda.synchronize()
+    except TypeError:
+        raise  # a codegen signature drift is a bench bug, not a status row
     except Exception as e:
         return name, interp_ms, None, None, f"cg-fail:{str(e)[:30]}", None
 

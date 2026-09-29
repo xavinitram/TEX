@@ -6,10 +6,12 @@ INVARIANT #7 posture, stated once: with no provider registered nothing is constr
 governor's `media` pool reports 0 bytes, and no cook path reaches this module —
 `test_v034_data7_unarmed_costs_nothing` is that assertion, not this sentence.
 """
+import tempfile
+
 import torch
 
 from helpers import devices as _devices
-from TEX_Wrangle import tex_memory, tex_engine, tex_provider
+from TEX_Wrangle import tex_memory, tex_engine, tex_provider, tex_results
 
 
 def _armed(**kw):
@@ -364,10 +366,18 @@ def test_v034_data7_pool_arbitrates_under_the_governor(r):
         assert freed >= held // 2, f"freed {freed} of a requested {held // 2}"
         assert tex_memory._media_pool_bytes("cpu") < held
 
+        # Register a result cache the way a host does (whether one is present depends on which
+        # test ran before), then unregister it.
         reg = tex_memory.get_cache_registry()
-        order = {n: p[2] for n, p in reg._pools.items()}
-        assert order["stdlib"] < order["media"] < order.get("results", 50) <= order["graphs"], \
-            order
+        with tempfile.TemporaryDirectory() as d:
+            tex_memory.register_result_cache(
+                tex_results.ResultCache(cache_dir=d), name="data7-results")
+            try:
+                order = {n: p[2] for n, p in reg._pools.items()}
+            finally:
+                reg.unregister("data7-results")
+        assert "data7-results" in order, f"the result-cache pool is missing: {sorted(order)}"
+        assert order["stdlib"] < order["media"] < order["data7-results"] <= order["graphs"], order
         r.ok("DATA-7: the media pool arbitrates, and drains before the result cache")
     except Exception as e:
         r.fail("DATA-7 governor arbitration", f"{type(e).__name__}: {e}")

@@ -23,7 +23,8 @@ Rows per (device, resolution):
   whole_all      every stage recooked whole-frame     — what a host without CACHE-9 pays
   region_all     every stage recooked over its window — the composition win
   region_mid     a MID-GRAPH edit: the clean prefix stands, the dirty suffix cooks its window
-  peak_mb        RAM held by the frame cache at the end, vs the governor budget
+  memory         ram_mb_undriven (frame cache before arbitration), arbitrate_freed_mb,
+                 cache_ram_mb (after), governor_budget_mb and under_budget
 """
 from __future__ import annotations
 

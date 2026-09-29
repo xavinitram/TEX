@@ -17,7 +17,10 @@ if E[ref]:
     for cfg in E[ref]["results"]:
         line = f"  {cfg:14}"; rows = []
         for t in tags[1:]:
-            if not E[t]: line += " |    n/a  "; continue
+            if not E[t]:
+                line += " |    n/a  "
+                if t == tags[-1]: rows = []      # the range below is for the LAST leg only
+                continue
             rs = []
             for prog, a in E[ref]["results"][cfg].items():
                 b = E[t]["results"].get(cfg, {}).get(prog)

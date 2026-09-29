@@ -64,8 +64,9 @@ def test_eng3_comfy_profile_canary(r: SubTestResult):
     if abs(m.item() - want) > 1e-6:
         fails.append(f"MASK luma/clamp drifted: {m.item()} != {want}")
 
-    lat = prepare_output(torch.rand(1, 4, 5, 4) * 3 - 1, "LATENT")    # never clamped
-    if lat.shape != (1, 4, 1, 4) and lat.dim() != 4:
+    gen = torch.Generator().manual_seed(0)
+    lat = prepare_output(torch.rand(1, 4, 5, 4, generator=gen) * 3 - 1, "LATENT")  # never clamped
+    if tuple(lat.shape) != (1, 4, 4, 5):     # [B,H,W,C] in -> [B,C,H,W] out
         fails.append(f"LATENT shape unexpected: {tuple(lat.shape)}")
     if lat.max() <= 1.0 and lat.min() >= 0.0:
         fails.append("LATENT looks clamped — latents must keep out-of-range values")
@@ -119,6 +120,7 @@ def test_eng3_engine_profile_preserves_values(r: SubTestResult):
                          "v0.20 overlap the node-hop path depends on")
 
     # Host-set, process-wide, and restorable.
+    prev_profile = get_egress_profile()
     try:
         set_egress_profile("engine")
         if get_egress_profile() != "engine":
@@ -126,8 +128,8 @@ def test_eng3_engine_profile_preserves_values(r: SubTestResult):
         if not torch.equal(prepare_output(raw4, "IMAGE"), raw4):
             fails.append("process-wide profile not honored by the default call")
     finally:
-        set_egress_profile("comfy")
-    if get_egress_profile() != "comfy":
+        set_egress_profile(prev_profile)
+    if get_egress_profile() != prev_profile:
         fails.append("profile not restored")
     try:
         set_egress_profile("nonsense")
@@ -481,11 +483,14 @@ def test_eng7_time_barred_from_frozen_tiers(r: SubTestResult):
     for label, code, mode in (("stencil", stencil, "none"), ("simple", simple, "none"),
                               ("simple", simple, "torch_compile"),
                               ("stencil", stencil, "auto"), ("simple", simple, "auto"),
-                              ("simple", simple, "cuda_graph"),
                               ("deep-nest", deep, "none"),
                               ("deep-nest", deep, "torch_compile"),
-                              ("deep-nest", deep, "auto")):
-        out = _N.execute(code=code, device="cpu", compile_mode=mode, precision="fp32",
+                              ("deep-nest", deep, "auto")) + (
+            # select_tier only picks cuda_graph for a cuda device, so that route is
+            # cooked on cuda when there is one and is not counted otherwise.
+            (("simple", simple, "cuda_graph"),) if torch.cuda.is_available() else ()):
+        dev = "cuda" if mode == "cuda_graph" else "cpu"
+        out = _N.execute(code=code, device=dev, compile_mode=mode, precision="fp32",
                          A=flat, _tex_time=_json.dumps({"frame": 0.9}))
         vals = out if isinstance(out, tuple) else getattr(out, "args", out)
         got = vals[0][0, 8, 8, 0].item()
@@ -590,12 +595,22 @@ def test_eng2_null_host_measures_vram(r: SubTestResult):
         # The allocator-slack correction is the point: memory torch has RESERVED but not
         # allocated is free to TEX, though the driver counts it used. Without it a
         # standalone cook under-reads its budget and tiles for no reason.
-        blob = torch.empty(int(64e6 // 4), dtype=torch.float32, device="cuda")
+        blob_bytes = 64_000_000
+        blob = torch.empty(blob_bytes // 4, dtype=torch.float32, device="cuda")
         del blob                       # freed to torch's cache, NOT back to the driver
-        driver_only, _ = torch.cuda.mem_get_info(0)
-        with_slack = null.get_free_memory("cuda")
-        if with_slack < driver_only:
-            fails.append(f"slack correction went backwards: {with_slack} < {driver_only}")
+        # Sampled back to back; another process allocating in between only LOWERS the gain,
+        # so any one of three tries reaching the bound is enough. The freed blob sits in
+        # torch's cache, so a working correction adds at least most of it to the driver's view.
+        gains = []
+        for _attempt in range(3):
+            driver_only, _ = torch.cuda.mem_get_info(0)
+            with_slack = null.get_free_memory("cuda")
+            gains.append(with_slack - driver_only)
+            if gains[-1] >= 0.9 * blob_bytes:
+                break
+        else:
+            fails.append(f"slack correction missing: free VRAM gained only {max(gains):.0f} "
+                         f"bytes over the driver's figure, want >= {0.9 * blob_bytes:.0f}")
     if null.get_free_memory("cpu") is not None:
         fails.append("get_free_memory('cpu') should be None (this probe is VRAM-only)")
 
@@ -660,7 +675,7 @@ def test_eng2_oom_ladder(r: SubTestResult):
     #     attempt and the ladder re-cooks it in strips. Asserting only that "an OOM
     #     re-raises" would leave the ladder's actual claim — that it turns a failure into
     #     a picture — completely untested, and it would pass with the rung deleted.
-    recovered = "skipped (no CUDA)"
+    recovered = "NOT RUN (needs a CUDA device; this pass covers only the propagation rows)"
     if torch.cuda.is_available():
         gimg = make_img(1, 256, 256, 3, seed=5).cuda()
         state = {"n": 0}
@@ -693,7 +708,8 @@ def test_eng2_oom_ladder(r: SubTestResult):
         r.fail("ENG-2 OOM ladder", "; ".join(fails))
     else:
         r.ok("non-OOM errors propagate untouched; an unrecoverable OOM drops TEX caches "
-             f"then re-raises THE ORIGINAL (ComfyUI's ladder still fires); {recovered}")
+             f"then re-raises THE ORIGINAL (ComfyUI's ladder still fires); tiled recovery "
+             f"rung: {recovered}")
 
 
 def test_eng1_cook_outputs_do_not_alias_inputs(r: SubTestResult):
@@ -717,6 +733,7 @@ def test_eng1_cook_outputs_do_not_alias_inputs(r: SubTestResult):
     # view at offset 3, so its FIRST-ELEMENT address differs from the input's while the
     # BUFFER is the same. `.rgb` starts at offset 0 and is caught either way — which is
     # exactly what made the broken guard look like it worked.
+    prev_profile = get_egress_profile()
     try:
         set_egress_profile("engine")
         for code, out_name in (("@OUT = @A;", "OUT"),            # literal identity
@@ -758,7 +775,7 @@ def test_eng1_cook_outputs_do_not_alias_inputs(r: SubTestResult):
             fails.append("under the 'engine' profile, writing the node's output corrupted "
                          "the caller's input")
     finally:
-        set_egress_profile("comfy")
+        set_egress_profile(prev_profile)
 
     # THE DEFAULT PATH — and the reason the arm above was not evidence. It set the profile
     # first, so it only ever tested a host that had opted in. tex_api.py:35 promises

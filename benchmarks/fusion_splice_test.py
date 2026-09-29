@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Validate tex_fusion.compile_fused: the AST-splicer must be BIT-EQUIVALENT to
-running the stages sequentially, even with deliberate cross-stage name
+"""Validate tex_fusion.compile_fused: the AST-splicer must match running the stages
+sequentially (max abs diff below 1e-5), even with deliberate cross-stage name
 collisions (every stage reuses local `t` and param `amt`) and params."""
 import sys
 from pathlib import Path

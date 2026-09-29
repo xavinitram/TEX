@@ -186,7 +186,7 @@ def test_boundary_key_moves_when_an_unread_plane_changes(r: SubTestResult):
 
 # ── the cook: both tiers, both devices ────────────────────────────────────────────
 
-def test_plane_cook_is_bit_exact_across_tiers(r: SubTestResult):
+def test_plane_cook_agrees_across_tiers(r: SubTestResult):
     print("\n--- DATA-6 L-C2: `@beauty.diffuse + @beauty.specular` cooks on both tiers (invariant #2) ---")
     for dev in devices():
         try:
@@ -194,19 +194,19 @@ def test_plane_cook_is_bit_exact_across_tiers(r: SubTestResult):
                 pv = _pv(B=2, H=16, W=16)
                 pv.planes = {n: t.to(dev) for n, t in pv.planes.items()}
                 res = tex_engine.cook(LIT, {"beauty": pv}, device_mode=dev)
-                interp = res.outputs["OUT"]
+                engine_out = res.outputs["OUT"]
                 ref = ((pv.planes["diffuse"] + pv.planes["specular"]) * pv.planes["Z"])
-                assert interp.shape == (2, 16, 16, 4), interp.shape
-                assert (interp[..., :3] - ref).abs().max().item() < 1e-5
-                assert torch.all(interp[..., 3] == 1.0)
+                assert engine_out.shape == (2, 16, 16, 4), engine_out.shape
+                assert (engine_out[..., :3] - ref).abs().max().item() < 1e-5
+                assert torch.all(engine_out[..., 3] == 1.0)
                 assert sorted(res.binding_names) == ["beauty.Z", "beauty.diffuse", "beauty.specular"], \
                     res.binding_names
                 # the codegen tier, on the SAME expanded bindings the engine cooks (the seam
                 # expands before any tier; the harness drives the tier one layer below routing)
                 expanded = expand_plane_bindings({"beauty": pv}, LIT)
                 cg = fh.run_tier(LIT, expanded, "codegen", device=dev)["OUT"]
-                assert fh.max_diff({"OUT": interp}, {"OUT": cg}) < 1e-5, \
-                    f"interp vs codegen maxdiff {fh.max_diff({'OUT': interp}, {'OUT': cg})}"
+                assert fh.max_diff({"OUT": engine_out}, {"OUT": cg}) < 1e-5, \
+                    f"engine vs codegen maxdiff {fh.max_diff({'OUT': engine_out}, {'OUT': cg})}"
             r.ok(f"[{dev}] engine cook == reference, and codegen == interpreter within 1e-5")
         except Exception as e:
             r.fail(f"[{dev}] plane cook", str(e))

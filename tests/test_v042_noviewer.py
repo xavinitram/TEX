@@ -94,15 +94,18 @@ def test_noviewer_names_no_longer_reserved(r: SubTestResult):
             r.fail(f"noviewer un-reserved {name}", f"{type(e).__name__}: {e}")
 
 
-def _assert_rejects_kwarg(callable_or_none, label: str, fails: list, **extra_ok_kwargs):
-    """Call `callable_or_none(viewer_context=..., **extra_ok_kwargs)` with otherwise-empty/
-    placeholder positional args is not attempted (most of these need real programs) — this
-    instead inspects the signature, which is the stable, side-effect-free way to prove a
-    parameter is gone from a function that is expensive or unsafe to actually invoke."""
+_GONE_PARAMS = ("viewer_context", "viewer")
+
+
+def _assert_rejects_kwarg(fn, label: str, fails: list):
+    """Prove the viewer parameters are gone from `fn` by inspecting its signature — the
+    side-effect-free way to check a function that is expensive or unsafe to actually invoke
+    (most of these need real programs). Both spellings of the parameter are checked."""
     try:
-        sig = inspect.signature(callable_or_none)
-        if "viewer_context" in sig.parameters:
-            fails.append(f"{label} still declares a viewer_context parameter: {sig}")
+        sig = inspect.signature(fn)
+        still = [n for n in _GONE_PARAMS if n in sig.parameters]
+        if still:
+            fails.append(f"{label} still declares {still}: {sig}")
     except (TypeError, ValueError) as e:
         fails.append(f"{label}: could not inspect signature: {e}")
 
@@ -115,6 +118,7 @@ def test_noviewer_kwarg_gone_from_every_seam(r: SubTestResult):
     from TEX_Wrangle.tex_runtime.codegen import _invoke_cg
     from TEX_Wrangle.tex_memory import run_tiled, run_roi, run_tiled_halo, run_batch_strips
     _assert_rejects_kwarg(tex_engine.prepare, "tex_engine.prepare", fails)
+    _assert_rejects_kwarg(tex_engine.cook, "tex_engine.cook", fails)
     _assert_rejects_kwarg(Interpreter.execute, "Interpreter.execute", fails)
     _assert_rejects_kwarg(tex_chain.cook_stage_list, "tex_chain.cook_stage_list", fails)
     _assert_rejects_kwarg(tex_chain.cook_fused_cached, "tex_chain.cook_fused_cached", fails)
@@ -136,7 +140,7 @@ def test_noviewer_kwarg_gone_from_every_seam(r: SubTestResult):
     if fails:
         r.fail("noviewer kwarg removed", "; ".join(fails))
     else:
-        r.ok("19 seams checked by signature — none declares viewer_context/viewer any more")
+        r.ok("20 seams checked by signature — none declares viewer_context or viewer any more")
 
     # And the ACTUAL call-time behaviour, not only the signature: a caller that still
     # passes the old kwarg gets Python's ordinary TypeError, never a silent no-op.

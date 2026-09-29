@@ -263,9 +263,13 @@ def test_v031_eng13_kill_the_process(r: SubTestResult):
         snap_path = os.path.join(d, "warm_state.json")
         snapped = json.load(open(snap_path, encoding="utf-8")).get("capturable", {}) \
             if os.path.exists(snap_path) else {}
+        # ...and it MUST hold the first one, else an absent snapshot passes the check above
+        # and the throttle-window premise was never established.
         r.ok("the snapshot holds the first verdict but not the windowed one") \
-            if "crash-survivor" not in snapped else \
-            r.fail("ENG-13 crash", "the snapshot already had it — the throttle did not hold")
+            if "crash-snapshotted" in snapped and "crash-survivor" not in snapped else \
+            r.fail("ENG-13 crash",
+                   f"snapshot premise broken (first verdict present, windowed absent): "
+                   f"{sorted(snapped)}")
 
         # The child wrote into `d`, which the fixture minted and already points
         # TEX_CACHE_DIR at, so `warm_state._path()` here resolves to the same directory.

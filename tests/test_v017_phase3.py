@@ -51,9 +51,17 @@ def test_str7_codegen_split(r: SubTestResult):
     try:
         # (1) the extracted modules must NOT import back into codegen (strict DAG).
         for mod in ("codegen_stdfns", "codegen_stencil", "codegen_persist"):
-            tree = ast.parse(open(os.path.join(rt, mod + ".py"), encoding="utf-8").read())
-            back = [n.module for n in ast.walk(tree)
-                    if isinstance(n, ast.ImportFrom) and n.module and n.module.endswith("codegen")]
+            with open(os.path.join(rt, mod + ".py"), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            # `from .codegen import x`, `from . import codegen`, `import ...codegen`.
+            back = []
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom):
+                    if (n.module or "").split(".")[-1] == "codegen":
+                        back.append(n.module)
+                    back += [a.name for a in n.names if a.name == "codegen"]
+                elif isinstance(n, ast.Import):
+                    back += [a.name for a in n.names if a.name.split(".")[-1] == "codegen"]
             assert not back, f"{mod} imports back into codegen: {back}"
         r.ok("codegen_stdfns/stencil/persist form a strict DAG (no edge back to codegen)")
     except Exception as e:

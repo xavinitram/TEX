@@ -2,7 +2,9 @@
 // Finds the actual min and max of the input and rescales so
 // the darkest pixel becomes 0 and the brightest becomes 1.
 // Useful after operations that compress the value range.
-// Works with both MASK inputs and IMAGE inputs (converts to luma).
+// Designed for MASK inputs. An IMAGE input is converted to luma, but
+// the range comes from the per-channel min/max, so a coloured image
+// is only approximately stretched to 0..1.
 
 float val = luma(@mask);
 float lo = luma(img_min(@mask));

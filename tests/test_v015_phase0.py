@@ -137,8 +137,14 @@ def test_uc5_literal_array_index(r: SubTestResult):
         r.fail("literal index out-of-bounds clamps", str(e))
 
     # Interpreter vs codegen equivalence for a literal-index fill+read
-    assert_equiv(r, "literal-index fill/read", """
+    _fill_read = """
         float arr[4];
         for (int i = 0; i < 4; i = i + 1) { arr[i] = float(i); }
         @OUT = vec3(arr[0], arr[2], arr[3]) * 0.1;
-    """, {"A": img})
+    """
+    # assert_equiv counts a declined codegen as a pass: require the tier to engage and
+    # both tiers to agree on shape, so this row cannot go green with nothing compared.
+    _i, _c = run_both(_fill_read, {"A": img})
+    if _c is None or any(_i[k].shape != _c[k].shape for k in _i):
+        r.fail("literal-index fill/read", "codegen declined or returned a different shape")
+    assert_equiv(r, "literal-index fill/read", _fill_read, {"A": img})

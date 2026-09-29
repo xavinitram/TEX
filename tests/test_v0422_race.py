@@ -10,10 +10,13 @@ microseconds), and several reader threads released together the instant the fram
 servable again, so some of them race straight into `_restore` (a fresh disk-tier miss) while
 others may catch the entry the instant it lands in `_ram`, mid-copy.
 
-THE AUDIT traced why this has been so hard to reproduce.
-`_restore`'s H2D (`tex_results.py` around `pinned.to(dev, non_blocking=True)`) records no CUDA
-event and does not synchronize before handing the tensor to `_admit` and back through `get`. But
-nothing reachable from `get`/`put`/`_restore` ever pushes a non-default CUDA stream — grep the
+THE AUDIT traced why this has been so hard to reproduce. (Before the TRK-178 fix,
+`_restore`'s H2D — `pinned.to(dev, non_blocking=True)` in `tex_results.py` — recorded no CUDA
+event and did not synchronize before handing the tensor to `_admit` and back through `get`;
+`_restore` now records a `pending_event` after that copy and `get` waits on it, which is what
+the foreign-stream row below pins. The reasoning that follows is why the same-stream race
+never showed.) But nothing reachable from `get`/`put`/`_restore` ever pushes a non-default
+CUDA stream — grep the
 package for `torch.cuda.stream(`/`set_stream`/`cuda.Stream(` outside `tex_runtime/graphed.py`'s
 warm-up captures (which fence with `wait_stream` before and after and never touch `ResultCache`)
 and outside `tex_runtime/streams.py`'s `egress` (the D2H demote leg, which already carries its
@@ -172,6 +175,7 @@ def test_v0422_race_restore_pinned_h2d_fences_a_foreign_stream(r):
             # this test nothing) or run so late the copy is long done (no window left to catch).
             admitted.set()
 
+        restores_before = c.restores
         t = threading.Thread(target=restorer, daemon=True)
         t.start()
         if not admitted.wait(timeout=10.0):
@@ -192,10 +196,12 @@ def test_v0422_race_restore_pinned_h2d_fences_a_foreign_stream(r):
         # (or lack of them) that matter; synchronizing here only makes the SNAPSHOT readable.
         torch.cuda.synchronize()
         matched = snapshot is not None and torch.equal(snapshot, frame)
+        restored = c.restores - restores_before
         ok = (not hung and not outcome.get("restorer_is_none", True) and snapshot is not None
-              and matched)
+              and matched and restored >= 1)
         r.ok("[cuda] a foreign-stream get() right after a restore reads the fenced, "
              "bit-exact frame") if ok else \
             r.fail("v0422 restore race (foreign stream)",
                    f"hung={hung} restorer_is_none={outcome.get('restorer_is_none')} "
-                   f"snapshot_is_none={snapshot is None} matched={matched}")
+                   f"snapshot_is_none={snapshot is None} matched={matched} "
+                   f"restores={restored} (need >= 1: no restore means nothing was raced)")

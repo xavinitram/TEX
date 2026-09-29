@@ -68,6 +68,25 @@ def test_tst5_tier_trace(r: SubTestResult):
         r.skip("TST-5 graph record", "no CUDA on this box")
 
 
+# The stdlib calls whose codegen run crashes on a 3-channel image input and self-falls-back
+# to the interpreter (the whole-image reductions mix a [1,1,1] scalar with [B,H,W] planes).
+# The parity rows below compare the interpreter with itself for exactly these, so the set is
+# pinned: a NEW fallback fails, and a fixed one fails until it is removed from this set.
+_CG_FALLBACK_KNOWN = frozenset({"img_sum", "img_mean", "img_min", "img_max", "img_median"})
+
+
+def _cg_fallback_problem(fell_back, expected):
+    """None when `fell_back` (names whose codegen run fell back to the interpreter) equals
+    `expected`, else a message naming the difference."""
+    new = sorted(set(fell_back) - expected)
+    stale = sorted(expected - set(fell_back))
+    if new:
+        return f"codegen fell back to the interpreter (parity compared it with itself): {new}"
+    if stale:
+        return f"no longer falls back, drop from _CG_FALLBACK_KNOWN: {stale}"
+    return None
+
+
 def test_tst6_registry_parity(r: SubTestResult):
     print("\n--- TST-6: codegen parity auto-derived from FUNCTION_SIGNATURES ---")
     from stdlib_probe import all_generated, SKIP
@@ -87,16 +106,24 @@ def test_tst6_registry_parity(r: SubTestResult):
     # Parity: interp == codegen for every auto-generated stdlib call.
     fails = []
     tested = 0
+    fell_back = []
     for name, (code, binds) in all_generated().items():
         try:
             base = run_tier(code, binds, "interp")
+            tier_trace.reset()
             got = run_tier(code, binds, "codegen")
+            rec = tier_trace.last()
+            if rec is not None and rec.fallback_from == "codegen":
+                fell_back.append(name)
             tested += 1
             md = max_diff(base, got)
             if md > 1e-4:
                 fails.append(f"{name}: maxdiff {md:.2e}")
         except Exception as e:
             fails.append(f"{name}: {type(e).__name__}: {str(e)[:55]}")
+    problem = _cg_fallback_problem(fell_back, _CG_FALLBACK_KNOWN)
+    if problem:
+        fails.append(problem)
     if fails:
         r.fail("TST-6 codegen parity",
                f"{len(fails)}/{tested} diverge:\n  " + "\n  ".join(fails[:25]))
@@ -133,7 +160,7 @@ def test_tst2_edge_matrix(r: SubTestResult):
         "int64":  ({"A": (base_a * 3).long(), "B": (base_b * 3).long()}, 1e-4),
     }
     for edge, (binds, tol) in edges.items():
-        fails, tested = [], 0
+        fails, tested, fell_back = [], 0, []
         for name, (code, _) in gen.items():
             try:
                 # ASK-1: convolve's @B is a KERNEL (batch must be 1 — a kernel batch > 1
@@ -146,7 +173,11 @@ def test_tst2_edge_matrix(r: SubTestResult):
                     edge_binds = dict(binds)
                     edge_binds["B"] = make_img(1, 8, 8, 3, seed=2)
                 b = run_tier(code, edge_binds, "interp")
+                tier_trace.reset()
                 c = run_tier(code, edge_binds, "codegen")
+                rec = tier_trace.last()
+                if rec is not None and rec.fallback_from == "codegen":
+                    fell_back.append(name)
                 tested += 1
                 md = _nan_diff(b, c)
                 if md > tol:
@@ -157,6 +188,11 @@ def test_tst2_edge_matrix(r: SubTestResult):
                         fails.append(f"{name}: fp16 non-finite (NaN/inf on normal pixels)")
             except Exception as e:
                 fails.append(f"{name}: {type(e).__name__}: {str(e)[:45]}")
+        # a 1x1 image has no [B,H,W] plane to mismatch, so nothing falls back there
+        problem = _cg_fallback_problem(
+            fell_back, frozenset() if edge == "1x1" else _CG_FALLBACK_KNOWN)
+        if problem:
+            fails.append(problem)
         if fails:
             r.fail(f"TST-2 edge={edge}",
                    f"{len(fails)}/{tested}:\n  " + "\n  ".join(fails[:15]))
@@ -726,9 +762,10 @@ def test_a1_1_auto_precision_fuzz(r: SubTestResult):
     o16 = Interpreter().execute(prog, binds, tm, device="cuda", output_names=["OUT"], precision="fp16")["OUT"]
     o32 = Interpreter().execute(prog, binds, tm, device="cuda", output_names=["OUT"], precision="fp32")["OUT"]
     if (o16.float() - o32.float()).abs().max().item() <= BAR:
-        r.ok("[note] amplifier within bar at fp16 (self-test weak here) — proceeding")
-    else:
-        r.ok("self-test: an fp16 amplifier exceeds the bar (accuracy check live)")
+        r.fail("A1-1 self-test", "the fp16 amplifier stayed within the bar - the accuracy "
+               "check below could not fail")
+        return
+    r.ok("self-test: an fp16 amplifier exceeds the bar (accuracy check live)")
 
     fails, checked, fp16_taken = [], 0, 0
     for _ in range(N):
@@ -765,6 +802,8 @@ def test_a1_1_auto_precision_fuzz(r: SubTestResult):
     if fails:
         r.fail("A1-1 auto fuzz", f"{len(fails)}/{checked} (fp16 taken {fp16_taken}):\n  " +
                "\n  ".join(fails[:10]))
+    elif fp16_taken == 0:
+        r.fail("A1-1 auto fuzz", f"none of {checked} programs took fp16, so nothing was compared")
     else:
         r.ok(f"{checked} programs gated; {fp16_taken} took fp16, all within {BAR} of fp32")
 

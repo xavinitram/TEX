@@ -34,6 +34,7 @@ import pickle
 import tempfile
 import textwrap
 import threading
+import time
 
 import torch
 
@@ -658,9 +659,11 @@ def test_v0332_h4_learn_spilled_does_not_orphan_a_racing_spill(r):
         real_scandir = os.scandir
         state = {"armed": True}
 
+        rdir = os.path.realpath(c._spill_dir())
+
         def racing_scandir(path):
             it = real_scandir(path)
-            if state["armed"]:
+            if state["armed"] and os.path.realpath(str(path)) == rdir:
                 state["armed"] = False
                 c.put("racer", _flat(5.0, res=32))
                 c.put("push", _frame(res=8))       # evicts racer -> it spills during the walk
@@ -815,9 +818,15 @@ def test_v0332_h7_a_restore_that_starts_inside_a_purge_is_refused_at_capture(r):
             c.hold_admit = True
             tg = threading.Thread(target=lambda: c.get("k"))
             tg.start()
-            # It may be refused at capture (the fix) and never reach `_admit` at all, so this
-            # wait is allowed to time out — that outcome IS the fix working.
-            reached_admit = c.at_admit.wait(3)
+            # It may be refused at capture (the fix) and never reach `_admit` at all — that
+            # outcome IS the fix working. Wait for whichever comes first: the restore parking
+            # at `_admit` (pre-fix) or the restore thread ending (refused), so the green path
+            # does not sit out a timeout.
+            deadline = time.monotonic() + 3
+            while (not c.at_admit.is_set() and tg.is_alive()
+                   and time.monotonic() < deadline):
+                time.sleep(0.002)
+            reached_admit = c.at_admit.is_set()
         finally:
             c.walk_go.set()
             tc.join(20)

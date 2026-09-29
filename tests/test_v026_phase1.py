@@ -42,6 +42,14 @@ def _stock(name):
     return tex_tool.load_tool(os.path.join(_STOCK, name + ".textool"))
 
 
+# One scratch root for every file this module writes; it is removed when the process exits.
+_SCRATCH = tempfile.TemporaryDirectory(prefix="tex_v026_phase1_", ignore_cleanup_errors=True)
+
+
+def _tmpdir() -> str:
+    return tempfile.mkdtemp(dir=_SCRATCH.name)
+
+
 # ── TOOL-1 + STOCK: the release exit gate ──────────────────────────────────────
 def test_tool_roundtrip_unfused(r: SubTestResult):
     print("\n--- TOOL-1: a fused tool cooks BIT-IDENTICAL to the unfused graph (exit gate) ---")
@@ -156,7 +164,7 @@ def test_tool_input_optional(r: SubTestResult):
         assert d[1]["optional"] is True and "optional" not in d[0], d
         s = tex_tool.tool_summary(m)["inputs"]
         assert s[1]["optional"] is True and "optional" not in s[0], s
-        path = tex_tool.write_tool(m, tempfile.mkdtemp())
+        path = tex_tool.write_tool(m, _tmpdir())
         reloaded = tex_tool.load_tool(path)
         assert reloaded.inputs[1]["optional"] is True, reloaded.inputs
 
@@ -215,8 +223,7 @@ def test_tool_warm_keys(r: SubTestResult):
         blob = str(raw)
         assert single[0] not in blob, "a fingerprint leaked into the manifest"
         # install (validate-only default) writes without compiling
-        import tempfile
-        dest = tempfile.mkdtemp()
+        dest = _tmpdir()
         info = tex_tool.install_tool(_stock("grade"), dest, warm=False)
         assert info["ok"] and os.path.exists(info["path"]), info
         assert info["warm_keys"] == [], "validate-only install should not derive warm keys"
@@ -249,7 +256,7 @@ def test_tool_audit5_fixes(r: SubTestResult):
         # (1) install_tool(warm=True) actually materializes a codegen fn (was a dead prewarm call).
         # >= 1: an IMAGE tool now warms both the RGB and RGBA channel variant (audit#6 #8), so a
         # tool with an image input materializes 2 codegen fns; a channel-independent tool, 1.
-        info = tex_tool.install_tool(_stock("grade"), tempfile.mkdtemp(), warm=True, device="cpu")
+        info = tex_tool.install_tool(_stock("grade"), _tmpdir(), warm=True, device="cpu")
         assert info.get("warmed", {}).get("codegen", 0) >= 1, f"warm did not compile: {info}"
         assert not any("warm-compile skipped" in w for w in info["warnings"]), info["warnings"]
         # (2) single-stage preflight is TYPE-AWARE: @image.a on a VEC3 IMAGE input must fail
@@ -510,7 +517,7 @@ def _hash_manifest(m) -> dict:
     a host might rely on, identical on every OS (see the note above _MANIFEST_BASELINE_SHA256)."""
     d = m.to_dict()
     s = tex_tool.tool_summary(m)
-    path = tex_tool.write_tool(m, tempfile.mkdtemp())
+    path = tex_tool.write_tool(m, _tmpdir())
     with open(path, "rb") as fh:
         written = fh.read()
     return {
@@ -1019,10 +1026,10 @@ def test_tool_fused_feeds_manifest_roundtrip(r: SubTestResult):
         d = m.to_dict()
         assert d["inputs"] == _merge_feed_manifest()["inputs"], d["inputs"]
         assert tex_tool.tool_summary(m)["inputs"] == d["inputs"], tex_tool.tool_summary(m)["inputs"]
-        dest = tempfile.mkdtemp()
+        dest = _tmpdir()
         again = tex_tool.load_tool(tex_tool.write_tool(m, dest))
         assert again.to_dict() == d, "write_tool -> load_tool changed the manifest"
-        assert tex_tool.install_tool(m, tempfile.mkdtemp())["ok"]
+        assert tex_tool.install_tool(m, _tmpdir())["ok"]
         # a tuple-spelled feeds (a Python host's dict) normalizes to the JSON shape
         raw = _merge_feed_manifest()
         raw["inputs"][1]["feeds"] = (("terminal", "B"),)
@@ -1447,14 +1454,12 @@ def test_cli_build(r: SubTestResult):
         # a valid stock tool: build_fn returns without exiting
         tex_cli.build_fn(_Args(os.path.join(_STOCK, "grade.textool")))
         # a manifest with a TEX type error: preflight fails -> SystemExit(1)
-        import json as _json
-        import tempfile
         bad = {"manifest_schema": 1, "name": "Bad", "tex_language": "0.23",
                "code": "@OUT = nosuchfn(@image);",
                "inputs": [{"name": "image", "type": "IMAGE"}], "promoted_params": []}
-        fd, p = tempfile.mkstemp(suffix=".textool")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            _json.dump(bad, fh)
+        p = os.path.join(_tmpdir(), "bad.textool")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(bad, fh)
         raised = False
         try:
             tex_cli.build_fn(_Args(p))

@@ -106,8 +106,8 @@ def test_v034_io1_prepare_resolves_and_refuses(r):
             unlanded = Promise("A", type=TEXType.VEC4)
             try:
                 tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": unlanded}, device_mode=dev)
-                r.fail("IO-1 unlanded refusal", "an unlanded promise cooked")
-                return
+                r.fail(f"IO-1 unlanded refusal ({dev})", "an unlanded promise cooked")
+                continue
             except Exception as e:
                 assert getattr(e, "_code", "") == "E7007", f"{getattr(e, '_code', '')}: {e}"
             r.ok(f"IO-1: a landed promise cooks bit-identically; an unlanded one is E7007 ({dev})")
@@ -332,10 +332,12 @@ def test_v034_io1_backpressure_refuses_rather_than_evicting(r):
 
 
 def test_v034_io1_cancellation_drops_on_landing(r):
-    """A cancelled prefetch's result is never installed.
+    """A prefetch cancelled while still QUEUED never runs, so it installs nothing.
 
-    The provider's read cannot be stopped from outside once it has begun; what TEX
-    guarantees is that nothing the host did not still want ends up in the pool."""
+    Only the queued half is pinned here: the tail of the window is cancelled behind the single
+    worker, so the pool must hold exactly the frames of the jobs that were not cancelled. A
+    cancel that lands while the provider's read is already in flight is not covered (that
+    frame is pooled by `materialize` before the job's cancel check runs)."""
     q = Q.CookQueue(name="io1-cancel")
     tex_provider.reset_provider()
     tex_provider.set_provider(tex_provider.SyntheticFrameProvider(res=16, rate=1.0,
@@ -349,9 +351,9 @@ def test_v034_io1_cancellation_drops_on_landing(r):
             q.cancel(j)
         q.drain(20)
         cancelled = sum(1 for j in jobs if j.state == Q.CANCELLED)
-        assert cancelled >= 1, [j.state for j in jobs]
+        assert len(jobs) == 6 and cancelled == 4, [j.state for j in jobs]
         frames = tex_provider.get_media_cache().stats()["frames"]
-        assert frames <= len(jobs) - cancelled + 1, \
+        assert frames == len(jobs) - cancelled, \
             f"{frames} frames pooled after {cancelled} cancellations of {len(jobs)}"
         r.ok(f"IO-1: {cancelled} cancelled prefetches installed nothing (pool={frames})")
     except Exception as e:
@@ -374,9 +376,11 @@ def test_v034_async_write_does_not_block_the_next_cook(r):
     holding, n1_started = threading.Event(), threading.Event()
     release = threading.Event()
     try:
-        frame_n = tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": _img(32)},
-                                  device_mode="cpu").outputs["OUT"]
+        # 4 MB: egress only goes asynchronous inside the pinned band (>= 1 MiB), on CUDA.
+        frame_n = _img(512, dev="cuda" if torch.cuda.is_available() else "cpu")
         handle = streams.egress(frame_n)
+        if frame_n.device.type == "cuda":
+            assert handle._event is not None, "a 4 MB CUDA frame did not take the async path"
 
         written = {}
 
@@ -417,9 +421,12 @@ def test_v034_async_write_bytes_are_bit_exact(r):
     from TEX_Wrangle.tex_runtime import streams
     for dev in _devices():
         try:
-            src = _img(64, dev=dev)
+            src = _img(512, dev=dev)         # 4 MB: inside the pinned band, so CUDA is async
             sync = src.detach().float().cpu().clone()
-            got = streams.egress(src).tensor()
+            handle = streams.egress(src)
+            if dev == "cuda":
+                assert handle._event is not None, "a 4 MB CUDA frame did not take the async path"
+            got = handle.tensor()
             assert torch.equal(got, sync), "a fenced handle's bytes differ from a sync copy"
 
             # host_demo's blit is the shipped consumer: handle and tensor must agree.

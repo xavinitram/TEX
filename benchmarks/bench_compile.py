@@ -25,12 +25,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import json
+import os
 import statistics
 import subprocess
 import sys
 import textwrap
+import tempfile
 import time
 from pathlib import Path
 
@@ -39,6 +42,10 @@ _bench_dir = Path(__file__).resolve().parent
 _pkg_dir = _bench_dir.parent
 _custom_nodes_dir = _pkg_dir.parent
 sys.path.insert(0, str(_custom_nodes_dir))
+
+# Keep torch.compile/.cg artifacts out of the shipping package cache and start cold.
+os.environ.setdefault(
+    "TEX_CACHE_DIR", str(Path(tempfile.gettempdir()) / "tex_bench_compile_cache"))
 
 import torch
 
@@ -63,6 +70,12 @@ WARMUP = 3
 RUNS = 5
 
 
+def _sync(device):
+    """Wait for queued GPU work so a timed region measures execution, not launch."""
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 # -- Measurement (in-process) -----------------------------------------
 
 def measure_interpreter(prog: BenchmarkProgram, B, H, W, device,
@@ -82,18 +95,21 @@ def measure_interpreter(prog: BenchmarkProgram, B, H, W, device,
             out_names = (list(assigned.keys())
                          if assigned and "OUT" not in assigned else None)
         run_interpreter(program, bindings, type_map, device,
-                        out_names, used_builtins=used)
+                        out_names, used_builtins=used, source=prog.code)
+    _sync(device)
 
     times = []
     for _ in range(runs):
         gc.collect()
+        _sync(device)
         t0 = time.perf_counter()
         if cold:
             program, type_map, assigned, used = compile_program(prog.code, btypes)
             out_names = (list(assigned.keys())
                          if assigned and "OUT" not in assigned else None)
         run_interpreter(program, bindings, type_map, device,
-                        out_names, used_builtins=used)
+                        out_names, used_builtins=used, source=prog.code)
+        _sync(device)
         times.append((time.perf_counter() - t0) * 1000)
     return times
 
@@ -110,20 +126,16 @@ def measure_compiled(prog: BenchmarkProgram, B, H, W, device,
                  if assigned and "OUT" not in assigned else None)
 
     # Warmup (one run to prime torch.compile)
+    # A failing call propagates: main() prints ERROR rather than a time-to-exception.
     clear_compiled_cache()
-    try:
-        execute_compiled(program, bindings, type_map, device, fp,
-                         output_names=out_names)
-    except Exception:
-        pass
+    execute_compiled(program, bindings, type_map, device, fp,
+                     output_names=out_names)
 
     if not cold:
         for _ in range(WARMUP - 1):
-            try:
-                execute_compiled(program, bindings, type_map, device, fp,
-                                 output_names=out_names)
-            except Exception:
-                pass
+            execute_compiled(program, bindings, type_map, device, fp,
+                             output_names=out_names)
+    _sync(device)
 
     times = []
     for _ in range(runs):
@@ -133,12 +145,11 @@ def measure_compiled(prog: BenchmarkProgram, B, H, W, device,
             program, type_map, assigned, used = compile_program(prog.code, btypes)
             out_names = (list(assigned.keys())
                          if assigned and "OUT" not in assigned else None)
+        _sync(device)
         t0 = time.perf_counter()
-        try:
-            execute_compiled(program, bindings, type_map, device, fp,
-                             output_names=out_names)
-        except Exception:
-            pass
+        execute_compiled(program, bindings, type_map, device, fp,
+                         output_names=out_names)
+        _sync(device)
         times.append((time.perf_counter() - t0) * 1000)
     return times
 
@@ -185,21 +196,20 @@ _SUBPROCESS_SCRIPT = textwrap.dedent("""\
     out_names = (list(assigned.keys())
                  if assigned and "OUT" not in assigned else None)
 
-    # Warmup
+    def sync():
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    # Warmup. A failing call exits non-zero and the parent reports it.
     clear_compiled_cache()
-    try:
-        execute_compiled(program, bindings, type_map, device, fp,
-                         output_names=out_names)
-    except Exception:
-        pass
+    execute_compiled(program, bindings, type_map, device, fp,
+                     output_names=out_names)
 
     if not cold:
         for _ in range(warmup - 1):
-            try:
-                execute_compiled(program, bindings, type_map, device, fp,
-                                 output_names=out_names)
-            except Exception:
-                pass
+            execute_compiled(program, bindings, type_map, device, fp,
+                             output_names=out_names)
+    sync()
 
     times = []
     for _ in range(runs):
@@ -209,20 +219,23 @@ _SUBPROCESS_SCRIPT = textwrap.dedent("""\
             program, type_map, assigned, used = compile_program(prog.code, btypes)
             out_names = (list(assigned.keys())
                          if assigned and "OUT" not in assigned else None)
+        sync()
         t0 = time.perf_counter()
-        try:
-            execute_compiled(program, bindings, type_map, device, fp,
-                             output_names=out_names)
-        except Exception:
-            pass
+        execute_compiled(program, bindings, type_map, device, fp,
+                         output_names=out_names)
+        sync()
         times.append((time.perf_counter() - t0) * 1000)
     print(json.dumps(times))
 """)
 
 
 def measure_compiled_subprocess(prog: BenchmarkProgram, B, H, W, device,
-                                cold=False, runs=RUNS) -> list[float] | None:
-    """Run torch.compile measurement in a subprocess to survive segfaults."""
+                                cold=False, runs=RUNS,
+                                timeout=None) -> list[float]:
+    """Run torch.compile measurement in a subprocess to survive segfaults.
+
+    Raises RuntimeError naming the reason (timeout, crash code, or an unparsable
+    result) so the table shows why a row has no number."""
     args_json = json.dumps({
         "prog_name": prog.name,
         "B": B, "H": H, "W": W,
@@ -235,7 +248,8 @@ def measure_compiled_subprocess(prog: BenchmarkProgram, B, H, W, device,
     })
 
     python = sys.executable
-    timeout = max(120, runs * 30)  # generous timeout
+    if not timeout:
+        timeout = max(120, (runs + WARMUP) * 30)
 
     try:
         result = subprocess.run(
@@ -244,20 +258,18 @@ def measure_compiled_subprocess(prog: BenchmarkProgram, B, H, W, device,
             timeout=timeout,
             cwd=str(_bench_dir),
         )
-        if result.returncode != 0:
-            # Segfault (139) or other crash
-            stderr_short = result.stderr.strip().split("\n")[-1][:80] if result.stderr else "unknown"
-            return None
-        # Parse times from stdout (last line of JSON)
-        for line in reversed(result.stdout.strip().split("\n")):
-            line = line.strip()
-            if line.startswith("["):
-                return json.loads(line)
-        return None
     except subprocess.TimeoutExpired:
-        return None
-    except Exception:
-        return None
+        raise RuntimeError(f"subprocess timed out after {timeout}s (see --timeout)")
+    if result.returncode != 0:
+        # Segfault (139) or a failed execute_compiled
+        err_lines = result.stderr.strip().split("\n")
+        raise RuntimeError(f"subprocess died rc={result.returncode}: {err_lines[-1][:60]}")
+    # Parse times from stdout (last line of JSON)
+    for line in reversed(result.stdout.strip().split("\n")):
+        line = line.strip()
+        if line.startswith("["):
+            return json.loads(line)
+    raise RuntimeError("subprocess printed no timing line")
 
 
 # -- Formatting --------------------------------------------------------
@@ -283,6 +295,9 @@ def main():
                         help="Skip real-world example programs")
     parser.add_argument("--no-subprocess", action="store_true",
                         help="Run torch.compile in-process (may crash)")
+    parser.add_argument("--timeout", type=int, default=0,
+                        help="per-row subprocess timeout in seconds "
+                             "(default: 30 x (runs + warmup), at least 120)")
     args = parser.parse_args()
 
     num_runs = args.runs
@@ -319,8 +334,9 @@ def main():
     total = len(programs) * 4
     done = 0
 
-    compiled_fn = (measure_compiled_subprocess if use_subprocess
-                   else measure_compiled)
+    compiled_fn = (functools.partial(measure_compiled_subprocess,
+                                     timeout=args.timeout)
+                   if use_subprocess else measure_compiled)
 
     for prog in programs:
         # Skip string-only programs at high res
@@ -344,16 +360,11 @@ def main():
             try:
                 t = measure_fn(prog, B, H, W, device, cold=is_cold,
                                runs=num_runs)
-                if t is None:
-                    print(f"{prog.name:<{nw}} {mode_name:<12} {cache_name:<5}"
-                          f"    CRASH (subprocess died)"
-                          f"  [{done}/{total}]")
-                else:
-                    print(f"{prog.name:<{nw}} {mode_name:<12} {cache_name:<5}"
-                          f" {fmt_ms(t)}"
-                          f"  [{done}/{total}]")
+                print(f"{prog.name:<{nw}} {mode_name:<12} {cache_name:<5}"
+                      f" {fmt_ms(t)}"
+                      f"  [{done}/{total}]")
             except Exception as e:
-                err = str(e)[:60]
+                err = str(e)[:100]
                 print(f"{prog.name:<{nw}} {mode_name:<12} {cache_name:<5}"
                       f"    ERROR: {err}"
                       f"  [{done}/{total}]")

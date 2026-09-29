@@ -910,7 +910,8 @@ def test_brief9_t2_uniform_output_stable_across_compile_modes(r):
                     f"cuda_graph vs none diverged on {n}"
         else:
             r.skip("BRIEF-9 T2 cuda_graph route", "no CUDA on this box")
-        r.ok("BRIEF-9 T2: uniform outputs are 0-dim and equal across every compile_mode route")
+        r.ok(f"BRIEF-9 T2: uniform outputs are 0-dim and equal across the {modes} routes"
+             + (" and cuda_graph" if torch.cuda.is_available() else ""))
     except Exception as e:
         r.fail("BRIEF-9 T2 route stability", f"{type(e).__name__}: {e}")
 
@@ -1074,6 +1075,11 @@ def test_brief9_t5_uniform_output_param_query_never_recompiles_moves_lineage(r):
             first = tex_engine.cook(code, base_binds, device_mode="cpu",
                                     compile_mode="auto", want_lineage=True)
             after_cold = dict(counts)
+            # POSITIVE CONTROL: the compile spy must have moved on the cold cook, or the zero
+            # below proves nothing. (`emissions` may legitimately stay 0 on a warm on-disk
+            # cache and `captures` only moves on CUDA graphs, so only `compiles` is required.)
+            assert after_cold["compiles"] >= 1, \
+                f"the compile spy never fired on the cold cook: {after_cold}"
             fps_before = set(cache._memory.keys())
             keys_seen = {first.lineage["OUT"]}
             for i in range(1, 6):

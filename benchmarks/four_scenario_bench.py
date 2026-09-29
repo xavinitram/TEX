@@ -38,7 +38,9 @@ from TEX_Wrangle.tex_compiler.optimizer import optimize
 from TEX_Wrangle.tex_runtime.interpreter import (
     Interpreter, _collect_identifiers, _ensure_spatial, _broadcast_pair,
 )
-from TEX_Wrangle.tex_runtime.codegen import try_compile as try_codegen, _CgBreak, _CgContinue
+from TEX_Wrangle.tex_runtime.codegen import (
+    try_compile as try_codegen, _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw,
+)
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON
 
 EXAMPLES_DIR = _pkg_dir / "examples"
@@ -349,7 +351,7 @@ def make_codegen_runner(cg_fn, bindings, used, sp):
         cg_fn(env, local_bindings, _stdlib_fns, dev, sp,
               torch, _broadcast_pair, _ensure_spatial, torch.where,
               math, SAFE_EPSILON, CHANNEL_MAP, 1024,
-              _CgBreak, _CgContinue)
+              _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
         return local_bindings
 
     return runner
@@ -460,6 +462,8 @@ def run_scenario(name: str, code: str, size: int, runs: int,
                 runner()
                 times.append((time.perf_counter() - t0) * 1000)
             results["compile_on_warm"] = statistics.median(times)
+        except TypeError:
+            raise  # a codegen signature drift is a bench bug, not "no codegen"
         except Exception as e:
             import traceback
             results["compile_on_cold"] = None

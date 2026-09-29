@@ -61,7 +61,8 @@ def test_color1_rec709_transfer(r: SubTestResult):
         r.fail("COLOR-1 rec709 alpha", f"{type(e).__name__}: {e}")
 
     # Codegen parity (invariant #2): the generic `_fns[name]` dispatch calls the SAME
-    # callable the interpreter uses, so this is a bit-exactness check, not a tolerance one.
+    # callable the interpreter uses, so the tiers should agree well inside the 1e-5 tolerance
+    # the rows below enforce.
     assert_tier_equiv(r, "rec709_to_linear", "@OUT = vec4(rec709_to_linear(@A.rgb), 1.0);",
                       {"A": img}, tiers=("codegen",), tol=1e-5)
     assert_tier_equiv(r, "linear_to_rec709", "@OUT = vec4(linear_to_rec709(@A.rgb), 1.0);",
@@ -214,13 +215,16 @@ def test_color1_apply_lut3d_pressure_paths(r: SubTestResult):
     # (3) roi_plan/stage_halo/batch_sliceable (tex_roi.py) take `code: str` only — no tensor
     # shapes ever reach them, so a LUT binding cannot perturb them. Confirmed by signature,
     # not by a runtime probe (there is nothing shape-shaped to probe).
-    import inspect
-    from TEX_Wrangle import tex_roi
-    for fname in ("roi_plan", "stage_halo", "batch_sliceable"):
-        params = list(inspect.signature(getattr(tex_roi, fname)).parameters)
-        assert params[0] == "code", f"{fname}'s first parameter is {params[0]!r}, not 'code'"
-    r.ok("roi_plan/stage_halo/batch_sliceable take source code only — no binding shapes, "
-         "so no LUT-shape exposure is possible there")
+    try:
+        import inspect
+        from TEX_Wrangle import tex_roi
+        for fname in ("roi_plan", "stage_halo", "batch_sliceable"):
+            params = list(inspect.signature(getattr(tex_roi, fname)).parameters)
+            assert params[0] == "code", f"{fname}'s first parameter is {params[0]!r}, not 'code'"
+        r.ok("roi_plan/stage_halo/batch_sliceable take source code only — no binding shapes, "
+             "so no LUT-shape exposure is possible there")
+    except Exception as e:
+        r.fail("COLOR-1 apply_lut3d roi signatures", f"{type(e).__name__}: {e}")
 
     # (4) graph-capture worthiness (graphed._spatial_px): before this lane's fix, dict
     # ITERATION ORDER decided whether the gate saw the LUT's tiny N*N or the real frame's
@@ -236,18 +240,24 @@ def test_color1_apply_lut3d_pressure_paths(r: SubTestResult):
     except Exception as e:
         r.fail("COLOR-1 apply_lut3d graph worthiness", f"{type(e).__name__}: {e}")
 
-    # (5) fingerprint / precision: no runtime probe needed — read, not measured. fingerprint()
-    # keys on `binding_types` (TEXType, e.g. IMAGE-shaped VEC3), never on tensor shape, so a
-    # LUT's size cannot perturb PROGRAM-fingerprint/graph-cache-key reuse (tex_cache.py:387).
-    # No engine site casts a raw tensor BINDING to fp16 wholesale for precision="fp16"/"auto"
-    # (checked: interpreter._PRECISION_DTYPES sets only the INTERNAL compute dtype;
-    # compiled._contiguous_bindings casts only an anomalous INTEGER dim>=3 tensor to fp32,
-    # never float->float16) — fn_apply_lut3d forces its OWN grid_sample compute to fp32
-    # regardless, so a LUT's storage precision is exactly as protected as any other function's
-    # own inputs, by the same mechanism every other Color function already relies on.
-    r.ok("fingerprint keys on binding TYPES not shapes; no engine-wide fp16 binding cast "
-         "exists for apply_lut3d's LUT argument to be caught by (read, not measured — see "
-         "the hand-back's Premises-verified section for the exact lines checked)")
+    # (5) fingerprint / precision. The program fingerprint keys on binding TYPES (a TEXType,
+    # e.g. an IMAGE-shaped VEC3), never on tensor shape, so a LUT's size cannot perturb
+    # fingerprint or graph-cache-key reuse: pinned below. That no engine site casts a raw
+    # tensor BINDING to fp16 wholesale for precision="fp16"/"auto" was read, not measured:
+    # the interpreter's precision map sets only the INTERNAL compute dtype, and
+    # fn_apply_lut3d forces its OWN grid_sample compute to fp32, so a LUT's storage precision
+    # is protected the way every other Color function's inputs are.
+    try:
+        from TEX_Wrangle.tex_cache import TEXCache
+        from TEX_Wrangle.tex_marshalling import infer_binding_type
+        lut_code = "@OUT = vec4(apply_lut3d(@A.rgb, @LUT), 1.0);"
+        fps = {n: TEXCache.fingerprint(lut_code, {"A": infer_binding_type(img),
+                                                  "LUT": infer_binding_type(_identity_lut(n))})
+               for n in (2, 5, 33)}
+        assert len(set(fps.values())) == 1, f"the fingerprint moved with the LUT size: {fps}"
+        r.ok("the program fingerprint is identical for 2^3, 5^3 and 33^3 LUTs (keys on types)")
+    except Exception as e:
+        r.fail("COLOR-1 apply_lut3d fingerprint", f"{type(e).__name__}: {e}")
 
 
 def test_color1_lut_io(r: SubTestResult):

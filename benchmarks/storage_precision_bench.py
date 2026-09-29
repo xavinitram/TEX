@@ -92,7 +92,9 @@ def _source(res: int, device: str) -> torch.Tensor:
 def _cook(code: str, src: torch.Tensor, device: str) -> torch.Tensor:
     res = tex_engine.cook(code, {"IN": src}, device_mode=device, precision="fp32")
     out = res.outputs.get("OUT")
-    return out if isinstance(out, torch.Tensor) else src
+    if not isinstance(out, torch.Tensor):
+        raise RuntimeError("program produced no OUT tensor; refusing to measure the source")
+    return out
 
 
 # ── the storage candidates ────────────────────────────────────────────────────
@@ -194,11 +196,13 @@ def main() -> int:
     if not args.cpu_only and torch.cuda.is_available():
         devices.append("cuda")
 
-    rows, caps = [], []
+    rows = []
     for dev in devices:
         rows += measure(args.resolution, dev)
-        caps += capacity(args.resolution, dev, args.budget_mb)
-        caps += capacity(4096, dev, args.budget_mb)
+    # Capacity is pure arithmetic (no device dependence): once per distinct resolution.
+    caps = []
+    for cap_res in dict.fromkeys((args.resolution, 4096)):
+        caps += capacity(cap_res, "n/a", args.budget_mb)
 
     print(f"\nPREC-1 storage fidelity @ {args.resolution}^2  "
           f"(q8_flip = fraction of pixels whose 8-bit display code CHANGES)")

@@ -20,7 +20,6 @@ def _run_unfused(stages):
     """Ground truth: run each stage as a standalone program, threading outputs
     along the declared (chain_input | chain_inputs) edges."""
     outs = {}
-    n = len(stages)
     for i, st in enumerate(stages):
         ext = dict(st.get("bindings") or {})
         ci = st.get("chain_inputs")
@@ -148,9 +147,11 @@ def test_cc2_state_machine(r: SubTestResult):
 
 
 def test_cc2_no_stall_sim(r: SubTestResult):
-    print("\n--- CC-2: 30-cook no-stall simulation ---")
-    # Model the roadmap's batch/video sequence: the first ~4 cooks stay on the
-    # baseline (no 28s stall), then a trial, then steady-state on the winner.
+    print("\n--- CC-2: 30-cook state-machine walk ---")
+    # A scripted walk over the decision state machine only (this loop picks each
+    # route itself and invents the background compile finishing ~2 cooks later;
+    # run_auto is not involved): baseline cooks first, then one trial, then
+    # steady state on the winner.
     try:
         AT.reset()
         k = AT.make_key("seq", "cpu", "fp32", (1, 512, 512))
@@ -176,15 +177,14 @@ def test_cc2_no_stall_sim(r: SubTestResult):
                         compiled_ready = True
                     else:
                         AT.mark_ready(k)
-        # No cook was ever a blocking compile; steady state is compiled.
         assert routes[-1] == "compiled", routes[-8:]
         assert routes.count("trial") == 1, "exactly one trial cook"
         assert routes[:3] == ["baseline"] * 3, "first cooks stay on baseline"
         n_compiled = routes.count("compiled")
         assert n_compiled >= 20, f"steady state not reached ({n_compiled} compiled)"
-        r.ok(f"30-cook seq: 3 baseline → 1 trial → {n_compiled} compiled, no stall")
+        r.ok(f"30-cook seq: 3 baseline → 1 trial → {n_compiled} compiled")
     except Exception as e:
-        r.fail("30-cook no-stall sim", str(e))
+        r.fail("30-cook state-machine walk", str(e))
 
 
 def test_cc2_end_to_end(r: SubTestResult):
@@ -207,7 +207,7 @@ def test_cc2_end_to_end(r: SubTestResult):
                                     output_names=["OUT"])["OUT"]
         fp = tc.get_cache().fingerprint(code, bt)
         ok = True
-        for _ in range(8):  # exercise several tier transitions
+        for _ in range(8):  # whichever tiers these cooks land on, each must match the interpreter
             out = run_auto(prog, {"A": img}, tm, "cpu", fp,
                            output_names=["OUT"], used_builtins=used)
             t = out["OUT"] if isinstance(out, dict) else out
@@ -215,7 +215,7 @@ def test_cc2_end_to_end(r: SubTestResult):
                 ok = False
                 break
         assert ok, "run_auto output diverged from interpreter"
-        r.ok("run_auto output interpreter-correct across tier transitions")
+        r.ok("run_auto output interpreter-correct on every cook")
     except Exception as e:
         r.fail("run_auto end-to-end correctness", str(e))
 
@@ -227,7 +227,7 @@ def test_q3_fusion_widening(r: SubTestResult):
 
     # Backward-compat: a plain linear chain still fuses bit-exactly.
     try:
-        _FUS.clear_fused_cache() if hasattr(_FUS, "clear_fused_cache") else None
+        _FUS._FUSED_MEMO.clear()
         stages = [
             {"code": "@OUT = @A * 0.5 + 0.1;", "chain_input": None, "bindings": {"A": img}},
             {"code": "@OUT = @X * 2.0;", "chain_input": "X", "bindings": {}},

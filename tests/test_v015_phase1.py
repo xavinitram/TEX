@@ -85,12 +85,17 @@ def test_pc3_codegen_persistence(r: SubTestResult):
     # A stale-version sidecar must be rejected (deleted, returns None).
     try:
         import pickle
+        from TEX_Wrangle import tex_recovery
         cache._codegen_memory.pop(fp, None)
         with open(cache._cg_path(fp), "rb") as f:
             good = pickle.load(f)
         bad = dict(good); bad["version"] = "STALE_VERSION"
-        with open(cache._cg_path(fp), "wb") as f:
-            pickle.dump(bad, f)
+        # Both files are MAC-signed, so only the version differs: an unsigned file would
+        # be rejected by the trailer check and never reach the version comparison.
+        assert tex_recovery.sign_pickle(cache._cg_path(fp), good)
+        assert cache.get_codegen_fn(fp) is not None, "signed current-version sidecar rejected"
+        cache._codegen_memory.pop(fp, None)
+        assert tex_recovery.sign_pickle(cache._cg_path(fp), bad)
         got = cache.get_codegen_fn(fp)  # must reject + delete
         assert got is None, "stale-version sidecar was not rejected"
         assert not cache._cg_path(fp).exists(), "stale sidecar not deleted"
@@ -135,6 +140,7 @@ def test_pc2_precompile_safety(r: SubTestResult):
         r.fail("precompile attach-failure allowlist classifies correctly", str(e))
 
     # The inductor cache dir is versioned by cache-version + torch build.
+    prev_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
     try:
         os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
         _C._ensure_inductor_cache_dir()
@@ -145,6 +151,11 @@ def test_pc2_precompile_safety(r: SubTestResult):
         r.ok("inductor cache dir is version-scoped")
     except Exception as e:
         r.fail("inductor cache dir is version-scoped", str(e))
+    finally:
+        if prev_dir is None:
+            os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+        else:
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = prev_dir
 
 
 def test_pc2_precompile_recovery_wipes_the_whole_store(r: SubTestResult):

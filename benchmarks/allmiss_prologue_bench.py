@@ -122,14 +122,16 @@ if __name__ == "__main__":
     ap.add_argument("--fresh-reps", type=int, default=5)
     a = ap.parse_args()
     if a.child is not None:
-        # Imports and the source tensor are OUTSIDE the timer; the process-scope first-call
-        # costs the memo exists to amortize (the CUDA context, the default-budget probe) are
-        # inside it, because that is exactly what a fresh process still pays.
+        # Imports and the CPU source tensor are OUTSIDE the timer; the process-scope
+        # first-call costs the memo exists to amortize (the CUDA context, reached by the
+        # device upload, and the default-budget probe) are inside it, because that is exactly
+        # what a fresh process still pays.
         import torch
         from TEX_Wrangle import tex_engine, tex_checkpoint, tex_results       # noqa: F401
         st = stages(a.n)
-        st[0]["bindings"] = {"IN": torch.rand(1, a.res, a.res, 3, device=a.device)}
+        src = torch.rand(1, a.res, a.res, 3)               # built on the CPU, outside the timer
         t0 = time.perf_counter()
+        st[0]["bindings"] = {"IN": src.to(a.device)}       # the first CUDA call: context init
         one_cook(a.device, a.n, st, a.child == "1")     # ONE definition of the timed operation
         _sync(a.device)
         print((time.perf_counter() - t0) * 1e3)

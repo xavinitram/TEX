@@ -18,6 +18,8 @@ def test_mem2_pool_trim_gating(r: SubTestResult):
     # Count BOTH allocator queries and empty_cache — the B2 fix is that same-size steady
     # state does ZERO allocator queries (the +48% tax was the always-on query).
     q = {"reserved": 0, "empty": 0}
+    # Rows (1)-(4) and (6) need the switch UNSET; put any ambient value back at the end.
+    ambient_switch = os.environ.pop("TEX_NO_POOL_TRIM", None)
     real = {k: getattr(torch.cuda, k, None) for k in
             ("memory_reserved", "memory_allocated", "get_device_properties",
              "empty_cache", "current_device")}
@@ -64,30 +66,29 @@ def test_mem2_pool_trim_gating(r: SubTestResult):
         MEM._last_trim_px[0] = 512 * 512
         _set(1.7, 0.2)
         os.environ["TEX_NO_POOL_TRIM"] = "1"; q["empty"] = 0
-        MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
-        os.environ.pop("TEX_NO_POOL_TRIM", None)
+        try:
+            MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
+        finally:
+            os.environ.pop("TEX_NO_POOL_TRIM", None)
         if q["empty"] != 0:
             fails.append("TEX_NO_POOL_TRIM=1 did not disable the trim")
         # (6) TRK-96: the UNSET state — the one every ComfyUI user runs, since nobody
         # sets this switch by default. Rows (1)-(5) never force it absent, so a change
         # that made the trim path unconditional (or made it never run) on the UNSET
-        # reading specifically would not red anywhere above. Force it absent (never
-        # assume the ambient environment already lacks it) and require the same
+        # reading specifically would not red anywhere above. The switch is unset here
+        # (popped at the top, and row 5 pops its own); require the same
         # downshift-over-threshold scenario as row (3) to still trim.
-        saved_switch = os.environ.pop("TEX_NO_POOL_TRIM", None)
-        try:
-            MEM._last_trim_px[0] = 512 * 512
-            _set(1.7, 0.2)  # 1.5 GB stranded (> threshold) — same shape as row (3)
-            q["reserved"] = q["empty"] = 0
-            MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
-            if q["reserved"] == 0:
-                fails.append("TEX_NO_POOL_TRIM unset did not query the allocator")
-            if q["empty"] != 1:
-                fails.append("TEX_NO_POOL_TRIM unset did not trim over threshold")
-        finally:
-            if saved_switch is not None:
-                os.environ["TEX_NO_POOL_TRIM"] = saved_switch
+        MEM._last_trim_px[0] = 512 * 512
+        _set(1.7, 0.2)  # 1.5 GB stranded (> threshold) — same shape as row (3)
+        q["reserved"] = q["empty"] = 0
+        MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
+        if q["reserved"] == 0:
+            fails.append("TEX_NO_POOL_TRIM unset did not query the allocator")
+        if q["empty"] != 1:
+            fails.append("TEX_NO_POOL_TRIM unset did not trim over threshold")
     finally:
+        if ambient_switch is not None:
+            os.environ["TEX_NO_POOL_TRIM"] = ambient_switch
         for k, v in real.items():
             if v is not None:
                 setattr(torch.cuda, k, v)

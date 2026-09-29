@@ -5,7 +5,7 @@ SL-3 color management (sRGB<->linear, OKLab), SL-1 premult compositing,
 SL-2 blend modes, SL-4 morphology.
 """
 from helpers import *
-from failure_harness import run_tier, max_diff, assert_tier_equiv
+from failure_harness import run_tier, assert_tier_equiv
 
 
 def _out(code, bindings):
@@ -231,15 +231,22 @@ def test_lx8_const_arrays(r: SubTestResult):
     except Exception as e:
         r.fail("LX-8 usage", f"{type(e).__name__}: {e}")
 
-    for code, why in [
-        ("const float lut[3] = {1.0,2.0,3.0}; lut[0] = 9.0; @OUT = vec4(lut[0]);", "element write"),
-        ("const float lut[3]; @OUT = vec4(lut[0]);", "no initializer"),
+    for code, why, exc, msg in [
+        ("const float lut[3] = {1.0,2.0,3.0}; lut[0] = 9.0; @OUT = vec4(lut[0]);", "element write",
+         TypeCheckError, "declared as const and cannot be modified"),
+        ("const float lut[3]; @OUT = vec4(lut[0]);", "no initializer",
+         ParseError, "must be initialized"),
     ]:
         try:
             compile_and_run(code, {"A": img})
             r.fail(f"LX-8 reject {why}", "not rejected")
-        except Exception:
-            r.ok(f"const array {why} correctly rejected")
+        except exc as e:
+            if msg in str(e):
+                r.ok(f"const array {why} correctly rejected")
+            else:
+                r.fail(f"LX-8 reject {why}", f"rejected with the wrong message: {e}")
+        except Exception as e:
+            r.fail(f"LX-8 reject {why}", f"rejected by {type(e).__name__}, not {exc.__name__}: {e}")
 
     # A plain (non-const) array still works and is writable (regression guard).
     try:

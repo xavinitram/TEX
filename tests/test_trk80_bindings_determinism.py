@@ -24,7 +24,6 @@ recorded as a finding for whoever next touches that module, not asserted as a fi
 PORTABILITY: CPU-only, no ComfyUI, no torch.compile requirement (the probe below only reads
 `tier_trace`, never asserts which tier was chosen), no numpy, no timing assertion.
 """
-import hashlib
 import importlib.util
 import os
 import sys

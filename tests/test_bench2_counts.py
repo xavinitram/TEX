@@ -709,6 +709,31 @@ def test_bench4_checkpoint_serve_settles_in_147_cooks(r: SubTestResult):
         r.ok(f"checkpoint_serve: settled in {warm} cooks, cuts={cuts}")
 
 
+def test_bench4_checkpoint_serve_leaves_a_callers_prof1_armed(r: SubTestResult):
+    """`run_all(prof1=True)` arms PROF-1 once around the whole run, so a scenario that
+    disarms it for its own counted ticks must hand it back armed: the scenarios after
+    checkpoint_serve would otherwise run unarmed under a report that says `prof1=True`."""
+    print("\n--- BENCH-4: checkpoint_serve restores a caller-armed PROF-1 ---")
+    from TEX_Wrangle.tex_runtime import profile as _profile
+    b = _bench()
+    cls = next(c for c in b.SCENARIOS if c.name == "checkpoint_serve")
+    with armed_profiler():
+        scn = cls(RES, WINDOW, "cpu", ticks=TICKS)
+        try:
+            b.pass_api(scn, TICKS)
+            during = _profile.enabled()
+        finally:
+            scn.teardown()
+        after = _profile.enabled()
+    if during:
+        r.fail("BENCH-4 counted ticks", "PROF-1 must stay disarmed during the counted ticks")
+    elif not after:
+        r.fail("BENCH-4 prof1 restore", "checkpoint_serve teardown left a caller-armed "
+               "PROF-1 disarmed for every later scenario")
+    else:
+        r.ok("counted ticks ran disarmed and teardown re-armed the caller's PROF-1")
+
+
 def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult):
     """With PROF-1 DISARMED, TEX itself issues no `torch.cuda.synchronize` on an interactive
     tick. A sync the host did not ask for is a pipeline stall charged to somebody else's

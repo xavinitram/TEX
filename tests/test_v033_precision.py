@@ -28,7 +28,7 @@ def _cache(tmp, **kw):
 
 # ── 1. the default path ───────────────────────────────────────────────────────
 
-def test_v033_prec1_default_put_is_unchanged(r, tmp_path=None):
+def test_v033_prec1_default_put_is_unchanged(r):
     """No quality tag = store exactly what was cooked. This is the whole of invariant #7's
     surface for this item: the ComfyUI node has no reference to ResultCache, and every
     engine-side caller that predates v0.33 passes no tag."""
@@ -311,7 +311,6 @@ def test_v033_prec1_colour_data_split_at_the_kind_seam(r):
 
 def test_v033_prec1_kind_reaches_the_cache(r):
     """The seam is only real if `put` carries it."""
-    import tempfile
     with tempfile.TemporaryDirectory() as d:
         c = _cache(d)
         f = _frame(res=32)

@@ -17,7 +17,7 @@ themselves).
 Each CUDA-dependent row skips (not silently passes) without a GPU.
 """
 from helpers import *
-from failure_harness import run_tier, max_diff, TierUnavailable
+from failure_harness import run_tier, TierUnavailable
 
 _CUDA = torch.cuda.is_available()
 _DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]

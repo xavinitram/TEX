@@ -18,14 +18,34 @@ What has to be pinned, and why:
   * GOV-1 OWNS CACHE-7's THRESHOLD — the report names it as a profile knob, and a thriftier
     profile must checkpoint LESS often (each checkpoint is a whole frame held in RAM).
 """
+import tempfile
+
 from helpers import *
 
 from TEX_Wrangle import tex_checkpoint as CK
 from TEX_Wrangle import tex_doctor, tex_memory, tex_results
 
+# Every ResultCache here spills into this directory (removed at exit), never the user's real
+# cache; every cache armed into the process-wide registry is unregistered by `_fresh()`.
+_SCRATCH = tempfile.TemporaryDirectory(prefix="tex_v032_gov_", ignore_cleanup_errors=True)
+_ARMED = []
+
+
+def _cache(budget_mb):
+    return tex_results.ResultCache(budget_mb=budget_mb,
+                                   cache_dir=tempfile.mkdtemp(dir=_SCRATCH.name))
+
+
+def _arm(cache, name):
+    tex_memory.register_result_cache(cache, name=name)
+    _ARMED.append(name)
+
 
 def _fresh():
     tex_memory._reset_profile_for_test()
+    registry = tex_memory.get_cache_registry()
+    while _ARMED:
+        registry.unregister(_ARMED.pop())
 
 
 def test_v032_gov1_profile_table(r: SubTestResult):
@@ -75,8 +95,8 @@ def test_v032_gov1_reaches_the_frame_cache_both_orders(r: SubTestResult):
     print("\n--- v0.32 GOV-1: the preset reaches the frame cache, either order ---")
     _fresh()
     # (a) cache armed FIRST, profile chosen SECOND.
-    before = tex_results.ResultCache(budget_mb=2048)
-    tex_memory.register_result_cache(before, name="gov1-before")
+    before = _cache(2048)
+    _arm(before, "gov1-before")
     tex_memory.set_profile("efficient")
     want = tex_memory.profile_knobs("efficient")["frame_mb"] * (1 << 20)
     if before._budget == want:
@@ -85,14 +105,14 @@ def test_v032_gov1_reaches_the_frame_cache_both_orders(r: SubTestResult):
         r.fail("GOV-1 apply order", f"armed-first cache kept {before._budget >> 20} MB")
 
     # (b) profile already active, cache armed SECOND.
-    after = tex_results.ResultCache(budget_mb=2048)
-    tex_memory.register_result_cache(after, name="gov1-after")
+    after = _cache(2048)
+    _arm(after, "gov1-after")
     if after._budget == want:
         r.ok(f"GOV-1: a cache armed AFTER the profile got its budget ({want >> 20} MB)")
     else:
         r.fail("GOV-1 apply order", f"armed-second cache kept {after._budget >> 20} MB")
 
-    # (c) balanced restores the shipped default rather than pinning a number.
+    # (c) switching to `performance` re-applies its budget to every armed cache.
     tex_memory.set_profile("performance")
     perf = tex_memory.profile_knobs("performance")["frame_mb"] * (1 << 20)
     if before._budget == perf:
@@ -107,7 +127,7 @@ def test_v032_gov1_tightening_evicts_now(r: SubTestResult):
     as long as the session is idle — which is exactly when a user switches to `efficient`."""
     print("\n--- v0.32 GOV-1: tightening takes effect immediately ---")
     _fresh()
-    cache = tex_results.ResultCache(budget_mb=64)
+    cache = _cache(64)
     frame = torch.rand(1, 256, 256, 4)          # 1 MiB each
     for i in range(24):
         cache.put(f"f{i}", frame)
@@ -211,9 +231,9 @@ def test_v032_gov1_balanced_restores_the_shipped_budget(r: SubTestResult):
     enforced, which is worse than having no report."""
     print("\n--- v0.32 GOV-1: balanced restores the shipped default ---")
     _fresh()
-    cache = tex_results.ResultCache(budget_mb=1536)
+    cache = _cache(1536)
     shipped = cache._budget
-    tex_memory.register_result_cache(cache, name="gov1-roundtrip")
+    _arm(cache, "gov1-roundtrip")
     if cache._budget == shipped:
         r.ok(f"GOV-1: arming under `balanced` leaves the shipped budget ({shipped >> 20} MB)")
     else:
@@ -261,14 +281,14 @@ def test_trk16_balanced_restores_a_fractional_mb_budget(r: SubTestResult):
 
     # The filer's own reproduction: 0.75 MiB survives construction (786432 bytes) but the
     # bug zeroed it the moment the cache was armed under the (no-op, default-restoring) profile.
-    cache = tex_results.ResultCache(budget_mb=0.75)
+    cache = _cache(0.75)
     shipped = cache._budget
     if shipped == 786432:
         r.ok(f"fractional-MiB constructor budget is exact ({shipped} bytes)")
     else:
         r.fail("fractional-MiB constructor budget", f"expected 786432 bytes, got {shipped}")
 
-    tex_memory.register_result_cache(cache, name="trk16-fractional")
+    _arm(cache, "trk16-fractional")
     if cache._budget == shipped:
         r.ok(f"GOV-1: arming under `balanced` leaves a fractional-MiB budget alone "
              f"({shipped} bytes)")
@@ -278,8 +298,8 @@ def test_trk16_balanced_restores_a_fractional_mb_budget(r: SubTestResult):
 
     # A whole-MiB budget alongside it must be unaffected by the fix (no behaviour change on
     # the path that was already correct).
-    whole = tex_results.ResultCache(budget_mb=64)
-    tex_memory.register_result_cache(whole, name="trk16-whole")
+    whole = _cache(64)
+    _arm(whole, "trk16-whole")
     if whole._budget == 64 << 20:
         r.ok("GOV-1: a whole-MiB budget is unaffected by the fractional-MiB fix")
     else:
@@ -314,7 +334,7 @@ def test_v032_gov1_governed_bytes_never_drifts(r: SubTestResult):
     destroys the frame reuse CACHE-2/CACHE-9 exist to provide."""
     print("\n--- v0.32 GOV-1: governed_bytes never drifts from the truth ---")
     _fresh()
-    cache = tex_results.ResultCache(budget_mb=4)          # tight: forces the eviction loop
+    cache = _cache(4)                                     # tight: forces the eviction loop
     frame = torch.rand(1, 256, 256, 4)                    # 1 MiB
     for i in range(40):
         cache.put(f"k{i}", frame)
@@ -343,7 +363,7 @@ def test_v032_gov1_governed_bytes_never_drifts(r: SubTestResult):
     else:
         r.fail("GOV-1 byte drift", "device-split and whole-cache totals disagree")
 
-    cache.clear()
+    cache.clear(disk=True)
     if cache.governed_bytes("cpu") == 0 and cache.governed_bytes("cuda") == 0:
         r.ok("GOV-1: clear() zeroes the per-device totals too")
     else:
@@ -357,8 +377,8 @@ def test_v032_gov1_arbitrate_lands_on_budget_not_on_the_floor(r: SubTestResult):
     evicts to the one-entry floor."""
     print("\n--- v0.32 GOV-1: arbitrate lands on budget, not on the floor ---")
     _fresh()
-    cache = tex_results.ResultCache(budget_mb=4096)       # deliberately loose: the GOVERNOR evicts
-    tex_memory.register_result_cache(cache, name="gov1-arb")
+    cache = _cache(4096)       # deliberately loose: the GOVERNOR evicts
+    _arm(cache, "gov1-arb")
     frame = torch.rand(1, 256, 256, 4)                    # 1 MiB
     for i in range(64):
         cache.put(f"a{i}", frame)

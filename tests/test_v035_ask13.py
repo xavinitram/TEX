@@ -11,7 +11,7 @@ Each edge case runs on both devices and both tiers — `_DEVICES` below follows 
 convention as test_v024_phase1.py / test_v02[5-8]_phase1.py.
 """
 from helpers import *
-from failure_harness import run_tier, max_diff
+from failure_harness import run_tier
 
 _CUDA = torch.cuda.is_available()
 _DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]
