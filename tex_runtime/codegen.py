@@ -3673,34 +3673,31 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                            f"or {value}.dtype is _torch.float32 else {value}.float()")
                 return tmp
 
+        tmp = self._tmp()
+        if node.target_type == "string":
+            # The interpreter's own text (`str()`): 6 significant digits, whole numbers as
+            # ints, NaN/Inf as 'nan'/'inf', a field averaged with its one-time warning.
+            fn = self._get_fn_local("str")
+            if self._scalar_loop:
+                value = (f"(_torch.scalar_tensor(float({value})) "
+                         f"if isinstance({value}, (int, float)) else {value})")
+            self._emit(f"{tmp} = {fn}({value})")
+            return tmp
+
         # Scalar loop mode: Python float casts
         if self._scalar_loop:
-            tmp = self._tmp()
-            if node.target_type == "int":
-                self._emit(f"{tmp} = float(_math.floor(float({value})))")
+            if node.target_type == "int":   # floor, and NaN/Inf pass through as in torch.floor
+                self._emit(f"{tmp} = float({value})")
+                self._emit(f"{tmp} = float(_math.floor({tmp})) if _math.isfinite({tmp}) else {tmp}")
             elif node.target_type == "float":
                 self._emit(f"{tmp} = float({value})")
-            elif node.target_type == "string":
-                self._emit(f"{tmp} = str({value})")
             else:
                 self._emit(f"{tmp} = {value}")
             return tmp
 
-        tmp = self._tmp()
-
-        if node.target_type == "string":
-            self._emit(f"if _torch.is_tensor({value}):")
-            self._indent += 1
-            self._emit(f"_cv = {value}.item() if {value}.dim() == 0 else {value}.float().mean().item()")
-            self._emit(f"{tmp} = str(int(_cv)) if _cv == int(_cv) else str(_cv)")
-            self._indent -= 1
-            self._emit(f"else:")
-            self._indent += 1
-            self._emit(f"{tmp} = str({value})")
-            self._indent -= 1
-        elif node.target_type == "int":
+        if node.target_type == "int":
             # floor() matches interpreter semantics (round toward -inf, not truncate)
-            self._emit(f"{tmp} = _torch.floor({value}) if _torch.is_tensor({value}) else _torch.scalar_tensor(_math.floor({value}), dtype=_torch.float32, device=_dev)")
+            self._emit(f"{tmp} = _torch.floor({value} if _torch.is_tensor({value}) else _torch.scalar_tensor(float({value}), dtype=_torch.float32, device=_dev))")
         elif node.target_type == "float":
             self._emit(f"{tmp} = {value}.float() if _torch.is_tensor({value}) else _torch.scalar_tensor(float({value}), dtype=_torch.float32, device=_dev)")
         else:

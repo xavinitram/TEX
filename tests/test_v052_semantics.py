@@ -218,3 +218,26 @@ def test_scalar_field_widens_to_the_declared_vector(code, n):
     assert tuple(ref["OUT"].shape) == (1, 4, 6, 4)
     for ch in range(n):
         assert torch.allclose(ref["OUT"][..., ch], field, atol=1e-5)
+
+
+# ── Casts: codegen prints numbers as the interpreter does, NaN/Inf included ─────────────
+
+@pytest.mark.parametrize("code,want", [
+    ("float b = 3e38; float x = b * 10.0; string s = string(x); @OUT = vec4(len(s));", 3.0),
+    ("float b = 3e38; float x = b * 10.0 - b * 10.0; string s = string(x); @OUT = vec4(len(s));", 3.0),
+    ("float x = @A.r * 0.0 + 3e38 * 10.0; string s = string(x); @OUT = vec4(len(s));", 3.0),
+    ("string s = string(1.0 / 3.0); @OUT = vec4(len(s));", 8.0),
+    ("string s = string(2.0); @OUT = vec4(len(s));", 1.0),
+    ("float c = 0.0; float b = 1.0; for (int i = 0; i < 3; i++) { b = b / 3.0;"
+     " string s = string(b); c = c + len(s); } @OUT = vec4(c);", 24.0),
+    ("float c = 0.0; float b = 3e37; for (int i = 0; i < 3; i++) { b = b * 10.0;"
+     " string s = string(b); c = c + len(s); } @OUT = vec4(c);", 45.0),
+    ("float c = 0.0; float b = 3e37; for (int i = 0; i < 3; i++) { b = b * 10.0;"
+     " c = c + int(b) * 0.0 + float(b) * 0.0; } @OUT = vec4(c);", float("nan")),
+    ("float c = 0.0; float b = 3e30; for (int i = 0; i < 40; i++) { b = b * 1e30;"
+     " c = c + int(b) * 0.0; } @OUT = vec4(c);", float("nan")),
+], ids=["inf", "nan", "inf-field", "third", "whole", "loop-third", "loop-inf", "loop-int-inf",
+        "scalar-loop-int-inf"])
+def test_cast_of_any_float(code, want):
+    ref = run_tiers(code, {"A": _img()})
+    assert torch.allclose(ref["OUT"], torch.full_like(ref["OUT"], want), equal_nan=True)
