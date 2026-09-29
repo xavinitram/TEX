@@ -553,9 +553,11 @@ def run_fused_leg(device: str, res: int, compile_mode: str, ticks: int, warmup: 
                 out["verdict"] = "compiled"
                 out["verdict_reason"] = "the forced tier's compiled artifact is cached and serving"
                 if baseline_first_ms is not None:
-                    # First-tick delta vs the fused/"none" leg's own first tick — both pay the
-                    # same splice+codegen setup, so the delta is dominated by the compile
-                    # itself. Labelled an ESTIMATE, not a measured compile-only span.
+                    # First-tick delta vs the fused/"none" leg's own first tick. Legs share
+                    # one process and run in a fixed order, so the earlier leg populates the
+                    # front-end and fuse caches the later one reuses: the delta is ORDER-
+                    # DEPENDENT and understates setup the later leg did not pay. An ESTIMATE,
+                    # not a measured compile-only span.
                     out["compile_time_ms_estimate"] = round(
                         out["first_cook_ms"] - baseline_first_ms, 4)
             elif fused_fp in tex_compiled._compile_blacklist:

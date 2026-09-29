@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Empirical test of the TEX cross-node fusion HYPOTHESIS (research, not impl):
 fusing a chain of TEX programs into one (each stage's @OUT -> a local, the next
-stage's input @A -> that local) is (a) BIT-EQUIVALENT to running them
-sequentially, and (b) faster (one compile, no intermediate materialization,
-cross-stage optimization). This is the backend half of 'only the terminal cooks'.
+stage's input @A -> that local) is (a) equivalent to running them sequentially
+(within 1e-5) and (b) faster: one compile, and one interpreter run with no
+intermediate materialization. The two are reported separately ("run" excludes the
+front end, "compile" is the front end alone). This is the backend half of 'only the terminal cooks'.
 
 The splice here is done at SOURCE level for the test (the production splicer would
 do it on the AST, per ast_nodes.py: flat Program.statements, @OUT = Assignment to
@@ -46,18 +47,21 @@ def comp(code, t):
     return program, tm, on, used, b
 
 
-def run_seq(t):  # sequential: 3 separate compile+interpret, materializing each intermediate
+def prep_seq(t):  # the front end (parse/typecheck/optimize) for each stage, done once
+    return [comp(src, t)[:4] for src in STAGES]
+
+
+def run_seq(t, prepped):  # sequential: 3 interpret runs, materializing each intermediate
     cur = t
-    for src in STAGES:
-        program, tm, on, used, b = comp(src, cur)
+    for program, tm, on, used in prepped:
         b = {"A": cur, "image": cur}
         cur = run_interpreter(program, b, tm, str(t.device).split(":")[0] if t.is_cuda else "cpu",
                               on, used_builtins=used)
     return cur
 
 
-def run_fused(t, fused_code):  # one compile, one interpret, no intermediates
-    program, tm, on, used, b = comp(fused_code, t)
+def run_fused(t, prepped):  # one interpret run, no intermediates
+    program, tm, on, used, b = prepped
     dev = "cuda" if t.is_cuda else "cpu"
     return run_interpreter(program, b, tm, dev, on, used_builtins=used)
 
@@ -83,11 +87,13 @@ print()
 for device in (["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]):
     H = W = 1024
     img = torch.rand(1, H, W, 4, device=device)
-    seq = run_seq(img)
-    fus = run_fused(img, fused_code)
+    # Front-end work is hoisted out of the "run" rows and reported on its own below.
+    seq_prep, fus_prep = prep_seq(img), comp(fused_code, img)
+    seq = run_seq(img, seq_prep)
+    fus = run_fused(img, fus_prep)
     maxdiff = (seq - fus).abs().max().item()
-    seq_ms = timeit(lambda: run_seq(img), device)
-    fus_ms = timeit(lambda: run_fused(img, fused_code), device)
+    seq_ms = timeit(lambda: run_seq(img, seq_prep), device)
+    fus_ms = timeit(lambda: run_fused(img, fus_prep), device)
     # compile-only cost: 3 compiles vs 1
     cseq = timeit(lambda: [comp(s, img) for s in STAGES], device, runs=20)
     cfus = timeit(lambda: comp(fused_code, img), device, runs=20)

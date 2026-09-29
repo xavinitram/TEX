@@ -8,7 +8,10 @@ Measures cook time across the full matrix:
 
   - compile OFF = tree-walking interpreter
   - compile ON  = execute_compiled() (torch.compile, falls back to interpreter)
-  - cold        = first run, includes (re)compilation
+  - cold        = first run with the in-memory compiled cache cleared. The on-disk
+                  TEX/Inductor cache in TEX_CACHE_DIR is NOT cleared, so a compile-ON cold
+                  figure is "cold memory, warm disk" and depends on earlier invocations
+                  that shared the cache dir.
   - warm        = subsequent run, caches primed
 
 Key differences vs the older bench scripts:
