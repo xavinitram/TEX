@@ -16,6 +16,7 @@ interpretation. Operates on the AST in-place (mutates nodes).
 from __future__ import annotations
 import copy
 import math
+import struct
 from collections.abc import Callable
 
 from .ast_nodes import (
@@ -67,7 +68,7 @@ _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
     "pow": math.pow, "pow2": lambda x: 2.0 ** x, "pow10": lambda x: 10.0 ** x,
     "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
     "min": min, "max": max,
-    "clamp": lambda x, lo, hi: max(lo, min(x, hi)),
+    "clamp": lambda x, lo, hi: min(hi, max(x, lo)),   # torch.clamp: hi wins when lo > hi
     "lerp": lambda a, b, t: a + (b - a) * t,
     "mix": lambda a, b, t: a + (b - a) * t,  # Alias for lerp
     # Mirror fn_smoothstep exactly: clamp((x-e0)/(e1-e0+SAFE_EPSILON), 0, 1)
@@ -350,9 +351,13 @@ def _opt_expr(expr: ASTNode) -> ASTNode:
         expr.condition = _opt_expr(expr.condition)
         expr.true_expr = _opt_expr(expr.true_expr)
         expr.false_expr = _opt_expr(expr.false_expr)
-        # Fold: literal_cond ? a : b -> a or b
+        # Fold: literal_cond ? a : b -> a or b, when the dropped arm is a literal (a
+        # dropped spatial arm would take the result's broadcast shape with it)
         if isinstance(expr.condition, NumberLiteral):
-            return expr.true_expr if expr.condition.value > 0.5 else expr.false_expr
+            keep, drop = ((expr.true_expr, expr.false_expr) if expr.condition.value > 0.5
+                          else (expr.false_expr, expr.true_expr))
+            if isinstance(drop, NumberLiteral):
+                return keep
         return expr
 
     if isinstance(expr, VecConstructor):
@@ -472,14 +477,28 @@ def _fold_binop(node: BinOp) -> ASTNode:
     return node
 
 
-def _eval_binop_const(op: str, a: float, b: float) -> float | None:
-    """Evaluate a binary operation on two constant values. Returns None on error."""
+def _f32(x: float) -> float | None:
+    """`x` rounded to fp32, the type the runtime computes in; None when it is not finite
+    there (a folded inf/nan would also be emitted as a bare name by codegen)."""
     try:
-        if op == "+": return a + b
-        if op == "-": return a - b
-        if op == "*": return a * b
-        if op == "/": return a / b if b != 0 else None
-        if op == "%": return math.fmod(a, b) if b != 0 else None
+        r = struct.unpack("f", struct.pack("f", x))[0]
+    except (OverflowError, struct.error):
+        return None
+    return r if math.isfinite(r) else None
+
+
+def _eval_binop_const(op: str, a: float, b: float) -> float | None:
+    """Evaluate a binary operation on two constant values as the fp32 runtime does.
+    Returns None (no fold) on error or a non-finite result. '%' is not folded: the
+    runtime's fp32 remainder is not Python's fmod on doubles."""
+    a, b = _f32(a), _f32(b)
+    if a is None or b is None:
+        return None
+    try:
+        if op == "+": return _f32(a + b)
+        if op == "-": return _f32(a - b)
+        if op == "*": return _f32(a * b)
+        if op == "/": return _f32(a / b) if b != 0 else None
         if op == "==": return 1.0 if a == b else 0.0
         if op == "!=": return 1.0 if a != b else 0.0
         if op == "<": return 1.0 if a < b else 0.0
@@ -517,7 +536,7 @@ def _fold_function(node: FunctionCall) -> ASTNode:
     # pow(x, 0) -> 1, pow(x, 1) -> x
     if name == "pow" and len(args) == 2 and _is_num_lit(args[1]):
         exp = _num_val(args[1])
-        if exp == 0.0:
+        if exp == 0.0 and _is_num_lit(args[0]):   # a spatial x keeps its shape: no fold
             return _make_num(1.0, node.loc)
         if exp == 1.0:
             return args[0]
@@ -537,12 +556,13 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         # pow(x, -1) -> 1 / x is NOT applied: division goes through the zero guard
         # (finite ~1e8 at x == 0) while pow(0, -1) is inf.
 
-    # lerp(a, b, 0) -> a, lerp(a, b, 1) -> b
+    # lerp(a, b, 0) -> a, lerp(a, b, 1) -> b, only when the dropped operand is a literal:
+    # a dropped spatial operand would take the result's shape with it.
     if name in ("lerp", "mix") and len(args) == 3 and _is_num_lit(args[2]):
         t = _num_val(args[2])
-        if t == 0.0:
+        if t == 0.0 and _is_num_lit(args[1]):
             return args[0]
-        if t == 1.0:
+        if t == 1.0 and _is_num_lit(args[0]):
             return args[1]
 
     # sqrt(x*x) -> abs(x) — only when the argument is exactly x*x
@@ -560,9 +580,9 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         if fn is not None:
             try:
                 float_args = [_num_val(a) for a in args]
-                result = fn(*float_args)
-                if isinstance(result, (int, float)) and math.isfinite(result):
-                    return _make_num(float(result), node.loc)
+                result = fn(*float_args) if name != "mod" else None   # see _eval_binop_const
+                if isinstance(result, (int, float)) and _f32(result) is not None:
+                    return _make_num(_f32(result), node.loc)
             except (ValueError, ZeroDivisionError, OverflowError, TypeError):
                 pass
 
@@ -1526,7 +1546,8 @@ def _unroll_small_loops(stmts: list[ASTNode]) -> list[ASTNode]:
             static = try_extract_static_range(stmt)
             if (static is not None
                     and len(stmt.body) <= _UNROLL_MAX_BODY_STMTS
-                    and not _contains_break_continue(stmt.body)):
+                    and not _contains_break_continue(stmt.body)
+                    and static[0] not in _collect_written_vars(stmt.body)):
                 var_name, start, stop, step = static
                 n_iters = len(range(start, stop, step))
                 if 0 < n_iters <= _UNROLL_MAX_ITERS:

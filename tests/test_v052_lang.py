@@ -380,3 +380,53 @@ def test_int_cast_of_a_vector_is_an_elementwise_vector():
     A = _a()
     ref = run_both("vec3 q = int(@A.rgb * 8.0) / 8.0; @OUT = vec4(q, 1.0);", {"A": A})
     assert torch.allclose(ref["OUT"][..., :3], torch.floor(A[..., :3] * 8.0) / 8.0)
+
+
+# ── Optimizer: folds agree with the fp32 runtime and keep shapes ────────────────────────
+
+def _optimized(code, bindings=None):
+    program, *_ = _compile(code, bindings or {"A": _a()})
+    return program
+
+
+def _unfolded_equals_folded(expr_folded, expr_runtime):
+    """OUT of a constant expression equals the same expression computed on a runtime value."""
+    A = _a()
+    folded = run_both(f"@OUT = vec4({expr_folded}) + @A * 0.0;", {"A": A})["OUT"]
+    live = run_both(f"float z = @A.r * 0.0; @OUT = vec4({expr_runtime}) + @A * 0.0;", {"A": A})["OUT"]
+    assert torch.equal(folded, live), (folded.flatten()[:1], live.flatten()[:1])
+
+
+@pytest.mark.parametrize("folded,live", [
+    ("clamp(0.5, 1.0, 0.0)", "clamp(0.5 + z, 1.0, 0.0)"),
+    ("1000000.0 % -3.7", "(1000000.0 + z) % -3.7"),
+    ("mod(1000000.0, -3.7)", "mod(1000000.0 + z, -3.7)"),
+    ("0.1 + 0.2", "(0.1 + z) + 0.2"),
+    ("16777217.0 * 3.0", "(16777217.0 + z) * 3.0"),
+], ids=["clamp-inverted", "rem", "mod", "add", "big"])
+def test_constant_fold_matches_the_runtime(folded, live):
+    _unfolded_equals_folded(folded, live)
+
+
+def test_fold_never_mints_a_non_finite_literal():
+    ref = run_both("float x = 1e38 * 10.0; @OUT = vec4(isinf(x)) + @A * 0.0;", {"A": _a()})
+    assert ref["OUT"].flatten()[0].item() == 1.0
+
+
+@pytest.mark.parametrize("expr", ["pow(@A.rgb, 0.0)", "lerp(vec3(1.0), @A.rgb, 0.0)",
+                                  "(1.0) ? vec3(1.0) : @A.rgb"], ids=["pow0", "lerp0", "ternary"])
+def test_fold_keeps_a_dropped_operands_shape(expr):
+    # A fold to a uniform 1.0 would make img_sum see one value, not the 16 pixels.
+    code = f"vec3 s = img_sum({expr}); @OUT = vec4(s.r, s.g, s.b, 1.0);"
+    program, tm, _r, _a2, _p, _u = _compile(code, {"A": _a()})
+    out = Interpreter().execute(program, {"A": _a()}, tm, device="cpu", output_names=["OUT"])["OUT"]
+    assert out.flatten()[:3].tolist() == [16.0, 16.0, 16.0]
+
+
+def test_unroll_leaves_a_loop_that_writes_its_counter():
+    # Unrolling used to substitute the counter into `i = i + 1`'s target (an assignment
+    # to a literal). The loop is now left a loop; both tiers agree on it.
+    prog = _optimized("float s = @A.r * 0.0; for (int i = 0; i < 4; i++) { s += 1.0; i = i + 1; } @OUT = vec4(s);")
+    assert any(type(st).__name__ == "ForLoop" for st in prog.statements)
+    run_both("float s = @A.r * 0.0; for (int i = 0; i < 4; i++) { s += 1.0; i = i + 1; } @OUT = vec4(s);",
+             {"A": _a()})
