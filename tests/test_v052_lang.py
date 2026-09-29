@@ -297,3 +297,9 @@ def test_blend_keeps_the_base_width():
 def test_builtin_argument_kinds_are_checked(code, bt):
     assert "E5003" in check_errors(code, bt)
 
+
+def test_not_of_a_vector_is_a_vector():
+    assert check_errors("float t = !@A.rgb; @OUT = vec4(t);", _V4) == ["E3200"]
+    A = _a()
+    ref = run_both("vec3 t = !(@A.rgb - @A.rgb); @OUT = vec4(t, 0.0);", {"A": A})
+    assert ref["OUT"][0, 0, 0].tolist() == [1.0, 1.0, 1.0, 0.0]

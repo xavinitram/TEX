@@ -1276,7 +1276,8 @@ class TypeChecker:
         return None
 
     def _check_unary(self, node: UnaryOp) -> TEXType:
-        """Type-check a unary operation (-/!): the operand must be numeric/scalar."""
+        """Type-check a unary operation (-/!): any numeric operand; both are element-wise,
+        so a vector or matrix keeps its type (a scalar '!' is a FLOAT 0/1)."""
         t = self._check_expr(node.operand)
         if t.is_string:
             self._error(f"Unary operator '{node.op}' is not supported for strings.",
@@ -1287,10 +1288,8 @@ class TypeChecker:
         if self._reject_aggregate_operand(node.op, node.loc, t) is not None:
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
-        if node.op == "!":
-            self._set_type(node, TEXType.FLOAT)
-            return TEXType.FLOAT
-        # Negation preserves type
+        if node.op == "!" and t.is_scalar:
+            t = TEXType.FLOAT
         self._set_type(node, t)
         return t
 
