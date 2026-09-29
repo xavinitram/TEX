@@ -25,6 +25,7 @@ PORTABILITY: every row here is stdlib-only against `gate.py`'s own functions (mo
 subprocess/env where a real interpreter or real CUDA hardware would otherwise be needed), so
 this needs no torch, no CUDA and no ComfyUI, and runs identically on the CI lane.
 """
+import hashlib
 import importlib.util
 import os
 import sys
@@ -145,54 +146,69 @@ def test_g1_run_ci_shape_runs_normally_when_the_probe_is_false(r: SubTestResult)
 
 # ── G2: LINT-1 (via SIMP-3's tracked_paths) sees untracked-not-ignored too ──
 
-def test_g2_enumerate_paths_matches_tree_hash_walk(r: SubTestResult):
-    print("\n--- G2: enumerate_paths is the same enumeration tree_hash() uses ---")
+def test_g2_tree_hash_is_built_from_enumerate_paths(r: SubTestResult):
+    print("\n--- G2: tree_hash() walks exactly what enumerate_paths returns ---")
     g = _gate()
     if not hasattr(g, "enumerate_paths"):
         r.fail("G2 shared helper missing", "gate.py has no enumerate_paths function")
         return
-    paths = g.enumerate_paths(g._PKG)
-    if paths is None:
-        r.fail("G2 enumerate_paths", "this checkout must enumerate as a git repository")
-        return
-    r.ok(f"enumerate_paths returned {len(paths)} path(s)")
+    orig = g.enumerate_paths
+    try:
+        g.enumerate_paths = lambda cwd=None: ["__g2_no_such_file__"]
+        got_one = g.tree_hash()
+        g.enumerate_paths = lambda cwd=None: []
+        got_none = g.tree_hash()
+    finally:
+        g.enumerate_paths = orig
+    # A path that cannot be read is hashed as `<unreadable>`; an empty enumeration hashes
+    # nothing. Both are computable here without any checkout, so this needs no git.
+    want_one = hashlib.sha256(b"__g2_no_such_file__\0<unreadable>\0").hexdigest()
+    want_none = hashlib.sha256().hexdigest()
+    if got_one == want_one and got_none == want_none:
+        r.ok("tree_hash() hashes exactly the paths enumerate_paths returns (it is the shared walk)")
+    else:
+        r.fail("G2 tree_hash source",
+               f"tree_hash() does not follow enumerate_paths: one={got_one == want_one} "
+               f"none={got_none == want_none}")
 
 
 def test_g2_enumerate_paths_sees_an_untracked_not_ignored_file(r: SubTestResult):
     """The exact reproduction: a file that exists only on disk (never committed, never
     staged) must still appear in the enumeration — the gap that let LINT-1 miss it while
-    `tree_hash()` (and the gate's own cache key) already saw its bytes."""
+    `tree_hash()` (and the gate's own cache key) already saw its bytes. Driven against a
+    throwaway repository, never the live checkout."""
     print("\n--- G2: an untracked-not-ignored file is enumerated, not just the cached set ---")
     g = _gate()
+    import shutil
     import subprocess as _subprocess
-    marker = "tests/_tex_g2_untracked_probe_delete_me.py"
-    abs_marker = os.path.join(g._PKG, marker)
-    try:
-        with open(abs_marker, "w", encoding="utf-8") as f:
-            f.write("# G2 probe: an untracked, not-ignored file.\n")
-        # sanity: git itself must see it as untracked-not-ignored (never staged/committed).
-        status = _subprocess.run(["git", "-C", g._PKG, "status", "--porcelain", "--", marker],
-                                 capture_output=True, text=True, timeout=60).stdout
-        if not status.strip().startswith("??"):
-            r.skip("G2 untracked probe",
-                   f"this checkout does not report the probe file as untracked ({status!r}); "
-                   f"cannot exercise the shape here")
-            return
-        paths = g.enumerate_paths(g._PKG)
-        if paths is None:
-            r.fail("G2 untracked probe", "enumerate_paths returned None for a real checkout")
-        elif marker not in paths:
-            r.fail("G2 untracked probe",
-                   f"{marker!r} is untracked-not-ignored but was not enumerated — LINT-1/"
-                   f"SIMP-3's tracked_paths() has the same gap tree_hash() already closed")
-        else:
-            r.ok(f"the untracked, not-ignored probe file is enumerated alongside the tracked "
-                 f"set ({len(paths)} total)")
-    finally:
+    if shutil.which("git") is None:
+        r.skip("G2 untracked probe", "no git binary on this box; cannot build a scratch repo")
+        return
+    with tempfile.TemporaryDirectory(prefix="tex-g2-") as repo:
         try:
-            os.remove(abs_marker)
-        except OSError:
-            pass
+            _subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True,
+                            timeout=60)
+            for name, body in (("staged.py", "# staged\n"), ("untracked.py", "# untracked\n"),
+                               ("ignored.tmp", "x\n"), (".gitignore", "*.tmp\n")):
+                with open(os.path.join(repo, name), "w", encoding="utf-8") as f:
+                    f.write(body)
+            _subprocess.run(["git", "-C", repo, "add", "staged.py"], check=True,
+                            capture_output=True, timeout=60)
+        except (OSError, _subprocess.SubprocessError) as e:
+            r.skip("G2 untracked probe", f"could not build a scratch repo ({e})")
+            return
+        paths = g.enumerate_paths(repo)
+        if paths is None:
+            r.fail("G2 untracked probe", "enumerate_paths returned None for a real repository")
+        elif "untracked.py" not in paths:
+            r.fail("G2 untracked probe",
+                   f"an untracked-not-ignored file was not enumerated: {paths} — LINT-1/"
+                   f"SIMP-3's tracked_paths() has the same gap tree_hash() already closed")
+        elif "staged.py" not in paths or "ignored.tmp" in paths:
+            r.fail("G2 untracked probe", f"tracked set wrong (want staged in, ignored out): {paths}")
+        else:
+            r.ok(f"the untracked, not-ignored file is enumerated alongside the staged one, "
+                 f"and the ignored one is not ({paths})")
 
 
 def test_g2_lint1_tracked_paths_delegates_to_the_shared_enumeration(r: SubTestResult):
@@ -201,8 +217,13 @@ def test_g2_lint1_tracked_paths_delegates_to_the_shared_enumeration(r: SubTestRe
     g = _gate()
     a, b = simp3.tracked_paths(), g.enumerate_paths(str(simp3._PKG))
     cap = simp3._MAX_TRACKED
-    if a is None or b is None:
-        r.fail("G2 delegation", f"expected both to enumerate this checkout, got {a!r}/{b!r}")
+    if a is None and b is None:
+        # Not a git checkout (a source archive, an installed copy): both consumers of the
+        # shared walk agree on "no enumeration", which is the delegation holding.
+        r.ok("not a git checkout: tracked_paths() and enumerate_paths() both report None")
+    elif a is None or b is None:
+        r.fail("G2 delegation", f"tracked_paths()/enumerate_paths() disagree on whether this "
+                                f"is a git checkout: {a!r}/{b!r}")
     elif a != sorted(b)[:cap]:
         r.fail("G2 delegation",
                "tracked_paths() no longer agrees with gate.py's own enumerate_paths — they "
@@ -363,10 +384,13 @@ def test_g5_prune_is_wired_into_a_gate_run(r: SubTestResult):
     orig_importable = g._importable_as_tex_wrangle
     g._importable_as_tex_wrangle = lambda: False   # refuse before any leg spawns
     try:
-        g.main(["--tier", "cheap"])
+        refusal_rc = g.main(["--tier", "cheap"])
     finally:
         g._prune_inductor_cache_root = orig_prune
         g._importable_as_tex_wrangle = orig_importable
+    if refusal_rc != 1:
+        r.fail("G5 wiring", f"main() must refuse with rc 1 when the package is not importable "
+                            f"as TEX_Wrangle, got {refusal_rc!r}")
     if calls:
         r.fail("G5 wiring", "main() must refuse (rc 1) BEFORE pruning, but pruning ran anyway")
     # Now let main() actually reach the pruning call, with a fake (non-spawning) cheap leg
@@ -380,6 +404,10 @@ def test_g5_prune_is_wired_into_a_gate_run(r: SubTestResult):
         leg.rc, leg.failures, leg.collected = 0, [], {"tests/fake.py::test_ok"}
         return leg
     g.run_cheap = _fake_run_cheap
+    # Hermetic: no whole-tree hash, no git label and no package-importability probe.
+    orig_env = (g.tree_hash, g.head_label, g._importable_as_tex_wrangle)
+    g.tree_hash, g.head_label = (lambda: "0" * 64), (lambda: "g5-test")
+    g._importable_as_tex_wrangle = lambda: True
     orig_cache_env = os.environ.get("TEX_GATE_CACHE")
     try:
         with tempfile.TemporaryDirectory(prefix="tex-g5-cache-") as cache_scratch:
@@ -388,6 +416,7 @@ def test_g5_prune_is_wired_into_a_gate_run(r: SubTestResult):
     finally:
         g._prune_inductor_cache_root = orig_prune
         g.run_cheap = orig_run_cheap
+        g.tree_hash, g.head_label, g._importable_as_tex_wrangle = orig_env
         if orig_cache_env is None:
             os.environ.pop("TEX_GATE_CACHE", None)
         else:
