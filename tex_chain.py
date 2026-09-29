@@ -559,6 +559,18 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
         # above for why its default canvas already answers a DAG stage list correctly). A
         # closure so both the skip branch and the consumer-resolution branch below share one
         # spelling rather than two that could drift apart.
+        # A boundary is keyed by `upstream` alone for tensor CONTENT, so a cache read or write
+        # needs one upstream key per tensor binding in the prefix it covers — the same gate
+        # `cook_fused_cached` applies. Without it two same-shape sources collide on one key.
+        _prefix_tensors = []
+        _seen = 0
+        for st in stages:
+            _seen += sum(1 for v in (st.get("bindings") or {}).values() if _is_tensor_binding(v))
+            _prefix_tensors.append(_seen)
+
+        def _cacheable(idx: int) -> bool:
+            return result_cache is not None and len(upstream) >= _prefix_tensors[idx]
+
         def _checkpoint_key(idx: int) -> str:
             return boundary_lineage_key(
                 stages, idx + 1, device, precision, upstream=upstream,
@@ -573,7 +585,7 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
             v = known_outputs.get(idx)
             if v is not None:
                 return v
-            if result_cache is not None:
+            if _cacheable(idx):
                 cached = result_cache.get(_checkpoint_key(idx))
                 if cached is not None:
                     return {"OUT": cached}
@@ -687,7 +699,7 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 # eligibility — a narrowing, never a widening, so a stage that reaches this
                 # line with `served_roi is None` (this section's one load-bearing fact) is
                 # unaffected by `store` unless the host explicitly leaves its index out.
-                if (result_cache is not None and windows is not None and i != n - 1
+                if (_cacheable(i) and windows is not None and i != n - 1
                         and "OUT" in out and (store is None or i in store)):
                     result_cache.put(_checkpoint_key(i), out["OUT"],
                                      canvas={"shape": list(out["OUT"].shape)})

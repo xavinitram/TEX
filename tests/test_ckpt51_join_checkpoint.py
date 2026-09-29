@@ -73,7 +73,7 @@ def test_ckpt51_checkpoint_boundary_at_a_join_pixel_identity(r: SubTestResult):
     A = torch.rand(1, H, W, 3)
     B = torch.rand(1, H, W, 3)
     rc = tex_results.ResultCache()
-    up = ("ckpt51-join-boundary-src",)
+    up = ("ckpt51-join-boundary-src", "second-source",)
     stages = _cp_join_boundary_stages(A, B)
 
     # Tick 1: everything dirty. Stage 2 (the JOIN) is planned a window (stage 3's heavy blur
@@ -143,7 +143,7 @@ def test_ckpt51_approximate_gauss_blur_declines_through_checkpointed_route(r: Su
     B_old = torch.rand(1, H, W, 3)
     B_new = torch.rand(1, H, W, 3)
     rc = tex_results.ResultCache()
-    up = ("ckpt51-approx-gauss-src",)
+    up = ("ckpt51-approx-gauss-src", "second-source",)
 
     # Tick 1: seed the checkpoint. Stage 1's own halo (3*264=792) does NOT saturate a 900px
     # frame from a small interior window, so this is a genuinely-narrowed shape, not a
@@ -192,7 +192,7 @@ def test_ckpt51_approximate_bilateral_declines_through_checkpointed_route(r: Sub
     B_old = torch.rand(1, H, W, 3)
     B_new = torch.rand(1, H, W, 3)
     rc = tex_results.ResultCache()
-    up = ("ckpt51-approx-bilateral-src",)
+    up = ("ckpt51-approx-bilateral-src", "second-source",)
     ss = _Sample._BILATERAL_APPROX_THRESHOLD_SS + 0.5  # spatial_sigma past the threshold
 
     def _stages(B):
