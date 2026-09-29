@@ -13,6 +13,9 @@ the AST-level function, plus one row proving the public `tex_api.Program.time_re
 reaches it, and one differential row proving the two truths (`time_reads` and graphed's
 capture bar) can only ever agree, not merely correlate.
 """
+import hashlib
+import json
+
 from TEX_Wrangle import tex_api
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_api import _collect_time_reads
@@ -124,18 +127,24 @@ def test_timereads45_program_attribute_is_wired(r):
 
 def test_timereads45_does_not_move_the_fingerprint(r):
     """A derived, read-only attribute must not perturb the compile fingerprint or any cache
-    key — the ask is explicit about this. Nothing in `_compile_impl` computes `time_reads`
-    before `fp` is minted, but pin it directly: the SAME source through `TEXCache.fingerprint`
-    (independently of `tex_api.compile`) must equal the `fp` `_compile_impl` used."""
+    key — the ask is explicit about this. The `fp` `_compile_impl` used is compared with the
+    documented encoding recomputed here from scratch (length-prefixed source bytes, then the
+    JSON of the sorted binding key), so a component added to the fingerprint — `time_reads`
+    or anything else — moves it and reds this row."""
     print("\n--- TIMEREADS-45: time_reads does not move the fingerprint ---")
     try:
         from TEX_Wrangle.tex_cache import get_cache
         fails = []
         for name, src, _expected in _CASES:
             prog, fp = tex_api._compile_impl(src, {})
-            direct_fp = get_cache().fingerprint(src, {})
-            if fp != direct_fp:
-                fails.append(f"{name}: fp={fp!r} != direct fingerprint {direct_fp!r}")
+            code_bytes = src.encode()
+            documented_fp = hashlib.sha256(
+                len(code_bytes).to_bytes(8, "little") + code_bytes + json.dumps(()).encode()
+            ).hexdigest()
+            if fp != documented_fp:
+                fails.append(f"{name}: fp={fp!r} != documented encoding {documented_fp!r}")
+            if get_cache().fingerprint(src, {}) != documented_fp:
+                fails.append(f"{name}: TEXCache.fingerprint != documented encoding")
             # Re-compiling must reproduce the identical time_reads value (a pure function of
             # the AST alone) without touching the fingerprint either.
             prog2, fp2 = tex_api._compile_impl(src, {})
