@@ -106,12 +106,17 @@ def test_cancel44_stencil_route_honours_cancel(r: SubTestResult):
     print("\n--- CANCEL-44 Gap 2: the stencil route (compile_mode='none') now cancels ---")
     bindings = _box_blur_bindings(48, 2, seed=5)
 
-    tok = _TripToken(1)
+    # Trip on the SECOND poll: `tex_engine.run` polls once before choosing a tier, so a token
+    # tripping on the first would raise here even with the stencil route deaf to cancel.
+    tok = _TripToken(2)
     try:
         tex_engine.cook(_BOX_BLUR, dict(bindings), device_mode="cpu", cancel=tok)
         r.fail("stencil route cancel", "cook did not raise -- the Gap 2 bug is back")
     except CookCancelled:
-        r.ok("stencil-routed cook raises CookCancelled on an armed token")
+        if tok.calls == 2:
+            r.ok("stencil-routed cook raises CookCancelled on the poll after the engine's own")
+        else:
+            r.fail("stencil route cancel", f"tripped after {tok.calls} polls, expected 2")
 
     never = _NeverToken()
     res = tex_engine.cook(_BOX_BLUR, dict(bindings), device_mode="cpu", cancel=never)
