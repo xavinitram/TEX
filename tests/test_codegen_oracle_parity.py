@@ -621,3 +621,27 @@ def test_float_counter_fractional_runtime_radius_matches_interpreter(r):
     got = _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
                                 used_builtins=used, fingerprint=None, time_context=None)
     assert (ref["OUT"] - got["OUT"]).abs().max().item() <= 1e-5
+
+
+# ── a scalar-mode loop leaves an enclosing local it only reads as the tensor it was ──────
+
+_SCALAR_READ_ONLY_ROWS = [
+    ("read-only local, no image bound",
+     "float f0 = -1.0;\nint i0 = 0;\nfor (int k0 = 0; k0 < 4; k0++) { f0 = f0; }\n"
+     "for (int k1 = 0; k1 < 2; k1++) { if (f0 <= 0.5) { break; } i0 *= 0; }\n@OUT = vec4(f0, f0, 0.0, 0.0);", {}),
+    ("read-only local, image bound",
+     "float f0 = -1.0;\nint i0 = 0;\nfor (int k0 = 0; k0 < 4; k0++) { f0 = f0; }\n"
+     "for (int k1 = 0; k1 < 2; k1++) { if (f0 <= 0.5) { break; } i0 *= 0; }\n@OUT = vec4(f0, f0, 0.0, 0.0) + @A * 0.0;",
+     {"A": None}),
+    ("scalar loop inside a per-pixel if",
+     "float acc = 0.0; float cnt = 0.0; float x = @A.r;\n"
+     "if ($g < x) { for (int i1 = 0; i1 < 3; i1++) { acc = acc * 0.5 + cnt; } }\n@OUT = vec4(acc, cnt, 0.0, 0.0);",
+     {"A": None, "g": 0.5}),
+]
+
+
+@pytest.mark.parametrize("label,code,extra", _SCALAR_READ_ONLY_ROWS,
+                         ids=[r[0] for r in _SCALAR_READ_ONLY_ROWS])
+def test_scalar_loop_keeps_read_only_locals_tensors(label, code, extra):
+    bindings = {k: (_img() if v is None else v) for k, v in extra.items()}
+    assert_parity(code, bindings)

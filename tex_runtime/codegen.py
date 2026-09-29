@@ -2819,6 +2819,15 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             or self._is_scalar_body(stmt.body, loop_var)
         )
 
+        # Scalar mode turns every local the body touches into a Python float in place. An
+        # enclosing local the loop only READS keeps its tensor: save it, restore it after.
+        read_only = {}
+        if use_scalar and not self._scalar_loop:
+            for vname in all_vars:
+                if (vname != loop_var and vname not in modified_vars
+                        and saved_locals[vname] is not None):
+                    read_only[vname] = self._tmp()
+                    self._emit(f"{read_only[vname]} = {self._local_vars[vname]}")
         if use_scalar:
             self._setup_scalar_loop(all_vars, loop_var)
         else:
@@ -2860,6 +2869,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                     # A local declared in a branch the loop never took (or in the
                     # body of a loop that ran zero passes) is still None.
                     self._emit(f"if {local} is not None and not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
+            for vname, saved in read_only.items():
+                self._emit(f"{self._local_vars[vname]} = {saved}")
 
         # Write back modified vars to _env
         for vname in writeback_vars:
