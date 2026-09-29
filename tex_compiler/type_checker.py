@@ -59,6 +59,17 @@ from .diagnostics import (
 _FUNCTION_SIGNATURES: dict | None = None
 
 
+def _literal_number(node) -> int | float | None:
+    """A literal number's value (`2`, `0.5`, `-0.3`), else None. Int literals stay int."""
+    neg = isinstance(node, UnaryOp) and node.op == "-"
+    if neg:
+        node = node.operand
+    if not isinstance(node, NumberLiteral):
+        return None
+    v = int(node.value) if node.is_int else node.value
+    return -v if neg else v
+
+
 def _accepts_any(arg_types) -> None:
     """The default argument rule of a signature row: any types (the count is checked apart)."""
     return None
@@ -187,8 +198,18 @@ class TypeChecker:
     # `_check_break_continue`'s E3015 branch.
     _in_function_body: bool = False
 
+    # The index in `_scopes` of the innermost function body being checked (0 outside one):
+    # a write to a name declared below it would be lost when the call returns.
+    _fn_scope: int = 0
+
+    # Input wires rebound by a whole-binding assignment (`@A = @A.r;`): later reads see
+    # the assigned type, not the connected wire's.
+    _rebound: dict[str, TEXType] = field(default_factory=dict)
+
     # User-defined function signatures: name -> {return_type, params, node}
     _user_functions: dict[str, dict] = field(default_factory=dict)
+    # The user functions each open scope defined (parallel to _scopes).
+    _scope_fns: list[list[str]] = field(default_factory=list)
 
     # Return type of the function currently being checked (None if not in a function)
     _current_function_return_type: TEXType | None = None
@@ -224,7 +245,10 @@ class TypeChecker:
         self.assigned_bindings = {}
         self.param_declarations = {}
         self._user_functions = {}
+        self._scope_fns = [[]]
         self._current_function_return_type = None
+        self._fn_scope = 0
+        self._rebound = {}
         self._const_scopes = [set()]
         self.warnings = []
         self._used_var_names = set()
@@ -281,11 +305,14 @@ class TypeChecker:
         return True
 
     def _push_scope(self):
+        self._scope_fns.append([])
         self._scopes.append({})
         self._array_scopes.append({})
         self._const_scopes.append(set())
 
     def _pop_scope(self):
+        for name in self._scope_fns.pop():
+            self._user_functions.pop(name, None)
         self._scopes.pop()
         self._array_scopes.pop()
         self._const_scopes.pop()
@@ -472,7 +499,7 @@ class TypeChecker:
                         code="E3100",
                         hint="Try: float, int, vec2, vec3, vec4, mat3, mat4, or string.")
             return
-        if elem_type in (TEXType.VOID, TEXType.ARRAY):
+        if not (elem_type.is_scalar or elem_type.is_vector or elem_type.is_string):
             self._error(
                 f"Arrays of '{node.element_type_name}' are not supported.",
                 node.loc,
@@ -613,36 +640,26 @@ class TypeChecker:
                     hint=f"The default value should match the parameter type ({tex_type.value}).",
                 )
 
-        # Extract default literal value (for backend fallback)
+        # The default literal's value (for backend fallback): a number, a negated number, a
+        # string, or vecN(numbers) — one component broadcasts to the declared width.
         default_value = None
-        if node.default_expr is not None:
-            if isinstance(node.default_expr, NumberLiteral):
-                default_value = (
-                    int(node.default_expr.value)
-                    if node.default_expr.is_int
-                    else node.default_expr.value
-                )
-            elif (isinstance(node.default_expr, UnaryOp) and node.default_expr.op == "-"
-                    and isinstance(node.default_expr.operand, NumberLiteral)):
-                # TRK-24: `f$k=-0.3;` parses as UnaryOp('-', NumberLiteral), which no
-                # earlier branch matched, so a negative literal default silently stayed
-                # None. Same fold the optimizer already does for VarDecl initializers
-                # (optimizer._const_literal_value, P2-UC4-NEG) — mirrored here rather than
-                # imported, since this runs before the optimizer pass exists.
-                lit = node.default_expr.operand
-                default_value = -int(lit.value) if lit.is_int else -lit.value
-            elif isinstance(node.default_expr, StringLiteral):
-                default_value = node.default_expr.value
-            elif isinstance(node.default_expr, VecConstructor):
-                # Extract component literals for vec/color param defaults
-                components = []
-                for arg in node.default_expr.args:
-                    if isinstance(arg, NumberLiteral):
-                        components.append(float(arg.value))
-                    else:
-                        break
-                if len(components) == len(node.default_expr.args):
-                    default_value = components
+        d = node.default_expr
+        if d is not None:
+            comps = d.args if isinstance(d, VecConstructor) else [d]
+            nums = [_literal_number(a) for a in comps]
+            if isinstance(d, StringLiteral):
+                default_value = d.value
+            elif None not in nums:
+                if tex_type.is_vector:
+                    default_value = [float(x) for x in nums]
+                    if len(default_value) == 1:
+                        default_value *= tex_type.channels
+                elif len(nums) == 1:
+                    default_value = nums[0]
+            else:
+                self._error(f"The default for ${node.name} must be a literal.", d.loc,
+                            code="E3200", hint="Use a number, a string, or vecN(numbers), "
+                            "e.g. f$gain = 0.5; or v3$tint = vec3(1.0, 0.5, 0.0);")
 
         # Register parameter
         self.param_declarations[node.name] = {
@@ -656,6 +673,24 @@ class TypeChecker:
         """Type-check an assignment: the value must be assignable to the target's type."""
         target_type = self._check_expr(node.target)
         value_type = self._check_expr(node.value)
+
+        root = self._write_root(node.target)
+        depth = self._scope_index(root) if root is not None else None
+        if depth == 0 and root in _BUILTIN_VAR_NAMES:
+            self._error(f"'{root}' is a built-in variable and is read-only.",
+                        node.loc, code="E3204",
+                        hint=f"Copy it into a local first, e.g. float my_{root} = {root};")
+        elif depth is not None and depth < self._fn_scope:
+            self._error(f"'{root}' is declared outside this function, so the function can't "
+                        f"assign to it (the write would be lost when the call returns).",
+                        node.loc, code="E3204",
+                        hint="Return the new value and assign it at the call site.")
+        elif (isinstance(node.target, ChannelAccess) and isinstance(node.target.object, Identifier)
+                and CHANNEL_MAP.get(node.target.channels) == 0
+                and self._lookup_var(root) in (TEXType.FLOAT, TEXType.INT)):
+            self._error(f"'{root}' is a scalar, so it has no channels to write.",
+                        node.loc, code="E3301",
+                        hint=f"Assign the whole value: {root} = ...;")
 
         # Reject assignment to const variables
         if isinstance(node.target, Identifier) and self._is_const(node.target.name):
@@ -743,8 +778,16 @@ class TypeChecker:
                 # Infer output type from assignment
                 if isinstance(node.target, ChannelAccess):
                     effective = self._infer_binding_from_channel(node.target)
+                    n = len(node.target.channels)
+                    want = TEXType.FLOAT if n == 1 else _VEC_SIZE_TYPE.get(n, TEXType.VEC4)
+                    if not self._is_assignable(want, value_type):
+                        self._error(f"Expected '{want.value}' for @{name}.{node.target.channels}, "
+                                    f"but found '{value_type.value}'.", node.loc, code="E3200",
+                                    hint=f"A {n}-channel write takes a {want.value} (or a scalar).")
                 else:
                     effective = value_type
+                    if isinstance(node.target, BindingRef):
+                        self._rebound[name] = value_type
 
                 # Honor explicit type prefix on the binding (e.g. m@mask, img@out).
                 # This lets the user force the ComfyUI output type regardless of
@@ -889,7 +932,9 @@ class TypeChecker:
             return
 
         name = node.name
-        if name in self._user_functions:
+        # Unrolling a loop copies its body, definition included, into one scope; the
+        # lenient re-check of the optimized AST takes the copies as the one definition.
+        if name in self._user_functions and self.strict_redeclare:
             self._error(f"Function '{name}' is already defined.", node.loc, code="E3010")
             return
 
@@ -918,10 +963,14 @@ class TypeChecker:
             "return_type": return_type,
             "params": param_types,
         }
+        # Callable from here to the end of the defining block, as at run time: the
+        # definition runs when its statement does, so a call after an untaken `if` fails.
+        self._scope_fns[-1].append(name)
 
         self._push_scope()
         saved_return_type = self._current_function_return_type
         self._current_function_return_type = return_type
+        self._fn_scope = len(self._scopes) - 1
         # LANG-L2: a function body is its own loop scope, checked fresh on every call —
         # NOT the scope of whatever loop happens to lexically wrap the `FunctionDef`
         # itself. Save and reset `_loop_depth` (and mark `_in_function_body`) around the
@@ -941,6 +990,7 @@ class TypeChecker:
         self._in_function_body = saved_in_function_body
         self._loop_depth = saved_loop_depth
         self._current_function_return_type = saved_return_type
+        self._fn_scope = 0
         self._pop_scope()
 
         self._set_type(node, TEXType.VOID)
@@ -1039,9 +1089,9 @@ class TypeChecker:
             self._set_type(node, t)
             return t
 
-        # @ wire bindings — check binding_types (inputs), then type hint, then fallback
-        # 1. Pre-set input type (from connected wire)
-        t = self.binding_types.get(node.name)
+        # @ wire bindings — a rebinding, the connected input, a previous output, the hint.
+        # 1. Pre-set input type (from connected wire), unless reassigned whole since
+        t = self._rebound.get(node.name) or self.binding_types.get(node.name)
         if t is not None:
             self._set_type(node, t)
             return t
@@ -1680,6 +1730,20 @@ class TypeChecker:
         return ret
 
     # -- Assignment compatibility ---------------------------------------
+
+    @staticmethod
+    def _write_root(target: ASTNode) -> str | None:
+        """The local a write lands in (`x`, `x.r`, `x[i]`), or None for a binding."""
+        if isinstance(target, (ChannelAccess, ArrayIndexAccess)):
+            target = target.object if isinstance(target, ChannelAccess) else target.array
+        return target.name if isinstance(target, Identifier) else None
+
+    def _scope_index(self, name: str) -> int | None:
+        """Index in `_scopes` of the innermost scope declaring `name` (None if undeclared)."""
+        for i in range(len(self._scopes) - 1, -1, -1):
+            if name in self._scopes[i]:
+                return i
+        return None
 
     @staticmethod
     def _int_hint(target: TEXType, value: TEXType) -> str:

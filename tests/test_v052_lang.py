@@ -303,3 +303,61 @@ def test_not_of_a_vector_is_a_vector():
     A = _a()
     ref = run_both("vec3 t = !(@A.rgb - @A.rgb); @OUT = vec4(t, 0.0);", {"A": A})
     assert ref["OUT"][0, 0, 0].tolist() == [1.0, 1.0, 1.0, 0.0]
+
+
+# ── Checker rules the runtime relies on ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("code,want", [
+    ("mat3 a[2]; a[0] = mat3(2.0); @OUT = vec4(a[0] * vec3(1.0), 1.0);", "E3101"),
+    ("f$a = 1.0 + 2.0; @OUT = vec4($a);", "E3200"),
+    ("f$k = PI; @OUT = vec4($k);", "E3200"),
+    ("PI = 3.0; @OUT = vec4(PI);", "E3204"),
+    ("ix = 0.0; @OUT = vec4(ix);", "E3204"),
+    ("u += 0.5; @OUT = vec4(u);", "E3204"),
+    ("for (frame = 0.0; frame < 2.0; frame += 1.0) { } @OUT = vec4(1.0);", "E3204"),
+    ("@A.r = vec3(1.0, 2.0, 3.0); @OUT = @A;", "E3200"),
+    ('@A.r = "x"; @OUT = @A;', "E3200"),
+    ("if (@A.r > 2.0) { float f(float x) { return x; } } @OUT = vec4(f(2.0));", "E5001"),
+    ("float g = 2.0; float f(float x) { g = x; return x; } float r = f(7.0); @OUT = vec4(g + r);", "E3204"),
+    ("vec4 c = vec4(0.0); float f(float x) { c.r = x; return x; } @OUT = c + f(1.0);", "E3204"),
+    ("float a[2] = {0.0, 0.0}; float f(float x) { a[0] = x; return x; } @OUT = vec4(a[0] + f(1.0));", "E3204"),
+    ("float f = 0.0; f.x = 2.0; @OUT = vec4(f);", "E3301"),
+], ids=["mat-array", "param-expr", "param-name", "PI", "ix", "u+=", "for-frame", "chan-vec3",
+        "chan-str", "fn-after-if", "fn-outer-var", "fn-outer-chan", "fn-outer-array",
+        "scalar-chan-write"])
+def test_checker_rejects_what_the_runtime_cannot_run(code, want):
+    assert want in check_errors(code, _V4)
+
+
+@pytest.mark.parametrize("code", [
+    "float f(float x) { float g = x; g = g * 2.0; return g; } @OUT = vec4(f(1.0));",
+    "float g = 1.0; float f(float x) { return x + g; } @OUT = vec4(f(1.0));",
+    "if (@A.r > 0.5) { float u = 2.0; u = 3.0; } @OUT = vec4(u);",
+    "f$k = -0.5; v3$t = vec3(-1.0, 0.5, 2); v3$s = 0.25; @OUT = vec4($k);",
+    "@OUT.r = 0.5; @OUT.gb = vec2(0.1, 0.2); @OUT.a = 1.0;",
+])
+def test_checker_still_accepts(code):
+    assert check_errors(code, _V4) == []
+
+
+def test_param_defaults_negative_and_broadcast():
+    code = "v3$t = vec3(-1.0, 0.5, 2); v3$s = 0.25; f$k = -2; @OUT = vec4($t, $k);"
+    ck = TypeChecker(binding_types={"OUT": TEXType.VEC4}, source=code)
+    ck.check(parse_and_split(code, {"OUT": TEXType.VEC4}))
+    assert ck.param_declarations["t"]["default_value"] == [-1.0, 0.5, 2.0]
+    assert ck.param_declarations["s"]["default_value"] == [0.25, 0.25, 0.25]
+    assert ck.param_declarations["k"]["default_value"] == -2
+
+
+def test_reading_a_rebound_input_uses_the_assigned_type():
+    assert "E3301" in check_errors("@A = @A.r; @OUT = vec4(@A.g);", _V4)
+    ref = run_both("@A = @A.r; @OUT = vec4(@A, 0.0, 0.0, 1.0);", {"A": _a()})
+    assert tuple(ref["OUT"].shape) == (1, 4, 4, 4)
+
+
+def test_function_defined_in_a_loop_survives_unrolling():
+    # The optimizer unrolls the loop, copying the definition; the cook's re-check accepts it.
+    run_both("float s = @A.r * 0.0; for (int i = 0; i < 2; i++) { float f(float x) { return x; } "
+             "s += f(1.0); } @OUT = vec4(s);", {"A": _a()}, torch.full((1, 4, 4, 4), 2.0))
+    run_both("float s = @A.r * 0.0; if (@A.r > -1.0) { float f(float x) { return x * 3.0; } s = f(1.0); } "
+             "@OUT = vec4(s);", {"A": _a()}, torch.full((1, 4, 4, 4), 3.0))
