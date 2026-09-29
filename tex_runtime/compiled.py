@@ -320,11 +320,13 @@ def should_stencil_route(fingerprint: str, program: Any) -> bool:
             v = bool(detect_stencil_route(program))
         except Exception:
             v = False
-        _stencil_route_memo[fingerprint] = v
-        while len(_stencil_route_memo) > _ROUTE_MEMO_MAX:
-            _stencil_route_memo.popitem(last=False)
+        from .lru_util import lru_put   # lazy: keeps the cold-import closure unchanged
+        lru_put(_stencil_route_memo, fingerprint, v, _ROUTE_MEMO_MAX)
     else:
-        _stencil_route_memo.move_to_end(fingerprint)
+        try:
+            _stencil_route_memo.move_to_end(fingerprint)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; the value stands
     return v
 
 
@@ -566,11 +568,13 @@ def execute_compiled(
         route = _route_memo.get(fingerprint)
         if route is None:
             route = (_count_tensor_ops(program), _max_loop_depth(program))
-            _route_memo[fingerprint] = route
-            while len(_route_memo) > _ROUTE_MEMO_MAX:
-                _route_memo.popitem(last=False)
+            from .lru_util import lru_put   # lazy: keeps the cold-import closure unchanged
+            lru_put(_route_memo, fingerprint, route, _ROUTE_MEMO_MAX)
         else:
-            _route_memo.move_to_end(fingerprint)
+            try:
+                _route_memo.move_to_end(fingerprint)
+            except KeyError:
+                pass          # a concurrent insert evicted it between the get and here; the value stands
         op_count, loop_depth = route
         # Skip torch.compile for trivial programs (tracing overhead > benefit)
         if op_count < _COMPILE_OP_THRESHOLD:
@@ -632,7 +636,7 @@ def execute_compiled(
                     program, type_map, fingerprint)), torch.inference_mode():
                 # Get or create the compiled callable (on THIS thread). A background job may
                 # evict the entry at any moment, so the lookup and the LRU touch are one step.
-                from .lru_util import lru_get
+                from .lru_util import lru_get, lru_put
                 cached = lru_get(_compiled_cache, cache_key)
                 if cached is None:
                     entry = _try_compile(device_type, program, type_map,
@@ -658,9 +662,8 @@ def execute_compiled(
                     # entry (backend None) has no dynamo to guard-churn, and its
                     # baseline cook would be pure waste.
                     if entry[1] is not None:
-                        _verify_state[cache_key] = {"px": cook_px, "samples": []}
-                        while len(_verify_state) > _VERIFY_STATE_MAX:
-                            _verify_state.popitem(last=False)
+                        lru_put(_verify_state, cache_key, {"px": cook_px, "samples": []},
+                                _VERIFY_STATE_MAX)
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         # Evict the oldest. Do NOT torch._dynamo.reset() here:
                         # this runs on the disposable worker thread, and dynamo

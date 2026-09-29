@@ -25,9 +25,12 @@ def lru_put(d: "OrderedDict[Any, Any]", key: Any, value: Any, max_size: int) -> 
     values MEMO (`fncalls_compile._memo`) are the same idiom with a different value, not
     two different idioms."""
     d[key] = value
-    d.move_to_end(key)
-    while len(d) > max_size:
-        d.popitem(last=False)
+    try:
+        d.move_to_end(key)
+        while len(d) > max_size:
+            d.popitem(last=False)
+    except KeyError:
+        pass        # another thread evicted `key` (or emptied the memo) mid-insert: the bound holds
 
 
 def lru_get(d: "OrderedDict[Any, Any]", key: Any, default: Any = None) -> Any:

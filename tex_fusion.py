@@ -263,9 +263,8 @@ def _fused_fp(memo_key: tuple) -> str:
             pass          # lost the LRU race to a concurrent evict; the value stands
         return hit
     fp = "fused_" + hashlib.sha256(repr(memo_key).encode()).hexdigest()[:24]
-    _FUSED_FP_MEMO[memo_key] = fp
-    while len(_FUSED_FP_MEMO) > _FUSED_FP_MEMO_MAX:
-        _FUSED_FP_MEMO.popitem(last=False)
+    from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+    lru_put(_FUSED_FP_MEMO, memo_key, fp, _FUSED_FP_MEMO_MAX)
     return fp
 
 
@@ -448,9 +447,8 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     # full splice + double-typecheck + optimize below.
     disk = _load_fused_from_disk(memo_key)
     if disk is not None:
-        _FUSED_MEMO[memo_key] = disk
-        while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
-            _FUSED_MEMO.popitem(last=False)
+        from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+        lru_put(_FUSED_MEMO, memo_key, disk, _FUSED_MEMO_MAX)
         return (*disk, _merged_bindings())
 
     fused_stmts: list[A.ASTNode] = []
@@ -700,9 +698,8 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     result = (fused, type_map, refs, asg, params, used_builtins)
     # Cache only on success (a failing chain must re-raise on every run) and
     # only the compile artifacts — never the binding values.
-    _FUSED_MEMO[memo_key] = result
-    while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
-        _FUSED_MEMO.popitem(last=False)
+    from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+    lru_put(_FUSED_MEMO, memo_key, result, _FUSED_MEMO_MAX)
     _save_fused_to_disk(memo_key, fused, binding_types, refs, asg, params)  # CT-1 persist
     return (*result, merged_bindings)
 

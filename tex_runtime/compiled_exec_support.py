@@ -182,10 +182,8 @@ def _timed_deferred(fn, device_type: str, slot):
                 # pair has already replaced it, so the slot self-heals next cook
                 # instead of re-reading the dead pair forever.
                 prev = _deferred_ev.get(slot)
-                _deferred_ev[slot] = (start, end)
-                _deferred_ev.move_to_end(slot)
-                while len(_deferred_ev) > _DEFERRED_EV_MAX:
-                    _deferred_ev.popitem(last=False)
+                from .lru_util import lru_put   # lazy: keeps the cold-import closure unchanged
+                lru_put(_deferred_ev, slot, (start, end), _DEFERRED_EV_MAX)
                 ms = None
                 if prev is not None and prev[1].query():   # prior end done → free read
                     ms = prev[0].elapsed_time(prev[1])

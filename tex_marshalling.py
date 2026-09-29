@@ -870,9 +870,8 @@ def sigil_names(code: str) -> tuple:
         except Exception:
             pass
     out = (ats, dollars)
-    _SIGIL_MEMO[code] = out
-    while len(_SIGIL_MEMO) > _SIGIL_MEMO_MAX:
-        _SIGIL_MEMO.popitem(last=False)          # LRU, matching every other memo in the engine
+    from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+    lru_put(_SIGIL_MEMO, code, out, _SIGIL_MEMO_MAX)
     return out
 
 
