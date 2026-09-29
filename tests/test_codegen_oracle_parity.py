@@ -9,6 +9,7 @@ quietly hands to the interpreter would otherwise compare the oracle against itse
 Each row's program is chosen so the optimizer cannot unroll or fold away the construct
 under test (a `break`, a large trip count or a large body keeps a loop a loop).
 """
+import re
 import pytest
 import torch
 
@@ -252,7 +253,9 @@ def test_loop_invariant_initializer_keeps_the_direct_fetch():
     program = Parser(Lexer(code).tokenize(), source=code).parse()
     program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
     src = try_compile(program, tm)._tex_src
-    assert "shape[2] - 1).long()" in src, "the zero-offset direct fetch was not emitted"
+    # The direct fetch clamps then casts, NaN-safe: `...shape[2] - 1)[.nan_to_num_(0.0)].long()`.
+    assert re.search(r"shape\[2\] - 1\)(\.nan_to_num_\(0\.0\))?\.long\(\)", src), \
+        "the zero-offset direct fetch was not emitted"
 
 
 # ── a scatter write replaces the binding the loop's hoisted sample view was taken from ─
