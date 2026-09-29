@@ -122,6 +122,7 @@ _FAMILIES = {
 # `TEX_GATE_NO_INDUCTOR` -- a gate-only escape hatch `tools/gate.py::run_ci_shape` sets so its
 # own verdict does not depend on whether `--ci-python`'s box happens to have a C++ toolchain
 # on PATH; unset (the default, every real ComfyUI process) it changes nothing.
+# env_read 24→23: the two cache-budget overrides now read the environment through one shared helper.
 # env_read 25→24: `tex_doctor._inductor_prereq` reads the C toolchain from PATH (`shutil.which`)
 # instead of the `INCLUDE` variable, so that one site is gone.
 # subprocess 1→2 (PREWARM-481, v0.48.1): `tex_runtime/prewarm_worker.py` re-invokes
@@ -130,7 +131,7 @@ _FAMILIES = {
 # this process's GIL with the caller. Constant argv (no shell string, no externally-supplied
 # path); SECURITY.md's finding table carries the new row.
 _SURFACE_PINS = {
-    "env_read": 24,
+    "env_read": 23,
     "subprocess": 2,
     "os_system": 0,
     "exec": 11,
