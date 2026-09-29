@@ -14,6 +14,7 @@ All passes preserve semantic equivalence. Applied after type checking, before
 interpretation. Operates on the AST in-place (mutates nodes).
 """
 from __future__ import annotations
+import contextvars
 import copy
 import math
 import struct
@@ -85,9 +86,28 @@ _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
 }
 
 
-def _fold_all(statements: list) -> list:
+# Whether a fold may drop a non-literal operand (a literal-condition ternary's dead arm,
+# `pow(x, 0)`'s x, `lerp`'s unused end). A dropped spatial operand takes the result's broadcast
+# shape with it, so the compile pipeline keeps it (`keep_shapes=True`); the input-requirement
+# analyses (`tex_lazy`, `tex_roi`) call `_fold_all` bare and want the dropped operand's inputs
+# gone. A context variable, so concurrent compiles never see each other's.
+_KEEP_SHAPES: contextvars.ContextVar[bool] = contextvars.ContextVar("tex_fold_keep_shapes",
+                                                                    default=True)
+
+
+def _may_drop(operand: ASTNode) -> bool:
+    """A fold may discard `operand` when it is a literal (it carries no shape) or the caller
+    does not compile the result (see `_KEEP_SHAPES`)."""
+    return isinstance(operand, NumberLiteral) or not _KEEP_SHAPES.get()
+
+
+def _fold_all(statements: list, *, keep_shapes: bool = False) -> list:
     """Constant folding + algebraic simplification, per statement."""
-    return [_opt_stmt(s) for s in statements]
+    token = _KEEP_SHAPES.set(keep_shapes)
+    try:
+        return [_opt_stmt(s) for s in statements]
+    finally:
+        _KEEP_SHAPES.reset(token)
 
 
 # STR-5: the optimization pipeline as data. ORDER IS LOAD-BEARING and documented
@@ -99,7 +119,7 @@ def _fold_all(statements: list) -> list:
 # glue adapting the heterogeneous pass signatures — no pass logic lives here.
 PASSES = [
     ("const-propagate-locals", lambda s, tm: _propagate_literal_locals(s)),
-    ("const-fold",             lambda s, tm: _fold_all(s)),
+    ("const-fold",             lambda s, tm: _fold_all(s, keep_shapes=True)),
     ("dce",                    lambda s, tm: _eliminate_dead_code(s)),
     ("cse",                    lambda s, tm: _eliminate_common_subexpressions(s, tm)),
     ("dce-repeat",             lambda s, tm: _eliminate_dead_code(s)),
@@ -356,7 +376,7 @@ def _opt_expr(expr: ASTNode) -> ASTNode:
         if isinstance(expr.condition, NumberLiteral):
             keep, drop = ((expr.true_expr, expr.false_expr) if expr.condition.value > 0.5
                           else (expr.false_expr, expr.true_expr))
-            if isinstance(drop, NumberLiteral):
+            if _may_drop(drop):
                 return keep
         return expr
 
@@ -536,7 +556,7 @@ def _fold_function(node: FunctionCall) -> ASTNode:
     # pow(x, 0) -> 1, pow(x, 1) -> x
     if name == "pow" and len(args) == 2 and _is_num_lit(args[1]):
         exp = _num_val(args[1])
-        if exp == 0.0 and _is_num_lit(args[0]):   # a spatial x keeps its shape: no fold
+        if exp == 0.0 and _may_drop(args[0]):
             return _make_num(1.0, node.loc)
         if exp == 1.0:
             return args[0]
@@ -563,9 +583,9 @@ def _fold_function(node: FunctionCall) -> ASTNode:
     # a dropped spatial operand would take the result's shape with it.
     if name in ("lerp", "mix") and len(args) == 3 and _is_num_lit(args[2]):
         t = _num_val(args[2])
-        if t == 0.0 and _is_num_lit(args[1]):
+        if t == 0.0 and _may_drop(args[1]):
             return args[0]
-        if t == 1.0 and _is_num_lit(args[0]):
+        if t == 1.0 and _may_drop(args[0]):
             return args[1]
 
     # sqrt(x*x) -> abs(x) — only when the argument is exactly x*x

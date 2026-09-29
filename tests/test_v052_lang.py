@@ -557,3 +557,13 @@ def test_block_recovery_keeps_parsing_after_the_bad_statement():
     ds = _parse_diags("if (a) { b = ; } else { c = ; }\nfloat z = ;")
     assert [d[1] for d in ds] == [1, 1, 2]
 
+
+def test_input_analysis_still_drops_the_dead_ternary_arm():
+    """The compile pipeline keeps a spatial arm a literal condition would drop (its shape);
+    the lazy-input analysis must still not ask for that arm's input."""
+    from TEX_Wrangle import tex_lazy
+    tex_lazy.clear_lazy_memo()
+    src = "@OUT = ($k > 0.5) ? @A : @B;"
+    assert tex_lazy.lazy_required_bindings(src, {"k": 0.0}) == frozenset({"OUT", "B"})
+    assert tex_lazy.lazy_required_bindings(src, {"k": 1.0}) == frozenset({"OUT", "A"})
+    tex_lazy.clear_lazy_memo()
