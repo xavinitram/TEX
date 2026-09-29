@@ -109,7 +109,7 @@ produces them.
 
 There is **no partial-write path in the package today**. Verified: exactly three
 slice-assignments exist outside tests and examples — `run_tiled` (`tex_memory.py:1020`),
-`run_batch_strips` (`tex_memory.py:1114`) and `run_tiled_halo` (`tex_memory.py:1380`) — and
+`run_batch_strips` (in `tex_memory.py`) and `run_tiled_halo` (in `tex_memory.py`) — and
 all three write into a `torch.empty()` allocated in the same call and fully filled before
 return. That is *assembly*, never a patch.
 

@@ -1,26 +1,24 @@
 """
-tex_chain — cooking a STAGE LIST, and the lineage keys that name what a cook produced.
+tex_chain: cooking a STAGE LIST, and the lineage keys that name what a cook produced.
 
-The CACHE-6 chain family (`cook_stage_list`, `boundary_lineage_key`, `cook_fused_cached`
-and the two binding predicates the keys rest on) plus CACHE-1's per-output
-`_compute_lineage`, moved here verbatim from `tex_engine.py` (NEG-2). One domain: a
-stage list goes in, raw `{output: tensor}` comes out, and every boundary between two
-stages — or between one cook and the next — is named by a content-derived key rather
-than by an address. `tex_engine` plans and dispatches a SINGLE program; this module
-cooks a chain of them and says what a cooked frame is called.
+The CACHE-6 chain family (`cook_stage_list`, `cook_fused_cached`, `boundary_lineage_key`
+and the two binding predicates the keys rest on), CACHE-1's per-output `_compute_lineage`,
+and `cook_stage_dag`, the node-by-node windowed cook of a DAG-shaped stage list. One
+domain: a stage list goes in, raw `{output: tensor}` comes out, and every boundary between
+two stages, or between one cook and the next, is named by a content-derived key rather
+than by an address. `tex_engine` plans and dispatches a SINGLE program; this module cooks
+a chain of them and says what a cooked frame is called.
 
 **Two engine primitives travel with the chain, and are re-exported back.** The ENG-4
 single raiser (`_compile_or_raise`) and the ENG-9 per-thread interpreter pool
 (`_interp_pool`, `_get_interpreter`, `_clear_all_interpreter_caches`) are what a cook
 needs in order to happen at all, and `cook_stage_list` reaches both. They live here so
-this module stays a LEAF — it must import nothing that can reach `tex_engine`, because
-that is what lets `tex_engine` import it at load and re-bind every moved name into the
-same global slot its callers already read. The alternative, a function-local import at
-each surviving call site, was measured at 0.286 us per site per cook and is exactly what
-the ENG-14 split refused. Nothing changed name and no body changed: the moved functions
-compile to byte-identical bytecode.
+this module stays a LEAF: it must import nothing that can reach `tex_engine`, because that
+is what lets `tex_engine` import it at load and re-bind every moved name into the same
+global slot its callers already read. A function-local import at each call site was
+measured at 0.286 us per site per cook, which is why the split refused it.
 
-`_interp_pool` is a module global whose lifecycle stays in one file by design — the
+`_interp_pool` is a module global whose lifecycle stays in one file by design: the
 sweep (`_clear_all_interpreter_caches`, reached from `tex_memory` under memory pressure)
 sits beside the accessor that creates it rather than a file away.
 
@@ -212,7 +210,7 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
         # one as E7007) makes every stage-list caller behave like `prepare()`, which is the whole
         # point of the family: a sub-chain must cook identically to those stages inside the full
         # program. Guarded: the rebuild allocates a list plus a dict per stage, and
-        # `cook_fused_cached` calls this up to three times per cook on the CACHE-6 hot path, so
+        # `cook_fused_cached` calls this up to twice per cook on the CACHE-6 hot path, so
         # a no-promise chain (every chain today) must not pay for the feature — the scan is one
         # class check per binding against ~15-25 us of copying on a 50-stage chain.
         if any(v.__class__ is _Promise
@@ -380,115 +378,57 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                    dirty_from: int = 0, valid=None, declined=(),
                    known_outputs: dict | None = None,
                    result_cache=None, upstream=(), store: set | None = None) -> dict:
-    """JOINWIRE-50 (host item 1): cook a DAG-shaped stage list — a join such as a Merge
-    reading two upstream stages, below an edit — node-by-node, windowed end-to-end via
-    `tex_roi.chain_windows_dag`, when the sink (the last stage) is asked for a sub-window.
+    """Cook a DAG-shaped stage list, such as a Merge reading two upstream stages below an
+    edit, node by node, windowed end to end via `tex_roi.chain_windows_dag` when the sink
+    (the last stage) is asked for a sub-window.
 
-    `stages[i]["chain_inputs"]` is the SAME DAG payload `tex_fusion.compile_fused` already
-    reads (`{binding_name: [src_stage_idx, "OUT"]}`) — every other binding is a plain value
-    exactly as `cook_stage_list` already takes it. Stage indices must be topologically
-    ordered (every `chain_inputs` index `< i`, else `ValueError` — a defect in the CALLER's
-    graph construction, mirroring `chain_windows_dag`'s own guard); the SINK is always the
-    last stage. `roi`/`dirty_from`/`valid`/`declined` are `chain_windows_dag`'s own
-    parameters, unchanged; `scale` is `cook_stage_list`'s (a scale-active cook never windows
-    here either, mirroring `roi_eligibility`'s existing `ROI_REASON_SCALE_ACTIVE` gate).
+    `stages[i]["chain_inputs"]` is the same DAG payload `tex_fusion.compile_fused` reads
+    (`{binding_name: [src_stage_idx, "OUT"]}`); every other binding is a plain value, as in
+    `cook_stage_list`. Stage indices must be topologically ordered (every `chain_inputs`
+    index `< i`, else `ValueError`, a defect in the caller's graph). `roi`, `dirty_from`,
+    `valid` and `declined` are `chain_windows_dag`'s own parameters. A scale-active cook
+    never windows here (the same `ROI_REASON_SCALE_ACTIVE` gate as `roi_eligibility`).
+    Every per-stage cook goes through `cook_stage_list`.
 
-    `known_outputs` (`{stage_index: {name: tensor}}`) supplies a CLEAN stage's (`i <
-    dirty_from`, not being recomputed) already-valid full-frame output, when a dirty
-    downstream stage reads it — the same thing a linear host already holds for
-    `chain_windows`'s own `valid`/`dirty_from` contract. A DIRTY stage that gets windowed
-    needs no such value even when it is itself referenced downstream: `_embed_window`'s own
-    docstring is the reason (the un-read region outside a fresh window is provably inert,
-    not merely assumed to be). A missing clean value that a dirty stage genuinely needs
-    raises `ValueError` rather than fabricate one.
+    Clean stages. `known_outputs` (`{stage_index: {name: tensor}}`) supplies the already-valid
+    full-frame output of a CLEAN stage (`i < dirty_from`) that a dirty consumer reads. A
+    missing clean value that a dirty stage needs raises `ValueError` rather than being
+    fabricated. Instead of `known_outputs`, a host may hand a `result_cache` (the object
+    `cook_checkpointed` takes) plus `upstream` (the CACHE-1 source keys, as in
+    `boundary_lineage_key`), and this function keeps the boundaries itself:
 
-    Every per-stage cook goes through the EXISTING `cook_stage_list`, so `tier_trace`/lineage
-    behave exactly as they already do for a single windowed cook (a windowed result is keyed
-    by its window the same way any other `roi=`-cooked frame already is — this function adds
-    no NEW keying scheme for the "a windowed result must never be served as whole-frame"
-    contract to get wrong). A host wanting checkpoint-style reuse across ticks supplies its
-    own keying via `known_outputs`/`valid`/`dirty_from`, same as it already must for
-    `chain_windows` — OR, JOINWIRE-50b, hands a `result_cache` (a `ResultCache`, same object
-    `cook_checkpointed` takes) plus `upstream` (its CACHE-1 source keys, same contract as
-    `boundary_lineage_key`'s own `upstream`), and this function does the `known_outputs`
-    bookkeeping FOR it:
+      * a clean stage not in `known_outputs` is looked up under `boundary_lineage_key(stages,
+        i + 1, ...)`, the same key `cook_checkpointed` uses for a linear boundary;
+      * a stage's own cook this tick is `put` under that key ONLY when `tier_trace.last_roi()`
+        says it served whole-frame. A windowed output carries an unread region outside its
+        window and must never be stored as a boundary that a later, differently-windowed tick
+        could read back as whole-frame. The cache is populated from the served window, never
+        from the requested one;
+      * both are inert unless windows are planned (`roi=` given and eligible), so `roi=None`
+        cooks every stage exactly as a bare `cook_stage_list` would;
+      * a boundary is read or written only when `upstream` has at least one key per tensor
+        binding in the prefix it covers (the gate `cook_fused_cached` applies); without it
+        two same-shape sources would share a key, so the cache is left out.
 
-      * a CLEAN stage (`i < dirty_from`) that a dirty consumer needs, or that the caller
-        wants reported in `stage_outputs`, and that is not already in `known_outputs`, is
-        looked up in `result_cache` under `boundary_lineage_key(stages, i + 1, ...)` — the
-        SAME function and key shape `cook_checkpointed` already uses for a linear boundary.
-        `_fused_memo_key`'s topology tuple (Q-3) already folds a DAG's `chain_inputs` edges
-        into the program fingerprint half of that key, and the shape/param halves are read
-        off the stages that carry the actual tensor/param `bindings` (a `chain_inputs`-fed
-        name carries none — it is a rewiring, not a second source), so no new canvas
-        resolver is needed: `boundary_lineage_key`'s own default already answers this
-        correctly for a DAG stage list, not only a linear one.
-      * a DIRTY stage's (`i >= dirty_from`) own cook this tick is `put` into `result_cache`
-        under that SAME key, but ONLY when `tier_trace.last_roi()` says THIS stage's cook
-        actually served whole-frame (`served_roi is None` below) — a windowed, re-embedded
-        output carries an unread-garbage region outside its window and MUST NEVER be stored
-        as a boundary a later, differently-windowed tick could read back as if it were
-        whole-frame. This is the one load-bearing safety rule of this whole addition: the
-        cache is populated from `served_roi`, the same signal that already gates re-embed
-        vs. pass-through above, never from `stage_roi` (the REQUEST) or from "no window was
-        planned for this stage" alone.
-      * Both only ever run when `windows is not None` (i.e. only under an active `roi=` —
-        `dirty_from`/`known_outputs`/`result_cache` are otherwise inert here exactly as they
-        already were before this ask, so `roi=None` keeps its existing behaviour and count
-        (invariant 7): a stage is never skipped, `result_cache` is never consulted, and every
-        stage cooks exactly as a bare `cook_stage_list` call would.
+    `store` (optional set of stage indices) narrows which clean whole-frame stages are `put`
+    into `result_cache`, never widens it: a stage not in `store` is not stored, a windowed
+    stage is not stored whatever `store` says, and reading a boundary back is unaffected.
+    `store=set()` stores nothing this tick but still serves earlier boundaries. An index
+    outside `range(len(stages))` is rejected up front with a `ValueError`.
 
-    Mints no new key scheme and adds no cache of its own beyond reusing `boundary_lineage_key`
-    verbatim — a windowed result stays keyed by its window (unchanged, above), and a
-    checkpoint boundary stays keyed by `boundary_lineage_key`'s own program+param+upstream+
-    canvas tuple (unchanged, `cook_checkpointed`'s existing contract) — so the two schemes
-    can never collide with each other, and neither can serve the other's shape back mislabeled.
-    `result_cache=None` (every caller before this ask) never reaches any of these branches.
-
-    Returns `{"result": {name: tensor}, "stage_outputs": {idx: {name: tensor}}, "stage_
-    windows": {idx: window}, "windows": windows_or_None, "stages_windowed": int,
-    "stages_whole": int}`. `result` is the sink's own raw output (a crop when windowed — the
-    same contract every other windowed cook in this codebase already has); `stage_outputs`
-    carries every OTHER cooked stage's raw output too, for a caller or test that wants to
-    inspect an intermediate.
-
-    FIX-DAG G1: `stage_outputs[idx]` is ALWAYS the RAW value a stage's own cook produced — a
-    genuinely windowed, non-sink stage's entry is its bare CROP, never padded back out to a
-    full canvas, so a caller inspecting it never sees a mostly-unwritten buffer. `stage_
-    windows` names exactly which `stage_outputs` entries are crops and at what absolute
-    `(x0, y0, w, h, W, H)` — an entry absent from `stage_windows` is already full-size
-    (a whole-frame cook, or a `known_outputs`/`result_cache`-supplied clean value, both of
-    which are full-frame by contract). The full-size re-embed a downstream consumer's own
-    `run_roi` step still needs happens ephemerally, in-memory, only at the point a stage is
-    actually fed as another stage's `chain_inputs` binding (see `_materialize_input` below) —
-    it is never what `stage_outputs` reports back. `windows` is `None` when nothing was
-    planned (no `roi=`, or `chain_windows_dag` refused the whole plan) or a
-    `chain_windows_dag`-shaped list (unchanged).
-
-    STORE-51: `store` (optional set of stage indices) lets the host NARROW which clean
-    whole-frame stages actually get `put` into `result_cache`, without touching where a
-    boundary is served from or how one is keyed. The host owns cut placement (which stage
-    indices are worth caching, given its own cost model); TEX owns the one safety rule this
-    whole mechanism exists to enforce (a windowed output is never storable as a whole-frame
-    boundary) and does not hand that rule to the host to re-implement. Concretely: `store=
-    None` (every caller before this ask, and the default) keeps today's behaviour exactly —
-    every stage that reaches the `put` line above (clean, `result_cache is not None`,
-    `windows is not None`, not the sink, and `served_roi is None`) is stored, as before.
-    `store={i, j, ...}` intersects with that same eligibility test — a stage index in `store`
-    is stored only if it was ALREADY eligible, and a stage NOT in `store` is never stored even
-    if it is eligible. `store` can therefore only narrow what gets stored, never widen it: a
-    windowed stage's index named in `store` still does not get a `put` (`served_roi is None`
-    is checked first, exactly as it always was), and `store` has no effect at all on reading a
-    boundary back (`_clean_lookup` above is unconditional on `store`) or on the never-serve-a-
-    window-as-whole-frame contract this section documents. `store=set()` stores nothing this
-    tick, but still SERVES any boundary a previous tick already put — narrowing what is
-    written is not the same as forgetting what was read. An index in `store` outside
-    `range(len(stages))` is a host wiring mistake (not a shape this cook can act on) and is
-    rejected up front, before any stage cooks, with a `ValueError` naming the bad index, how
-    many stages there are, and what a valid index looks like."""
+    Returns `{"result": {name: tensor}, "stage_outputs": {idx: {name: tensor}},
+    "stage_windows": {idx: window}, "windows": windows_or_None, "stages_windowed": int,
+    "stages_whole": int}`. `stage_outputs[idx]` is always the RAW value the stage's cook
+    produced: a windowed, non-sink stage's entry is its bare crop, and `stage_windows` names
+    which entries are crops and at what absolute `(x0, y0, w, h, W, H)`. An entry absent
+    from `stage_windows` is full-size (a whole-frame cook, or a `known_outputs` or
+    `result_cache` value). The full-size re-embed a downstream consumer needs happens
+    ephemerally in `_materialize_input` and is never reported. `windows` is `None` when
+    nothing was planned (no `roi=`, or `chain_windows_dag` refused the plan)."""
     with _cook_observer.scope("cook_stage_dag"):
         from . import tex_roi as _tex_roi
         from .tex_runtime import tier_trace as _tier_trace_mod
+        from .tex_tiling import _scalar_params
         n = len(stages)
         known_outputs = known_outputs or {}
         eff_precision = "fp32" if latent_channel_count else precision
@@ -521,27 +461,18 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
             name_to_upstream = {b: idx for b, (idx, _out) in ci.items()}
             binding_types = {name: _infer_binding_type(v) for name, v in bindings.items()
                              if name not in ci} or None
-            from .tex_tiling import _scalar_params
             halo, arg_halo = _tex_roi.stage_dag_arg_halos(
                 st["code"], name_to_upstream, param_values=_scalar_params(bindings),
                 binding_types=binding_types)
             specs.append(_tex_roi.StageSpec(
                 halo, tuple(sorted(set(name_to_upstream.values()))), arg_halo or None))
 
-        # 2. Plan windows — only when eligible. FIX-DAG G2 (R1#1): call the SAME shared
-        #    ladder `cook_stage_list` above already calls (`tex_roi.roi_eligibility`)
-        #    instead of hand-copying its arithmetic a second time, so a future edit to that
-        #    ladder (a new ROI_REASON_*, a scale/precision bugfix) reaches this gate the way
-        #    the comment two hundred lines up already promises for `cook_stage_list` — never
-        #    only by someone remembering to hand-port it here too. This gate's own
-        #    `tier_id`/`fused_chain`/`executable` legs are legitimately answered elsewhere —
-        #    per-stage, via `StageSpec`/`stage_dag_arg_halos` in step 1 above, never by one
-        #    program's source — so the call passes a neutral `code=""`/`fused_chain=False`
-        #    to satisfy those three legs trivially (an empty program is always
-        #    `tier_id="default"`, is never fused, and is always ROI-3-executable with
-        #    `halo=0` — `roi_plan("", ...)` walks no statements at all), leaving only the
-        #    five conditions this gate actually decides (scale, latent, precision, armed,
-        #    malformed) live behind the one function every other caller already uses.
+        # 2. Plan windows, only when eligible. The gate is the shared ladder
+        #    `tex_roi.roi_eligibility`, the same one `cook_stage_list` calls, so a change to
+        #    it reaches both. Its `tier_id`, `fused_chain` and `executable` legs are answered
+        #    per stage by `StageSpec` in step 1, so this call passes a neutral empty program
+        #    (default tier, never fused, halo 0) and only the scale, latent, precision, armed
+        #    and malformed conditions are live here.
         windows = None
         if roi is not None:
             _elig = _tex_roi.roi_eligibility(
@@ -679,26 +610,12 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 stages_windowed += 1
             else:
                 stages_whole += 1
-                # JOINWIRE-50b: `result_cache` is populated ONLY here — `served_roi is None`
-                # is `tier_trace`'s own record of what THIS cook actually served, so a
-                # genuinely windowed output (the branch above, whose crop `stage_windows`
-                # now names instead of eagerly re-embedding) never reaches this line and can
-                # never be stored as a boundary a later tick's clean lookup could read back
-                # as if it were whole-frame. `windows is not None` is its
-                # own separate guard (every stage lands in THIS branch when `windows is
-                # None` too — a plain, unwindowed roi=None cook — so without it a host that
-                # merely passed `result_cache` with no `roi=` at all would start paying
-                # `put`s invariant 7 promises it will not): checkpointing only ever engages
-                # under an active window plan, matching `_clean_lookup`'s own gating above.
-                # `i != n - 1`: the SINK has no suffix, so `boundary_lineage_key`/
-                # `prefix_fingerprint`'s own `1 <= k < len(stages)` range contract (a
-                # boundary is always "AFTER stage k-1", which needs a stage AT k to exist)
-                # has no valid key for it — there is nothing downstream of the sink for a
-                # cached boundary to ever serve anyway. STORE-51: `store is None or i in
-                # store` is the ONLY new condition ANDed onto this already-computed
-                # eligibility — a narrowing, never a widening, so a stage that reaches this
-                # line with `served_roi is None` (this section's one load-bearing fact) is
-                # unaffected by `store` unless the host explicitly leaves its index out.
+                # `result_cache` is populated ONLY here: `served_roi is None` is tier_trace's own
+                # record that THIS cook served whole-frame, so a windowed crop (the branch
+                # above) never reaches this line. `windows is not None` keeps a plain
+                # `roi=None` cook from paying puts (invariant 7). `i != n - 1`: the sink has
+                # no suffix, so `boundary_lineage_key` has no valid key for it and nothing
+                # downstream could read it. `store` only narrows this eligibility.
                 if (_cacheable(i) and windows is not None and i != n - 1
                         and "OUT" in out and (store is None or i in store)):
                     result_cache.put(_checkpoint_key(i), out["OUT"],
@@ -791,23 +708,6 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
         from . import tex_results
         from .tex_fusion import prefix_fingerprint
         fp = prefix_fingerprint(stages, k, _infer_binding_type)
-        # LINT-46 (MEASURE-44's isinstance sweep): `_is_tensor_binding(v)` was asked TWICE per
-        # `stages[:k]` binding on the `canvas is None` path below — once here (the params/tensor
-        # split) and again inside `_shapes` (the canvas enumeration), both walking the exact same
-        # bindings within this SAME call. id()-keyed memo (the same convention the checker's
-        # type_map already uses): a binding's tensor-or-not answer cannot change within one
-        # `boundary_lineage_key` call, so the second walk reuses the first walk's answer instead of
-        # re-deriving it. `_is_tensor_binding` always returns a bool (never None), so a plain
-        # `dict.get` miss unambiguously means "not computed yet" — no sentinel needed.
-        _tensor_memo: dict = {}
-
-        def _is_tensor_memo(v):
-            key = id(v)
-            cached = _tensor_memo.get(key)
-            if cached is None:
-                cached = _tensor_memo[key] = _is_tensor_binding(v)
-            return cached
-
         # P0-H: a Promise is a TENSOR binding that has not arrived yet, so it belongs on the
         # tensor side of this split — not in `params`. It landed there because the test asks
         # "is it a Tensor?", and `_canon_params` folds unknown objects via `repr`, which for a
@@ -825,7 +725,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
         params = {f"s{i}:{n}": v
                   for i, st in enumerate(stages[:k])
                   for n, v in (st.get("bindings") or {}).items()
-                  if not _is_tensor_memo(v)}
+                  if not _is_tensor_binding(v)}
         if canvas is None:
             # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
             # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
@@ -840,7 +740,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
                 out = []
                 for i, st in enumerate(sts):
                     for n, v in sorted((st.get("bindings") or {}).items()):
-                        if not _is_tensor_memo(v):
+                        if not _is_tensor_binding(v):
                             continue
                         shape = _binding_shape(v)
                         if shape is None:
@@ -899,14 +799,10 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     # shares this one notification rather than adding its own (see
     # tex_runtime/cook_observer.py).
     #
-    # R2 (v0.46, FIX-OBSROUTE): `_full()`, and the hit/miss branches below, call
-    # `cook_stage_list`/`boundary_lineage_key` through `_tex_engine`'s attribute (ROUTE-45's
-    # own routing convention — see tex_engine_tiers.py's module docstring for the general
-    # form), not this module's own local name. Before this fix they called the LOCAL name,
-    # so a host wrap on `tex_engine.cook_stage_list` (several already exist — see
-    # tex_engine_tiers.py's docstring) never saw these 3 of the 6 calls this function makes
-    # to them; the observer seam already covered it independently (that's what this `with`
-    # is), but a host's own direct wrap is a documented, older seam this restores.
+    # `_full()` and the hit/miss branches below call `cook_stage_list`/`boundary_lineage_key`
+    # through `_tex_engine`'s attribute (ROUTE-45's routing convention, see
+    # tex_engine_tiers.py's module docstring), not this module's own local name, so a host
+    # wrap on `tex_engine.cook_stage_list` sees every call this function makes.
     with _cook_observer.scope("cook_fused_cached"):
         from . import tex_engine as _tex_engine
         from .tex_fusion import is_linear_stage_list, suffix_stage_list, FusionError
