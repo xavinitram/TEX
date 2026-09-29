@@ -5,7 +5,7 @@
       "entries": [
         {
           "name": "sin",
-          "sig": "sin(x) → float",
+          "sig": "sin(x) → float|vec",
           "desc": "Sine (radians).",
           "example": "float s = sin(u * PI * 2.0);",
           "tags": [],
@@ -13,7 +13,7 @@
         },
         {
           "name": "cos",
-          "sig": "cos(x) → float",
+          "sig": "cos(x) → float|vec",
           "desc": "Cosine (radians).",
           "example": "float c = cos(v * PI);",
           "tags": [],
@@ -21,7 +21,7 @@
         },
         {
           "name": "tan",
-          "sig": "tan(x) → float",
+          "sig": "tan(x) → float|vec",
           "desc": "Tangent (radians).",
           "example": "float t = tan(u);",
           "tags": [],
@@ -29,7 +29,7 @@
         },
         {
           "name": "asin",
-          "sig": "asin(x) → float",
+          "sig": "asin(x) → float|vec",
           "desc": "Arcsine. Returns radians.",
           "example": "float angle = asin(0.5);",
           "tags": [],
@@ -37,7 +37,7 @@
         },
         {
           "name": "acos",
-          "sig": "acos(x) → float",
+          "sig": "acos(x) → float|vec",
           "desc": "Arccosine. Returns radians.",
           "example": "float angle = acos(0.5);",
           "tags": [],
@@ -45,7 +45,7 @@
         },
         {
           "name": "atan",
-          "sig": "atan(x) → float",
+          "sig": "atan(x) → float|vec",
           "desc": "Arctangent. Returns radians.",
           "example": "float angle = atan(1.0);",
           "tags": [],
@@ -53,7 +53,7 @@
         },
         {
           "name": "atan2",
-          "sig": "atan2(y, x) → float",
+          "sig": "atan2(y, x) → float|vec",
           "desc": "Two-argument arctangent. Returns radians.",
           "example": "float angle = atan2(v - 0.5, u - 0.5);",
           "tags": [],
@@ -69,7 +69,7 @@
         },
         {
           "name": "sqrt",
-          "sig": "sqrt(x) → float",
+          "sig": "sqrt(x) → float|vec",
           "desc": "Square root.",
           "example": "float s = sqrt(u * u + v * v);",
           "tags": [],
@@ -77,7 +77,7 @@
         },
         {
           "name": "pow",
-          "sig": "pow(x, y) → float",
+          "sig": "pow(x, y) → float|vec",
           "desc": "Raise x to the power y.",
           "example": "float p = pow(u, 2.2);",
           "tags": [],
@@ -85,7 +85,7 @@
         },
         {
           "name": "exp",
-          "sig": "exp(x) → float",
+          "sig": "exp(x) → float|vec",
           "desc": "e raised to the power x.",
           "example": "float e = exp(-u * 5.0);",
           "tags": [],
@@ -93,7 +93,7 @@
         },
         {
           "name": "log",
-          "sig": "log(x) → float",
+          "sig": "log(x) → float|vec",
           "desc": "Natural logarithm (base e).",
           "example": "float l = log(u + 1.0);",
           "tags": [],
@@ -101,7 +101,7 @@
         },
         {
           "name": "abs",
-          "sig": "abs(x) → float",
+          "sig": "abs(x) → float|vec",
           "desc": "Absolute value.",
           "example": "float a = abs(u - 0.5);",
           "tags": [],
@@ -109,7 +109,7 @@
         },
         {
           "name": "sign",
-          "sig": "sign(x) → float",
+          "sig": "sign(x) → float|vec",
           "desc": "Returns -1, 0, or 1.",
           "example": "float s = sign(u - 0.5);",
           "tags": [],
@@ -117,7 +117,7 @@
         },
         {
           "name": "floor",
-          "sig": "floor(x) → float",
+          "sig": "floor(x) → float|vec",
           "desc": "Round down to nearest integer.",
           "example": "float f = floor(u * 10.0);",
           "tags": [],
@@ -125,7 +125,7 @@
         },
         {
           "name": "ceil",
-          "sig": "ceil(x) → float",
+          "sig": "ceil(x) → float|vec",
           "desc": "Round up to nearest integer.",
           "example": "float c = ceil(u * 10.0);",
           "tags": [],
@@ -133,15 +133,15 @@
         },
         {
           "name": "round",
-          "sig": "round(x) → float",
-          "desc": "Round to nearest integer.",
+          "sig": "round(x) → float|vec",
+          "desc": "Round to nearest integer; halves go to the even integer, so round(2.5) is 2.",
           "example": "float r = round(u * 10.0) / 10.0;",
           "tags": [],
           "aliases": []
         },
         {
           "name": "trunc",
-          "sig": "trunc(x) → float",
+          "sig": "trunc(x) → float|vec",
           "desc": "Truncate toward zero (drop fractional part).",
           "example": "float t = trunc(u * 10.0);",
           "tags": [],
@@ -149,7 +149,7 @@
         },
         {
           "name": "fract",
-          "sig": "fract(x) → float",
+          "sig": "fract(x) → float|vec",
           "desc": "Fractional part: x - floor(x).",
           "example": "float f = fract(u * 5.0);",
           "tags": [],
@@ -157,15 +157,15 @@
         },
         {
           "name": "mod",
-          "sig": "mod(x, y) → float",
-          "desc": "Modulo (remainder).",
+          "sig": "mod(x, y) → float|vec",
+          "desc": "Modulo (remainder), truncated: the sign follows x, so mod(-1, 3) is -1 (unlike fract).",
           "example": "float m = mod(u * 10.0, 1.0);",
           "tags": [],
           "aliases": []
         },
         {
           "name": "log2",
-          "sig": "log2(x) → float",
+          "sig": "log2(x) → float|vec",
           "desc": "Logarithm base 2.",
           "example": "float l = log2(256.0);",
           "tags": [],
@@ -173,7 +173,7 @@
         },
         {
           "name": "log10",
-          "sig": "log10(x) → float",
+          "sig": "log10(x) → float|vec",
           "desc": "Logarithm base 10.",
           "example": "float l = log10(1000.0);",
           "tags": [],
@@ -181,7 +181,7 @@
         },
         {
           "name": "pow2",
-          "sig": "pow2(x) → float",
+          "sig": "pow2(x) → float|vec",
           "desc": "2 raised to the power x.",
           "example": "float p = pow2(8.0);",
           "tags": [],
@@ -189,7 +189,7 @@
         },
         {
           "name": "pow10",
-          "sig": "pow10(x) → float",
+          "sig": "pow10(x) → float|vec",
           "desc": "10 raised to the power x.",
           "example": "float p = pow10(3.0);",
           "tags": [],
@@ -197,7 +197,7 @@
         },
         {
           "name": "sinh",
-          "sig": "sinh(x) → float",
+          "sig": "sinh(x) → float|vec",
           "desc": "Hyperbolic sine.",
           "example": "float s = sinh(u);",
           "tags": [],
@@ -205,7 +205,7 @@
         },
         {
           "name": "cosh",
-          "sig": "cosh(x) → float",
+          "sig": "cosh(x) → float|vec",
           "desc": "Hyperbolic cosine.",
           "example": "float c = cosh(u);",
           "tags": [],
@@ -213,7 +213,7 @@
         },
         {
           "name": "tanh",
-          "sig": "tanh(x) → float",
+          "sig": "tanh(x) → float|vec",
           "desc": "Hyperbolic tangent.",
           "example": "float t = tanh(u * 2.0);",
           "tags": [],
@@ -221,7 +221,7 @@
         },
         {
           "name": "hypot",
-          "sig": "hypot(x, y) → float",
+          "sig": "hypot(x, y) → float|vec",
           "desc": "Hypotenuse: sqrt(x*x + y*y).",
           "example": "float d = hypot(u - 0.5, v - 0.5);",
           "tags": [],
@@ -229,7 +229,7 @@
         },
         {
           "name": "isnan",
-          "sig": "isnan(x) → float",
+          "sig": "isnan(x) → float|vec",
           "desc": "Returns 1.0 if x is NaN, 0.0 otherwise.",
           "example": "float check = isnan(x);",
           "tags": [],
@@ -237,7 +237,7 @@
         },
         {
           "name": "isinf",
-          "sig": "isinf(x) → float",
+          "sig": "isinf(x) → float|vec",
           "desc": "Returns 1.0 if x is infinite, 0.0 otherwise.",
           "example": "float check = isinf(x);",
           "tags": [],
@@ -245,7 +245,7 @@
         },
         {
           "name": "degrees",
-          "sig": "degrees(x) → float",
+          "sig": "degrees(x) → float|vec",
           "desc": "Convert radians to degrees.",
           "example": "float d = degrees(PI);",
           "tags": [],
@@ -253,7 +253,7 @@
         },
         {
           "name": "radians",
-          "sig": "radians(x) → float",
+          "sig": "radians(x) → float|vec",
           "desc": "Convert degrees to radians.",
           "example": "float r = radians(180.0);",
           "tags": [],
@@ -261,7 +261,7 @@
         },
         {
           "name": "spow",
-          "sig": "spow(x, y) → float",
+          "sig": "spow(x, y) → float|vec",
           "desc": "Sign-preserving power. Safe for negative x.",
           "example": "float s = spow(u - 0.5, 2.0);",
           "tags": [],
@@ -269,7 +269,7 @@
         },
         {
           "name": "sdiv",
-          "sig": "sdiv(a, b) → float",
+          "sig": "sdiv(a, b) → float|vec",
           "desc": "Safe divide. Returns 0 when b is zero.",
           "example": "float d = sdiv(1.0, u);",
           "tags": [],
@@ -311,7 +311,7 @@
       "entries": [
         {
           "name": "min",
-          "sig": "min(a, b) → float",
+          "sig": "min(a, b) → float|vec",
           "desc": "Returns the smaller value.",
           "example": "float m = min(u, 0.5);",
           "tags": [],
@@ -319,7 +319,7 @@
         },
         {
           "name": "max",
-          "sig": "max(a, b) → float",
+          "sig": "max(a, b) → float|vec",
           "desc": "Returns the larger value.",
           "example": "float m = max(u, 0.0);",
           "tags": [],
@@ -327,7 +327,7 @@
         },
         {
           "name": "clamp",
-          "sig": "clamp(x, lo, hi) → float",
+          "sig": "clamp(x, lo, hi) → float|vec",
           "desc": "Clamp x to [lo, hi] range.",
           "example": "float c = clamp(u * 2.0, 0.0, 1.0);",
           "tags": [],
@@ -335,7 +335,7 @@
         },
         {
           "name": "lerp",
-          "sig": "lerp(a, b, t) → float",
+          "sig": "lerp(a, b, t) → float|vec",
           "desc": "Linear interpolation from a to b by t.",
           "example": "@OUT = lerp(@A, @B, 0.5);",
           "tags": [],
@@ -353,7 +353,7 @@
         },
         {
           "name": "fit",
-          "sig": "fit(x, inLo, inHi, outLo, outHi) → float",
+          "sig": "fit(x, inLo, inHi, outLo, outHi) → float|vec",
           "desc": "Remap x from [inLo, inHi] to [outLo, outHi].",
           "example": "float y = fit(u, 0.2, 0.8, 0.0, 1.0);",
           "tags": [],
@@ -361,7 +361,7 @@
         },
         {
           "name": "smoothstep",
-          "sig": "smoothstep(lo, hi, x) → float",
+          "sig": "smoothstep(lo, hi, x) → float|vec",
           "desc": "Smooth Hermite interpolation between lo and hi.",
           "example": "float s = smoothstep(0.3, 0.7, u);",
           "tags": [],
@@ -369,7 +369,7 @@
         },
         {
           "name": "step",
-          "sig": "step(edge, x) → float",
+          "sig": "step(edge, x) → float|vec",
           "desc": "Returns 0 if x < edge, 1 otherwise.",
           "example": "float s = step(0.5, u);",
           "tags": [],
@@ -845,23 +845,23 @@
       "entries": [
         {
           "name": "perlin",
-          "sig": "perlin(x, y) → float",
-          "desc": "2D Perlin noise. Returns value in [-1, 1].",
+          "sig": "perlin(x, y, z?) → float",
+          "desc": "2D Perlin noise; pass z for 3D. Returns value in [-1, 1].",
           "example": "float n = perlin(u * 10.0, v * 10.0);",
           "tags": [],
           "aliases": []
         },
         {
           "name": "simplex",
-          "sig": "simplex(x, y) → float",
-          "desc": "2D Simplex noise. Returns value in [-1, 1].",
+          "sig": "simplex(x, y, z?) → float",
+          "desc": "2D Simplex noise. With a z argument it returns 3D Perlin noise (there is no 3D simplex). Returns value in [-1, 1].",
           "example": "float n = simplex(u * 8.0, v * 8.0);",
           "tags": [],
           "aliases": []
         },
         {
           "name": "fbm",
-          "sig": "fbm(x, y, octaves) → float",
+          "sig": "fbm(x, y, [z,] octaves) → float",
           "desc": "Fractal Brownian Motion (multi-octave Perlin).",
           "example": "float n = fbm(u * 4.0, v * 4.0, 6);",
           "tags": [
@@ -871,7 +871,7 @@
         },
         {
           "name": "worley_f1",
-          "sig": "worley_f1(x, y) → float",
+          "sig": "worley_f1(x, y, z?) → float",
           "desc": "Worley (cellular) noise — distance to nearest cell center.",
           "example": "float n = worley_f1(u * 5.0, v * 5.0);",
           "tags": [],
@@ -879,7 +879,7 @@
         },
         {
           "name": "worley_f2",
-          "sig": "worley_f2(x, y) → float",
+          "sig": "worley_f2(x, y, z?) → float",
           "desc": "Worley noise — distance to second-nearest cell center.",
           "example": "float n = worley_f2(u * 5.0, v * 5.0);",
           "tags": [],
@@ -887,7 +887,7 @@
         },
         {
           "name": "voronoi",
-          "sig": "voronoi(x, y) → float",
+          "sig": "voronoi(x, y, z?) → float",
           "desc": "Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id.",
           "example": "float d = voronoi(u * 8.0, v * 8.0);",
           "tags": [],
@@ -895,7 +895,7 @@
         },
         {
           "name": "worley_id",
-          "sig": "worley_id(x, y) → float",
+          "sig": "worley_id(x, y, z?) → float",
           "desc": "Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point.",
           "example": "float id = worley_id(u * 8.0, v * 8.0);",
           "tags": [],
@@ -903,15 +903,15 @@
         },
         {
           "name": "curl",
-          "sig": "curl(x, y) → vec2",
-          "desc": "Curl of 2D noise field. Returns a divergence-free vector.",
+          "sig": "curl(x, y, z?) → vec2|vec3",
+          "desc": "Curl of a noise field: a vec2 for (x, y), a vec3 with z. Divergence-free.",
           "example": "vec2 c = curl(u * 5.0, v * 5.0);",
           "tags": [],
           "aliases": []
         },
         {
           "name": "ridged",
-          "sig": "ridged(x, y, octaves) → float",
+          "sig": "ridged(x, y, [z,] octaves) → float",
           "desc": "Ridged multifractal — sharp ridges, good for mountains.",
           "example": "float n = ridged(u * 4.0, v * 4.0, 6);",
           "tags": [
@@ -921,7 +921,7 @@
         },
         {
           "name": "billow",
-          "sig": "billow(x, y, octaves) → float",
+          "sig": "billow(x, y, [z,] octaves) → float",
           "desc": "Billowy noise — abs(fbm). Puffy cloud shapes.",
           "example": "float n = billow(u * 4.0, v * 4.0, 6);",
           "tags": [
@@ -931,7 +931,7 @@
         },
         {
           "name": "turbulence",
-          "sig": "turbulence(x, y, octaves) → float",
+          "sig": "turbulence(x, y, [z,] octaves) → float",
           "desc": "Turbulence — sum of abs(noise) per octave. Veiny patterns.",
           "example": "float n = turbulence(u * 4.0, v * 4.0, 6);",
           "tags": [
@@ -941,7 +941,7 @@
         },
         {
           "name": "flow",
-          "sig": "flow(x, y, angle) → float",
+          "sig": "flow(x, y, [z,] angle) → float",
           "desc": "Flow noise — Perlin rotated by angle per octave. Avoids static patterns.",
           "example": "float n = flow(u * 6.0, v * 6.0, fi * 0.1);",
           "tags": [
@@ -951,8 +951,8 @@
         },
         {
           "name": "alligator",
-          "sig": "alligator(x, y) → float",
-          "desc": "Alligator noise — cellular crack patterns.",
+          "sig": "alligator(x, y, [z,] octaves?) → float",
+          "desc": "Alligator noise — cellular crack patterns. With z, octaves is required.",
           "example": "float n = alligator(u * 5.0, v * 5.0);",
           "tags": [
             "sync"
@@ -1035,7 +1035,7 @@
         },
         {
           "name": "replace",
-          "sig": "replace(s, old, new) → string",
+          "sig": "replace(s, old, new, count?) → string",
           "desc": "Replace all occurrences of old with new.",
           "example": "string r = replace(s, \"foo\", \"bar\");",
           "tags": [],
@@ -1131,7 +1131,7 @@
         },
         {
           "name": "split",
-          "sig": "split(s, sep) → string[]",
+          "sig": "split(s, sep, max_splits?) → string[]",
           "desc": "Split string into array by separator.",
           "example": "string parts[4] = split(s, \",\");",
           "tags": [],
@@ -1155,7 +1155,7 @@
         },
         {
           "name": "pad_left",
-          "sig": "pad_left(s, width, fill) → string",
+          "sig": "pad_left(s, width, fill?) → string",
           "desc": "Pad string on the left to reach width.",
           "example": "string n = pad_left(str(fi), 4, \"0\");",
           "tags": [],
@@ -1163,7 +1163,7 @@
         },
         {
           "name": "pad_right",
-          "sig": "pad_right(s, width, fill) → string",
+          "sig": "pad_right(s, width, fill?) → string",
           "desc": "Pad string on the right to reach width.",
           "example": "string n = pad_right(s, 20, \" \");",
           "tags": [],
@@ -1249,16 +1249,16 @@
         {
           "name": "sort",
           "sig": "sort(arr) → array",
-          "desc": "Sort array elements in ascending order.",
-          "example": "sort(arr);",
+          "desc": "Sort array elements in ascending order; returns a sorted copy.",
+          "example": "arr = sort(arr);",
           "tags": [],
           "aliases": []
         },
         {
           "name": "reverse",
           "sig": "reverse(arr) → array",
-          "desc": "Reverse array element order.",
-          "example": "reverse(arr);",
+          "desc": "Reverse array element order; returns a reversed copy.",
+          "example": "arr = reverse(arr);",
           "tags": [],
           "aliases": []
         },
@@ -1289,7 +1289,7 @@
         {
           "name": "median",
           "sig": "median(arr) → float",
-          "desc": "Median value of array.",
+          "desc": "Median value of array; an even count gives the lower of the two middle values.",
           "example": "float mid = median(arr);",
           "tags": [],
           "aliases": []

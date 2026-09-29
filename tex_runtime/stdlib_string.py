@@ -67,7 +67,7 @@ class _StdlibString:
             return torch.scalar_tensor(float(s.shape[-1]), dtype=torch.float32)
         raise ValueError("len() expects a string or array argument")
 
-    @stdlib("replace", sig='replace(s, old, new) \\u2192 string', category='Strings', doc='Replace all occurrences of old with new.', ex='string r = replace(s, "foo", "bar");')
+    @stdlib("replace", sig='replace(s, old, new, count?) \\u2192 string', category='Strings', doc='Replace all occurrences of old with new.', ex='string r = replace(s, "foo", "bar");')
     @staticmethod
     def fn_replace(s, old, new, max_count=None) -> str:
         """Replace occurrences of old with new. Optional max_count limits replacements."""
@@ -183,7 +183,7 @@ class _StdlibString:
             return "_" + cleaned
         return cleaned
 
-    @stdlib("split", sig='split(s, sep) \\u2192 string[]', category='Strings', doc='Split string into array by separator.', ex='string parts[4] = split(s, ",");')
+    @stdlib("split", sig='split(s, sep, max_splits?) \\u2192 string[]', category='Strings', doc='Split string into array by separator.', ex='string parts[4] = split(s, ",");')
     @staticmethod
     def fn_split(s, delimiter, max_splits=None) -> list:
         """Split string by delimiter. Returns a list of strings."""
@@ -212,7 +212,7 @@ class _StdlibString:
             raise ValueError("rstrip() expects a string argument")
         return s.rstrip()
 
-    @stdlib("pad_left", sig='pad_left(s, width, fill) \\u2192 string', category='Strings', doc='Pad string on the left to reach width.', ex='string n = pad_left(str(fi), 4, "0");')
+    @stdlib("pad_left", sig='pad_left(s, width, fill?) \\u2192 string', category='Strings', doc='Pad string on the left to reach width.', ex='string n = pad_left(str(fi), 4, "0");')
     @staticmethod
     def fn_pad_left(s, width, char=None) -> str:
         """Pad string on the left to reach target width. Default pad char is space."""
@@ -226,7 +226,7 @@ class _StdlibString:
             fill = char
         return s.rjust(w, fill)
 
-    @stdlib("pad_right", sig='pad_right(s, width, fill) \\u2192 string', category='Strings', doc='Pad string on the right to reach width.', ex='string n = pad_right(s, 20, " ");')
+    @stdlib("pad_right", sig='pad_right(s, width, fill?) \\u2192 string', category='Strings', doc='Pad string on the right to reach width.', ex='string n = pad_right(s, 20, " ");')
     @staticmethod
     def fn_pad_right(s, width, char=None) -> str:
         """Pad string on the right to reach target width. Default pad char is space."""

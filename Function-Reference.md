@@ -8,54 +8,54 @@
 
 | Function | Signature | Description | Tags |
 |----------|-----------|-------------|------|
-| `sin` | `sin(x) → float` | Sine (radians). | — |
-| `cos` | `cos(x) → float` | Cosine (radians). | — |
-| `tan` | `tan(x) → float` | Tangent (radians). | — |
-| `asin` | `asin(x) → float` | Arcsine. Returns radians. | — |
-| `acos` | `acos(x) → float` | Arccosine. Returns radians. | — |
-| `atan` | `atan(x) → float` | Arctangent. Returns radians. | — |
-| `atan2` | `atan2(y, x) → float` | Two-argument arctangent. Returns radians. | — |
+| `sin` | `sin(x) → float\|vec` | Sine (radians). | — |
+| `cos` | `cos(x) → float\|vec` | Cosine (radians). | — |
+| `tan` | `tan(x) → float\|vec` | Tangent (radians). | — |
+| `asin` | `asin(x) → float\|vec` | Arcsine. Returns radians. | — |
+| `acos` | `acos(x) → float\|vec` | Arccosine. Returns radians. | — |
+| `atan` | `atan(x) → float\|vec` | Arctangent. Returns radians. | — |
+| `atan2` | `atan2(y, x) → float\|vec` | Two-argument arctangent. Returns radians. | — |
 | `sincos` | `sincos(x) → vec2` | Returns vec2(sin(x), cos(x)). More efficient than separate sin/cos calls. | — |
-| `sinh` | `sinh(x) → float` | Hyperbolic sine. | — |
-| `cosh` | `cosh(x) → float` | Hyperbolic cosine. | — |
-| `tanh` | `tanh(x) → float` | Hyperbolic tangent. | — |
-| `pow` | `pow(x, y) → float` | Raise x to the power y. | — |
-| `sqrt` | `sqrt(x) → float` | Square root. | — |
-| `exp` | `exp(x) → float` | e raised to the power x. | — |
-| `log` | `log(x) → float` | Natural logarithm (base e). | — |
-| `log2` | `log2(x) → float` | Logarithm base 2. | — |
-| `log10` | `log10(x) → float` | Logarithm base 10. | — |
-| `abs` | `abs(x) → float` | Absolute value. | — |
-| `sign` | `sign(x) → float` | Returns -1, 0, or 1. | — |
-| `pow2` | `pow2(x) → float` | 2 raised to the power x. | — |
-| `pow10` | `pow10(x) → float` | 10 raised to the power x. | — |
-| `hypot` | `hypot(x, y) → float` | Hypotenuse: sqrt(x*x + y*y). | — |
-| `floor` | `floor(x) → float` | Round down to nearest integer. | — |
-| `ceil` | `ceil(x) → float` | Round up to nearest integer. | — |
-| `round` | `round(x) → float` | Round to nearest integer. | — |
-| `trunc` | `trunc(x) → float` | Truncate toward zero (drop fractional part). | — |
-| `fract` | `fract(x) → float` | Fractional part: x - floor(x). | — |
-| `mod` | `mod(x, y) → float` | Modulo (remainder). | — |
-| `degrees` | `degrees(x) → float` | Convert radians to degrees. | — |
-| `radians` | `radians(x) → float` | Convert degrees to radians. | — |
-| `spow` | `spow(x, y) → float` | Sign-preserving power. Safe for negative x. | — |
-| `sdiv` | `sdiv(a, b) → float` | Safe divide. Returns 0 when b is zero. | — |
-| `isnan` | `isnan(x) → float` | Returns 1.0 if x is NaN, 0.0 otherwise. | — |
-| `isinf` | `isinf(x) → float` | Returns 1.0 if x is infinite, 0.0 otherwise. | — |
+| `sinh` | `sinh(x) → float\|vec` | Hyperbolic sine. | — |
+| `cosh` | `cosh(x) → float\|vec` | Hyperbolic cosine. | — |
+| `tanh` | `tanh(x) → float\|vec` | Hyperbolic tangent. | — |
+| `pow` | `pow(x, y) → float\|vec` | Raise x to the power y. | — |
+| `sqrt` | `sqrt(x) → float\|vec` | Square root. | — |
+| `exp` | `exp(x) → float\|vec` | e raised to the power x. | — |
+| `log` | `log(x) → float\|vec` | Natural logarithm (base e). | — |
+| `log2` | `log2(x) → float\|vec` | Logarithm base 2. | — |
+| `log10` | `log10(x) → float\|vec` | Logarithm base 10. | — |
+| `abs` | `abs(x) → float\|vec` | Absolute value. | — |
+| `sign` | `sign(x) → float\|vec` | Returns -1, 0, or 1. | — |
+| `pow2` | `pow2(x) → float\|vec` | 2 raised to the power x. | — |
+| `pow10` | `pow10(x) → float\|vec` | 10 raised to the power x. | — |
+| `hypot` | `hypot(x, y) → float\|vec` | Hypotenuse: sqrt(x*x + y*y). | — |
+| `floor` | `floor(x) → float\|vec` | Round down to nearest integer. | — |
+| `ceil` | `ceil(x) → float\|vec` | Round up to nearest integer. | — |
+| `round` | `round(x) → float\|vec` | Round to nearest integer; halves go to the even integer, so round(2.5) is 2. | — |
+| `trunc` | `trunc(x) → float\|vec` | Truncate toward zero (drop fractional part). | — |
+| `fract` | `fract(x) → float\|vec` | Fractional part: x - floor(x). | — |
+| `mod` | `mod(x, y) → float\|vec` | Modulo (remainder), truncated: the sign follows x, so mod(-1, 3) is -1 (unlike fract). | — |
+| `degrees` | `degrees(x) → float\|vec` | Convert radians to degrees. | — |
+| `radians` | `radians(x) → float\|vec` | Convert degrees to radians. | — |
+| `spow` | `spow(x, y) → float\|vec` | Sign-preserving power. Safe for negative x. | — |
+| `sdiv` | `sdiv(a, b) → float\|vec` | Safe divide. Returns 0 when b is zero. | — |
+| `isnan` | `isnan(x) → float\|vec` | Returns 1.0 if x is NaN, 0.0 otherwise. | — |
+| `isinf` | `isinf(x) → float\|vec` | Returns 1.0 if x is infinite, 0.0 otherwise. | — |
 
 ## Interpolation
 
 | Function | Signature | Description | Tags |
 |----------|-----------|-------------|------|
-| `min` | `min(a, b) → float` | Returns the smaller value. | — |
-| `max` | `max(a, b) → float` | Returns the larger value. | — |
-| `clamp` | `clamp(x, lo, hi) → float` | Clamp x to [lo, hi] range. | — |
-| `lerp` | `lerp(a, b, t) → float` | Linear interpolation from a to b by t. | — |
-| `mix` | `mix(a, b, t) → float` | Linear interpolation from a to b by t. | — |
+| `min` | `min(a, b) → float\|vec` | Returns the smaller value. | — |
+| `max` | `max(a, b) → float\|vec` | Returns the larger value. | — |
+| `clamp` | `clamp(x, lo, hi) → float\|vec` | Clamp x to [lo, hi] range. | — |
+| `lerp` | `lerp(a, b, t) → float\|vec` | Linear interpolation from a to b by t. | — |
+| `mix` | `mix(a, b, t) → float\|vec` | Linear interpolation from a to b by t. | — |
 | `select` | `select(cond, a, b) → vec` | Pick a or b by cond, without an if. Both a and b are always computed — nothing is skipped — but this never syncs, so it stays capturable under CUDA graphs where an equivalent if on a per-pixel or uniform cond may not. | — |
-| `fit` | `fit(x, inLo, inHi, outLo, outHi) → float` | Remap x from [inLo, inHi] to [outLo, outHi]. | — |
-| `step` | `step(edge, x) → float` | Returns 0 if x < edge, 1 otherwise. | — |
-| `smoothstep` | `smoothstep(lo, hi, x) → float` | Smooth Hermite interpolation between lo and hi. | — |
+| `fit` | `fit(x, inLo, inHi, outLo, outHi) → float\|vec` | Remap x from [inLo, inHi] to [outLo, outHi]. | — |
+| `step` | `step(edge, x) → float\|vec` | Returns 0 if x < edge, 1 otherwise. | — |
+| `smoothstep` | `smoothstep(lo, hi, x) → float\|vec` | Smooth Hermite interpolation between lo and hi. | — |
 
 ## Vector
 
@@ -122,19 +122,19 @@
 
 | Function | Signature | Description | Tags |
 |----------|-----------|-------------|------|
-| `perlin` | `perlin(x, y) → float` | 2D Perlin noise. Returns value in [-1, 1]. | — |
-| `simplex` | `simplex(x, y) → float` | 2D Simplex noise. Returns value in [-1, 1]. | — |
-| `fbm` | `fbm(x, y, octaves) → float` | Fractal Brownian Motion (multi-octave Perlin). | sync |
-| `worley_f1` | `worley_f1(x, y) → float` | Worley (cellular) noise — distance to nearest cell center. | — |
-| `worley_f2` | `worley_f2(x, y) → float` | Worley noise — distance to second-nearest cell center. | — |
-| `voronoi` | `voronoi(x, y) → float` | Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id. | — |
-| `worley_id` | `worley_id(x, y) → float` | Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point. | — |
-| `billow` | `billow(x, y, octaves) → float` | Billowy noise — abs(fbm). Puffy cloud shapes. | sync |
-| `turbulence` | `turbulence(x, y, octaves) → float` | Turbulence — sum of abs(noise) per octave. Veiny patterns. | sync |
-| `ridged` | `ridged(x, y, octaves) → float` | Ridged multifractal — sharp ridges, good for mountains. | sync |
-| `flow` | `flow(x, y, angle) → float` | Flow noise — Perlin rotated by angle per octave. Avoids static patterns. | sync |
-| `curl` | `curl(x, y) → vec2` | Curl of 2D noise field. Returns a divergence-free vector. | — |
-| `alligator` | `alligator(x, y) → float` | Alligator noise — cellular crack patterns. | sync |
+| `perlin` | `perlin(x, y, z?) → float` | 2D Perlin noise; pass z for 3D. Returns value in [-1, 1]. | — |
+| `simplex` | `simplex(x, y, z?) → float` | 2D Simplex noise. With a z argument it returns 3D Perlin noise (there is no 3D simplex). Returns value in [-1, 1]. | — |
+| `fbm` | `fbm(x, y, [z,] octaves) → float` | Fractal Brownian Motion (multi-octave Perlin). | sync |
+| `worley_f1` | `worley_f1(x, y, z?) → float` | Worley (cellular) noise — distance to nearest cell center. | — |
+| `worley_f2` | `worley_f2(x, y, z?) → float` | Worley noise — distance to second-nearest cell center. | — |
+| `voronoi` | `voronoi(x, y, z?) → float` | Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id. | — |
+| `worley_id` | `worley_id(x, y, z?) → float` | Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point. | — |
+| `billow` | `billow(x, y, [z,] octaves) → float` | Billowy noise — abs(fbm). Puffy cloud shapes. | sync |
+| `turbulence` | `turbulence(x, y, [z,] octaves) → float` | Turbulence — sum of abs(noise) per octave. Veiny patterns. | sync |
+| `ridged` | `ridged(x, y, [z,] octaves) → float` | Ridged multifractal — sharp ridges, good for mountains. | sync |
+| `flow` | `flow(x, y, [z,] angle) → float` | Flow noise — Perlin rotated by angle per octave. Avoids static patterns. | sync |
+| `curl` | `curl(x, y, z?) → vec2\|vec3` | Curl of a noise field: a vec2 for (x, y), a vec3 with z. Divergence-free. | — |
+| `alligator` | `alligator(x, y, [z,] octaves?) → float` | Alligator noise — cellular crack patterns. With z, octaves is required. | sync |
 
 ## SDF & Smooth
 
@@ -164,7 +164,7 @@
 | Function | Signature | Description | Tags |
 |----------|-----------|-------------|------|
 | `str` | `str(x) → string` | Convert a number to a string. | — |
-| `replace` | `replace(s, old, new) → string` | Replace all occurrences of old with new. | — |
+| `replace` | `replace(s, old, new, count?) → string` | Replace all occurrences of old with new. | — |
 | `strip` | `strip(s) → string` | Remove leading/trailing whitespace. | — |
 | `lower` | `lower(s) → string` | Convert to lowercase. | — |
 | `upper` | `upper(s) → string` | Convert to uppercase. | — |
@@ -184,11 +184,11 @@
 | `to_float` | `to_float(s) → float` | Parse a string as a float. | — |
 | `sanitize_filename` | `sanitize_filename(s) → string` | Remove unsafe characters for use in file paths. | — |
 | `format` | `format(fmt, ...) → string` | Python-style {} placeholders, filled in order; specs like {:04d} and {:.2f} work. A whole number formats as an int. % sequences are not placeholders. | — |
-| `split` | `split(s, sep) → string[]` | Split string into array by separator. | — |
+| `split` | `split(s, sep, max_splits?) → string[]` | Split string into array by separator. | — |
 | `lstrip` | `lstrip(s) → string` | Remove leading whitespace. | — |
 | `rstrip` | `rstrip(s) → string` | Remove trailing whitespace. | — |
-| `pad_left` | `pad_left(s, width, fill) → string` | Pad string on the left to reach width. | — |
-| `pad_right` | `pad_right(s, width, fill) → string` | Pad string on the right to reach width. | — |
+| `pad_left` | `pad_left(s, width, fill?) → string` | Pad string on the left to reach width. | — |
+| `pad_right` | `pad_right(s, width, fill?) → string` | Pad string on the right to reach width. | — |
 | `count` | `count(s, sub) → float` | Count non-overlapping occurrences of sub in s. | — |
 | `char_at` | `char_at(s, idx) → string` | Character at index (0-based). | — |
 
@@ -196,12 +196,12 @@
 
 | Function | Signature | Description | Tags |
 |----------|-----------|-------------|------|
-| `sort` | `sort(arr) → array` | Sort array elements in ascending order. | — |
-| `reverse` | `reverse(arr) → array` | Reverse array element order. | — |
+| `sort` | `sort(arr) → array` | Sort array elements in ascending order; returns a sorted copy. | — |
+| `reverse` | `reverse(arr) → array` | Reverse array element order; returns a reversed copy. | — |
 | `arr_sum` | `arr_sum(arr) → float` | Sum of all array elements. | — |
 | `arr_min` | `arr_min(arr) → float` | Minimum value in array. | — |
 | `arr_max` | `arr_max(arr) → float` | Maximum value in array. | — |
-| `median` | `median(arr) → float` | Median value of array. | — |
+| `median` | `median(arr) → float` | Median value of array; an even count gives the lower of the two middle values. | — |
 | `arr_avg` | `arr_avg(arr) → float` | Average of all array elements. | — |
 | `join` | `join(arr, sep) → string` | Concatenate string array with separator. | — |
 

@@ -23,7 +23,7 @@ class _StdlibArray:
 
     # -- Array functions ------------------------------------------------
 
-    @stdlib("sort", sig='sort(arr) \\u2192 array', category='Arrays', doc='Sort array elements in ascending order.', ex='sort(arr);')
+    @stdlib("sort", sig='sort(arr) \\u2192 array', category='Arrays', doc='Sort array elements in ascending order; returns a sorted copy.', ex='arr = sort(arr);')
     @staticmethod
     def fn_sort(arr):
         """Sort array elements in ascending order. Returns sorted copy."""
@@ -34,7 +34,7 @@ class _StdlibArray:
             return torch.sort(t, dim=-2).values
         return torch.sort(t, dim=-1).values
 
-    @stdlib("reverse", sig='reverse(arr) \\u2192 array', category='Arrays', doc='Reverse array element order.', ex='reverse(arr);')
+    @stdlib("reverse", sig='reverse(arr) \\u2192 array', category='Arrays', doc='Reverse array element order; returns a reversed copy.', ex='arr = reverse(arr);')
     @staticmethod
     def fn_reverse(arr):
         """Reverse array elements. Returns reversed copy."""
@@ -63,7 +63,7 @@ class _StdlibArray:
         """Maximum element of an array per channel. Returns scalar (or vec) per pixel."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.max(dim=d).values)
 
-    @stdlib("median", sig='median(arr) \\u2192 float', category='Arrays', doc='Median value of array.', ex='float mid = median(arr);')
+    @stdlib("median", sig='median(arr) \\u2192 float', category='Arrays', doc='Median value of array; an even count gives the lower of the two middle values.', ex='float mid = median(arr);')
     @staticmethod
     def fn_median(arr) -> torch.Tensor:
         """Median element of an array per channel. Returns scalar (or vec) per pixel.
