@@ -258,10 +258,12 @@ class ScalarOracle:
 
     @staticmethod
     def _coerce_decl(type_name, v):
+        # Arrays are Python lists: always hand back a copy, so a parameter binding never
+        # aliases the caller's array (the language has value semantics).
         tn = (type_name or "").lower()
         if tn in ("vec2", "vec3") and isinstance(v, list):
             return v[: int(tn[-1])]
-        return v
+        return list(v) if isinstance(v, list) else v
 
     def _for(self, n):
         if n.init is not None:
@@ -312,6 +314,8 @@ class ScalarOracle:
                 value = [value] * len(cur)
             elif isinstance(cur, list) and isinstance(value, list):
                 value = value[: len(cur)] if len(value) > len(cur) else value
+            if isinstance(value, list):
+                value = list(value)          # `b = a` copies; a later `b[i] = x` must not move `a`
             self.env[target.name] = value
             return None
         if cls is A.BindingRef:
@@ -654,10 +658,11 @@ def sweep(program, bindings, B, H, W, output_names, latent_channels=0,
     """Run the oracle over every pixel of a `(B, H, W)` grid, in ROW-MAJOR order (M5's
     stated compaction order), and reassemble the per-pixel answers into whole tensors.
 
-    Returns `(outputs, skipped)`: `outputs` maps each name in `output_names` to a
-    `[B, H, W]` or `[B, H, W, C]` tensor, `skipped` is None or the `OracleUnsupported`
-    reason the sweep could not be completed. A scatter output is returned from
-    `scatter_init`'s buffer, written by the pixels in source order."""
+    Returns `(outputs, probes)`: `outputs` maps each name in `output_names` to a
+    `[B, H, W]` or `[B, H, W, C]` tensor, `probes` is the list of `debug_print` probes the
+    pixels recorded. `OracleUnsupported` and `OracleLoopCap` propagate to the caller, which
+    reports them as a skip. A scatter output is returned from `scatter_init`'s buffer,
+    written by the pixels in source order."""
     scatter = {k: v.clone() for k, v in (scatter_init or {}).items()}
     per_pixel = {name: [] for name in output_names}
     probes: list = []

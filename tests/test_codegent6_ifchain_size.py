@@ -11,16 +11,18 @@ an n-arm chain cost O(2^n) emitted text, not O(n).
 
 This file uses its OWN synthetic n-arm chain (never the host's program or file name) on its
 own uniform `$sel` parameter, so the size law and the parity rows are provable without the
-host's tree.  It is entirely new coverage: nothing above this docstring exists elsewhere in
-the suite, so removing the fix should turn every row below red on its own (no shared fixture
-masks a regression here)."""
+host's tree.  Only the size-law and timing rows go red without the fix (the pre-fix
+emission was bigger, not wrong); the parity and no-`if` rows pin that the closure sharing
+does not change values or text for programs it does not concern."""
 import builtins
+import functools
 import time
 
 import pytest
 import torch
 
 from helpers import *   # noqa: F403
+from failure_harness import compile_program as _compile
 
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import codegen as cg_mod
@@ -57,14 +59,6 @@ def _make_perpixel_chain(n_arms: int) -> str:
     return PRAGMA + "\n".join(lines) + "\n"
 
 
-def _compile(src, bindings):
-    bt = {name: _infer_binding_type(v) for name, v in bindings.items()}
-    program = parse_and_split(src, bt)
-    checker = TypeChecker(binding_types=bt, source=src)
-    type_map = checker.check(program)
-    return program, type_map, sorted(checker.assigned_bindings.keys())
-
-
 def _emit(src, bindings):
     """Compile *src* on the codegen tier and return its emitted `_tex_src`."""
     program, type_map, _names = _compile(src, bindings)
@@ -97,6 +91,13 @@ def _cook_both(src, bindings, device="cpu"):
 _ARM_COUNTS = (2, 4, 8, 12, 16)
 
 
+@functools.lru_cache(maxsize=None)
+def _emit_chain(n_arms: int) -> str:
+    """The uniform n-arm chain's emitted source, emitted once per arm count and shared by the
+    size, line-count and compile-time rows."""
+    return _emit(_make_chain(n_arms), {})
+
+
 def test_emitted_chars_grow_linearly_not_exponentially():
     """The acceptance row. Pre-fix this chain's emitted `_tex_src` roughly DOUBLES per extra
     arm (2^n over an n-arm chain: measured 3,932 / 21,791 / 109,579 / 530,560 chars at 2/4/6/8
@@ -107,8 +108,6 @@ def test_emitted_chars_grow_linearly_not_exponentially():
     the per-arm delta stays bounded by a constant that a 2^n law blows through almost
     immediately, and the 16-vs-2-arm ratio stays a small multiple of the 8x arm-count ratio."""
     sizes = {}
-    for n in _ARM_COUNTS:
-        sizes[n] = len(_emit(_make_chain(n), {}))
     # Monotone, and every consecutive step's growth ratio-per-arm stays bounded — the
     # opposite of the pre-fix shape, where the ratio-per-arm was itself growing (~2x/arm
     # compounding, i.e. per_arm roughly DOUBLING each step rather than merely rising). The
@@ -116,6 +115,9 @@ def test_emitted_chars_grow_linearly_not_exponentially():
     # made the 8->12 delta alone (2^8=256 -> 2^12=4096, a 16x jump) dwarf this ceiling.
     prev_n = None
     for n in _ARM_COUNTS:
+        # Emit and check one arm count at a time, ascending: with the fix reverted the first
+        # steps already fail, before a 12- or 16-arm emit (10^6..10^8 chars) is attempted.
+        sizes[n] = len(_emit_chain(n))
         if prev_n is not None:
             delta_arms = n - prev_n
             delta_chars = sizes[n] - sizes[prev_n]
@@ -131,7 +133,7 @@ def test_emitted_chars_grow_linearly_not_exponentially():
 
 
 def test_emitted_lines_grow_linearly_not_exponentially():
-    line_counts = {n: _emit(_make_chain(n), {}).count("\n") + 1 for n in _ARM_COUNTS}
+    line_counts = {n: _emit_chain(n).count("\n") + 1 for n in (2, 16)}
     ratio = line_counts[16] / line_counts[2]
     assert ratio < 50, f"16-arm/2-arm line-count ratio {ratio:.1f}x — still exponential-shaped"
 
@@ -143,7 +145,7 @@ def test_compile_of_the_16_arm_chain_is_fast():
     emitted source.
     Pre-fix, a chain this size would not even finish emitting in reasonable time; post-fix
     it is milliseconds."""
-    text = _emit(_make_chain(16), {})
+    text = _emit_chain(16)
     t0 = time.perf_counter()
     builtins.compile(text, "<gen>", "exec")
     ms = (time.perf_counter() - t0) * 1000.0

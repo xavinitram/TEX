@@ -44,7 +44,6 @@ from helpers import *
 import compat_corpus as cc
 from TEX_Wrangle import tex_api, tex_fusion
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The one corpus program the design note's own §0/§2 census already names as the sole
 # class-B (per-pixel loop bound) member of the (then) 130-program corpus.
@@ -296,6 +295,9 @@ def test_l3_plan_is_program_instance_keyed(r: SubTestResult):
         loops1 = {id(n) for n in _walk(p1) if isinstance(n, A.ForLoop)}
         loops2 = {id(n) for n in _walk(p2) if isinstance(n, A.ForLoop)}
         assert plan1.per_pixel_loops == loops1
+        plan2 = tex_api.flow_plan(p2)
+        assert plan2.per_pixel_loops == loops2, "the re-parse's plan must name ITS OWN loops"
+        assert plan1.per_pixel_loops != plan2.per_pixel_loops
         assert plan1.per_pixel_loops.isdisjoint(loops2), (
             "a re-parse must not share node ids with the original — if it did, this test "
             "would not be exercising the identity contract FlowPlan documents")

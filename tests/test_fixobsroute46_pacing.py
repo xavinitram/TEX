@@ -119,14 +119,14 @@ def test_overhead462_cook_done_event_skips_device_ctx_when_already_current(r):
              "entry, and still returned an event")
 
 
-def test_overhead462_cook_done_event_reuses_resets_cached_answer(r):
-    """OVERHEAD-462 arm (a): after `reset()` has resolved is-CUDA/index/is-current for a
-    device, `cook_done_event` for that SAME device must not re-derive it — `_is_cuda`
-    (via `torch.device(...)` + `torch.cuda.is_available()`) is called at most once across
-    `reset()` + N `cook_done_event` calls, not once per call."""
-    print("\n--- OVERHEAD-462: cook_done_event reuses reset()'s cached answer ---")
+def test_overhead462_cook_done_event_memoizes_its_own_answer(r):
+    """OVERHEAD-462 arm (a): `cook_done_event` resolves is-CUDA/index/is-current for a
+    device once and reuses its own memo -- `torch.cuda.is_available()` is called exactly
+    once across `reset()` (unpaced, so it contributes nothing) + N `cook_done_event`
+    calls for the same device, not once per call."""
+    print("\n--- OVERHEAD-462: cook_done_event memoizes its own answer ---")
     calls = {"n": 0}
-    with _DeviceSpy(current=0) as spy:
+    with _DeviceSpy(current=0):
         real_available = torch.cuda.is_available
 
         def _counting_available():
@@ -146,7 +146,6 @@ def test_overhead462_cook_done_event_reuses_resets_cached_answer(r):
     else:
         r.fail("OVERHEAD-462 cache reuse", f"torch.cuda.is_available() was called "
                f"{calls['n']} times (expected 1)")
-    _ = spy
 
 
 def test_overhead462_cook_done_event_falls_back_without_a_prior_reset(r):
@@ -240,7 +239,7 @@ def test_p2_cook_done_event_caches_on_its_own_raw_value_not_resets(r):
     and cook_done_event's memo must hit on calls 2-5."""
     print("\n--- P2: cook_done_event caches on its own raw value, mismatched vs reset() ---")
     calls = {"n": 0}
-    with _DeviceSpy(current=0) as spy:
+    with _DeviceSpy(current=0):
         real_available = torch.cuda.is_available
 
         def _counting_available():
@@ -260,7 +259,6 @@ def test_p2_cook_done_event_caches_on_its_own_raw_value_not_resets(r):
     else:
         r.fail("P2 cook_done_event own memo", f"is_available called {calls['n']} times "
                f"(expected 1)")
-    _ = spy
 
 
 # ── P7 (Phase C): the public record_on(event, device) seam ────────────────────────

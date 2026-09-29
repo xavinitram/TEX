@@ -119,7 +119,7 @@ def test_fuseddev46_fused_torch_compile_cuda_stays_on_device(r: SubTestResult):
         # free to reassociate float ops (a real, expected ~1e-7-scale divergence here).
         if not torch.allclose(a, b, atol=1e-5, rtol=1e-5):
             maxdiff = (a.double() - b.double()).abs().max().item()
-            r.fail("FUSEDDEV-46 bit-exact",
+            r.fail("FUSEDDEV-46 allclose",
                   f"torch_compile diverged from the interpreter, maxdiff={maxdiff:.3e}")
             return
         r.ok("fused chain runs on CUDA under torch_compile, within invariant 2's own "
@@ -145,15 +145,24 @@ def test_fuseddev46_single_node_torch_compile_cuda_stays_on_device(r: SubTestRes
         clear_compiled_cache()
         out_none = tex_engine.cook(code, dict(bindings), device_mode="cuda",
                                    precision="fp32", compile_mode="none", cancel=None)
+        blacklisted_before = set(tex_compiled._compile_blacklist)
         out_tc = tex_engine.cook(code, dict(bindings), device_mode="cuda",
                                  precision="fp32", compile_mode="torch_compile", cancel=None)
         a, b = out_none.outputs["OUT"], out_tc.outputs["OUT"]
+        # The bug's symptom is a swallowed crash: the fallback net blacklists the program and
+        # re-runs the interpreter, so `out_tc` would be interp-vs-interp and pass the compare.
+        newly_blacklisted = set(tex_compiled._compile_blacklist) - blacklisted_before
+        if newly_blacklisted:
+            r.fail("FUSEDDEV-46 single-node blacklisted",
+                   f"the torch_compile cook blacklisted {sorted(newly_blacklisted)} instead of "
+                   f"running the compiled path")
+            return
         # COMPILE-51b: see the fused row's own comment above — same `_has_fn_calls`
         # class, same reason invariant 2's tolerance (1e-5) is the right bar here, not
         # bit-exact `torch.equal`.
         if not torch.allclose(a, b, atol=1e-5, rtol=1e-5):
             maxdiff = (a.double() - b.double()).abs().max().item()
-            r.fail("FUSEDDEV-46 single-node bit-exact",
+            r.fail("FUSEDDEV-46 single-node allclose",
                   f"torch_compile diverged from the interpreter, maxdiff={maxdiff:.3e}")
             return
         r.ok("a plain single-node cook runs on CUDA under torch_compile, within "

@@ -29,7 +29,7 @@ from __future__ import annotations
 import torch
 
 from helpers import *  # noqa: F401,F403
-from TEX_Wrangle import tex_engine
+from helpers import windowed_vs_whole as _windowed_vs_whole
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib as _Sample  # populates REGISTRY
 
 _CUDA = torch.cuda.is_available()
@@ -38,16 +38,6 @@ _CUDA = torch.cuda.is_available()
 def _make_frame(H, W, seed):
     torch.manual_seed(seed)
     return torch.rand(1, H, W, 3)
-
-
-def _windowed_vs_whole(code, image, roi, device):
-    x0, y0, w, h, W, H = roi
-    full = tex_engine.cook(code, {"A": image.clone()}, device_mode=device).outputs["OUT"]
-    res = tex_engine.cook(code, {"A": image.clone()}, device_mode=device,
-                           roi=roi, roi_exec=True)
-    win = res.outputs["OUT"]
-    crop = full[:, y0:y0 + h, x0:x0 + w]
-    return res.cooked_roi, win, crop
 
 
 def _repro_roi(r: SubTestResult, ss: float, seed: int, device: str):

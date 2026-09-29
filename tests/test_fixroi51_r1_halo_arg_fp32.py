@@ -168,23 +168,16 @@ def test_r1_approx_above_decline_uses_rounded_value(r: SubTestResult):
     v = 13.3333336
     threshold = 13.3333338
     fp32_v = struct.unpack("<f", struct.pack("<f", v))[0]
-    assert v <= threshold and fp32_v > threshold, "fixture literals stopped straddling"
+    if not (v <= threshold and fp32_v > threshold):
+        r.fail("R1 approx_above decline", "fixture literals stopped straddling the fp32 "
+               f"rounding cell (raw={v}, fp32={fp32_v}, threshold={threshold})")
+        return
     fp = ("halo_arg", 0, 1.0, threshold)
     lit = NumberLiteral(value=v, is_int=False)
     got = _R._reach_of(fp, [lit])
-    expect_declined = abs(fp32_v) > threshold
-    if expect_declined:
-        if got != "unbounded":
-            r.fail("R1 approx_above decline", f"raw={v}, fp32={fp32_v} > {threshold} "
-                   f"should decline (unbounded), got {got}")
-            return
-        r.ok(f"declines to unbounded when the ROUNDED value ({fp32_v}) crosses "
-             f"approx_above={threshold}")
-    else:
-        want = int(math.ceil(1.0 * abs(fp32_v)))
-        if got != want:
-            r.fail("R1 approx_above decline", f"expected reach={want} (rounded, not "
-                   f"declined), got {got}")
-            return
-        r.ok(f"reach={got} computed from the rounded value, consistent with the "
-             f"(non-)decline")
+    if got != "unbounded":
+        r.fail("R1 approx_above decline", f"raw={v}, fp32={fp32_v} > {threshold} "
+               f"should decline (unbounded), got {got}")
+        return
+    r.ok(f"declines to unbounded when the ROUNDED value ({fp32_v}) crosses "
+         f"approx_above={threshold}")

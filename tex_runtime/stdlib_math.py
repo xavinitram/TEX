@@ -44,37 +44,37 @@ class _StdlibMath:
 
     # -- Math functions -------------------------------------------------
 
-    @stdlib("sin", sig='sin(x) \\u2192 float', category='Math', doc='Sine (radians).', ex='float s = sin(u * PI * 2.0);')
+    @stdlib("sin", sig='sin(x) \\u2192 float|vec', category='Math', doc='Sine (radians).', ex='float s = sin(u * PI * 2.0);')
     @staticmethod
     def fn_sin(x) -> torch.Tensor:
         return torch.sin(_to_tensor(x))
 
-    @stdlib("cos", sig='cos(x) \\u2192 float', category='Math', doc='Cosine (radians).', ex='float c = cos(v * PI);')
+    @stdlib("cos", sig='cos(x) \\u2192 float|vec', category='Math', doc='Cosine (radians).', ex='float c = cos(v * PI);')
     @staticmethod
     def fn_cos(x) -> torch.Tensor:
         return torch.cos(_to_tensor(x))
 
-    @stdlib("tan", sig='tan(x) \\u2192 float', category='Math', doc='Tangent (radians).', ex='float t = tan(u);')
+    @stdlib("tan", sig='tan(x) \\u2192 float|vec', category='Math', doc='Tangent (radians).', ex='float t = tan(u);')
     @staticmethod
     def fn_tan(x) -> torch.Tensor:
         return torch.tan(_to_tensor(x))
 
-    @stdlib("asin", sig='asin(x) \\u2192 float', category='Math', doc='Arcsine. Returns radians.', ex='float angle = asin(0.5);')
+    @stdlib("asin", sig='asin(x) \\u2192 float|vec', category='Math', doc='Arcsine. Returns radians.', ex='float angle = asin(0.5);')
     @staticmethod
     def fn_asin(x) -> torch.Tensor:
         return torch.asin(torch.clamp(_to_tensor(x), -1.0, 1.0))
 
-    @stdlib("acos", sig='acos(x) \\u2192 float', category='Math', doc='Arccosine. Returns radians.', ex='float angle = acos(0.5);')
+    @stdlib("acos", sig='acos(x) \\u2192 float|vec', category='Math', doc='Arccosine. Returns radians.', ex='float angle = acos(0.5);')
     @staticmethod
     def fn_acos(x) -> torch.Tensor:
         return torch.acos(torch.clamp(_to_tensor(x), -1.0, 1.0))
 
-    @stdlib("atan", sig='atan(x) \\u2192 float', category='Math', doc='Arctangent. Returns radians.', ex='float angle = atan(1.0);')
+    @stdlib("atan", sig='atan(x) \\u2192 float|vec', category='Math', doc='Arctangent. Returns radians.', ex='float angle = atan(1.0);')
     @staticmethod
     def fn_atan(x) -> torch.Tensor:
         return torch.atan(_to_tensor(x))
 
-    @stdlib("atan2", sig='atan2(y, x) \\u2192 float', category='Math', doc='Two-argument arctangent. Returns radians.', ex='float angle = atan2(v - 0.5, u - 0.5);')
+    @stdlib("atan2", sig='atan2(y, x) \\u2192 float|vec', category='Math', doc='Two-argument arctangent. Returns radians.', ex='float angle = atan2(v - 0.5, u - 0.5);')
     @staticmethod
     def fn_atan2(y, x) -> torch.Tensor:
         return torch.atan2(*_align_field_rank(_to_tensor(y), _to_tensor(x)))
@@ -86,12 +86,12 @@ class _StdlibMath:
         t = _to_tensor(x)
         return torch.stack([torch.sin(t), torch.cos(t)], dim=-1)
 
-    @stdlib("sqrt", sig='sqrt(x) \\u2192 float', category='Math', doc='Square root.', ex='float s = sqrt(u * u + v * v);')
+    @stdlib("sqrt", sig='sqrt(x) \\u2192 float|vec', category='Math', doc='Square root.', ex='float s = sqrt(u * u + v * v);')
     @staticmethod
     def fn_sqrt(x) -> torch.Tensor:
         return torch.sqrt(torch.clamp(_to_tensor(x), min=0.0))
 
-    @stdlib("pow", sig='pow(x, y) \\u2192 float', category='Math', doc='Raise x to the power y.', ex='float p = pow(u, 2.2);')
+    @stdlib("pow", sig='pow(x, y) \\u2192 float|vec', category='Math', doc='Raise x to the power y.', ex='float p = pow(u, 2.2);')
     @staticmethod
     def fn_pow(base, exp) -> torch.Tensor:
         b, e = _align_field_rank(_to_tensor(base), _to_tensor(exp))
@@ -119,54 +119,54 @@ class _StdlibMath:
                 )
         return out
 
-    @stdlib("exp", sig='exp(x) \\u2192 float', category='Math', doc='e raised to the power x.', ex='float e = exp(-u * 5.0);')
+    @stdlib("exp", sig='exp(x) \\u2192 float|vec', category='Math', doc='e raised to the power x.', ex='float e = exp(-u * 5.0);')
     @staticmethod
     def fn_exp(x) -> torch.Tensor:
         return torch.exp(_to_tensor(x))
 
-    @stdlib("log", sig='log(x) \\u2192 float', category='Math', doc='Natural logarithm (base e).', ex='float l = log(u + 1.0);')
+    @stdlib("log", sig='log(x) \\u2192 float|vec', category='Math', doc='Natural logarithm (base e).', ex='float l = log(u + 1.0);')
     @staticmethod
     def fn_log(x) -> torch.Tensor:
         t = _to_tensor(x)
         return torch.log(torch.clamp(t, min=_eps(t)))
 
-    @stdlib("abs", sig='abs(x) \\u2192 float', category='Math', doc='Absolute value.', ex='float a = abs(u - 0.5);')
+    @stdlib("abs", sig='abs(x) \\u2192 float|vec', category='Math', doc='Absolute value.', ex='float a = abs(u - 0.5);')
     @staticmethod
     def fn_abs(x) -> torch.Tensor:
         return torch.abs(_to_tensor(x))
 
-    @stdlib("sign", sig='sign(x) \\u2192 float', category='Math', doc='Returns -1, 0, or 1.', ex='float s = sign(u - 0.5);')
+    @stdlib("sign", sig='sign(x) \\u2192 float|vec', category='Math', doc='Returns -1, 0, or 1.', ex='float s = sign(u - 0.5);')
     @staticmethod
     def fn_sign(x) -> torch.Tensor:
         return torch.sign(_to_tensor(x))
 
-    @stdlib("floor", sig='floor(x) \\u2192 float', category='Math', doc='Round down to nearest integer.', ex='float f = floor(u * 10.0);')
+    @stdlib("floor", sig='floor(x) \\u2192 float|vec', category='Math', doc='Round down to nearest integer.', ex='float f = floor(u * 10.0);')
     @staticmethod
     def fn_floor(x) -> torch.Tensor:
         return torch.floor(_to_tensor(x))
 
-    @stdlib("ceil", sig='ceil(x) \\u2192 float', category='Math', doc='Round up to nearest integer.', ex='float c = ceil(u * 10.0);')
+    @stdlib("ceil", sig='ceil(x) \\u2192 float|vec', category='Math', doc='Round up to nearest integer.', ex='float c = ceil(u * 10.0);')
     @staticmethod
     def fn_ceil(x) -> torch.Tensor:
         return torch.ceil(_to_tensor(x))
 
-    @stdlib("round", sig='round(x) \\u2192 float', category='Math', doc='Round to nearest integer.', ex='float r = round(u * 10.0) / 10.0;')
+    @stdlib("round", sig='round(x) \\u2192 float|vec', category='Math', doc='Round to nearest integer; halves go to the even integer, so round(2.5) is 2.', ex='float r = round(u * 10.0) / 10.0;')
     @staticmethod
     def fn_round(x) -> torch.Tensor:
         return torch.round(_to_tensor(x))
 
-    @stdlib("trunc", sig='trunc(x) \\u2192 float', category='Math', doc='Truncate toward zero (drop fractional part).', ex='float t = trunc(u * 10.0);')
+    @stdlib("trunc", sig='trunc(x) \\u2192 float|vec', category='Math', doc='Truncate toward zero (drop fractional part).', ex='float t = trunc(u * 10.0);')
     @staticmethod
     def fn_trunc(x) -> torch.Tensor:
         return torch.trunc(_to_tensor(x))
 
-    @stdlib("fract", sig='fract(x) \\u2192 float', category='Math', doc='Fractional part: x - floor(x).', ex='float f = fract(u * 5.0);')
+    @stdlib("fract", sig='fract(x) \\u2192 float|vec', category='Math', doc='Fractional part: x - floor(x).', ex='float f = fract(u * 5.0);')
     @staticmethod
     def fn_fract(x) -> torch.Tensor:
         t = _to_tensor(x)
         return t - torch.floor(t)
 
-    @stdlib("mod", sig='mod(x, y) \\u2192 float', category='Math', doc='Modulo (remainder).', ex='float m = mod(u * 10.0, 1.0);')
+    @stdlib("mod", sig='mod(x, y) \\u2192 float|vec', category='Math', doc='Modulo (remainder), truncated: the sign follows x, so mod(-1, 3) is -1 (unlike fract).', ex='float m = mod(u * 10.0, 1.0);')
     @staticmethod
     def fn_mod(a, b) -> torch.Tensor:
         a_t, b_t = _align_field_rank(_to_tensor(a), _to_tensor(b))
@@ -175,69 +175,69 @@ class _StdlibMath:
         safe_b = torch.where(zero, _eps(b_t), b_t)
         return torch.fmod(a_t, safe_b)
 
-    @stdlib("log2", sig='log2(x) \\u2192 float', category='Math', doc='Logarithm base 2.', ex='float l = log2(256.0);')
+    @stdlib("log2", sig='log2(x) \\u2192 float|vec', category='Math', doc='Logarithm base 2.', ex='float l = log2(256.0);')
     @staticmethod
     def fn_log2(x) -> torch.Tensor:
         t = _to_tensor(x)
         return torch.log2(torch.clamp(t, min=_eps(t)))
 
-    @stdlib("log10", sig='log10(x) \\u2192 float', category='Math', doc='Logarithm base 10.', ex='float l = log10(1000.0);')
+    @stdlib("log10", sig='log10(x) \\u2192 float|vec', category='Math', doc='Logarithm base 10.', ex='float l = log10(1000.0);')
     @staticmethod
     def fn_log10(x) -> torch.Tensor:
         t = _to_tensor(x)
         return torch.log10(torch.clamp(t, min=_eps(t)))
 
-    @stdlib("pow2", sig='pow2(x) \\u2192 float', category='Math', doc='2 raised to the power x.', ex='float p = pow2(8.0);')
+    @stdlib("pow2", sig='pow2(x) \\u2192 float|vec', category='Math', doc='2 raised to the power x.', ex='float p = pow2(8.0);')
     @staticmethod
     def fn_pow2(x) -> torch.Tensor:
         return torch.pow(2.0, _to_tensor(x))
 
-    @stdlib("pow10", sig='pow10(x) \\u2192 float', category='Math', doc='10 raised to the power x.', ex='float p = pow10(3.0);')
+    @stdlib("pow10", sig='pow10(x) \\u2192 float|vec', category='Math', doc='10 raised to the power x.', ex='float p = pow10(3.0);')
     @staticmethod
     def fn_pow10(x) -> torch.Tensor:
         return torch.pow(10.0, _to_tensor(x))
 
-    @stdlib("sinh", sig='sinh(x) \\u2192 float', category='Math', doc='Hyperbolic sine.', ex='float s = sinh(u);')
+    @stdlib("sinh", sig='sinh(x) \\u2192 float|vec', category='Math', doc='Hyperbolic sine.', ex='float s = sinh(u);')
     @staticmethod
     def fn_sinh(x) -> torch.Tensor:
         return torch.sinh(_to_tensor(x))
 
-    @stdlib("cosh", sig='cosh(x) \\u2192 float', category='Math', doc='Hyperbolic cosine.', ex='float c = cosh(u);')
+    @stdlib("cosh", sig='cosh(x) \\u2192 float|vec', category='Math', doc='Hyperbolic cosine.', ex='float c = cosh(u);')
     @staticmethod
     def fn_cosh(x) -> torch.Tensor:
         return torch.cosh(_to_tensor(x))
 
-    @stdlib("tanh", sig='tanh(x) \\u2192 float', category='Math', doc='Hyperbolic tangent.', ex='float t = tanh(u * 2.0);')
+    @stdlib("tanh", sig='tanh(x) \\u2192 float|vec', category='Math', doc='Hyperbolic tangent.', ex='float t = tanh(u * 2.0);')
     @staticmethod
     def fn_tanh(x) -> torch.Tensor:
         return torch.tanh(_to_tensor(x))
 
-    @stdlib("hypot", sig='hypot(x, y) \\u2192 float', category='Math', doc='Hypotenuse: sqrt(x*x + y*y).', ex='float d = hypot(u - 0.5, v - 0.5);')
+    @stdlib("hypot", sig='hypot(x, y) \\u2192 float|vec', category='Math', doc='Hypotenuse: sqrt(x*x + y*y).', ex='float d = hypot(u - 0.5, v - 0.5);')
     @staticmethod
     def fn_hypot(x, y) -> torch.Tensor:
         return torch.hypot(*_align_field_rank(_to_tensor(x), _to_tensor(y)))
 
-    @stdlib("isnan", sig='isnan(x) \\u2192 float', category='Math', doc='Returns 1.0 if x is NaN, 0.0 otherwise.', ex='float check = isnan(x);')
+    @stdlib("isnan", sig='isnan(x) \\u2192 float|vec', category='Math', doc='Returns 1.0 if x is NaN, 0.0 otherwise.', ex='float check = isnan(x);')
     @staticmethod
     def fn_isnan(x) -> torch.Tensor:
         return torch.isnan(_to_tensor(x)).float()
 
-    @stdlib("isinf", sig='isinf(x) \\u2192 float', category='Math', doc='Returns 1.0 if x is infinite, 0.0 otherwise.', ex='float check = isinf(x);')
+    @stdlib("isinf", sig='isinf(x) \\u2192 float|vec', category='Math', doc='Returns 1.0 if x is infinite, 0.0 otherwise.', ex='float check = isinf(x);')
     @staticmethod
     def fn_isinf(x) -> torch.Tensor:
         return torch.isinf(_to_tensor(x)).float()
 
-    @stdlib("degrees", sig='degrees(x) \\u2192 float', category='Math', doc='Convert radians to degrees.', ex='float d = degrees(PI);')
+    @stdlib("degrees", sig='degrees(x) \\u2192 float|vec', category='Math', doc='Convert radians to degrees.', ex='float d = degrees(PI);')
     @staticmethod
     def fn_degrees(x) -> torch.Tensor:
         return torch.rad2deg(_to_tensor(x))
 
-    @stdlib("radians", sig='radians(x) \\u2192 float', category='Math', doc='Convert degrees to radians.', ex='float r = radians(180.0);')
+    @stdlib("radians", sig='radians(x) \\u2192 float|vec', category='Math', doc='Convert degrees to radians.', ex='float r = radians(180.0);')
     @staticmethod
     def fn_radians(x) -> torch.Tensor:
         return torch.deg2rad(_to_tensor(x))
 
-    @stdlib("spow", sig='spow(x, y) \\u2192 float', category='Math', doc='Sign-preserving power. Safe for negative x.', ex='float s = spow(u - 0.5, 2.0);')
+    @stdlib("spow", sig='spow(x, y) \\u2192 float|vec', category='Math', doc='Sign-preserving power. Safe for negative x.', ex='float s = spow(u - 0.5, 2.0);')
     @staticmethod
     def fn_spow(x, y) -> torch.Tensor:
         """Safe power — sign(x) * pow(abs(x), y). Avoids NaN on negative bases."""
@@ -248,7 +248,7 @@ class _StdlibMath:
         safe_abs = torch.clamp(abs_t, min=eps)
         return torch.where(mask, torch.zeros_like(t), torch.sign(t) * torch.pow(safe_abs, yt))
 
-    @stdlib("sdiv", sig='sdiv(a, b) \\u2192 float', category='Math', doc='Safe divide. Returns 0 when b is zero.', ex='float d = sdiv(1.0, u);')
+    @stdlib("sdiv", sig='sdiv(a, b) \\u2192 float|vec', category='Math', doc='Safe divide. Returns 0 when b is zero.', ex='float d = sdiv(1.0, u);')
     @staticmethod
     def fn_sdiv(a, b) -> torch.Tensor:
         """Safe division — returns 0.0 where abs(b) < the dtype's epsilon guard."""
@@ -288,17 +288,17 @@ class _StdlibMath:
 
     # -- Clamping / interpolation ---------------------------------------
 
-    @stdlib("min", sig='min(a, b) \\u2192 float', category='Interpolation', doc='Returns the smaller value.', ex='float m = min(u, 0.5);')
+    @stdlib("min", sig='min(a, b) \\u2192 float|vec', category='Interpolation', doc='Returns the smaller value.', ex='float m = min(u, 0.5);')
     @staticmethod
     def fn_min(a, b) -> torch.Tensor:
         return torch.minimum(*_align_field_rank(_to_tensor(a), _to_tensor(b)))
 
-    @stdlib("max", sig='max(a, b) \\u2192 float', category='Interpolation', doc='Returns the larger value.', ex='float m = max(u, 0.0);')
+    @stdlib("max", sig='max(a, b) \\u2192 float|vec', category='Interpolation', doc='Returns the larger value.', ex='float m = max(u, 0.0);')
     @staticmethod
     def fn_max(a, b) -> torch.Tensor:
         return torch.maximum(*_align_field_rank(_to_tensor(a), _to_tensor(b)))
 
-    @stdlib("clamp", sig='clamp(x, lo, hi) \\u2192 float', category='Interpolation', doc='Clamp x to [lo, hi] range.', ex='float c = clamp(u * 2.0, 0.0, 1.0);')
+    @stdlib("clamp", sig='clamp(x, lo, hi) \\u2192 float|vec', category='Interpolation', doc='Clamp x to [lo, hi] range.', ex='float c = clamp(u * 2.0, 0.0, 1.0);')
     @staticmethod
     def fn_clamp(x, lo, hi) -> torch.Tensor:
         # Python-number bounds: the scalar torch.clamp overload (one kernel).
@@ -318,7 +318,7 @@ class _StdlibMath:
         xt, lot, hit = _align_field_rank(_to_tensor(x), _to_tensor(lo), _to_tensor(hi))
         return torch.minimum(torch.maximum(xt, lot), hit)
 
-    @stdlib("lerp", sig='lerp(a, b, t) \\u2192 float', category='Interpolation', aliases=("mix",), doc='Linear interpolation from a to b by t.', ex='@OUT = lerp(@A, @B, 0.5);')
+    @stdlib("lerp", sig='lerp(a, b, t) \\u2192 float|vec', category='Interpolation', aliases=("mix",), doc='Linear interpolation from a to b by t.', ex='@OUT = lerp(@A, @B, 0.5);')
     @staticmethod
     def fn_lerp(a, b, t) -> torch.Tensor:
         # A [B,H,W] weight against [B,H,W,C] values gains the channel axis.
@@ -344,7 +344,7 @@ class _StdlibMath:
         cond_bool = (cond_t > 0.5) if cond_t.is_floating_point() else cond_t.bool()
         return _tensor_where(cond_bool, _to_tensor(a), _to_tensor(b))
 
-    @stdlib("fit", sig='fit(x, inLo, inHi, outLo, outHi) \\u2192 float', category='Interpolation', doc='Remap x from [inLo, inHi] to [outLo, outHi].', ex='float y = fit(u, 0.2, 0.8, 0.0, 1.0);')
+    @stdlib("fit", sig='fit(x, inLo, inHi, outLo, outHi) \\u2192 float|vec', category='Interpolation', doc='Remap x from [inLo, inHi] to [outLo, outHi].', ex='float y = fit(u, 0.2, 0.8, 0.0, 1.0);')
     @staticmethod
     def fn_fit(val, old_min, old_max, new_min, new_max) -> torch.Tensor:
         """Remap val from [old_min, old_max] to [new_min, new_max]."""
@@ -354,14 +354,14 @@ class _StdlibMath:
         t = (v - o_min) / (o_max - o_min + _eps(v))
         return _lerp_f32(n_min, n_max, t)
 
-    @stdlib("smoothstep", sig='smoothstep(lo, hi, x) \\u2192 float', category='Interpolation', doc='Smooth Hermite interpolation between lo and hi.', ex='float s = smoothstep(0.3, 0.7, u);')
+    @stdlib("smoothstep", sig='smoothstep(lo, hi, x) \\u2192 float|vec', category='Interpolation', doc='Smooth Hermite interpolation between lo and hi.', ex='float s = smoothstep(0.3, 0.7, u);')
     @staticmethod
     def fn_smoothstep(edge0, edge1, x) -> torch.Tensor:
         e0, e1, xv = _align_field_rank(_to_tensor(edge0), _to_tensor(edge1), _to_tensor(x))
         t = torch.clamp((xv - e0) / (e1 - e0 + _eps(xv)), 0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
 
-    @stdlib("step", sig='step(edge, x) \\u2192 float', category='Interpolation', doc='Returns 0 if x < edge, 1 otherwise.', ex='float s = step(0.5, u);')
+    @stdlib("step", sig='step(edge, x) \\u2192 float|vec', category='Interpolation', doc='Returns 0 if x < edge, 1 otherwise.', ex='float s = step(0.5, u);')
     @staticmethod
     def fn_step(edge, x) -> torch.Tensor:
         xt, et = _align_field_rank(_to_tensor(x), _to_tensor(edge))

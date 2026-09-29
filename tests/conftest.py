@@ -4,6 +4,14 @@ Pytest configuration for TEX test suite.
 The tests use a shared SubTestResult object (r) to accumulate pass/fail counts.
 This fixture provides it and asserts no failures at the end of each test.
 """
+import os
+import tempfile
+
+# Same scratch cache run_all.py picks, set BEFORE the first TEX import below: a test that
+# clears or rewrites compiled artifacts must never touch the developer's real cache. An
+# explicit TEX_CACHE_DIR from the caller still wins.
+os.environ.setdefault("TEX_CACHE_DIR", os.path.join(tempfile.gettempdir(), "tex_test_cache"))
+
 import pytest
 import torch
 from helpers import SubTestResult

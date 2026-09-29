@@ -97,9 +97,8 @@ def is_tile_safe_cached(program, fingerprint) -> bool:
     v = _tile_safe_memo.get(fingerprint)
     if v is None:
         v = is_tile_safe(program)
-        _tile_safe_memo[fingerprint] = v
-        while len(_tile_safe_memo) > _TILE_SAFE_MEMO_MAX:
-            _tile_safe_memo.popitem(last=False)
+        from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+        lru_put(_tile_safe_memo, fingerprint, v, _TILE_SAFE_MEMO_MAX)
     else:
         try:
             _tile_safe_memo.move_to_end(fingerprint)
@@ -181,9 +180,8 @@ def _estimate_peak_statics_cached(program, fingerprint) -> tuple:
     v = _peak_static_memo.get(fingerprint)
     if v is None:
         v = _estimate_peak_statics(program)
-        _peak_static_memo[fingerprint] = v
-        while len(_peak_static_memo) > _PEAK_STATIC_MEMO_MAX:
-            _peak_static_memo.popitem(last=False)
+        from .tex_runtime.lru_util import lru_put   # lazy: not part of the cold-import closure
+        lru_put(_peak_static_memo, fingerprint, v, _PEAK_STATIC_MEMO_MAX)
     else:
         try:
             _peak_static_memo.move_to_end(fingerprint)

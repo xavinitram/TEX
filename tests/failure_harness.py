@@ -27,6 +27,8 @@ another happy-path assertion.
 Every helper reports into the standard SubTestResult and reuses helpers.py, so
 these compose with the existing runner (run_all.py) and pytest unchanged.
 """
+import hashlib
+
 from helpers import *
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
@@ -69,8 +71,9 @@ def _as_dict(res, outs):
 
 
 def _harness_fp(code, tier, precision):
-    """Stable-per-(code,tier,precision) fingerprint (no Date/random needed)."""
-    return f"harness_{tier}_{precision}_{abs(hash(code)) & 0xFFFFFFFF:08x}"
+    """Stable-across-processes fingerprint of (code, tier, precision)."""
+    digest = hashlib.sha1(code.encode("utf-8")).hexdigest()[:16]
+    return f"harness_{tier}_{precision}_{digest}"
 
 
 # ── run_tier: dispatch a program through the REAL tier entry point ─────
@@ -113,12 +116,25 @@ def run_tier(code, bindings, tier, device="cpu", precision="fp32"):
 
 
 def max_diff(a_dict, b_dict):
-    """Largest abs difference across matching outputs; inf on a non-tensor mismatch."""
+    """Largest abs difference across matching outputs.
+
+    inf on a non-tensor mismatch, a shape mismatch, or a non-finite value that the
+    other side does not share (NaN and inf agree only with themselves)."""
     m = 0.0
     for k, av in a_dict.items():
         bv = b_dict.get(k)
         if isinstance(av, torch.Tensor) and isinstance(bv, torch.Tensor):
-            m = max(m, (av.float() - bv.float()).abs().max().item())
+            if av.shape != bv.shape:
+                return float("inf")
+            fa, fb = av.float(), bv.float()
+            both_finite = torch.isfinite(fa) & torch.isfinite(fb)
+            # Non-finite positions must agree exactly (inf == inf, NaN on both
+            # sides); a NaN or inf on one side only is a disagreement.
+            same_nonfinite = (fa == fb) | (torch.isnan(fa) & torch.isnan(fb))
+            if not bool((both_finite | same_nonfinite).all()):
+                return float("inf")
+            if bool(both_finite.any()):
+                m = max(m, (fa - fb).abs()[both_finite].max().item())
         elif av != bv:
             return float("inf")
     return m

@@ -81,7 +81,9 @@ def test_trk144_min_engine_gate_is_patch_precise(r: SubTestResult):
             "code": "@OUT = @image;", "inputs": [{"name": "image", "type": "IMAGE"}],
             "promoted_params": []}
     parts = pkg_version.split(".")
-    bumped_patch = ".".join(parts[:2] + [str(int(parts[2]) + 1)]) if len(parts) > 2 else "999.0.0"
+    import re
+    patch = re.match(r"\d+", parts[2]) if len(parts) > 2 else None
+    bumped_patch = ".".join(parts[:2] + [str(int(patch.group()) + 1)]) if patch else "999.0.0"
 
     try:
         # min_engine one patch AHEAD of the running package -> must still refuse.

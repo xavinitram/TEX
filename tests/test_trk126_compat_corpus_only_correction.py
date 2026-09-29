@@ -25,6 +25,11 @@ import tempfile
 import compat_corpus
 
 
+def _read_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def _isolated_archive():
     tmp = tempfile.mkdtemp(prefix="tex_trk126_")
     return tmp
@@ -75,7 +80,7 @@ def test_trk126_only_requires_every_named_row_to_already_exist(r):
                    "widening this filter exists to prevent")
             return
         assert "aov_relight" in str(raised)
-        payload = json.load(open(os.path.join(tmp, "0.99.json"), encoding="utf-8"))
+        payload = _read_json(os.path.join(tmp, "0.99.json"))
         assert set(payload["hashes"]) == {"p0", "p1"}, \
             "the refused correction must not have widened the archive"
         r.ok("TRK-126: only= refuses to add a row that isn't already frozen")
@@ -109,7 +114,7 @@ def test_trk126_only_corrects_named_rows_and_preserves_every_other_row(r):
         assert len(data["hashes"]) == 20, "only= must never change the row COUNT"
         assert data["language_version"] == "0.99"
 
-        on_disk = json.load(open(os.path.join(tmp, "0.99.json"), encoding="utf-8"))
+        on_disk = _read_json(os.path.join(tmp, "0.99.json"))
         assert on_disk == data, "the corrected payload must be what was written to disk"
         r.ok("TRK-126: only= corrects exactly the named rows and leaves every other "
              "row byte-for-byte unchanged")
@@ -138,8 +143,8 @@ def test_trk126_only_can_correct_a_version_that_is_not_the_newest(r):
         compat_corpus._compute_selected = lambda names: {n: "FIXED" for n in names}
         compat_corpus.freeze("0.23", only={"p0"})   # correct the OLDER, non-newest file
 
-        older = json.load(open(os.path.join(tmp, "0.23.json"), encoding="utf-8"))
-        newer = json.load(open(os.path.join(tmp, "0.24.json"), encoding="utf-8"))
+        older = _read_json(os.path.join(tmp, "0.23.json"))
+        newer = _read_json(os.path.join(tmp, "0.24.json"))
         assert older["hashes"]["p0"] == "FIXED"
         assert older["hashes"]["p1"] == "old1", "the untouched row in 0.23 must survive"
         assert set(older["hashes"]) == {"p0", "p1"}, \

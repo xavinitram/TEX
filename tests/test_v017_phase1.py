@@ -663,7 +663,7 @@ def test_cg2_generated_programs_all_cook(r: SubTestResult):
     for _ in range(N):
         code = _gen_program(rng, 3, channels=4)
         try:
-            run_both(code, binds, B=1, H=2, W=4)
+            run_both(code, binds)
         except Exception as e:                                   # noqa: BLE001
             refused.append(f"{type(e).__name__}: {str(e)[:60]} :: {code[:70]}")
     if refused:

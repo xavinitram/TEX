@@ -60,7 +60,7 @@ class _StdlibNoise:
     #   2 args = 2D, 3 args = 3D (for base noise)
     #   3 args = 2D with octaves, 4 args = 3D with octaves (for FBM family)
 
-    @stdlib("perlin", sig='perlin(x, y) \\u2192 float', category='Noise', doc='2D Perlin noise. Returns value in [-1, 1].', ex='float n = perlin(u * 10.0, v * 10.0);')
+    @stdlib("perlin", sig='perlin(x, y, z?) \\u2192 float', category='Noise', doc='2D Perlin noise; pass z for 3D. Returns value in [-1, 1].', ex='float n = perlin(u * 10.0, v * 10.0);')
     @staticmethod
     def fn_perlin(x, y, z=None) -> torch.Tensor:
         """Perlin noise. 2D when z omitted, 3D when z provided. Returns float in ~[-1, 1]."""
@@ -68,7 +68,7 @@ class _StdlibNoise:
             return _perlin3d_fast(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _perlin2d_fast(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("simplex", sig='simplex(x, y) \\u2192 float', category='Noise', doc='2D Simplex noise. Returns value in [-1, 1].', ex='float n = simplex(u * 8.0, v * 8.0);')
+    @stdlib("simplex", sig='simplex(x, y, z?) \\u2192 float', category='Noise', doc='2D Simplex noise. With a z argument it returns 3D Perlin noise (there is no 3D simplex). Returns value in [-1, 1].', ex='float n = simplex(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_simplex(x, y, z=None) -> torch.Tensor:
         """Simplex noise. 2D when z omitted, 3D falls back to Perlin. Returns float in ~[-1, 1]."""
@@ -76,7 +76,7 @@ class _StdlibNoise:
             return _perlin3d_fast(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _simplex2d(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("fbm", sig='fbm(x, y, octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Fractal Brownian Motion (multi-octave Perlin).', ex='float n = fbm(u * 4.0, v * 4.0, 6);')
+    @stdlib("fbm", sig='fbm(x, y, [z,] octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Fractal Brownian Motion (multi-octave Perlin).', ex='float n = fbm(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_fbm(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """FBM noise. fbm(x,y,octaves) for 2D, fbm(x,y,z,octaves) for 3D."""
@@ -85,7 +85,7 @@ class _StdlibNoise:
                           _octaves("fbm", octaves))
         return _fbm2d(_to_tensor(x), _to_tensor(y), _octaves("fbm", z_or_oct))
 
-    @stdlib("worley_f1", sig='worley_f1(x, y) \\u2192 float', category='Noise', heavy=True, doc='Worley (cellular) noise — distance to nearest cell center.', ex='float n = worley_f1(u * 5.0, v * 5.0);')
+    @stdlib("worley_f1", sig='worley_f1(x, y, z?) \\u2192 float', category='Noise', heavy=True, doc='Worley (cellular) noise — distance to nearest cell center.', ex='float n = worley_f1(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_worley_f1(x, y, z=None) -> torch.Tensor:
         """Worley F1 noise (nearest cell distance). Returns float in ~[0, 1]."""
@@ -93,7 +93,7 @@ class _StdlibNoise:
             return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=False)
         return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=False)
 
-    @stdlib("worley_f2", sig='worley_f2(x, y) \\u2192 float', category='Noise', heavy=True, doc='Worley noise — distance to second-nearest cell center.', ex='float n = worley_f2(u * 5.0, v * 5.0);')
+    @stdlib("worley_f2", sig='worley_f2(x, y, z?) \\u2192 float', category='Noise', heavy=True, doc='Worley noise — distance to second-nearest cell center.', ex='float n = worley_f2(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_worley_f2(x, y, z=None) -> torch.Tensor:
         """Worley F2 noise (2nd nearest cell distance). Returns float in ~[0, 1]."""
@@ -101,7 +101,7 @@ class _StdlibNoise:
             return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=True)
         return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=True)
 
-    @stdlib("voronoi", sig='voronoi(x, y) \\u2192 float', category='Noise', heavy=True, doc='Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id.', ex='float d = voronoi(u * 8.0, v * 8.0);')
+    @stdlib("voronoi", sig='voronoi(x, y, z?) \\u2192 float', category='Noise', heavy=True, doc='Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id.', ex='float d = voronoi(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_voronoi(x, y, z=None) -> torch.Tensor:
         """Voronoi noise: an alias for worley_f1 (a distance; worley_id gives a per-cell id)."""
@@ -113,7 +113,7 @@ class _StdlibNoise:
     # which calls this exact object, so interp/codegen agree by construction). Runs
     # eager on every tier deliberately — see noise._worley2d_id's docstring for why it
     # never touches the noise cache's eager->traced->compiled promotion path.
-    @stdlib("worley_id", sig='worley_id(x, y) \\u2192 float', category='Noise', heavy=True, doc="Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point.", ex='float id = worley_id(u * 8.0, v * 8.0);')
+    @stdlib("worley_id", sig='worley_id(x, y, z?) \\u2192 float', category='Noise', heavy=True, doc="Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point.", ex='float id = worley_id(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_worley_id(x, y, z=None) -> torch.Tensor:
         """Worley per-cell id (hash of the nearest cell). Returns float in [0, 1].
@@ -127,7 +127,7 @@ class _StdlibNoise:
             return _worley3d_id(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _worley2d_id(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("curl", sig='curl(x, y) \\u2192 vec2', category='Noise', doc='Curl of 2D noise field. Returns a divergence-free vector.', ex='vec2 c = curl(u * 5.0, v * 5.0);')
+    @stdlib("curl", sig='curl(x, y, z?) \\u2192 vec2|vec3', category='Noise', doc='Curl of a noise field: a vec2 for (x, y), a vec3 with z. Divergence-free.', ex='vec2 c = curl(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_curl(x, y, z=None) -> torch.Tensor:
         """Curl noise. 2D → vec2 (divergence-free), 3D → vec3."""
@@ -135,7 +135,7 @@ class _StdlibNoise:
             return _curl3d(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _curl2d(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("ridged", sig='ridged(x, y, octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Ridged multifractal — sharp ridges, good for mountains.', ex='float n = ridged(u * 4.0, v * 4.0, 6);')
+    @stdlib("ridged", sig='ridged(x, y, [z,] octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Ridged multifractal — sharp ridges, good for mountains.', ex='float n = ridged(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_ridged(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """Ridged FBM. ridged(x,y,octaves) for 2D, ridged(x,y,z,octaves) for 3D."""
@@ -144,7 +144,7 @@ class _StdlibNoise:
                              _octaves("ridged", octaves))
         return _ridged2d(_to_tensor(x), _to_tensor(y), _octaves("ridged", z_or_oct))
 
-    @stdlib("billow", sig='billow(x, y, octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Billowy noise — abs(fbm). Puffy cloud shapes.', ex='float n = billow(u * 4.0, v * 4.0, 6);')
+    @stdlib("billow", sig='billow(x, y, [z,] octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Billowy noise — abs(fbm). Puffy cloud shapes.', ex='float n = billow(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_billow(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """Billow FBM. billow(x,y,octaves) for 2D, billow(x,y,z,octaves) for 3D."""
@@ -153,7 +153,7 @@ class _StdlibNoise:
                              _octaves("billow", octaves))
         return _billow2d(_to_tensor(x), _to_tensor(y), _octaves("billow", z_or_oct))
 
-    @stdlib("turbulence", sig='turbulence(x, y, octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Turbulence — sum of abs(noise) per octave. Veiny patterns.', ex='float n = turbulence(u * 4.0, v * 4.0, 6);')
+    @stdlib("turbulence", sig='turbulence(x, y, [z,] octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Turbulence — sum of abs(noise) per octave. Veiny patterns.', ex='float n = turbulence(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_turbulence(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """Turbulence. turbulence(x,y,octaves) for 2D, turbulence(x,y,z,octaves) for 3D."""
@@ -162,7 +162,7 @@ class _StdlibNoise:
                                  _octaves("turbulence", octaves))
         return _turbulence2d(_to_tensor(x), _to_tensor(y), _octaves("turbulence", z_or_oct))
 
-    @stdlib("flow", sig='flow(x, y, angle) \\u2192 float', category='Noise', sync=True, doc='Flow noise — Perlin rotated by angle per octave. Avoids static patterns.', ex='float n = flow(u * 6.0, v * 6.0, fi * 0.1);')
+    @stdlib("flow", sig='flow(x, y, [z,] angle) \\u2192 float', category='Noise', sync=True, doc='Flow noise — Perlin rotated by angle per octave. Avoids static patterns.', ex='float n = flow(u * 6.0, v * 6.0, fi * 0.1);')
     @staticmethod
     def fn_flow(x, y, z_or_time, time=None) -> torch.Tensor:
         """Flow noise. flow(x,y,time) for 2D, flow(x,y,z,time) for 3D."""
@@ -171,7 +171,7 @@ class _StdlibNoise:
                            _finite_time("flow", time))
         return _flow2d(_to_tensor(x), _to_tensor(y), _finite_time("flow", z_or_time))
 
-    @stdlib("alligator", sig='alligator(x, y) \\u2192 float', category='Noise', sync=True, doc='Alligator noise — cellular crack patterns.', ex='float n = alligator(u * 5.0, v * 5.0);')
+    @stdlib("alligator", sig='alligator(x, y, [z,] octaves?) \\u2192 float', category='Noise', sync=True, doc='Alligator noise — cellular crack patterns. With z, octaves is required.', ex='float n = alligator(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_alligator(x, y, z_or_oct=None, octaves=None) -> torch.Tensor:
         """Alligator noise. 2 args: 2D default octaves; 3 args: 2D custom octaves; 4 args: 3D."""

@@ -32,6 +32,10 @@ mechanism and one real-CUDA row for the real thing:
     `test_prof462_cpu_path_unchanged_and_queues_nothing`;
   * one real CUDA cook, sampled with stages, actually resolves to a positive device ms —
     `test_prof462_real_cuda_cook_resolves_device_ms` (skip off CUDA).
+
+The `test_fixprof_f1` to `f5` rows further down are the later FIX-PROF regressions (outer
+stage sink suspended in capture, a failed boundary dropping only its own split, the warm-up
+gate counting in-flight samples, the plain lock, and the shared `record_on` seam).
 """
 import time
 
@@ -40,7 +44,6 @@ import pytest
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img)
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle.tex_runtime import profile as P
-from TEX_Wrangle.tex_runtime import pacing as _pace
 from TEX_Wrangle.tex_testkit import armed_profiler, DeviceSpy, FakeCudaEvent
 
 #: F6: shared with `test_fixobsroute46_pacing.py`/`test_pace462_bounded_lookahead.py` via

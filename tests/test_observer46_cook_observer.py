@@ -64,7 +64,17 @@ def test_observer46_no_notification_when_nothing_registered(r):
         tex_engine.run(plan)
         tex_chain.cook_stage_list([{"code": "@OUT = @A * 1.5;", "bindings": {"A": img}}],
                                   device="cpu")
-        r.ok("cook/run/cook_stage_list all ran with no registered observer and no error")
+        # A probe that is live for one cook (positive control) and unregistered before the
+        # next: only the live cook may reach it.
+        seen = []
+        with _register(lambda entry, thread: seen.append(entry)):
+            tex_engine.cook("@OUT = @A * 1.5;", {"A": img}, device_mode="cpu")
+        assert seen == ["cook"], f"a live probe must see the cook exactly once: {seen}"
+        tex_engine.cook("@OUT = @A * 1.5;", {"A": img}, device_mode="cpu")
+        tex_engine.run(plan)
+        assert seen == ["cook"], f"an unregistered probe was notified again: {seen}"
+        assert not cook_observer._callbacks, "the probe leaked into the callback list"
+        r.ok("no notification reaches an unregistered probe, and a live one sees the cook once")
     except Exception as e:
         r.fail("OBSERVER-46 no-op", f"{type(e).__name__}: {e}")
 
@@ -252,6 +262,9 @@ def test_observer46_raising_callback_does_not_break_the_cook(r):
                 tex_engine.cook("@OUT = @A * 1.5;", {"A": img}, device_mode="cpu")
             if any("cook_observer callback raised" in str(w.message) for w in caught2):
                 r.fail("OBSERVER-46 warn-once", "the warning fired a second time in one process")
+            elif calls != ["cook"]:
+                r.fail("OBSERVER-46 warn-once",
+                       f"the raising callback stopped being called after its first failure: {calls}")
             else:
                 r.ok("the warn-once latch suppressed a second identical warning")
     except Exception as e:

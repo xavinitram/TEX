@@ -67,7 +67,9 @@ def _sample_mip_fp16_vs_fp32_diff(u, v):
 def test_trk6_sample_mip_fp16_grid_is_fp32(r: SubTestResult):
     """Every probed UV's fp16-vs-fp32 divergence must sit at the fp16-QUANTIZATION
     order (a few 1e-2 at worst, matching `sample()`'s own control) — not at the
-    pre-fix wrong-row-addressing order (0.3+)."""
+    pre-fix wrong-row-addressing order (0.3+). Only UVs whose pre-fix divergence was
+    itself above the 0.05 bound can fail without the fix; the others are reported, not
+    counted as evidence."""
     print("\n--- TRK-6: sample_mip's fp16 grid is fp32, not the UV's own dtype ---")
     for u, v in _UVS:
         diff = _sample_mip_fp16_vs_fp32_diff(u, v)
@@ -76,6 +78,9 @@ def test_trk6_sample_mip_fp16_grid_is_fp32(r: SubTestResult):
             r.fail(f"UV=({u},{v}): fp16 max abs diff stays under 0.05 (fp16 "
                   f"quantization order, not the pre-fix {pre} wrong-addressing order)",
                   f"got {diff}")
+        elif pre < 0.05:
+            r.ok(f"UV=({u},{v}): max abs diff {diff} (pre-fix {pre} was already under the "
+                 f"bound, so this UV cannot tell fixed from unfixed; reported only)")
         else:
             r.ok(f"UV=({u},{v}): max abs diff {diff} (pre-fix was {pre})")
 
@@ -83,8 +88,7 @@ def test_trk6_sample_mip_fp16_grid_is_fp32(r: SubTestResult):
 def test_trk6_sample_mip_matches_sample_control(r: SubTestResult):
     """`sample()`'s own grid-sample path was always immune (unconditionally fp32
     buffer) — pin its control value, and that sample_mip's WORST-case UV is now
-    within an order of magnitude of it, not ~1900x larger (0.332 / 1.76e-4) as
-    it was pre-fix."""
+    within 100x of it, not ~1900x larger (0.332 / 1.76e-4) as it was pre-fix."""
     print("\n--- TRK-6: sample_mip's worst-UV diff is now near sample()'s own control ---")
     K = _kernel()
     code = "@OUT = sample(@K, 0.25, 0.75);"
@@ -101,10 +105,9 @@ def test_trk6_sample_mip_matches_sample_control(r: SubTestResult):
     if control_diff >= 0.05:
         r.fail("sample()'s own control stays at fp16-quantization order",
               f"got {control_diff}")
-    elif worst > control_diff * 100:
+    elif worst > max(control_diff, 1e-9) * 100:
         r.fail("sample_mip's worst-UV diff is within ~100x of sample()'s control "
               "(not ~1900x, the pre-fix ratio)",
-              f"worst={worst} control={control_diff} ratio={worst / control_diff:.1f}")
+              f"worst={worst} control={control_diff}")
     else:
-        r.ok(f"worst sample_mip diff {worst} vs sample() control {control_diff} "
-            f"(ratio {worst / control_diff:.1f}x)")
+        r.ok(f"worst sample_mip diff {worst} vs sample() control {control_diff}")

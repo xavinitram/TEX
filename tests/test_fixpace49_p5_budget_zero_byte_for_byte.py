@@ -15,6 +15,7 @@ bookkeeping), matching the docstring's claim exactly.
 RED at base `32f6917` (after P1-P4 land): `_cost_feed` is still called (and `_COST_TABLE`
 still grows) even with `pace_budget_ms=0`.
 """
+import types
 import contextlib
 
 import pytest
@@ -57,12 +58,12 @@ class _FakeClock:
 @contextlib.contextmanager
 def _clock_ctx():
     c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
     try:
         yield c
     finally:
-        _pace._time.perf_counter = real
+        _pace._time = real
 
 
 def test_pace_budget_ms_zero_performs_zero_attribution_work(r):

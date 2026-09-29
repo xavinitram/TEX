@@ -3,6 +3,14 @@ from helpers import *
 from TEX_Wrangle.tex_cache import parse_and_split
 
 
+def _scratch_dir():
+    """A temp dir removed at interpreter exit, so a failing row cannot leak it."""
+    import atexit
+    d = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    return d
+
+
 def test_examples(r: SubTestResult):
     print("\n--- Example Snippet Tests ---")
 
@@ -44,12 +52,13 @@ def test_examples(r: SubTestResult):
         float vignette = 1.0 - smoothstep(0.3, 0.7, dist * @B);
         @OUT = @A * vec3(vignette, vignette, vignette);
         """
-        result = compile_and_run(code, {"A": test_img, "B": 1.0})
+        result = compile_and_run(code, {"A": torch.ones(B, H, W, 3), "B": 1.0})
         assert result.shape == (B, H, W, 3)
-        # Center should be brighter than corners
+        # On a white frame the result IS the vignette factor: full at the centre, cut at the corner.
         center = result[0, H//2, W//2, 0].item()
         corner = result[0, 0, 0, 0].item()
-        # Not checking magnitude since input is random, but shape should be right
+        assert center > 0.99, f"centre should be untouched, got {center}"
+        assert corner < center - 0.5, f"corner should be darkened: centre {center}, corner {corner}"
         r.ok("example: vignette")
     except Exception as e:
         r.fail("example: vignette", f"{e}\n{traceback.format_exc()}")
@@ -152,10 +161,10 @@ _STRING_FUNCTIONS = frozenset({
 })
 
 
-def _collect_binding_hints(program) -> dict:
+def _collect_binding_hints(program) -> tuple[dict, bool]:
     """Walk AST to find BindingRef nodes and infer their types.
 
-    Returns dict mapping binding name -> TEXType based on:
+    Returns `(hints, has_vec4_context)`; `hints` maps binding name -> TEXType based on:
     1. Explicit type_hint prefixes (e.g. s@text → STRING)
     2. .a channel access on a binding → VEC4
     3. String function calls on a binding → STRING
@@ -198,10 +207,7 @@ def _collect_binding_hints(program) -> dict:
                 for arg in node.args:
                     if isinstance(arg, BindingRef):
                         needs_string.add(arg.name)
-                    elif isinstance(arg, FunctionCall):
-                        # nested: lower(strip(@text)) — we'll catch the inner call too
-                        pass
-            stack.extend(node.args)
+            stack.extend(node.args)   # nested calls (lower(strip(@text))) are visited here
             continue
         # Recurse into all child nodes, detect vec4 context
         if isinstance(node, VarDecl):
@@ -473,24 +479,30 @@ def test_example_files_compiled(r: SubTestResult):
                 codegen_fallback += 1
 
             # Run with timeout — torch.compile can hang on complex programs
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    execute_compiled,
-                    program, bindings, type_map, "cpu", fp,
-                    output_names=output_names,
-                )
-                try:
-                    result = future.result(timeout=_PER_PROGRAM_TIMEOUT)
-                except concurrent.futures.TimeoutError:
-                    timed_out += 1
-                    # Emit a named skip, never a silent drop: the timeout is
-                    # load-dependent (a program that compiles in 10s alone can
-                    # exceed 30s under whole-suite GPU contention), so a dropped
-                    # sub-test would make the suite total vary with machine load
-                    # and break PASS-set diffing.
-                    r.skip(f"example compiled: {name}",
-                           f"torch.compile exceeded {_PER_PROGRAM_TIMEOUT}s")
-                    continue
+            # No `with`: leaving a `with ThreadPoolExecutor` block waits for the worker,
+            # which would turn this guard into a wait for the very compile it guards
+            # against. A worker that outlives the timeout keeps running in the background
+            # (a thread cannot be killed); the suite moves on.
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(
+                execute_compiled,
+                program, bindings, type_map, "cpu", fp,
+                output_names=output_names,
+            )
+            try:
+                result = future.result(timeout=_PER_PROGRAM_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                pool.shutdown(wait=False, cancel_futures=True)
+                timed_out += 1
+                # Emit a named skip, never a silent drop: the timeout is
+                # load-dependent (a program that compiles in 10s alone can
+                # exceed 30s under whole-suite GPU contention), so a dropped
+                # sub-test would make the suite total vary with machine load
+                # and break PASS-set diffing.
+                r.skip(f"example compiled: {name}",
+                       f"torch.compile exceeded {_PER_PROGRAM_TIMEOUT}s")
+                continue
+            pool.shutdown(wait=False)
 
             # Verify we got outputs
             if isinstance(result, dict):
@@ -510,10 +522,11 @@ def test_example_files_compiled(r: SubTestResult):
                 for oname in output_names:
                     iv = interp_result.get(oname)
                     cv = compiled_dict.get(oname)
-                    if (isinstance(iv, torch.Tensor) and isinstance(cv, torch.Tensor)
-                            and iv.is_floating_point()):
+                    if isinstance(iv, torch.Tensor) and iv.is_floating_point():
+                        assert isinstance(cv, torch.Tensor), (
+                            f"compiled output '{oname}' missing or not a tensor: {type(cv).__name__}")
                         max_diff = (iv.float() - cv.float()).abs().max().item()
-                        assert max_diff < 0.1, (
+                        assert max_diff < 1e-5, (
                             f"Codegen/interpreter mismatch for '{oname}': "
                             f"max_diff={max_diff:.6f}"
                         )
@@ -545,7 +558,7 @@ def test_cache(r: SubTestResult):
 
     # Memory cache hit returns same AST object
     try:
-        tmp = tempfile.mkdtemp()
+        tmp = _scratch_dir()
         cache = TEXCache(cache_dir=Path(tmp))
         code = "float g = luma(@A); @OUT = vec3(g, g, g);"
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
@@ -560,7 +573,7 @@ def test_cache(r: SubTestResult):
 
     # Disk cache hit after memory is cleared
     try:
-        tmp = tempfile.mkdtemp()
+        tmp = _scratch_dir()
         cache = TEXCache(cache_dir=Path(tmp))
         code = "@OUT = @A * 0.5;"
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
@@ -581,7 +594,7 @@ def test_cache(r: SubTestResult):
 
     # Corrupted disk file handled gracefully
     try:
-        tmp = tempfile.mkdtemp()
+        tmp = _scratch_dir()
         cache = TEXCache(cache_dir=Path(tmp))
         code = "@OUT = @A;"
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
@@ -600,10 +613,12 @@ def test_cache(r: SubTestResult):
     except Exception as e:
         r.fail("cache: corrupted disk handled", f"{e}\n{traceback.format_exc()}")
 
-    # Version mismatch triggers recompile
+    # Version mismatch triggers recompile. The stale payload is re-SIGNED, so the MAC gate
+    # passes and the epoch check is the one that has to refuse it.
+    tmp = _scratch_dir()
     try:
-        import pickle
-        tmp = tempfile.mkdtemp()
+        from TEX_Wrangle.tex_recovery import load_verified, sign_pickle
+        from TEX_Wrangle.tex_cache import _AST_EPOCH
         cache = TEXCache(cache_dir=Path(tmp))
         code = "@OUT = @A + 1.0;"
         bt = {"A": TEXType.FLOAT, "OUT": TEXType.VEC4}
@@ -611,22 +626,25 @@ def test_cache(r: SubTestResult):
         cache.compile_tex(code, bt)
         cache.clear_memory()
 
-        # Tamper with the version in the pickled file
         fp = cache.fingerprint(code, bt)
         disk_path = Path(tmp) / f"{fp}.pkl"
-        with open(disk_path, "rb") as f:
-            data = pickle.load(f)
-        data["version"] = "0.0.0-old"
-        with open(disk_path, "wb") as f:
-            pickle.dump(data, f)
+        data = load_verified(disk_path)
+        assert isinstance(data, dict) and data.get("version") == _AST_EPOCH, \
+            "premise: the freshly written entry verifies and carries the current epoch"
+        stale = dict(data, version="0.0.0-old")
+        assert sign_pickle(disk_path, stale), "could not write the signed stale entry"
+        assert load_verified(disk_path)["version"] == "0.0.0-old", "premise: stale entry verifies"
 
-        # Should miss (version mismatch) and recompile fresh
+        # Should miss (version mismatch), recompile fresh, and rewrite the entry.
         result = cache.compile_tex(code, bt)
         assert result is not None
+        assert load_verified(disk_path)["version"] == _AST_EPOCH, \
+            "the stale entry was adopted instead of being replaced"
         r.ok("cache: version mismatch recompile")
-        shutil.rmtree(tmp, ignore_errors=True)
     except Exception as e:
         r.fail("cache: version mismatch recompile", f"{e}\n{traceback.format_exc()}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     # Fingerprint stability and differentiation
     try:
@@ -649,23 +667,29 @@ def test_cache(r: SubTestResult):
 def test_cache_eviction(r: SubTestResult):
     print("\n--- Cache Eviction Tests ---")
 
-    # Memory eviction at 128
+    # Memory eviction at 128: the cache stays FULL (never emptied), and the survivors are the
+    # most recently used entries, not the first ones compiled.
+    tmp_dir = _scratch_dir()
     try:
-        tmp_dir = tempfile.mkdtemp()
         cache = TEXCache(cache_dir=Path(tmp_dir))
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+        fps = []
         for i in range(135):
             code = f"@OUT = @A * {i}.0;"
             cache.compile_tex(code, bt)
-        assert len(cache._memory) <= 128, f"Memory has {len(cache._memory)} entries (limit: 128)"
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            fps.append(cache.fingerprint(code, bt))
+        assert len(cache._memory) == 128, f"Memory has {len(cache._memory)} entries (limit: 128)"
+        assert fps[-1] in cache._memory, "the newest entry was evicted"
+        assert fps[0] not in cache._memory, "the oldest entry survived eviction"
         r.ok(f"cache: memory eviction ({len(cache._memory)} entries)")
     except Exception as e:
         r.fail("cache: memory eviction", f"{e}\n{traceback.format_exc()}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Disk eviction at 512
     try:
-        tmp_dir = tempfile.mkdtemp()
+        tmp_dir = _scratch_dir()
         cache = TEXCache(cache_dir=Path(tmp_dir))
         # Create 515 dummy .pkl files
         for i in range(515):
@@ -676,10 +700,14 @@ def test_cache_eviction(r: SubTestResult):
             # so we use mtime as a proxy — the eviction sorts by atime)
             os.utime(p, (i, i))
         cache._evict_disk_if_needed()
-        remaining = len(list(Path(tmp_dir).glob("*.pkl")))
-        assert remaining <= 512, f"Disk has {remaining} files (limit: 512)"
+        left = {p.name for p in Path(tmp_dir).glob("*.pkl")}
+        assert len(left) == 512, f"Disk has {len(left)} files (limit: 512)"
+        # The three OLDEST (lowest atime) go, the newest stay.
+        assert not ({"dummy_0000.pkl", "dummy_0001.pkl", "dummy_0002.pkl"} & left), \
+            "the oldest entries survived eviction"
+        assert "dummy_0514.pkl" in left and "dummy_0003.pkl" in left, "a newer entry was evicted"
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        r.ok(f"cache: disk eviction ({remaining} files)")
+        r.ok(f"cache: disk eviction ({len(left)} files)")
     except Exception as e:
         r.fail("cache: disk eviction", f"{e}\n{traceback.format_exc()}")
 
@@ -703,9 +731,13 @@ def test_device_selection(r: SubTestResult):
 
     # Auto mode with CPU tensor -> should stay on CPU
     try:
-        result = compile_and_run("@OUT = @A * 0.5;", {"A": test_img}, device="cpu")
+        from TEX_Wrangle.tex_engine import resolve_device
+        dev = resolve_device("auto", {"A": test_img})
+        assert dev == "cpu", f"auto picked {dev!r} for a CPU tensor"
+        result = compile_and_run("@OUT = @A * 0.5;", {"A": test_img}, device=dev)
         expected = test_img * 0.5
         assert torch.allclose(result, expected, atol=1e-5)
+        assert result.device.type == "cpu"
         r.ok("device: auto cpu tensor")
     except Exception as e:
         r.fail("device: auto cpu tensor", f"{e}\n{traceback.format_exc()}")
@@ -1116,17 +1148,12 @@ def test_batch_temporal(r: SubTestResult):
 
 # ── Latent Tests ──────────────────────────────────────────────────────
 
-def _make_latent(B=1, C=4, H=4, W=4) -> dict:
-    """Create a fake LATENT dict for testing."""
-    return {"samples": torch.randn(B, C, H, W)}
-
-
 def test_latent(r: SubTestResult):
     print("\n--- Latent Tests ---")
 
     # latent: unwrap permute
     try:
-        lat = _make_latent(1, 4, 8, 8)
+        lat = make_latent(1, 4, 8, 8)
         tensor_cl, meta = _unwrap_latent(lat)
         assert tensor_cl.shape == (1, 8, 8, 4), f"Expected [1,8,8,4] got {tensor_cl.shape}"
         assert isinstance(meta, dict)
@@ -1138,7 +1165,7 @@ def test_latent(r: SubTestResult):
 
     # latent: infer type dict
     try:
-        lat4 = _make_latent(1, 4, 4, 4)
+        lat4 = make_latent(1, 4, 4, 4)
         assert _infer_binding_type(lat4) == TEXType.VEC4
         lat3 = {"samples": torch.randn(1, 3, 4, 4)}
         assert _infer_binding_type(lat3) == TEXType.VEC3
@@ -1161,7 +1188,7 @@ def test_latent(r: SubTestResult):
 
     # latent: passthrough
     try:
-        lat = _make_latent(1, 4, 4, 4)
+        lat = make_latent(1, 4, 4, 4)
         original = lat["samples"].clone()
         tensor_cl, meta = _unwrap_latent(lat)
         result = compile_and_run("@OUT = @A;", {"A": tensor_cl}, latent_channel_count=4)
@@ -1174,7 +1201,7 @@ def test_latent(r: SubTestResult):
 
     # latent: scalar gain
     try:
-        lat = _make_latent(1, 4, 4, 4)
+        lat = make_latent(1, 4, 4, 4)
         tensor_cl, _ = _unwrap_latent(lat)
         result = compile_and_run("@OUT = @A * 0.5;", {"A": tensor_cl}, latent_channel_count=4)
         expected = tensor_cl * 0.5
@@ -1185,7 +1212,7 @@ def test_latent(r: SubTestResult):
 
     # latent: bias
     try:
-        lat = _make_latent(1, 4, 4, 4)
+        lat = make_latent(1, 4, 4, 4)
         tensor_cl, _ = _unwrap_latent(lat)
         result = compile_and_run("@OUT = @A + 0.1;", {"A": tensor_cl}, latent_channel_count=4)
         expected = tensor_cl + 0.1
@@ -1223,7 +1250,7 @@ def test_latent(r: SubTestResult):
 
     # latent: ic variable
     try:
-        lat = _make_latent(1, 4, 4, 4)
+        lat = make_latent(1, 4, 4, 4)
         tensor_cl, _ = _unwrap_latent(lat)
         # Use ic to verify it equals channel count
         result = compile_and_run(
@@ -1289,7 +1316,7 @@ def test_latent(r: SubTestResult):
 
     # latent: fingerprint_inputs
     try:
-        lat = _make_latent(1, 4, 4, 4)
+        lat = make_latent(1, 4, 4, 4)
         from TEX_Wrangle.tex_node import TEXWrangleNode
         # Should not crash with LATENT dict
         h = TEXWrangleNode.fingerprint_inputs(code="@OUT = @A;", A=lat)
@@ -1384,9 +1411,9 @@ def test_auto_inference(r: SubTestResult):
             "@OUT = @A; @OUT.r = 1.0; @OUT.g = 0.5; @OUT.b = 0.0;",
             {"A": test_img},
         )
-        # First assignment @OUT = @A infers VEC4, channel .r/.g/.b don't widen
-        # Actually: first assigns VEC4, channel accesses on VEC4 stay VEC4
-        assert inferred in (TEXType.VEC3, TEXType.VEC4), f"Expected VEC3/VEC4, got {inferred}"
+        # The first full assignment `@OUT = @A` infers VEC4 from the 4-channel `test_img`; the
+        # channel writes that follow do not narrow it (channel-only programs are the next row).
+        assert inferred == TEXType.VEC4, f"Expected VEC4, got {inferred}"
         assert _map_inferred_type(inferred, False) == "IMAGE"
         r.ok("auto: channel assignment -> IMAGE")
     except Exception as e:
@@ -1727,43 +1754,30 @@ def test_v03_features(r: SubTestResult):
     except Exception as e:
         r.fail("tex_node: param default fallback", f"{e}\n{traceback.format_exc()}")
 
-    # ── tex_node: param widget value as kwarg ──
-    try:
-        from TEX_Wrangle.tex_node import TEXWrangleNode
-        img = torch.ones(1, 2, 2, 3)
-        # Widget value injected as kwarg by graphToPrompt hook (overrides code default)
-        result = TEXWrangleNode.execute(
-            code="f$strength = 0.5;\n@OUT = @A * $strength;",
-            A=img, strength=0.3,
-            device="cpu", compile_mode="none"
-        )
-        out = result[0]
-        assert out is not None, "OUT should not be None"
-        assert abs(out.mean().item() - 0.3) < 0.01, f"Expected ~0.3, got {out.mean().item()}"
-        r.ok("tex_node: param widget value as kwarg")
-    except Exception as e:
-        r.fail("tex_node: param widget value as kwarg", f"{e}\n{traceback.format_exc()}")
-
-    # ── tex_node: param widget overrides code default ──
-    try:
-        from TEX_Wrangle.tex_node import TEXWrangleNode
-        img = torch.ones(1, 2, 2, 3)
-        # Widget value (scalar kwarg) overrides code default of 0.5
-        result = TEXWrangleNode.execute(
-            code="f$strength = 0.5;\n@OUT = @A * $strength;",
-            A=img, strength=0.8,
-            device="cpu", compile_mode="none"
-        )
-        out = result[0]
-        assert out is not None, "OUT should not be None"
-        assert abs(out.mean().item() - 0.8) < 0.01, f"Expected ~0.8 (widget), got {out.mean().item()}"
-        r.ok("tex_node: param widget overrides code default")
-    except Exception as e:
-        r.fail("tex_node: param widget overrides code default", f"{e}\n{traceback.format_exc()}")
+    # ── tex_node: param widget value as kwarg overrides the code default ──
+    # The widget value is injected as a kwarg by the graphToPrompt hook; the code default (0.5)
+    # must lose, whichever side of it the widget value falls on.
+    for widget in (0.3, 0.8):
+        label = f"tex_node: param widget value {widget} as kwarg overrides code default"
+        try:
+            from TEX_Wrangle.tex_node import TEXWrangleNode
+            img = torch.ones(1, 2, 2, 3)
+            result = TEXWrangleNode.execute(
+                code="f$strength = 0.5;\n@OUT = @A * $strength;",
+                A=img, strength=widget,
+                device="cpu", compile_mode="none"
+            )
+            out = result[0]
+            assert out is not None, "OUT should not be None"
+            assert abs(out.mean().item() - widget) < 0.01, \
+                f"Expected ~{widget} (widget), got {out.mean().item()}"
+            r.ok(label)
+        except Exception as e:
+            r.fail(label, f"{e}\n{traceback.format_exc()}")
 
     # ── type checker: param default_value extraction ──
     try:
-        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
+        cache = TEXCache(cache_dir=Path(_scratch_dir()))
         code = "f$strength = 0.005;\ni$count = 3;\ns$label = \"hello\";\n@OUT = @A * $strength;"
         bt = {"A": TEXType.VEC3}
         program, type_map, refs, assigned, params, *_ = cache.compile_tex(code, bt)
@@ -1782,7 +1796,7 @@ def test_v03_features(r: SubTestResult):
 
     # ── cache: multi-output compile_tex ──
     try:
-        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
+        cache = TEXCache(cache_dir=Path(_scratch_dir()))
         code = "@result = @A * 0.5;\n@mask = luma(@A);"
         bt = {"A": TEXType.VEC3}
         program, type_map, refs, assigned, params, *_ = cache.compile_tex(code, bt)
@@ -2069,8 +2083,7 @@ mat3 s = 0.5 * m;
         # s = 0.5 * m, then s * vec3
         m = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float32) * 0.5
         rgb = img[..., :3]
-        expected = torch.matmul(rgb.unsqueeze(-2), m.T).squeeze(-2)
-        # Actually mat * vec = matmul(m, v), so expected = matmul(m, v.unsqueeze(-1)).squeeze(-1)
+        # mat * vec = matmul(m, v)
         expected = torch.matmul(m, rgb.unsqueeze(-1)).squeeze(-1)
         assert torch.allclose(result, expected, atol=1e-4), f"scalar*mat3 failed"
         r.ok("scalar * mat3 (element-wise scale)")
@@ -2190,8 +2203,10 @@ mat3 prod = m * inv;
         tc.check(program)
         r.fail("vec * mat type error", "Expected TypeCheckError")
     except TypeCheckError as e:
-        assert "transpose" in str(e).lower() or "cannot" in str(e).lower() or "isn't supported" in str(e).lower(), f"Unexpected error: {e}"
-        r.ok("vec * mat -> type error")
+        if "transpose" in str(e).lower() or "isn't supported" in str(e).lower():
+            r.ok("vec * mat -> type error")
+        else:
+            r.fail("vec * mat type error", f"Unexpected error text: {e}")
     except Exception as e:
         r.fail("vec * mat type error", f"{e}\n{traceback.format_exc()}")
 
@@ -2219,7 +2234,7 @@ mat3 prod = m * inv;
     except Exception as e:
         r.fail("mat3 as @OUT error", f"{e}\n{traceback.format_exc()}")
 
-    # 20. ACES color transform roundtrip (sRGB -> XYZ -> sRGB)
+    # 20. sRGB (D65) <-> XYZ matrix roundtrip
     try:
         code = """
 // sRGB to XYZ (D65)
@@ -2237,20 +2252,22 @@ vec3 xyz = srgb_to_xyz * @A.rgb;
         result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
         expected = img[..., :3]
         assert torch.allclose(result, expected, atol=1e-3), "sRGB->XYZ->sRGB roundtrip failed"
-        r.ok("ACES: sRGB -> XYZ -> sRGB roundtrip")
+        r.ok("sRGB -> XYZ -> sRGB matrix roundtrip")
     except Exception as e:
-        r.fail("ACES: sRGB -> XYZ -> sRGB roundtrip", f"{e}\n{traceback.format_exc()}")
+        r.fail("sRGB -> XYZ -> sRGB matrix roundtrip", f"{e}\n{traceback.format_exc()}")
 
 
 # ── Matrix Benchmark Tests ─────────────────────────────────────────────
 
 def test_matrix_benchmarks(r: SubTestResult):
     print("\n--- Matrix Benchmark Tests ---")
-    H, W = 512, 512
+    # A smoke run, not a benchmark: small frame, two timed reps, and a finiteness check so the
+    # row asserts something. The timing lines are informational only.
+    H, W = 64, 64
     img3 = torch.rand(1, H, W, 3)
     img4 = torch.rand(1, H, W, 4)
 
-    # 1. mat3 * vec3 at 512x512
+    # 1. mat3 * vec3
     try:
         code = """
 mat3 m = mat3(0.4124564, 0.3575761, 0.1804375,
@@ -2258,19 +2275,18 @@ mat3 m = mat3(0.4124564, 0.3575761, 0.1804375,
               0.0193339, 0.1191920, 0.9503041);
 @OUT = m * @A.rgb;
 """
-        # Warmup
-        compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
-        # Benchmark
+        warm = compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        assert torch.isfinite(warm).all(), "non-finite output"
         t0 = time.perf_counter()
-        N = 10
+        N = 2
         for _ in range(N):
             compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
         elapsed = (time.perf_counter() - t0) / N * 1000
-        r.ok(f"mat3 * vec3 @ 512x512: {elapsed:.1f}ms")
+        r.ok(f"mat3 * vec3 @ {W}x{H}: {elapsed:.1f}ms")
     except Exception as e:
         r.fail("mat3 * vec3 benchmark", f"{e}\n{traceback.format_exc()}")
 
-    # 2. mat4 * vec4 at 512x512
+    # 2. mat4 * vec4 at {W}x{H}
     try:
         code = """
 mat4 m = mat4(1.0, 0.0, 0.0, 0.1,
@@ -2279,17 +2295,18 @@ mat4 m = mat4(1.0, 0.0, 0.0, 0.1,
               0.0, 0.0, 0.0, 1.0);
 @OUT = m * @A;
 """
-        compile_and_run(code, {"A": img4})
+        warm = compile_and_run(code, {"A": img4})
+        assert torch.isfinite(warm).all(), "non-finite output"
         t0 = time.perf_counter()
-        N = 10
+        N = 2
         for _ in range(N):
             compile_and_run(code, {"A": img4})
         elapsed = (time.perf_counter() - t0) / N * 1000
-        r.ok(f"mat4 * vec4 @ 512x512: {elapsed:.1f}ms")
+        r.ok(f"mat4 * vec4 @ {W}x{H}: {elapsed:.1f}ms")
     except Exception as e:
         r.fail("mat4 * vec4 benchmark", f"{e}\n{traceback.format_exc()}")
 
-    # 3. chained mat3 * mat3 * vec3 at 512x512
+    # 3. chained mat3 * mat3 * vec3 at {W}x{H}
     try:
         code = """
 mat3 a = mat3(0.4124564, 0.3575761, 0.1804375,
@@ -2299,17 +2316,18 @@ mat3 b = inverse(a);
 mat3 c = a * b;
 @OUT = c * @A.rgb;
 """
-        compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        warm = compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        assert torch.isfinite(warm).all(), "non-finite output"
         t0 = time.perf_counter()
-        N = 10
+        N = 2
         for _ in range(N):
             compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
         elapsed = (time.perf_counter() - t0) / N * 1000
-        r.ok(f"chained mat3*mat3*vec3 @ 512x512: {elapsed:.1f}ms")
+        r.ok(f"chained mat3*mat3*vec3 @ {W}x{H}: {elapsed:.1f}ms")
     except Exception as e:
         r.fail("chained mat3*mat3*vec3 benchmark", f"{e}\n{traceback.format_exc()}")
 
-    # 4. inverse(mat3) at 512x512
+    # 4. inverse(mat3) at {W}x{H}
     try:
         code = """
 mat3 m = mat3(2.0, 1.0, 0.0,
@@ -2318,13 +2336,14 @@ mat3 m = mat3(2.0, 1.0, 0.0,
 mat3 inv = inverse(m);
 @OUT = inv * @A.rgb;
 """
-        compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        warm = compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        assert torch.isfinite(warm).all(), "non-finite output"
         t0 = time.perf_counter()
-        N = 10
+        N = 2
         for _ in range(N):
             compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
         elapsed = (time.perf_counter() - t0) / N * 1000
-        r.ok(f"inverse(mat3) @ 512x512: {elapsed:.1f}ms")
+        r.ok(f"inverse(mat3) @ {W}x{H}: {elapsed:.1f}ms")
     except Exception as e:
         r.fail("inverse(mat3) benchmark", f"{e}\n{traceback.format_exc()}")
 
@@ -2489,8 +2508,10 @@ def test_node_helpers(r: SubTestResult):
         _convert_param_value("not-a-color", {"type_hint": "c"}, "mycol")
         r.fail("convert_param: color malformed raises", "expected ValueError")
     except ValueError as e:
-        assert "mycol" in str(e), f"Got {e}"
-        r.ok("convert_param: color malformed raises")
+        if "mycol" in str(e):
+            r.ok("convert_param: color malformed raises")
+        else:
+            r.fail("convert_param: color malformed raises", f"error does not name the param: {e}")
     except Exception as e:
         r.fail("convert_param: color malformed raises", str(e))
 
@@ -2547,8 +2568,10 @@ def test_node_helpers(r: SubTestResult):
         _convert_param_value("abc, def", {"type_hint": "v3"}, "myvec")
         r.fail("convert_param: vec malformed raises", "expected ValueError")
     except ValueError as e:
-        assert "myvec" in str(e), f"Got {e}"
-        r.ok("convert_param: vec malformed raises")
+        if "myvec" in str(e):
+            r.ok("convert_param: vec malformed raises")
+        else:
+            r.fail("convert_param: vec malformed raises", f"error does not name the param: {e}")
     except Exception as e:
         r.fail("convert_param: vec malformed raises", str(e))
 
@@ -2672,6 +2695,8 @@ def test_node_helpers(r: SubTestResult):
         t = torch.ones(1, 4, 4, 3) * 0.5
         result = _prepare_output(t, "MASK")
         assert result.shape == (1, 4, 4), f"Shape {result.shape}"
+        assert torch.allclose(result, torch.full((1, 4, 4), 0.5), atol=1e-5), \
+            f"uniform 0.5 gray should have luminance 0.5, got {result.flatten()[:3].tolist()}"
         r.ok("prepare_output: MASK from vec3 -> luminance")
     except Exception as e:
         r.fail("prepare_output: MASK from vec3 -> luminance", str(e))
@@ -2760,7 +2785,7 @@ def test_node_helpers(r: SubTestResult):
 
     # LATENT values are NOT clamped (latent space is unbounded)
     try:
-        t = torch.tensor([[[[5.0, -3.0]]]]).permute(0, 2, 3, 1)  # [1,1,1,2]
+        t = torch.tensor([[[[5.0, -3.0]]]]).permute(0, 2, 3, 1)  # [1,1,2,1]
         result = _prepare_output(t, "LATENT")
         assert result.max().item() > 1.0 or result.min().item() < 0.0, "Should not clamp"
         r.ok("prepare_output: LATENT no clamping")
@@ -2984,6 +3009,7 @@ def test_compiled_audit_fixes(r: SubTestResult):
     print("\n--- Compiled-path Audit Fix Tests ---")
 
     import TEX_Wrangle.tex_runtime.compiled as compiled_mod
+    from TEX_Wrangle.tex_cache import get_cache as _gc
 
     B, H, W = 1, 4, 4
     torch.manual_seed(3)
@@ -3006,7 +3032,6 @@ for (int i = 0; i < 2; i = i + 1) {
 @OUT = @A * 0.0 + s * 0.001;
 """
     try:
-        from TEX_Wrangle.tex_cache import get_cache as _gc
         clear_compiled_cache()
         cache = TEXCache()
         prog, tm, refs, asg, params, used = cache.compile_tex(deep_code, bt)
@@ -3047,7 +3072,14 @@ for (int i = 0; i < 2; i = i + 1) {
 
     # clear_compiled_cache must clear the new memos too (test isolation).
     try:
-        assert len(compiled_mod._route_memo) > 0
+        # Populate the memos here (this row owns its premise), then clear them.
+        clear_compiled_cache()
+        cache = TEXCache()
+        prog, tm, refs, asg, params, used = cache.compile_tex(deep_code, bt)
+        fp = cache.fingerprint(deep_code, bt)
+        execute_compiled(prog, {"A": test_img}, tm, "cpu", fp, used_builtins=used)
+        assert len(compiled_mod._route_memo) > 0, "premise: the cook populated the route memo"
+        assert len(_gc()._codegen_memory) > 0, "premise: the cook populated the codegen memo"
         clear_compiled_cache()
         assert len(compiled_mod._route_memo) == 0
         assert len(_gc()._codegen_memory) == 0

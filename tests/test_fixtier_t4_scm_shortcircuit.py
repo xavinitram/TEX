@@ -52,6 +52,13 @@ def _bindings(res: int = 20):
 
 
 def test_fixtier_t4_scm_never_called_at_scale_one(r: SubTestResult):
+    # A warm on-disk codegen entry from an earlier run would serve a function built without
+    # the counting wrapper, so the scale=0.5 leg would never reach it: start from a cold cache.
+    with cold_engine_state():
+        _run_counting_cooks(r)
+
+
+def _run_counting_cooks(r: SubTestResult):
     print("\n--- FIX-TIER T4: _SCM is never invoked for a scale==1.0 pixel_args= call site ---")
     calls = {"n": 0}
     real = _stdlib_core._scale_pixel_arg
@@ -64,21 +71,18 @@ def test_fixtier_t4_scm_never_called_at_scale_one(r: SubTestResult):
     try:
         out1 = tex_engine.cook(_CODE, _bindings(), device_mode="cpu", compile_mode="none",
                                scale=1.0)
-    except Exception:
+        n_at_one = calls["n"]
+        # Same compiled fn (fingerprint unchanged -- scale excluded), a genuine scale value:
+        # the wrapper (and therefore the real multiply) MUST still be reached.
+        out2 = tex_engine.cook(_CODE, dict(_bindings(), A=_bindings()["A"].clone()),
+                               device_mode="cpu", compile_mode="none", scale=0.5)
+    finally:
         _cg._scale_pixel_arg = real
-        raise
-    if calls["n"] != 0:
-        r.fail("no call at scale=1.0", f"_SCM's wrapper was invoked {calls['n']}x for a "
+    if n_at_one != 0:
+        r.fail("no call at scale=1.0", f"_SCM's wrapper was invoked {n_at_one}x for a "
                f"scale==1.0 cook -- the short-circuit should have skipped the call entirely")
-        _cg._scale_pixel_arg = real
         return
     r.ok("scale=1.0 cook never called into _scale_pixel_arg (inline == short-circuits it)")
-
-    # Same compiled fn (fingerprint unchanged -- scale excluded), a genuine scale value:
-    # the wrapper (and therefore the real multiply) MUST still be reached.
-    out2 = tex_engine.cook(_CODE, dict(_bindings(), A=_bindings()["A"].clone()),
-                           device_mode="cpu", compile_mode="none", scale=0.5)
-    _cg._scale_pixel_arg = real
     if calls["n"] == 0:
         r.fail("still reachable at scale!=1.0", "_scale_pixel_arg's wrapper was never called "
                "for a genuine scale=0.5 cook of the SAME compiled function -- the "

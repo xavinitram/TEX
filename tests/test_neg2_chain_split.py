@@ -20,6 +20,8 @@ The re-export surface itself is pinned elsewhere, deliberately: by
 everything `tex_engine` still promises to expose.
 """
 from helpers import *
+from helpers import (assigned_at_module_level, line_count as _loc,
+                     runtime_module_level_imports as _runtime_module_level_imports)
 import ast
 
 _PKG = Path(__file__).resolve().parent.parent
@@ -39,33 +41,6 @@ _MOVED_FUNCS = (
 # It is the ENG-9 pool: there must be exactly ONE per process, so it travels with the
 # accessor that creates it and the sweep that empties it.
 _MOVED_OBJECTS = ("_interp_pool",)
-
-
-def _loc(path: Path) -> int:
-    with open(path, encoding="utf-8") as f:
-        return sum(1 for _ in f)
-
-
-def _runtime_module_level_imports(tree: ast.Module):
-    """The dotted name of every import statement that RUNS at module level.
-
-    Deliberately excludes two classes. Function-local imports are the lazy edges
-    ARCHITECTURE.md refuses to let anyone hoist. And an `if TYPE_CHECKING:` block never
-    executes, so an import inside one creates no edge — `tex_chain` annotates two
-    parameters with `tex_engine`'s value bundles, which are strings under PEP 563 and are
-    never evaluated.
-    """
-    out = []
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            out.extend(a.name for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            prefix = "." * node.level
-            if node.module:
-                out.append(prefix + node.module)
-            else:                       # `from . import x`
-                out.extend(prefix + a.name for a in node.names)
-    return out
 
 
 def test_neg2_tex_chain_exists_and_carries_the_move(r: SubTestResult):
@@ -112,9 +87,9 @@ def test_neg2_the_moved_names_are_the_same_objects(r: SubTestResult):
         if mod != "TEX_Wrangle.tex_chain":
             fails.append(f"{name}: __module__ is {mod!r}, expected TEX_Wrangle.tex_chain")
     # The half-done move: a name left assigned in tex_engine.py would shadow the import.
-    eng_src = (_PKG / "tex_engine.py").read_text(encoding="utf-8")
+    eng_tree = ast.parse((_PKG / "tex_engine.py").read_text(encoding="utf-8"))
     for name in _MOVED_OBJECTS:
-        if f"\n{name} = " in eng_src:
+        if assigned_at_module_level(eng_tree, name):
             fails.append(f"{name}: still assigned in tex_engine.py — the move is half-done")
     if fails:
         r.fail("NEG-2 homes", "; ".join(fails))

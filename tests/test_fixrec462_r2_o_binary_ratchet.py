@@ -38,12 +38,10 @@ def _os_open_calls(path):
     one file's AST. AST-based, not textual, so a docstring/comment that merely quotes
     `os.open(` (this file's own module docstring, `tex_recovery._open_state_ro_binary`'s
     docstring) is never mistaken for a call."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            src = f.read()
-        tree = ast.parse(src, filename=path)
-    except (OSError, UnicodeDecodeError, SyntaxError):
-        return []
+    # No except: a file that cannot be read or parsed must fail the ratchet, not be exempt.
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src, filename=path)
     hits = []
 
     class _Visitor(ast.NodeVisitor):
@@ -74,7 +72,12 @@ def test_r2_only_one_raw_os_open_in_the_tracked_tree(r):
     helper_hits = 0
     for path in _iter_py_files():
         rel = os.path.relpath(path, _PKG).replace(os.sep, "/")
-        for func_name, lineno in _os_open_calls(path):
+        try:
+            calls = _os_open_calls(path)
+        except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+            offenders.append(f"{rel}: could not be scanned ({type(exc).__name__}: {exc})")
+            continue
+        for func_name, lineno in calls:
             if rel.endswith(_HELPER_MODULE) and func_name == _HELPER_FUNC:
                 helper_hits += 1
                 continue
@@ -87,7 +90,7 @@ def test_r2_only_one_raw_os_open_in_the_tracked_tree(r):
                f"expected exactly 1 os.open( call inside {_HELPER_MODULE}::{_HELPER_FUNC}, "
                f"found {helper_hits}")
     else:
-        r.ok(f"the tracked tree's only os.open( call is inside {_HELPER_MODULE}::{_HELPER_FUNC}")
+        r.ok(f"the package tree's only os.open( call is inside {_HELPER_MODULE}::{_HELPER_FUNC}")
 
 
 def test_r2_helper_ors_in_o_binary(r):
@@ -114,8 +117,8 @@ def test_r2_helper_ors_in_o_binary(r):
     want_bit = getattr(os, "O_BINARY", 0)
     if "flags" not in captured:
         r.fail("FIX-REC R2 helper", "os.open was never called")
-    elif captured["flags"] & os.O_RDONLY != os.O_RDONLY:
-        r.fail("FIX-REC R2 helper", f"O_RDONLY not set: flags={captured['flags']!r}")
+    elif captured["flags"] & (os.O_WRONLY | os.O_RDWR):
+        r.fail("FIX-REC R2 helper", f"opened for writing, not read-only: flags={captured['flags']!r}")
     elif captured["flags"] & want_bit != want_bit:
         r.fail("FIX-REC R2 helper", f"O_BINARY not set: flags={captured['flags']!r}")
     else:

@@ -38,7 +38,19 @@ def test_scale47b_proxy_assert_never_raises_on_odd_input(r: SubTestResult):
     except Exception as e:
         r.fail("defensive", f"raised on scalar/string bindings: {type(e).__name__}: {e}")
         return
-    r.ok(f"scalar/string bindings are skipped, not mistaken for a spatial proxy: {msg!r}")
+    if msg is not None:
+        r.fail("defensive", f"scalar/string bindings were treated as a spatial proxy: {msg!r}")
+        return
+    # Positive control: the same odd values beside a valid and a mismatched tensor still
+    # leave only the tensor to be judged.
+    good = tex_api.check_proxy_scale({"A": 1.0, "B": "plate", "C": make_img(1, 32, 32, 4)},
+                                     full_hw=(64, 64), scale=0.5)
+    bad = tex_api.check_proxy_scale({"A": 1.0, "B": "plate", "C": make_img(1, 30, 30, 4)},
+                                    full_hw=(64, 64), scale=0.5)
+    if good is not None or bad is None or "C" not in bad:
+        r.fail("defensive", f"mixed bindings misjudged: valid -> {good!r}, mismatched -> {bad!r}")
+        return
+    r.ok("scalar/string bindings are skipped, not mistaken for a spatial proxy")
 
 
 def test_scale47b_proxy_assert_is_never_enforced(r: SubTestResult):

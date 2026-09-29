@@ -115,9 +115,12 @@ def test_joinwire50_merge_below_edit_poisoned_fill_is_never_read(r: SubTestResul
     full = tex_chain.cook_stage_dag(stages)
     ref = _crop(full["result"]["OUT"], roi)
 
+    embed_calls = []
+
     def _poisoned_embed(val, window):
         if not isinstance(val, torch.Tensor) or val.dim() < 3:
             return val
+        embed_calls.append(window)
         x0, y0, w, h, W2, H2 = window
         full_t = val.new_full((val.shape[0], H2, W2, *val.shape[3:]), float("nan"))
         full_t[:, y0:y0 + h, x0:x0 + w] = val
@@ -130,6 +133,10 @@ def test_joinwire50_merge_below_edit_poisoned_fill_is_never_read(r: SubTestResul
     finally:
         tex_chain._embed_window = orig
     got = win["result"]["OUT"]
+    if not embed_calls:
+        r.fail("JOINWIRE-50 poisoned-fill", "the poisoned _embed_window was never called, so "
+               "this cook proves nothing about the unread region")
+        return
     if torch.isnan(got).any():
         r.fail("JOINWIRE-50 poisoned-fill", "NaN leaked into the sink's own output")
         return

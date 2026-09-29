@@ -18,6 +18,7 @@ credited to the outer) -- matching this fix's own confirmed-by-running repro exa
 ("`OUTER_STMT_A`'s own entry never received anything" / the inner's entry absorbed the
 outer's real interval).
 """
+import types
 import contextlib
 
 import pytest
@@ -59,12 +60,12 @@ class _FakeClock:
 @contextlib.contextmanager
 def _clock_ctx():
     c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
     try:
         yield c
     finally:
-        _pace._time.perf_counter = real
+        _pace._time = real
 
 
 def test_nested_same_device_cook_never_lets_the_outer_credit_the_inners_call_site(r):
@@ -141,20 +142,13 @@ def test_restore_without_nesting_still_attributes_correctly(r):
         _pace.restore_state(snapshot)  # no nested cook ran in between -- anchor cleared
 
         clock.advance(20.0)
-        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)  # E2: seeds
-                                                                                   # a fresh
-                                                                                   # anchor,
-                                                                                   # nothing
-                                                                                   # to
-                                                                                   # attribute
-                                                                                   # yet
+        # E2 seeds a fresh anchor, so there is nothing to attribute yet.
+        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)
         clock.advance(20.0)
         _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)  # E3, real
         clock.advance(0.001)
-        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)  # confirms
-                                                                                   # E3 ->
-                                                                                   # attributes
-                                                                                   # (E2, E3)
+        # This call confirms E3, which attributes the interval (E2, E3).
+        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)
 
         est = _pace._cost_lookup(("A", idx, bkt), stmt)
 

@@ -283,7 +283,9 @@ def test_neg3_every_product_env_switch_is_documented(r: SubTestResult):
         readme = (_PKG / "README.md").read_text(encoding="utf-8")
         assert "## Environment switches" in readme, \
             "README.md has no environment-switch section for a new switch to land in"
-        missing = sorted(n for n in names if n not in readme)
+        # A whole-name match: a documented longer switch must not hide an undocumented prefix.
+        missing = sorted(n for n in names
+                         if not re.search(r"(?<![A-Z0-9_])" + re.escape(n) + r"(?![A-Z0-9_])", readme))
         assert not missing, f"read by the product, absent from README.md: {missing}"
         r.ok(f"all {len(names)} product environment switches are named in README.md")
     except Exception as e:

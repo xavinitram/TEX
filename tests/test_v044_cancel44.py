@@ -33,23 +33,11 @@ import pytest
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img, try_compile, TEXType)
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle.tex_runtime.host import CookCancelled
+from helpers import TripToken   # the shared trip-on-Nth-check token
 from TEX_Wrangle.tex_runtime import compiled as _compiled
 from TEX_Wrangle.tex_runtime import codegen as _codegen
 from TEX_Wrangle.tex_runtime.interpreter import InterpreterError
 from TEX_Wrangle.tex_cache import parse_and_split
-
-
-class _TripToken:
-    """A CancelToken that raises CookCancelled on its Nth check() (n >= 1)."""
-
-    def __init__(self, n: int):
-        self.n = n
-        self.calls = 0
-
-    def check(self) -> None:
-        self.calls += 1
-        if self.calls >= self.n:
-            raise CookCancelled("test: tripped")
 
 
 class _NeverToken:
@@ -108,7 +96,7 @@ def test_cancel44_stencil_route_honours_cancel(r: SubTestResult):
 
     # Trip on the SECOND poll: `tex_engine.run` polls once before choosing a tier, so a token
     # tripping on the first would raise here even with the stencil route deaf to cancel.
-    tok = _TripToken(2)
+    tok = TripToken(2)
     try:
         tex_engine.cook(_BOX_BLUR, dict(bindings), device_mode="cpu", cancel=tok)
         r.fail("stencil route cancel", "cook did not raise -- the Gap 2 bug is back")
@@ -142,7 +130,7 @@ def test_cancel44_stencil_route_polls_between_statements(r: SubTestResult):
 
     # A token that trips on the VERY LAST recorded poll must still abort cleanly as
     # CookCancelled -- proves the in-body polls are real yield points, not just counted.
-    tok = _TripToken(total)
+    tok = TripToken(total)
     try:
         tex_engine.cook(_BOX_BLUR, dict(bindings), device_mode="cpu", cancel=tok)
         r.fail("stencil route last-poll cancel", "did not raise on the last recorded poll")
@@ -242,7 +230,7 @@ def test_cancel44_gauss_blur_polls_between_passes(r: SubTestResult):
     else:
         r.ok(f"{total} total polls for one gauss_blur cook (includes the between-pass poll)")
 
-    tok = _TripToken(total)
+    tok = TripToken(total)
     try:
         tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=tok)
         r.fail("gauss_blur mid-builtin cancel", "did not raise on the last recorded poll")
@@ -265,7 +253,7 @@ def test_cancel44_mip_pyramid_polls_between_levels(r: SubTestResult):
         return
     r.ok(f"{total} total polls for one sample_mip cook (includes per-level polls)")
 
-    tok = _TripToken(total)
+    tok = TripToken(total)
     try:
         tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=tok)
         r.fail("mip pyramid mid-builtin cancel", "did not raise on the last recorded poll")

@@ -178,8 +178,7 @@ def test_gauss8_thin_strip_holds_the_bar(r: SubTestResult):
     for sigma in (260.0, 300.0):
         exact = _gauss_blur_bchw(p, sigma)
         approx = _gauss_blur_pyramid_approx(p, sigma)
-        diff = (_d8.aces_srgb8(approx).double() - _d8.aces_srgb8(exact).double()).abs().amax(dim=-1)
-        maxcode = int(diff.max())
+        maxcode = _d8.code_diff_stats(_d8.aces_srgb8(approx), _d8.aces_srgb8(exact))["max"]
         if maxcode > 1:
             r.fail(f"gauss8 thin strip sigma={sigma}", f"worst-channel code diff {maxcode} exceeds the 1-code bar")
             continue
@@ -201,10 +200,10 @@ def test_gauss8_below_threshold_still_bitexact(r: SubTestResult):
 
 
 def test_gauss8_edge_pad_matches_kernel_of_plain_replicate_when_uniform(r: SubTestResult):
-    print("\n--- GAUSS8-51: _gauss_blur_bchw_edge_pad reduces to plain replicate-pad "
-          "behaviour on a spatially uniform image (no edge/interior mismatch possible) ---")
+    print("\n--- GAUSS8-51: _gauss_blur_bchw_edge_pad, handed the image's TRUE border strips, "
+          "reduces to plain replicate-pad behaviour ---")
     torch.manual_seed(1)
-    img = torch.full((1, 3, 12, 12), 0.4)
+    img = torch.rand(1, 3, 12, 12)   # not uniform: a swapped or transposed strip must show
     sigma = 3.0
     plain = _gauss_blur_bchw(img, sigma)
     left = img[:, :, :, 0:1]
@@ -214,12 +213,17 @@ def test_gauss8_edge_pad_matches_kernel_of_plain_replicate_when_uniform(r: SubTe
     corners = (img[:, :, 0:1, 0:1], img[:, :, 0:1, -1:], img[:, :, -1:, 0:1], img[:, :, -1:, -1:])
     edge_padded = _gauss_blur_bchw_edge_pad(img, sigma, left, right, top, bottom, corners)
     if not torch.allclose(plain, edge_padded, atol=1e-5):
-        r.fail("gauss8 edge pad uniform equivalence",
-               f"max abs diff {(plain - edge_padded).abs().max().item():.6f} on a uniform "
-               f"image, where the true edge and the block-averaged edge are identical")
+        r.fail("gauss8 edge pad equivalence",
+               f"max abs diff {(plain - edge_padded).abs().max().item():.6f} with the true "
+               f"border strips, where it must equal the plain replicate-pad blur")
         return
-    r.ok("edge-pad blur matches plain replicate-pad blur exactly when there is no "
-         "edge/interior content to mismatch")
+    swapped = _gauss_blur_bchw_edge_pad(img, sigma, right, left, top, bottom, corners)
+    if torch.allclose(plain, swapped, atol=1e-5):
+        r.fail("gauss8 edge pad control", "swapping the left and right strips changed nothing, "
+               "so this row cannot see a mis-wired strip")
+        return
+    r.ok("edge-pad blur with the true border strips matches the plain replicate-pad blur "
+         "on a random image, and swapped strips do not")
 
 
 # ── v0.51: fast rows for the shape families the display-8 bar and
@@ -293,9 +297,9 @@ def test_gauss8_fast_rows_fp16(r: SubTestResult):
 def test_gauss8_fast_rows_tiny_frames(r: SubTestResult):
     print("\n--- tiny frames -- 1x1, 2x2 and elongated 1xN/Nx1 frames, where the "
           "pyramid's own factor almost always exceeds every side (a flat-field reduction, "
-          "never padded/extended). Uses a direct worst-channel-code diff, not "
-          "`code_diff_stats`'s centre-half crop -- that crop (`h//4:3*h//4`) is EMPTY "
-          "for H or W < 4, which is the whole point of this row ---")
+          "never padded/extended). `code_diff_stats`'s `max` is the full-frame worst-channel "
+          "code diff (only its `centre_*` keys use the centre half, which falls back to the "
+          "full frame when empty) ---")
     torch.manual_seed(13)
     sigma = 1024.0
     for H, W in ((1, 1), (2, 2), (1, 64), (64, 1), (3, 5)):
@@ -308,8 +312,7 @@ def test_gauss8_fast_rows_tiny_frames(r: SubTestResult):
         if not torch.isfinite(approx).all():
             r.fail(f"gauss8 tiny finite {H}x{W}", "non-finite output")
             continue
-        diff = (_d8.aces_srgb8(approx).double() - _d8.aces_srgb8(exact).double()).abs().amax(dim=-1)
-        maxcode = int(diff.max())
+        maxcode = _d8.code_diff_stats(_d8.aces_srgb8(approx), _d8.aces_srgb8(exact))["max"]
         if maxcode > 1:
             r.fail(f"gauss8 tiny bar {H}x{W}",
                    f"worst-channel code diff {maxcode} exceeds the 1-code bar")

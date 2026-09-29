@@ -1,4 +1,6 @@
 """Interpreter tests — execution, loops, control flow, compound assignments."""
+import math
+
 from helpers import *
 
 
@@ -9,7 +11,6 @@ def test_interpreter(r: SubTestResult):
     B, H, W = 1, 4, 4
     test_img = torch.rand(B, H, W, 3)
     test_img4 = torch.rand(B, H, W, 4)
-    test_mask = torch.rand(B, H, W)
 
     # Simple passthrough
     try:
@@ -156,8 +157,10 @@ def test_interpreter(r: SubTestResult):
         @OUT = vec3(x, x, x);
         """
         result = compile_and_run(code, {"A": test_img})
-        # sin(0) = 0, sin(pi/2) ~= 1, sin(pi) ~= 0
-        assert abs(result[0, 0, 0, 0].item()) < 0.1  # sin(0) ~= 0
+        # u runs 0, 1/3, 2/3, 1 across the four columns: sin(PI*u) = 0, .866, .866, 0
+        want = torch.sin(math.pi * torch.linspace(0.0, 1.0, W))
+        assert torch.allclose(result[0, 0, :, 0], want, atol=1e-5), \
+            f"sin(PI * u) row: {result[0, 0, :, 0].tolist()} != {want.tolist()}"
         r.ok("math functions (sin, PI)")
     except Exception as e:
         r.fail("math functions (sin, PI)", f"{e}\n{traceback.format_exc()}")
@@ -204,8 +207,10 @@ def test_interpreter(r: SubTestResult):
         compile_and_run("float x = 1.0;", {"A": test_img})
         r.fail("missing @OUT error", "Should have raised InterpreterError")
     except InterpreterError as e:
-        assert "OUT" in str(e)
-        r.ok("missing @OUT error")
+        if "OUT" in str(e):
+            r.ok("missing @OUT error")
+        else:
+            r.fail("missing @OUT error", f"unexpected message: {e}")
     except RuntimeError as e:
         if "OUT" in str(e):
             r.ok("missing @OUT error")
@@ -288,8 +293,10 @@ def test_interpreter(r: SubTestResult):
         tc.check(program)
         r.fail("variable v redecl error", "Expected TypeCheckError")
     except TypeCheckError as e:
-        assert "already declared" in str(e)
-        r.ok("variable v redecl error")
+        if "already declared" in str(e):
+            r.ok("variable v redecl error")
+        else:
+            r.fail("variable v redecl error", f"unexpected message: {e}")
     except Exception as e:
         r.fail("variable v redecl error", f"{e}\n{traceback.format_exc()}")
 
@@ -376,8 +383,10 @@ def test_for_loops(r: SubTestResult):
         compile_and_run(code, {"A": test_img})
         r.fail("for loop: iteration limit", "Should have raised InterpreterError")
     except InterpreterError as e:
-        assert "maximum iteration limit" in str(e).lower() or "1024" in str(e) or "iterations without finishing" in str(e).lower()
-        r.ok("for loop: iteration limit")
+        if "maximum iteration limit" in str(e).lower() or "1024" in str(e) or "iterations without finishing" in str(e).lower():
+            r.ok("for loop: iteration limit")
+        else:
+            r.fail("for loop: iteration limit", f"unexpected message: {e}")
     except Exception as e:
         r.fail("for loop: iteration limit", f"{e}\n{traceback.format_exc()}")
 
@@ -488,8 +497,10 @@ def test_break_continue(r: SubTestResult):
         compile_and_run(code, {"A": test_img})
         r.fail("break: outside loop error", "Should have raised TypeCheckError")
     except TypeCheckError as e:
-        assert "outside" in str(e).lower() or "loop" in str(e).lower()
-        r.ok("break: outside loop error")
+        if "outside" in str(e).lower() or "loop" in str(e).lower():
+            r.ok("break: outside loop error")
+        else:
+            r.fail("break: outside loop error", f"unexpected message: {e}")
     except Exception as e:
         r.fail("break: outside loop error", f"{e}\n{traceback.format_exc()}")
 
@@ -499,8 +510,10 @@ def test_break_continue(r: SubTestResult):
         compile_and_run(code, {"A": test_img})
         r.fail("continue: outside loop error", "Should have raised TypeCheckError")
     except TypeCheckError as e:
-        assert "outside" in str(e).lower() or "loop" in str(e).lower()
-        r.ok("continue: outside loop error")
+        if "outside" in str(e).lower() or "loop" in str(e).lower():
+            r.ok("continue: outside loop error")
+        else:
+            r.fail("continue: outside loop error", f"unexpected message: {e}")
     except Exception as e:
         r.fail("continue: outside loop error", f"{e}\n{traceback.format_exc()}")
 
@@ -706,8 +719,10 @@ while (1) {
         compile_and_run(code, {"A": img})
         r.fail("while: iteration limit", "Should have raised InterpreterError")
     except Exception as e:
-        assert "maximum iteration limit" in str(e).lower() or "exceeded" in str(e).lower() or "iterations without finishing" in str(e).lower()
-        r.ok("while: iteration limit")
+        if "maximum iteration limit" in str(e).lower() or "exceeded" in str(e).lower() or "iterations without finishing" in str(e).lower():
+            r.ok("while: iteration limit")
+        else:
+            r.fail("while: iteration limit", f"unexpected message: {e}")
 
     # 6. Nested while loops
     try:

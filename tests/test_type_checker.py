@@ -1,6 +1,16 @@
 from helpers import *
 
 
+def _expect_code(r, name, exc, code):
+    """A rejection labelled with a code passes only if that code is among the diagnostics,
+    so an unrelated type error cannot stand in for the rule under test."""
+    codes = [d.code for d in exc.diagnostics] if isinstance(exc, TEXMultiError) else [exc.code]
+    if code in codes:
+        r.ok(name)
+    else:
+        r.fail(name, f"expected {code}, got {codes}")
+
+
 def test_type_checker(r: SubTestResult):
     print("\n--- Type Checker Tests ---")
 
@@ -134,8 +144,8 @@ def test_stdlib_promote_typing(r: SubTestResult):
         check_code("float f = step(0.5, @A);\n@OUT = vec4(f);", {"A": TEXType.VEC3})
         r.fail("promote typing: float var from vec call errors (E3200)",
                "Should have raised TypeCheckError")
-    except (TypeCheckError, TEXMultiError):
-        r.ok("promote typing: float var from vec call errors (E3200)")
+    except (TypeCheckError, TEXMultiError) as e:
+        _expect_code(r, "promote typing: float var from vec call errors (E3200)", e, "E3200")
     except Exception as e:
         r.fail("promote typing: float var from vec call errors (E3200)", str(e))
 
@@ -144,8 +154,8 @@ def test_stdlib_promote_typing(r: SubTestResult):
         check_code("int i = 3;\nint j = mod(i, 2.5);\n@OUT = vec4(float(j));")
         r.fail("promote typing: int var from mod(int, float) errors (E3200)",
                "Should have raised TypeCheckError")
-    except (TypeCheckError, TEXMultiError):
-        r.ok("promote typing: int var from mod(int, float) errors (E3200)")
+    except (TypeCheckError, TEXMultiError) as e:
+        _expect_code(r, "promote typing: int var from mod(int, float) errors (E3200)", e, "E3200")
     except Exception as e:
         r.fail("promote typing: int var from mod(int, float) errors (E3200)", str(e))
 
@@ -166,8 +176,8 @@ def test_stdlib_promote_typing(r: SubTestResult):
                    {"A": TEXType.VEC3})
         r.fail("promote typing: vec3(smoothstep(vec), 0, 0) errors (E3601)",
                "Should have raised TypeCheckError")
-    except (TypeCheckError, TEXMultiError):
-        r.ok("promote typing: vec3(smoothstep(vec), 0, 0) errors (E3601)")
+    except (TypeCheckError, TEXMultiError) as e:
+        _expect_code(r, "promote typing: vec3(smoothstep(vec), 0, 0) errors (E3601)", e, "E3601")
     except Exception as e:
         r.fail("promote typing: vec3(smoothstep(vec), 0, 0) errors (E3601)", str(e))
 
@@ -240,8 +250,8 @@ def test_select_type_checking(r: SubTestResult):
         try:
             check_code(code, binds)
             r.fail(f"select() E5003: {name} rejected", "Should have raised TypeCheckError")
-        except (TypeCheckError, TEXMultiError):
-            r.ok(f"select() E5003: {name} rejected")
+        except (TypeCheckError, TEXMultiError) as e:
+            _expect_code(r, f"select() E5003: {name} rejected", e, "E5003")
         except Exception as e:
             r.fail(f"select() E5003: {name} rejected", str(e))
 
@@ -254,7 +264,7 @@ def test_select_type_checking(r: SubTestResult):
         try:
             check_code(code)
             r.fail(f"select() E5003: {name} rejected", "Should have raised TypeCheckError")
-        except (TypeCheckError, TEXMultiError):
-            r.ok(f"select() E5003: {name} rejected")
+        except (TypeCheckError, TEXMultiError) as e:
+            _expect_code(r, f"select() E5003: {name} rejected", e, "E5003")
         except Exception as e:
             r.fail(f"select() E5003: {name} rejected", str(e))

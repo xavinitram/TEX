@@ -1379,11 +1379,11 @@
    "plans": {
     "1024/12GiB/128MiB": {
      "halo": null,
-     "tile": null
+     "tile": 2
     },
     "1024/12GiB/16MiB": {
      "halo": null,
-     "tile": 6
+     "tile": 14
     },
     "1024/12GiB/1GiB": {
      "halo": null,
@@ -1395,11 +1395,11 @@
     },
     "1024/256MiB/128MiB": {
      "halo": null,
-     "tile": null
+     "tile": 2
     },
     "1024/256MiB/16MiB": {
      "halo": null,
-     "tile": 6
+     "tile": 14
     },
     "1024/256MiB/1GiB": {
      "halo": null,
@@ -1411,11 +1411,11 @@
     },
     "1024/64MiB/128MiB": {
      "halo": null,
-     "tile": null
+     "tile": 2
     },
     "1024/64MiB/16MiB": {
      "halo": null,
-     "tile": 6
+     "tile": 14
     },
     "1024/64MiB/1GiB": {
      "halo": null,
@@ -1427,11 +1427,11 @@
     },
     "2048/12GiB/128MiB": {
      "halo": null,
-     "tile": 3
+     "tile": 7
     },
     "2048/12GiB/16MiB": {
      "halo": null,
-     "tile": 24
+     "tile": 32
     },
     "2048/12GiB/1GiB": {
      "halo": null,
@@ -1443,11 +1443,11 @@
     },
     "2048/256MiB/128MiB": {
      "halo": null,
-     "tile": 3
+     "tile": 7
     },
     "2048/256MiB/16MiB": {
      "halo": null,
-     "tile": 24
+     "tile": 32
     },
     "2048/256MiB/1GiB": {
      "halo": null,
@@ -1459,11 +1459,11 @@
     },
     "2048/64MiB/128MiB": {
      "halo": null,
-     "tile": 3
+     "tile": 7
     },
     "2048/64MiB/16MiB": {
      "halo": null,
-     "tile": 24
+     "tile": 32
     },
     "2048/64MiB/1GiB": {
      "halo": null,

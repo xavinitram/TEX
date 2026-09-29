@@ -101,11 +101,10 @@ def test_trk65_real_region_dependence_still_declines(r: SubTestResult):
 
 
 def test_trk65_mutation_a_wrongly_independent_verdict_is_visible(r: SubTestResult):
-    """RED-FIRST HALF, inverted: patch the helper to lie ("everything is independent") and
-    require `_walk` to still decline the loop repro correctly — i.e. prove the mutation WOULD
-    be visible if the safety property broke, by observing the wrong answer the lie produces
-    directly. This is the "test that would catch a stale verdict" the ask requires: it exists
-    to fail loudly the day someone weakens the helper's safety argument, not to pass quietly.
+    """Meta-test: patch the helper to lie ("everything is independent") and require that the
+    lie visibly flips `_walk`'s `region_dep` on the loop repro, which proves `_walk` trusts
+    the helper's verdict and that this repro exercises the fast path. It does NOT guard the
+    real helper's safety argument; the row above (the real helper declining the repro) does.
     """
     print("\n--- TRK-65 mutation guard: a broken fast path is CAUGHT, not silently trusted ---")
     tex_roi.clear_roi_memo()

@@ -237,7 +237,12 @@ def test_perf6_the_tile_plans_are_identical(r: SubTestResult):
                                    f"{row['key']} [{label}] {k}: {v} -> {got.get(k)}")
             strips += sum(1 for v in want.values() if v["tile"] is not None)
             halos += sum(1 for v in want.values() if v["halo"] is not None)
-        if moved:
+        # Floors so a truncated golden, or a corpus where nothing compiles, cannot pass empty.
+        if cells < 6000 or strips < 500 or halos < 5:
+            r.fail("PERF-6 plans", f"the golden contributed only {cells} cells, {strips} strip "
+                   f"counts and {halos} halo plans (floors 6000/500/5) -- it is truncated or "
+                   f"the corpus stopped compiling")
+        elif moved:
             r.fail("PERF-6 plans", f"{moved} of {cells} plan cells moved")
         else:
             r.ok(f"{cells} plan cells identical to the base-sha golden "

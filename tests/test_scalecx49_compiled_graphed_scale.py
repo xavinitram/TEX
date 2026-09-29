@@ -8,21 +8,19 @@ bounced, UNCONDITIONALLY, to the plain interpreter the instant `tier_id != "defa
 threaded a runtime scale multiplier through their compiled/captured code at all. This ask
 makes all three scale-aware:
 
-  - `execute_compiled`/`run_auto` (tex_runtime/compiled.py) key their compiled ARTIFACT
-    cache (`_compiled_cache`, and `autotier.make_key`'s own bucket) by an EXPLICIT,
-    trailing `scale` component -- appended only when `scale is not None`, so a `scale=None`
-    cook keys exactly as before this ask (invariant 7).
+  - `execute_compiled` (tex_runtime/compiled.py) keeps ONE compiled artifact per
+    (fingerprint, device, precision) and passes `scale` to it as a runtime input, so a
+    sweep over scale values compiles once (FIX-SCALECX X2).
+  - `run_auto`'s bucket (`autotier.make_key`) gains a trailing `scale` component, appended
+    only when `scale` is active, so a `scale=None` cook keys exactly as before this ask
+    (invariant 7).
   - `run_graphed` (tex_runtime/graphed.py) keys its captured-graph cache (`_capture_key`)
-    the identical way, for the identical reason: a `pixel_args=`-tagged builtin's scaled
-    radius is a SHAPE baked at capture/compile time (`ceil(3*sigma*scale)` for
-    `gauss_blur`, a truncated int for `erode`/`dilate`), so two different scale values on
-    the SAME canvas/precision/device genuinely need two different artifacts/captures --
-    canvas shape alone does not distinguish them.
+    the same way: a `pixel_args=`-tagged builtin's scaled radius is a SHAPE baked at capture
+    time (`ceil(3*sigma*scale)` for `gauss_blur`, a truncated int for `erode`/`dilate`), so
+    two scale values on the same canvas/precision/device need two captures.
 
-Never per call: a repeated request at an already-seen scale value is a cache hit against
-the SAME artifact/capture, never a rebuild -- "bounded" means bounded by the number of
-DISTINCT scale values a session actually requests, exactly like a distinct canvas shape or
-precision already gets its own entry today, never a recompile/recapture per call.
+A repeated request at an already-seen scale value is a cache hit, never a rebuild: the
+number of captures is bounded by the number of distinct scale values a session requests.
 
 Scope: ROI stays entirely out of the compiled/graphed tiers (`tex_roi.roi_eligibility`
 declines ROI outright once `tier_id != "default"`, and separately the instant
@@ -71,37 +69,12 @@ def _prog():
 # used before this ask, and what `_capture_key` still produces when a caller omits
 # `scale=`) against the NEW one.
 
-def test_scalecx49_capture_key_mismatch_before_fix(r: SubTestResult):
-    """Red-first, in-process (no git history, no `.git` needed -- a shallow CI checkout or
-    an archive install has neither): reconstruct the PRE-FIX key shape by wrapping the REAL,
-    current `_capture_key` in a scale-blind adapter that drops the `scale` kwarg entirely --
-    exactly what every call site did before this ask, and the same technique
-    `test_scalecx49_cuda_graph_capture_mismatch_before_fix_live` below uses to reproduce the
-    mismatch live on CUDA. Two cooks of the SAME program/canvas/precision/device but
-    DIFFERENT scale values then collide under that adapter -- the exact bug that would let a
-    capture taken at one scale replay for a request at another. Then show the FIXED
-    `_capture_key` (called directly, un-wrapped) distinguishes them; since this second half
-    calls the real function under test, it still reds if the scale component is ever removed
-    from `_capture_key` -- the fix's proof strength never depended on the git-history half."""
+def test_scalecx49_capture_key_distinguishes_scale_values(r: SubTestResult):
+    """Two cooks of the same program/canvas/precision/device at different scale values must
+    get different capture keys, or a capture taken at one scale would replay for a request at
+    another. The real `_capture_key` is called directly, so this reds if the scale component
+    is ever removed from it."""
     bindings = {"A": make_img(1, 8, 8, 3, seed=1)}
-    real_key = _graphed._capture_key
-
-    def _scale_blind_key(fingerprint, device, precision, bindings, output_names,
-                         latent_channel_count, scale=None):
-        return real_key(fingerprint, device, precision, bindings, output_names,
-                        latent_channel_count)   # scale dropped -- the pre-fix shape
-
-    old_key_half = _scale_blind_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
-                                    scale=0.5)
-    old_key_quarter = _scale_blind_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
-                                       scale=0.25)
-    if old_key_half == old_key_quarter:
-        r.ok("pre-fix-shaped (scale-blind) _capture_key collides across scale values (no "
-             "scale component at all) -- reproduced in-process")
-    else:
-        r.fail("scalecx49 red-first premise",
-               "scale-blind _capture_key did not collide -- this test's premise is stale")
-
     new_key_half = _graphed._capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
                                          scale=0.5)
     new_key_quarter = _graphed._capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
@@ -347,7 +320,10 @@ def test_scalecx49_execute_compiled_real_backend_compiles_once_across_scale_swee
                 A = A.cuda()
             _compiled.execute_compiled(prog, {"A": A}, tm, device, fp, scale=s)
         extra = compiles["n"] - 1
-        if extra <= 0:
+        if compiles["n"] == 0:
+            r.fail("scalecx49 X2 real backend sweep",
+                   "no real torch.compile() attempt happened, so the sweep exercised nothing")
+        elif extra <= 0:
             r.ok(f"5 calls over 4 distinct scale values -> {compiles['n']} real "
                  f"torch.compile() attempt (shared artifact, real backend)")
         elif extra <= recoveries["n"]:
@@ -373,13 +349,19 @@ def test_scalecx49_execute_compiled_parity_cpu(r: SubTestResult):
     exactly like a scale=None cook without a backend already does). This proves `scale`
     survives `execute_compiled`'s own plumbing intact; it does not exercise Inductor's own
     scale handling, which needs a real backend and is reported separately as owed."""
-    program = _prog()
     A = make_img(1, 16, 16, 3, seed=6)
     for s in (1.0, 0.5, 0.25, 0.125):
+        program = _prog()
         compiled_out = _compiled.execute_compiled(
             program, {"A": A.clone()}, {}, "cpu", None, scale=s, time_context=None)
+        # The reference is NOT the same call again: the unscaled program with its sigma
+        # already multiplied by the scale (exact in fp32 for these scales), so a scale that
+        # was dropped, or applied twice, anywhere on the way makes the two differ.
+        ref_code = f"@OUT = gauss_blur(@A, {6.0 * s});\n"
+        ref_prog = parse_and_split(ref_code, _BLUR_BT)
+        TypeChecker(binding_types=_BLUR_BT, source=ref_code).check(ref_prog)
         interp_out = _compiled._plain_execute(
-            program, {"A": A.clone()}, {}, "cpu", scale=s, time_context=None)
+            ref_prog, {"A": A.clone()}, {}, "cpu", scale=None, time_context=None)
         maxdiff = (compiled_out - interp_out).abs().max().item()
         if maxdiff < 1e-5:
             r.ok(f"execute_compiled(scale={s}) matches plain interpreter, maxdiff={maxdiff:.2e}")

@@ -278,12 +278,18 @@ def run_both(code, bindings, B=1, H=4, W=4):
     return interp_result, cg_result
 
 
-def assert_equiv(r, name, code, bindings, B=1, H=4, W=4):
-    """run_both() + assert outputs match within 1e-5. Reports to SubTestResult."""
+def assert_equiv(r, name, code, bindings, B=1, H=4, W=4, allow_decline=False):
+    """run_both() + assert outputs match within 1e-5. Reports to SubTestResult.
+
+    A codegen decline is a FAILURE (only one tier was measured) unless the row passes
+    `allow_decline=True`, and non-tensor outputs are compared for equality, not skipped."""
     try:
         interp_res, cg_res = run_both(code, bindings, B, H, W)
         if cg_res is None:
-            r.ok(f"codegen equiv: {name} (codegen unsupported, SKIPPED)")
+            if allow_decline:
+                r.ok(f"codegen equiv: {name} (codegen declined, allowed)")
+            else:
+                r.fail(f"codegen equiv: {name}", "codegen declined, so only one tier was measured")
             return
         for out_name in interp_res:
             interp_t = interp_res[out_name]
@@ -291,6 +297,8 @@ def assert_equiv(r, name, code, bindings, B=1, H=4, W=4):
             if isinstance(interp_t, torch.Tensor) and isinstance(cg_t, torch.Tensor):
                 max_diff = (interp_t.float() - cg_t.float()).abs().max().item()
                 assert max_diff < 1e-5, f"Max diff={max_diff} for output '{out_name}'"
+            else:
+                assert interp_t == cg_t, f"'{out_name}': {interp_t!r} != {cg_t!r}"
         r.ok(f"codegen equiv: {name}")
     except Exception as e:
         r.fail(f"codegen equiv: {name}", f"{e}")
@@ -403,6 +411,30 @@ def load_counts_harness():
     return mod
 
 
+def load_benchmark(filename):
+    """Load `benchmarks/<filename>` by path, once per process, under one `sys.modules` key.
+
+    Like `load_counts_harness`, and for the same reason: `benchmarks/` is not a package, and
+    hand-spelled copies of this incantation drift (two files once loaded the same script
+    under different names, so it ran twice). A failed exec leaves nothing behind in
+    `sys.modules`. Not in `__all__`; callers import it by name."""
+    import importlib.util
+    key = "_bench_" + os.path.splitext(filename)[0]
+    mod = sys.modules.get(key)
+    if mod is not None:
+        return mod
+    spec = importlib.util.spec_from_file_location(
+        key, os.path.join(_pkg_dir, "benchmarks", filename))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(key, None)
+        raise
+    return mod
+
+
 def load_display8_harness():
     """Load `tools/display8.py` by path, once per process (v0.51) --
     the same shape as `load_counts_harness` above, for the same reason: GAUSS8-51/
@@ -443,6 +475,191 @@ def run_python_kv(code: str, *, timeout: int = 60, python: str | None = None) ->
     if proc.returncode != 0:
         raise RuntimeError(f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-800:]}")
     return dict(line.split(" ", 1) for line in proc.stdout.strip().splitlines() if " " in line)
+
+
+def scratch_dir(prefix="tex_test_"):
+    """A fresh scratch directory (`Path`) that is removed when the interpreter exits, so a
+    row that fails before its own cleanup cannot leak it.
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+    import atexit
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    atexit.register(shutil.rmtree, str(d), ignore_errors=True)
+    return d
+
+
+def isolated_warm_state():
+    """Context manager: point `warm_state` at a scratch snapshot file for the block, so a
+    row that records fn-calls or capturability verdicts neither reads a previous run's
+    on-disk verdicts nor writes its own into the process's cache dir. Yields the snapshot
+    path; the module state is reset on entry and restored on exit.
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        from TEX_Wrangle.tex_runtime import fncalls_compile as fc
+        from TEX_Wrangle.tex_runtime import warm_state as ws
+        real_path, real_tag = ws._path, ws._tag
+        snap = scratch_dir("warm_state_") / ws._FILE
+        ws._path = lambda *a, **k: str(snap)
+        try:
+            ws._reset_for_test()
+            fc.reset_for_test()
+            yield snap
+        finally:
+            ws._path, ws._tag = real_path, real_tag
+            fc.reset_for_test()
+            ws._reset_for_test()
+
+    return _cm()
+
+
+class FakeClock:
+    """A callable stand-in for `time.perf_counter` under direct control: `advance(dt)` moves
+    it. Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+class StatementTripToken:
+    """A cancel token that trips deterministically once `trip_after` top-level statements
+    have been DISPATCHED, via the same `on_progress("stmt", ...)` callback the interpreter
+    and codegen tiers report per statement. It is immune to wall-clock and GPU-clock
+    variance, unlike a background `threading.Timer` racing a moving completion target.
+    Pass it as BOTH `cancel=` and `on_progress=tok.on_progress` to `tex_engine.cook`. The
+    trip is observed by `token.check()` at the next poll point after it fires, which is the
+    yield-point mechanism under test; only the arming is deterministic. Because the unpaced
+    statement loop polls too, a row using it cannot distinguish paced from unpaced.
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+
+    def __init__(self, trip_after, pace=True, pace_depth=None, label="statement-count trip"):
+        self.pace = pace
+        if pace_depth is not None:
+            self.pace_depth = pace_depth
+        self._trip_after = trip_after
+        self._label = label
+        self._count = 0
+        self._tripped = False
+
+    def on_progress(self, phase, frac):
+        if phase == "stmt":
+            self._count += 1
+            if self._count >= self._trip_after:
+                self._tripped = True
+
+    def check(self):
+        if self._tripped:
+            from TEX_Wrangle.tex_runtime.host import CookCancelled
+            raise CookCancelled(f"{self._label} fired")
+
+
+def measure_full_cuda_runtime(program, make_bindings, first_seed):
+    """The TRUE uncancelled GPU completion time of `program` (drain included), independent
+    of pacing: an explicit `torch.cuda.synchronize()` after each `cook()`. Discards a
+    cold-cache first leg and takes the FLOOR of two warm legs, a lower-bound scale and not a
+    precise duration. `make_bindings(seed)` builds the CUDA bindings. Needs CUDA.
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+    from TEX_Wrangle import tex_engine
+
+    def once(seed):
+        t0 = time.perf_counter()
+        tex_engine.cook(program, make_bindings(seed), device_mode="cuda")
+        torch.cuda.synchronize()
+        return time.perf_counter() - t0
+
+    once(first_seed)  # discard cold leg
+    return min(once(first_seed + 1), once(first_seed + 2))
+
+
+def line_count(path) -> int:
+    """Number of lines in a text file. Deliberately NOT in `__all__` (HOOK-4 pins that list)."""
+    with open(path, encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def runtime_module_level_imports(tree) -> list:
+    """The dotted name of every import statement that RUNS at module level of a parsed module.
+
+    Descends into module-level `try`/`if`/`with` blocks (a guarded import still creates the
+    edge) but not into function or class bodies, whose imports are the lazy edges
+    ARCHITECTURE.md refuses to let anyone hoist, and skips the body of an
+    `if TYPE_CHECKING:` block, which never executes. Deliberately NOT in `__all__`."""
+    import ast
+    out = []
+
+    def _type_checking(test):
+        return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+            isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+
+    def _visit(body):
+        for node in body:
+            if isinstance(node, ast.Import):
+                out.extend(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                prefix = "." * node.level
+                if node.module:
+                    out.append(prefix + node.module)
+                else:                   # `from . import x`
+                    out.extend(prefix + a.name for a in node.names)
+            elif isinstance(node, ast.If):
+                if not _type_checking(node.test):
+                    _visit(node.body)
+                _visit(node.orelse)
+            elif isinstance(node, ast.Try):
+                _visit(node.body)
+                for h in node.handlers:
+                    _visit(h.body)
+                _visit(node.orelse)
+                _visit(node.finalbody)
+            elif isinstance(node, ast.With):
+                _visit(node.body)
+
+    _visit(tree.body)
+    return out
+
+
+def assigned_at_module_level(tree, name) -> bool:
+    """True when `name` is bound by a plain or annotated assignment at module level of a
+    parsed module. Deliberately NOT in `__all__`."""
+    import ast
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return True
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                return True
+    return False
+
+
+def windowed_vs_whole(code, image, roi, device="cpu", params=None, whole=False):
+    """Cook `code` on `image` twice, whole frame and with `roi` (x0, y0, w, h, W, H) as a
+    real window. Returns `(cooked_roi, windowed_out, reference)`, where `reference` is the
+    whole-frame output cropped to the window (`whole=True`: the uncropped frame instead).
+
+    Deliberately NOT in `__all__` (HOOK-4 pins that list); callers import it by name."""
+    from TEX_Wrangle import tex_engine
+    from TEX_Wrangle import tex_roi
+    x0, y0, w, h, _W, _H = roi
+    binds = dict(params or {}, A=image.clone())
+    tex_roi.clear_roi_memo()
+    full = tex_engine.cook(code, dict(binds, A=image.clone()), device_mode=device).outputs["OUT"]
+    tex_roi.clear_roi_memo()
+    res = tex_engine.cook(code, dict(binds, A=image.clone()), device_mode=device,
+                          roi=roi, roi_exec=True)
+    ref = full if whole else full[:, y0:y0 + h, x0:x0 + w]
+    return res.cooked_roi, res.outputs["OUT"], ref
 
 
 # ── Windows Application/Smart App Control kernel-load block (V045-FIX) ──────
@@ -516,3 +733,35 @@ def _crop(full, roi):
     like `load_counts_harness`/`retry_on_os_policy_kernel_block` above."""
     x0, y0, w, h, _W, _H = roi
     return full[:, y0:y0 + h, x0:x0 + w]
+
+
+class TripToken:
+    """A CancelToken that raises `CookCancelled` on its Nth `check()` (n >= 1); `calls` counts
+    the polls made so far. The one shared trip-on-Nth-check token the cancellation tests use.
+
+    Deliberately NOT in `helpers.__all__` (HOOK-4 pins that list): import it by name."""
+
+    def __init__(self, n: int):
+        self.n = n
+        self.calls = 0
+
+    def check(self) -> None:
+        self.calls += 1
+        if self.calls >= self.n:
+            from TEX_Wrangle.tex_runtime.host import CookCancelled
+            raise CookCancelled("test: tripped")
+
+
+def recount_bytes(cache):
+    """`(recount, maintained)` for a `tex_results.ResultCache`: the per-device byte buckets
+    recomputed from its entries, and the buckets as the cache maintains them, both read under
+    the cache lock so they are one snapshot. A mismatch is a lost or duplicated accounting
+    update.
+
+    Deliberately NOT in `helpers.__all__` (HOOK-4 pins that list): import it by name."""
+    from TEX_Wrangle import tex_results
+    with cache._lock:
+        recount = {"cuda": 0, "cpu": 0}
+        for e in cache._ram.values():
+            recount[tex_results._dev_bucket(e.device)] += e.nbytes
+        return recount, dict(cache._bytes_by_dev)

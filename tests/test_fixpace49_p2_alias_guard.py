@@ -34,6 +34,7 @@ RED at base `32f6917`: neither `_cost_feed` nor `_cost_lookup` nor `_pace49_cost
 an `anchor` argument at all (`TypeError`), and `paced_check` has no `call_site_anchor`
 keyword.
 """
+import types
 import contextlib
 
 import pytest
@@ -77,12 +78,12 @@ class _FakeClock:
 @contextlib.contextmanager
 def _clock_ctx():
     c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
     try:
         yield c
     finally:
-        _pace._time.perf_counter = real
+        _pace._time = real
 
 
 # ── unit level: _cost_feed/_cost_lookup's own anchor check ───────────────────────

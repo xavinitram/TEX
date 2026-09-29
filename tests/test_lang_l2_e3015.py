@@ -73,7 +73,7 @@ def test_lang_l2_e3015_trk28_refused_at_compile_time(r: SubTestResult):
     try:
         raised = None
         try:
-            run_both(_TRK28_SRC, {"A": make_img(1, 1, 4, 4, seed=1)}, B=1, H=1, W=4)
+            run_both(_TRK28_SRC, {"A": make_img(1, 1, 4, 4, seed=1)})
         except Exception as e:
             raised = e
         assert raised is not None, "run_both() produced an answer for a program with no defensible meaning"
@@ -208,7 +208,7 @@ def test_lang_l2_return_inside_function_in_loop_stays_legal(r: SubTestResult):
 
     try:
         r_img = torch.tensor([0.10, 0.30, 0.70, 0.90]).view(1, 1, 4, 1).repeat(1, 1, 1, 4)
-        interp_res, cg_res = run_both(src, {"A": r_img}, B=1, H=1, W=4)
+        interp_res, cg_res = run_both(src, {"A": r_img})
         if cg_res is None:
             r.skip("return-in-function-in-loop", "codegen unsupported (interp only)")
         else:

@@ -92,9 +92,16 @@ def test_scatter_determinism_band(r: SubTestResult):
     # A1-4: read the value the PR-LP5 pin recorded and gate a release on out-of-band
     # drift, even if the pin itself was in SOFT (WARN) mode. Must run AFTER the pin.
     try:
+        import torch
         import test_determinism_pin as pin
         val = pin.LAST_CUDA_DET_VAR
-        if val is None:
+        if val is None and torch.cuda.is_available():
+            # A CUDA box where the pin has not run in this process (this file first, `-k`,
+            # a worker): the band is NOT gated, and saying "no CUDA" would be false.
+            r.fail("scatter-determinism band",
+                   "CUDA is available but test_determinism_pin has not recorded a value in "
+                   "this process -- run it first (it must precede this gate)")
+        elif val is None:
             # No CUDA on this runner (the CPU CI lane) — can't gate what wasn't measured.
             # This is the honest hardware limitation S-4 (validate-hw) exists to close.
             r.skip("scatter-determinism release band",

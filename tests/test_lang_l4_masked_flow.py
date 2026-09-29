@@ -29,10 +29,13 @@ can exist at this head. That is proved here over the whole corpus rather than as
 it is why the tests below ask for the rules explicitly through `Interpreter.execute`'s
 `_masked_flow` seam.
 """
+import functools
+
 import pytest
 import torch
 
 from helpers import *
+from failure_harness import compile_program as _compile
 
 import compat_corpus as cc
 import scalar_oracle
@@ -61,14 +64,6 @@ def _wire(seed=0.0):
 
 def _bindings():
     return {"A": _wire(), "B": _wire(0.37)}
-
-
-def _compile(src, bindings):
-    bt = {name: _infer_binding_type(v) for name, v in bindings.items()}
-    program = parse_and_split(src, bt)
-    checker = TypeChecker(binding_types=bt, source=src)
-    type_map = checker.check(program)
-    return program, type_map, sorted(checker.assigned_bindings.keys())
 
 
 def _cook(src, bindings, masked):
@@ -185,8 +180,10 @@ def test_pragma_025_alone_does_not_mask_below_masked_flow():
     """A `//!tex 0.25` pragma alone does not open the masked path while the ENGINE is below
     `MASKED_FLOW_SINCE` — `docs/masked-control-flow.md` §4's `min(...)` rule, the same one
     that keeps the region-dependence sunset shut below `0.25`. LANG-L7 moved the REAL engine
-    to `0.25` (`test_worked_table_after_column` above is the proof that this exact pragma, at
-    THIS head, now takes effect), so the live engine can no longer reach this case on its own
+    to `0.25` (`test_masked_gate_is_open_only_for_this_lanes_pragma_rows`, the corpus-wide
+    gate census, is the proof that this pragma now takes effect at the live engine level; the
+    worked-table column test forces the rules through the `_masked_flow` seam and does not
+    show that), so the live engine can no longer reach this case on its own
     — monkeypatched DOWN to `0.24` for exactly this check, restored in `finally`."""
     real = tex_api.LANGUAGE_VERSION
     try:
@@ -265,9 +262,9 @@ def test_empty_flow_plan_never_binds_the_masked_table():
     src = "float x = @A.r * 2.0; @OUT = vec4(x, x, x, 1.0);"
     prog = Parser(Lexer(PRAGMA + src).tokenize(), source=PRAGMA + src).parse()
     assert tex_api.flow_plan(prog).is_empty()
-    # …and with the version gate forced open, `enabled_for`'s second condition still shuts
-    # it: the plan is what decides, not the pragma.
-    assert tex_api.flow_plan(prog).is_empty() is True
+    # The version condition is met (ambient 0.25, pragma 0.25), yet `enabled_for`'s second
+    # condition still shuts the gate: the plan is what decides, not the pragma.
+    assert masked_flow.enabled_for(prog, PRAGMA + src) is False
 
 
 def test_masked_cook_of_a_plan_free_program_is_bit_identical():
@@ -532,8 +529,7 @@ def test_scatter_is_gated_by_source():
 def test_scatter_unmasked_reading_is_unchanged():
     """…and without the rules it is `0.23`'s destination-gated answer, unchanged."""
     b = _bindings()
-    out, interp = _cook(_SCATTER_SRC, b, None)
-    assert interp._masked is False
+    out, _interp = _cook(_SCATTER_SRC, b, None)
     # `0.23`'s answer, pinned as a characterization and not as a desirable one: the
     # `break` under a per-pixel `if` unwinds region-wide on the FIRST pass, so the scatter
     # statement never executes at all and `@S` is still the 0-dim `0.0` it was declared
@@ -558,15 +554,19 @@ for (int i = 0; i < 2; i = i + 1) {
 }
 @OUT = vec4(keep, keep, keep, 1.0);
 """
-    b = _bindings()
-    live_at_origin = bool((b["A"][0, 0, 0, 0] <= 0.5).item())
-    tier_trace.clear_probes()
-    _cook(PRAGMA + src, b, True)
-    probes = tier_trace.get_probes()
-    if live_at_origin:
-        assert probes, "pixel (0,0) is live, so its probe must have recorded"
-    else:
-        assert not probes, "pixel (0,0) left the loop, so its probe must not record"
+    # Both branches of the rule, forced by construction (the probe pixel is (0,0)): with
+    # A.r = 0.1 the pixel stays in the loop and records; with 0.9 it breaks on the first
+    # pass, before the probe statement, and must not.
+    for a0, records in ((0.1, True), (0.9, False)):
+        b = _bindings()
+        b["A"][0, 0, 0, 0] = a0
+        tier_trace.clear_probes()
+        _cook(PRAGMA + src, b, True)
+        probes = tier_trace.get_probes()
+        if records:
+            assert probes, "pixel (0,0) is live, so its probe must have recorded"
+        else:
+            assert not probes, "pixel (0,0) left the loop, so its probe must not record"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -782,8 +782,20 @@ def _fuzz_ids(programs):
     return [f"g{i:02d}" for i in range(len(programs))]
 
 
-_FUZZ_AS_SHIPPED = _generate(_FUZZ_N, require=("break", "continue", "return"))
-_FUZZ_LIVE = _generate(_FUZZ_N, conds=_LIVE_CONDS, require=("break", "continue"))
+@functools.lru_cache(maxsize=None)
+def _fuzz_corpus(kind):
+    """The generated corpora, built on first use (they cook every candidate, so building them
+    at import cost every file that imports this module, and a generator refusal would take
+    down collection instead of one test)."""
+    if kind == "shipped":
+        return tuple(_generate(_FUZZ_N, require=("break", "continue", "return")))
+    return tuple(_generate(_FUZZ_N, conds=_LIVE_CONDS, require=("break", "continue")))
+
+
+def _fuzz_src(kind, i):
+    corpus = _fuzz_corpus(kind)
+    assert i < len(corpus), f"the {kind} corpus has only {len(corpus)} programs"
+    return corpus[i]
 
 
 def _assert_matches_oracle(src, b, B, H, W):
@@ -809,24 +821,24 @@ def _assert_matches_oracle(src, b, B, H, W):
         assert worst <= 1e-5, f"@{k}: max relative |cook - oracle| = {worst}"
 
 
-@pytest.mark.parametrize("src", _FUZZ_AS_SHIPPED, ids=_fuzz_ids(_FUZZ_AS_SHIPPED))
-def test_generated_program_equals_oracle(src):
+@pytest.mark.parametrize("i", range(_FUZZ_N), ids=lambda i: f"g{i:02d}")
+def test_generated_program_equals_oracle(i):
     """A `0.25` cook of a program from the SHIPPED generator equals the per-pixel oracle
     sweep."""
-    _assert_matches_oracle(src, _fuzz_bindings(), _FUZZ_B, _FUZZ_H, _FUZZ_W)
+    _assert_matches_oracle(_fuzz_src("shipped", i), _fuzz_bindings(), _FUZZ_B, _FUZZ_H, _FUZZ_W)
 
 
-@pytest.mark.parametrize("src", _FUZZ_LIVE, ids=_fuzz_ids(_FUZZ_LIVE))
-def test_generated_program_with_live_conditions_equals_oracle(src):
+@pytest.mark.parametrize("i", range(_FUZZ_N), ids=lambda i: f"g{i:02d}")
+def test_generated_program_with_live_conditions_equals_oracle(i):
     """…and so does one whose early-exit conditions are genuinely per-pixel — the half the
     shipped pool cannot reach."""
-    _assert_matches_oracle(src, _fuzz_bindings(), _FUZZ_B, _FUZZ_H, _FUZZ_W)
+    _assert_matches_oracle(_fuzz_src("live", i), _fuzz_bindings(), _FUZZ_B, _FUZZ_H, _FUZZ_W)
 
 
 def test_generated_corpora_are_not_empty():
     """A sweep over nothing passes trivially, so the two corpora's sizes are pinned."""
-    assert len(_FUZZ_AS_SHIPPED) >= 20, len(_FUZZ_AS_SHIPPED)
-    assert len(_FUZZ_LIVE) >= 20, len(_FUZZ_LIVE)
+    assert len(_fuzz_corpus("shipped")) == _FUZZ_N, len(_fuzz_corpus("shipped"))
+    assert len(_fuzz_corpus("live")) == _FUZZ_N, len(_fuzz_corpus("live"))
 
 
 def test_the_live_condition_corpus_actually_clears_bits():
@@ -834,13 +846,14 @@ def test_the_live_condition_corpus_actually_clears_bits():
     Measured: most of the live-condition programs must differ from their unmasked cook."""
     b = _fuzz_bindings()
     moved = 0
-    for src in _FUZZ_LIVE:
+    live = _fuzz_corpus("live")
+    for src in live:
         plain, _ = _cook(src, b, None)
         masked, _ = _cook(PRAGMA + src, b, True)
         if any(not torch.equal(plain[k], masked[k]) for k in plain):
             moved += 1
-    assert moved >= len(_FUZZ_LIVE) // 2, \
-        f"only {moved}/{len(_FUZZ_LIVE)} live-condition programs moved"
+    assert moved >= len(live) // 2, \
+        f"only {moved}/{len(live)} live-condition programs moved"
 
 
 def test_shipped_generator_conditions_are_false_on_every_pixel():
@@ -860,3 +873,19 @@ def test_shipped_generator_conditions_are_false_on_every_pixel():
             live_somewhere.append(cond)
     assert live_somewhere == [], \
         f"the shipped pool is no longer all-false: {live_somewhere}"
+
+
+def test_oracle_array_assignment_copies():
+    """`b = a` copies an array in the language, so the oracle must not alias the list: a
+    later `b[0] = x` leaves `a[0]` alone, exactly as the interpreter's cook does."""
+    src = """float a[3] = {1.0, 2.0, 3.0};
+float b[3] = {0.0, 0.0, 0.0};
+b = a;
+b[0] = 9.0;
+@OUT = vec4(a[0], b[0], 0.0, 1.0);"""
+    b = _bindings()
+    out, _ = _cook(src, b, False)
+    program, _tm, names = _compile(src, b)
+    ref, _probes = sweep(program, dict(b), _B, _H, _W, names)
+    assert ref["OUT"][0, 0, 0].tolist() == [1.0, 9.0, 0.0, 1.0]
+    assert out["OUT"][0, 0, 0].tolist() == [1.0, 9.0, 0.0, 1.0]

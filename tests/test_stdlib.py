@@ -1,5 +1,6 @@
 """Stdlib function tests — math, color, SDF, reductions, edge cases."""
 from helpers import *
+from helpers import check_val as _check_val
 
 
 def test_stdlib_coverage(r: SubTestResult):
@@ -10,13 +11,7 @@ def test_stdlib_coverage(r: SubTestResult):
 
     # Helper: run code, extract pixel [0,0,0,0]
     def check_val(name, code, expected, atol=1e-3):
-        try:
-            result = compile_and_run(code, {"A": test_img})
-            val = result[0, 0, 0, 0].item()
-            assert abs(val - expected) < atol, f"Got {val}, expected {expected}"
-            r.ok(f"stdlib: {name}")
-        except Exception as e:
-            r.fail(f"stdlib: {name}", f"{e}\n{traceback.format_exc()}")
+        _check_val(r, f"stdlib: {name}", code, expected, {"A": test_img}, atol)
 
 
 
@@ -51,13 +46,7 @@ def test_stdlib_extended(r: SubTestResult):
     test_img = torch.rand(B, H, W, 3)
 
     def check_val(name, code, expected, atol=1e-3):
-        try:
-            result = compile_and_run(code, {"A": test_img})
-            val = result[0, 0, 0, 0].item()
-            assert abs(val - expected) < atol, f"Got {val}, expected {expected}"
-            r.ok(f"stdlib: {name}")
-        except Exception as e:
-            r.fail(f"stdlib: {name}", f"{e}\n{traceback.format_exc()}")
+        _check_val(r, f"stdlib: {name}", code, expected, {"A": test_img}, atol)
 
 
 
@@ -529,8 +518,45 @@ def test_numeric_edge_case_matrix(r: SubTestResult):
     B, H, W = 1, 2, 2
     img = torch.rand(B, H, W, 3)
 
+    import re, struct
+
+    def _f32(x):
+        return struct.unpack("f", struct.pack("f", x))[0]
+
+    # Reference values in float64 on the float32-rounded arguments. The two deliberate
+    # departures from the libm answer are TEX's own contract: log/log2/log10 clamp their
+    # argument to 1e-8 (never -inf), and mod is truncated (fmod), not floored.
+    def _safe(fn):
+        return lambda x: fn(max(x, 1e-8))
+
+    def _smooth(a, b, x):
+        t = min(max((x - a) / (b - a), 0.0), 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    _ref = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan, "asin": math.asin,
+        "acos": math.acos, "atan": math.atan, "atan2": math.atan2, "sqrt": math.sqrt,
+        "pow": math.pow, "exp": math.exp, "log": _safe(math.log), "log2": _safe(math.log2),
+        "log10": _safe(math.log10), "abs": abs, "sign": lambda x: float((x > 0) - (x < 0)),
+        "floor": math.floor, "ceil": math.ceil, "round": lambda x: float(round(x)),
+        "fract": lambda x: x - math.floor(x), "mod": math.fmod,
+        "clamp": lambda x, lo, hi: min(max(x, lo), hi),
+        "lerp": lambda a, b, t: a + (b - a) * t, "smoothstep": _smooth,
+        "step": lambda edge, x: 1.0 if x >= edge else 0.0,
+    }
+
+    def _expected(code):
+        m = re.fullmatch(r"float x = (\w+)\(([^)]*)\); @OUT = vec3\(x,x,x\);", code)
+        args = [_f32(float(t)) for t in m.group(2).split(",")]
+        try:
+            want = float(_ref[m.group(1)](*args))
+        except OverflowError:
+            want = float("inf")
+        return math.copysign(float("inf"), want) if abs(want) > 3.4028235e38 else want
+
     def run_check(name, code, expect_finite=True):
-        """Run code and check that it doesn't crash. If expect_finite, verify result is finite."""
+        """Run one math builtin on a special input and compare with its reference value.
+        `expect_finite=False` marks the one row whose reference (1e60) overflows float32."""
         try:
             result = compile_and_run(code, {"A": img})
             val = result[0,0,0,0].item()
@@ -541,7 +567,15 @@ def test_numeric_edge_case_matrix(r: SubTestResult):
             elif expect_finite and is_inf:
                 r.fail(f"edge: {name}", f"Got Inf, expected finite")
             else:
-                r.ok(f"edge: {name}")
+                want = _expected(code)
+                if want in (float("inf"), float("-inf")) and abs(want) == float("inf"):
+                    ok = val == want
+                else:
+                    ok = abs(val - want) <= 1e-5 + 1e-4 * abs(want)
+                if ok:
+                    r.ok(f"edge: {name}")
+                else:
+                    r.fail(f"edge: {name}", f"Got {val!r}, expected {want!r}")
         except Exception as e:
             r.fail(f"edge: {name}", f"{e}")
 
@@ -684,7 +718,7 @@ def test_nan_inf_propagation(r: SubTestResult):
     try:
         nan_img = torch.full((1, 4, 4, 3), float('nan'))
         result = compile_and_run("@OUT = @A;", {"A": nan_img})
-        # Should not crash
+        assert torch.isnan(result).all(), "a NaN input must reach the output untouched"
         r.ok("nan: passthrough NaN tensor")
     except Exception as e:
         r.fail("nan: passthrough NaN tensor", f"{e}")
@@ -693,28 +727,31 @@ def test_nan_inf_propagation(r: SubTestResult):
     try:
         code = "float x = 0.0 / 0.0; @OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": img})
-        # Should produce NaN or handled value, but not crash
-        r.ok("nan: 0/0 does not crash")
+        assert torch.equal(result, torch.zeros_like(result)), \
+            "0/0 is a guarded division: it must give 0, not NaN"
+        r.ok("nan: 0/0 is the guarded 0")
     except Exception as e:
-        r.fail("nan: 0/0 does not crash", f"{e}")
+        r.fail("nan: 0/0 is the guarded 0", f"{e}")
 
     # NaN through sin
     try:
         nan_img = torch.full((1, 4, 4, 3), float('nan'))
         code = "float x = sin(@A.r); @OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": nan_img})
-        r.ok("nan: sin(NaN) does not crash")
+        assert torch.isnan(result).all(), "sin(NaN) must stay NaN"
+        r.ok("nan: sin(NaN) stays NaN")
     except Exception as e:
-        r.fail("nan: sin(NaN) does not crash", f"{e}")
+        r.fail("nan: sin(NaN) stays NaN", f"{e}")
 
     # NaN through cos
     try:
         nan_img = torch.full((1, 4, 4, 3), float('nan'))
         code = "float x = cos(@A.r); @OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": nan_img})
-        r.ok("nan: cos(NaN) does not crash")
+        assert torch.isnan(result).all(), "cos(NaN) must stay NaN"
+        r.ok("nan: cos(NaN) stays NaN")
     except Exception as e:
-        r.fail("nan: cos(NaN) does not crash", f"{e}")
+        r.fail("nan: cos(NaN) stays NaN", f"{e}")
 
     # Safe division: 1/0 produces large value (not Inf) due to SAFE_EPSILON
     try:
@@ -750,34 +787,40 @@ def test_nan_inf_propagation(r: SubTestResult):
     try:
         inf_img = torch.full((1, 4, 4, 3), float('inf'))
         result = compile_and_run("@OUT = @A;", {"A": inf_img})
-        r.ok("nan: Inf passthrough does not crash")
+        assert torch.isinf(result).all(), "an Inf input must reach the output untouched"
+        r.ok("nan: Inf passthrough")
     except Exception as e:
-        r.fail("nan: Inf passthrough does not crash", f"{e}")
+        r.fail("nan: Inf passthrough", f"{e}")
 
     # NaN in lerp
     try:
         nan_img = torch.full((1, 4, 4, 3), float('nan'))
         code = "float x = lerp(0.0, 1.0, @A.r); @OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": nan_img})
-        r.ok("nan: lerp with NaN does not crash")
+        assert torch.isnan(result).all(), "lerp with a NaN factor must stay NaN"
+        r.ok("nan: lerp with NaN stays NaN")
     except Exception as e:
-        r.fail("nan: lerp with NaN does not crash", f"{e}")
+        r.fail("nan: lerp with NaN stays NaN", f"{e}")
 
     # Inf in arithmetic
     try:
         code = "float x = 1.0 / 0.0 + 1.0; @OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": img})
-        r.ok("nan: Inf + 1 does not crash")
+        assert bool((result > 1e6).all()) and bool(torch.isfinite(result).all()), \
+            "1/0 + 1 stays a large finite value"
+        r.ok("nan: guarded 1/0 + 1 stays large and finite")
     except Exception as e:
-        r.fail("nan: Inf + 1 does not crash", f"{e}")
+        r.fail("nan: guarded 1/0 + 1 stays large and finite", f"{e}")
 
     # Inf - Inf = NaN
     try:
         code = "float x = (1.0/0.0) - (1.0/0.0); @OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": img})
-        r.ok("nan: Inf - Inf does not crash")
+        assert torch.equal(result, torch.zeros_like(result)), \
+            "two guarded divisions are equal finite values, so their difference is 0, not NaN"
+        r.ok("nan: guarded (1/0) - (1/0) = 0")
     except Exception as e:
-        r.fail("nan: Inf - Inf does not crash", f"{e}")
+        r.fail("nan: guarded (1/0) - (1/0) = 0", f"{e}")
 
     # NaN comparison
     try:
@@ -788,10 +831,11 @@ if (x == x) { y = 1.0; }
 @OUT = vec3(y, y, y);
 """
         result = compile_and_run(code, {"A": img})
-        # NaN == NaN behavior depends on implementation
-        r.ok("nan: NaN comparison does not crash")
+        # 0/0 is a guarded 0 (above), so x == x holds
+        assert torch.equal(result, torch.ones_like(result)), "x == x must hold for the guarded 0"
+        r.ok("nan: x == x holds for the guarded 0/0")
     except Exception as e:
-        r.fail("nan: NaN comparison does not crash", f"{e}")
+        r.fail("nan: x == x holds for the guarded 0/0", f"{e}")
 
     # isnan() function — use NaN from image input since safe division won't produce NaN
     try:
@@ -1026,9 +1070,10 @@ float soft = smin(d1, d2, 0.1);
 @OUT = vec3(hard, soft, soft - hard);
 """
         result = compile_and_run(code, {"A": sdf_img})
-        # smin should be <= min (smoother)
+        # smin never exceeds min, and blends (goes strictly below it) somewhere near the seam
         diff = result[..., 2]
-        assert diff.min().item() <= 0.01, "smin should be <= min"
+        assert diff.max().item() <= 1e-6, "smin should be <= min at every pixel"
+        assert diff.min().item() < -1e-3, "smin should blend below min near the seam"
         r.ok("sdf: smin blending")
     except Exception as e:
         r.fail("sdf: smin blending", f"{e}\n{traceback.format_exc()}")
@@ -1044,7 +1089,8 @@ float soft = smax(a, b, 0.1);
 """
         result = compile_and_run(code, {"A": sdf_img})
         diff = result[..., 2]
-        assert diff.max().item() >= -0.01, "smax should be >= max"
+        assert diff.min().item() >= -1e-6, "smax should be >= max at every pixel"
+        assert diff.max().item() > 1e-3, "smax should blend above max near the seam"
         r.ok("sdf: smax blending")
     except Exception as e:
         r.fail("sdf: smax blending", f"{e}\n{traceback.format_exc()}")
@@ -1135,9 +1181,12 @@ def test_new_builtins_and_fixes(r: SubTestResult):
     # 2b. the reference no longer mis-describes px/py, and the diagnostics hint no
     # longer calls px "the pixel x" (ASK-12 red-first doc-truth pin)
     try:
-        sys.path.insert(0, os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
-        import gen_function_reference as G
+        import importlib.util
+        _gp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "tools", "gen_function_reference.py")
+        _spec = importlib.util.spec_from_file_location("_stdlib_gen_function_reference", _gp)
+        G = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(G)
         from TEX_Wrangle.tex_compiler.diagnostics import _BUILTIN_VAR_HINTS
         entries, _cats = G.parse_help()
         pixel_step = entries["Pixel Step"]
@@ -1346,7 +1395,7 @@ def test_stdlib_nan_inf(r: SubTestResult):
         """Run code and verify it doesn't crash."""
         try:
             compile_and_run(code, bindings)
-            r.ok(f"nan_inf: {name}")
+            r.ok(f"nan_inf: {name} does not crash")
         except Exception as e:
             r.fail(f"nan_inf: {name}", f"{e}\n{traceback.format_exc()}")
 

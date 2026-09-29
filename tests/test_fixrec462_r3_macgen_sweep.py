@@ -11,6 +11,7 @@ The fix sweeps stale `.macgen-*.tmp` files in the key home on the way into
 so a peer's in-flight mint — microseconds old — is never mistaken for an orphan.
 """
 from helpers import *
+from helpers import scratch_dir
 
 import time
 
@@ -20,7 +21,7 @@ from TEX_Wrangle import tex_recovery as R
 def test_r3_crash_orphaned_macgen_temp_is_reclaimed(r: SubTestResult):
     print("\n--- FIX-REC R3: a stale .macgen-*.tmp is swept on the next key resolve ---")
     try:
-        home = Path(tempfile.mkdtemp())
+        home = scratch_dir()
         # The exact shape a crash mid-mint leaves: `_publish_new_key`'s own prefix/suffix,
         # aged past the grace window (a real orphan, not a peer mid-mint).
         orphan = home / (R._MACGEN_PREFIX + "deadbeef.tmp")
@@ -51,7 +52,7 @@ def test_r3_a_peers_fresh_macgen_temp_is_never_removed(r: SubTestResult):
     loaded box, not a crash)."""
     print("\n--- FIX-REC R3: a fresh .macgen-*.tmp (a peer's in-flight mint) survives ---")
     try:
-        home = Path(tempfile.mkdtemp())
+        home = scratch_dir()
         fresh = home / (R._MACGEN_PREFIX + "feedface.tmp")
         fresh.write_bytes(b"\x00" * R._MAC_KEY_LEN)   # mtime = now, well inside the grace window
 
@@ -76,7 +77,7 @@ def test_r3_sweep_helper_reports_count_and_ignores_other_names(r: SubTestResult)
     it removed, and tolerates a directory that does not exist."""
     print("\n--- FIX-REC R3: _sweep_stale_macgen_temps is name-scoped and reports its count ---")
     try:
-        home = Path(tempfile.mkdtemp())
+        home = scratch_dir()
         old = time.time() - R._MACGEN_ORPHAN_GRACE_SEC - 5
 
         stale_macgen = home / (R._MACGEN_PREFIX + "aaaaaaaa.tmp")

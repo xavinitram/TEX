@@ -6,9 +6,9 @@ an ordinary decline (a missing backend, an unsupported construct): a
 PRIOR cook's record (or `None`, right after `prepare()`'s `tier_trace.reset()`),
 indistinguishable from "no fallback happened" — the interpreter served its own
 (possibly wrong) value with no diagnostic reaching the node, on every one of the
-torch_compile / auto / cuda_graph strategies (`tex_engine.py`'s three
-`except Exception as {compile_exc,auto_exc,_g_exc}:` sites, verified at head
-`5c8cf7d` to sit at lines 451/467/483 exactly as the row cites them).
+torch_compile / auto / cuda_graph strategies (`tex_engine_tiers.py`'s three
+`except Exception as {compile_exc,auto_exc,_g_exc}:` sites, in `_run_torch_compile`,
+`_run_auto` and `_run_cuda_graph`).
 
 Fixed at those same three sites: `_record_codegen_defect_fallback` (added right
 after `_interp_fallback`) special-cases ONLY `_CgBreak`/`_CgContinue` — logging
@@ -26,6 +26,10 @@ monkeypatching the compiled-tier entry point to raise the class directly, which
 is not a program a host can construct. The fix changes what gets LOGGED and
 recorded in a diagnostics-only trace on an already-unreachable path; it moves no
 pixel of any cook a ComfyUI user can produce.
+
+Rows cover the torch_compile and auto sites. The cuda_graph site (`_run_cuda_graph`) calls
+the same `_record_codegen_defect_fallback` helper but is only selected for a CUDA device, so
+no row here drives it.
 """
 from helpers import *
 
@@ -69,6 +73,7 @@ def test_trk141_torch_compile_cgbreak_is_recorded_not_silent(r: SubTestResult):
             r.ok(f"recorded and non-silent: {rec!r}")
     finally:
         tex_engine.execute_compiled = orig
+        tier_trace.reset()
 
 
 def test_trk141_auto_cgcontinue_is_recorded_not_silent(r: SubTestResult):
@@ -102,6 +107,7 @@ def test_trk141_auto_cgcontinue_is_recorded_not_silent(r: SubTestResult):
             r.ok(f"recorded and non-silent: {rec!r}")
     finally:
         compiled_mod.run_auto = orig
+        tier_trace.reset()
 
 
 def test_trk141_ordinary_decline_unchanged(r: SubTestResult):
@@ -132,3 +138,4 @@ def test_trk141_ordinary_decline_unchanged(r: SubTestResult):
             r.ok("ordinary decline behaviour unchanged: tier_trace.last() is still None")
     finally:
         tex_engine.execute_compiled = orig
+        tier_trace.reset()

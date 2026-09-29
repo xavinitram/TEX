@@ -30,10 +30,6 @@ from TEX_Wrangle import tex_engine, tex_results
 from TEX_Wrangle import tex_roi as _R
 
 
-def _devices():
-    return ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-
-
 # Three plain pointwise prefix stages, then a $mode-switched tail (mirrors
 # test_roi48a_uniform_branch.py's BLUR_SRC): mode=0 is a bounded, narrowable `gauss_blur`;
 # mode=1 is a whole-image gather. Chained through `@IN`, the stage-list convention.
@@ -71,7 +67,7 @@ def test_roi48a_checkpoint_windowed_pixel_identity(r: SubTestResult):
     x0, y0, w, h, _, _ = roi
     up = ("roi48a-src",)
     try:
-        for device in _devices():
+        for device in devices():
             torch.manual_seed(2048)
             src = torch.rand(1, H, W, 3, device=device)
             stages = _stages(src, mode=0)
@@ -88,9 +84,10 @@ def test_roi48a_checkpoint_windowed_pixel_identity(r: SubTestResult):
                 continue
 
             _R.clear_roi_memo()
+            from TEX_Wrangle.tex_runtime import tier_trace as _tt
+            _tt.reset()
             got = CK.cook_checkpointed(stages, cache, device=device, precision="fp32",
                                        upstream=up, cuts=[cut], roi=roi, roi_exec=True)["OUT"]
-            from TEX_Wrangle.tex_runtime import tier_trace as _tt
             served = _tt.last_roi()[0]
             if served != roi:
                 r.fail(f"ROI-48A checkpoint window ({device})",
@@ -117,7 +114,6 @@ def test_roi48a_checkpoint_roi_refusal_never_served_as_whole_frame(r: SubTestRes
     # cook_stage_list's own single-stage gate must decline (the same posture as a fused
     # chain under tex_engine.cook). The important thing is what it does NOT do: it must
     # never report `roi` served while actually returning the whole frame.
-    N = len(_PREFIX) + 1
     up = ("roi48a-src2",)
     roi = (4, 4, 8, 8, 48, 40)
     try:
@@ -131,9 +127,10 @@ def test_roi48a_checkpoint_roi_refusal_never_served_as_whole_frame(r: SubTestRes
             r.fail("ROI-48A multi-stage suffix setup", f"materialized {done}, expected 1 in it")
             return
         _R.clear_roi_memo()
+        from TEX_Wrangle.tex_runtime import tier_trace as _tt
+        _tt.reset()
         out = CK.cook_checkpointed(stages, cache, device="cpu", precision="fp32",
                                    upstream=up, cuts=[1], roi=roi, roi_exec=True)["OUT"]
-        from TEX_Wrangle.tex_runtime import tier_trace as _tt
         served = _tt.last_roi()[0]
         if served is not None:
             r.fail("ROI-48A multi-stage suffix", f"a 3-stage suffix reported a served window: {served}")

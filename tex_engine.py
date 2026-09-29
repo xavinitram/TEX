@@ -476,8 +476,9 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
     # F1 fix: tier_trace is imported function-locally per method (the SCC convention);
     # the C1-st extraction moved this block out of execute() without carrying the import,
     # so the recovery path NameError-crashed exactly when auto-fp16 overflowed.
-    from .tex_runtime import tier_trace
+    from .tex_runtime import tier_trace, guard_trace
     tier_trace.clear_probes()  # discard the fp16 cook's probes (no dup)
+    guard_trace.reset()        # and its guard counts: they describe the discarded attempt
     tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
     if auto_ckey is not None:
         _AUTO_DECISION[auto_ckey] = ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
@@ -976,8 +977,9 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
     # narrowed bindings and would report the wrong pixel. Same reason the C2 finiteness
     # net clears before its own re-cook, two functions away.
     try:
-        from .tex_runtime import tier_trace
+        from .tex_runtime import tier_trace, guard_trace
         tier_trace.clear_probes()
+        guard_trace.reset()     # the strips re-count from zero; the failed attempt's mask has another shape
     except Exception:
         pass
     _drop_tex_caches_on_oom()
@@ -1141,11 +1143,15 @@ def run(plan: CookPlan) -> CookResult:
         # them in when it owned the loop.
         near_sing = None
         if plan.debug_nan_highlight:
-            from .tex_runtime import guard_trace   # off the default path: only the toggle pays
-            mask = guard_trace.mask()              # hoisted out of the loop (was once/output)
+            from .tex_runtime import guard_trace, tier_trace   # off the default path: only the toggle pays
+            # Only the interpreter's guards are hooked (and the tiled strips run on it): a cook
+            # a compiled or captured tier served has no count to report, which is not zero.
+            _rec = tier_trace.last()
+            _hooked = _rec is None or _rec.tier in ("interpreter", "tiled", "halo_tiled")
+            mask = guard_trace.mask() if _hooked else None   # hoisted out of the loop
             raw_output = {name: _nan_highlight(_singularity_highlight(raw, mask))
                           for name, raw in raw_output.items()}
-            near_sing = guard_trace.count()   # read BEFORE the disarm below
+            near_sing = guard_trace.count() if _hooked else None   # read BEFORE the disarm below
             guard_trace.disarm()
 
         # CACHE-1: attach per-output lineage keys when the caller asked (a frame cache / graph

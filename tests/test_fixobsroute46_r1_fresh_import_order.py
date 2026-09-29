@@ -42,7 +42,7 @@ import pathlib
 import subprocess
 import sys as _sys
 
-from helpers import SubTestResult   # noqa: F401  (imported for type/documentation parity)
+from helpers import SubTestResult
 
 
 def _custom_nodes_dir() -> str:
@@ -95,10 +95,10 @@ def test_r1_every_product_module_imports_first_in_a_fresh_process(r: SubTestResu
     print("\n--- FIX-OBSROUTE R1: every product module imports first, alone, cleanly ---")
     custom_nodes = _custom_nodes_dir()
     modules = _discover_modules()
-    if len(modules) < 40:
+    if len(modules) < 70:
         r.fail("FIX-OBSROUTE R1 discovery",
                f"only found {len(modules)} candidate modules — the glob-based discovery "
-               f"probably broke (expected 60+); refusing to report a false-green pass")
+               f"probably broke (expected 70+); refusing to report a false-green pass")
         return
 
     bad = []

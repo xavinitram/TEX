@@ -2,12 +2,12 @@
 TEX Benchmark Suite — comprehensive performance measurement for TEX programs.
 
 Measures compile time, interpreter time, and total E2E time across multiple
-resolutions, batch sizes, and cache states. Includes all 29 real-world
-examples plus 14 synthetic micro-benchmarks.
+resolutions, batch sizes, and cache states. Includes every program under
+examples/ plus the synthetic micro-benchmarks.
 
 Usage:
     python tests/bench_tex.py                       # Default: 512x512 B=1 warm
-    python tests/bench_tex.py --quick               # Quick: 512x512 B=1 warm, fewer programs
+    python tests/bench_tex.py --quick               # Quick: 512x512 B=1 warm, all programs
     python tests/bench_tex.py --full                 # Full: all resolutions x batches x cache modes
     python tests/bench_tex.py --save baseline.json   # Save results
     python tests/bench_tex.py --compare baseline.json # Compare against baseline
@@ -378,6 +378,11 @@ def generate_bindings(prog: BenchmarkProgram, B: int, H: int, W: int,
     if prog.needs_mask:
         bindings["mask"] = torch.rand(B, H, W, dtype=torch.float32, device=device)
 
+    # A program that reads no image wire would otherwise cook on a 1x1 grid, so
+    # give it a spatial carrier to make the reported NxN resolution real.
+    if not prog.string_only and not any(isinstance(v, torch.Tensor) for v in bindings.values()):
+        bindings["ref"] = torch.rand(B, H, W, 4, dtype=torch.float32, device=device)
+
     # Add param defaults as bindings
     for pname, pval in prog.param_defaults.items():
         bindings[pname] = pval
@@ -505,10 +510,6 @@ def measure_program(prog: BenchmarkProgram, B: int, H: int, W: int,
         while num_runs < MAX_RUNS:
             gc.collect()
 
-            # Track memory
-            tracemalloc.start()
-            mem_before = tracemalloc.get_traced_memory()[1]
-
             t_total_start = time.perf_counter()
 
             # Compile phase
@@ -531,9 +532,6 @@ def measure_program(prog: BenchmarkProgram, B: int, H: int, W: int,
 
             interp_times.append((t_interp_end - t_interp_start) * 1000)
             total_times.append((t_total_end - t_total_start) * 1000)
-
-            mem_peak = tracemalloc.get_traced_memory()[1]
-            tracemalloc.stop()
 
             num_runs += 1
 
@@ -560,7 +558,18 @@ def measure_program(prog: BenchmarkProgram, B: int, H: int, W: int,
         p5 = _percentile(total_times, 5)
         p95 = _percentile(total_times, 95)
 
-        # Memory: rough estimate from last run's tracemalloc
+        # Memory: one extra untimed run under tracemalloc (it slows everything it
+        # traces, so it never sits inside the timed region). Python objects only.
+        gc.collect()
+        tracemalloc.start()
+        try:
+            mem_before = tracemalloc.get_traced_memory()[1]
+            if cache_mode == "cold":
+                compile_program(prog.code, binding_types)
+            run_interpreter(program, bindings, type_map, device, output_names, precision, used_builtins)
+            mem_peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
         mem_delta_mb = max(0, (mem_peak - mem_before)) / (1024 * 1024)
 
         return BenchResult(
@@ -708,7 +717,7 @@ def save_results(results: list[BenchResult], path: str):
 def main():
     parser = argparse.ArgumentParser(description="TEX Benchmark Suite")
     parser.add_argument("--quick", action="store_true",
-                        help="Quick mode: 512x512 B=1 warm, synthetic only")
+                        help="Quick mode: 512x512 B=1 warm (combine with --synthetic-only for fewer programs)")
     parser.add_argument("--full", action="store_true",
                         help="Full mode: all resolutions x batches x cache modes")
     parser.add_argument("--resolution", type=int, default=None,

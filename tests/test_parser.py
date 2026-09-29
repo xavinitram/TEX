@@ -14,7 +14,7 @@ def test_parser(r: SubTestResult):
         assert prog.statements[0].__class__.__name__ == "VarDecl"
         r.ok("var declaration")
     except Exception as e:
-        r.fail("var declaration", str(e))
+        r.fail("var declaration", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Assignment to @OUT
     try:
@@ -23,7 +23,7 @@ def test_parser(r: SubTestResult):
         assert prog.statements[0].__class__.__name__ == "Assignment"
         r.ok("@OUT assignment")
     except Exception as e:
-        r.fail("@OUT assignment", str(e))
+        r.fail("@OUT assignment", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # If/else
     try:
@@ -32,7 +32,7 @@ def test_parser(r: SubTestResult):
         assert prog.statements[0].__class__.__name__ == "IfElse"
         r.ok("if/else")
     except Exception as e:
-        r.fail("if/else", str(e))
+        r.fail("if/else", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Operator precedence: a + b * c should parse as a + (b * c)
     try:
@@ -45,7 +45,7 @@ def test_parser(r: SubTestResult):
         assert init.right.op == "*"
         r.ok("operator precedence")
     except Exception as e:
-        r.fail("operator precedence", str(e))
+        r.fail("operator precedence", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Ternary operator
     try:
@@ -55,7 +55,7 @@ def test_parser(r: SubTestResult):
         assert init.__class__.__name__ == "TernaryOp"
         r.ok("ternary operator")
     except Exception as e:
-        r.fail("ternary operator", str(e))
+        r.fail("ternary operator", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Vector constructor
     try:
@@ -67,7 +67,7 @@ def test_parser(r: SubTestResult):
         assert len(init.args) == 4
         r.ok("vec4 constructor")
     except Exception as e:
-        r.fail("vec4 constructor", str(e))
+        r.fail("vec4 constructor", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # vec3 constructor
     try:
@@ -78,7 +78,7 @@ def test_parser(r: SubTestResult):
         assert init.size == 3
         r.ok("vec3 constructor")
     except Exception as e:
-        r.fail("vec3 constructor", str(e))
+        r.fail("vec3 constructor", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Channel access — DATA-6: the lexer hands the parser ONE token `A.r`, so the raw parse is a
     # dotted BindingRef; the front end (`parse_and_split`, the splitback against the binding
@@ -96,7 +96,7 @@ def test_parser(r: SubTestResult):
         assert pre.__class__.__name__ == "ChannelAccess" and pre.channels == "r"
         r.ok("channel access")
     except Exception as e:
-        r.fail("channel access", str(e))
+        r.fail("channel access", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Function call
     try:
@@ -108,7 +108,7 @@ def test_parser(r: SubTestResult):
         assert len(init.args) == 3
         r.ok("function call")
     except Exception as e:
-        r.fail("function call", str(e))
+        r.fail("function call", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Cast expression
     try:
@@ -118,7 +118,7 @@ def test_parser(r: SubTestResult):
         assert init.__class__.__name__ == "CastExpr"
         r.ok("cast expression")
     except Exception as e:
-        r.fail("cast expression", str(e))
+        r.fail("cast expression", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Parse error: missing semicolon
     try:
@@ -128,7 +128,7 @@ def test_parser(r: SubTestResult):
     except ParseError:
         r.ok("missing semicolon error")
     except Exception as e:
-        r.fail("missing semicolon error", str(e))
+        r.fail("missing semicolon error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Nested expressions (through the front end: `@A.r` inside the call is a swizzle of @A)
     try:
@@ -138,7 +138,7 @@ def test_parser(r: SubTestResult):
         assert inner.__class__.__name__ == "ChannelAccess" and inner.object.name == "A", inner
         r.ok("nested expressions")
     except Exception as e:
-        r.fail("nested expressions", str(e))
+        r.fail("nested expressions", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 def test_parser_v11(r: SubTestResult):
@@ -152,7 +152,7 @@ def test_parser_v11(r: SubTestResult):
         assert prog.statements[0].__class__.__name__ == "ForLoop"
         r.ok("parse for loop")
     except Exception as e:
-        r.fail("parse for loop", str(e))
+        r.fail("parse for loop", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Compound assignment parsing
     try:
@@ -164,7 +164,7 @@ def test_parser_v11(r: SubTestResult):
         assert stmt.value.op == "+"
         r.ok("parse +=")
     except Exception as e:
-        r.fail("parse +=", str(e))
+        r.fail("parse +=", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Increment parsing
     try:
@@ -176,7 +176,7 @@ def test_parser_v11(r: SubTestResult):
         assert stmt.value.op == "+"
         r.ok("parse x++")
     except Exception as e:
-        r.fail("parse x++", str(e))
+        r.fail("parse x++", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # Decrement parsing
     try:
@@ -187,7 +187,7 @@ def test_parser_v11(r: SubTestResult):
         assert stmt.value.op == "-"
         r.ok("parse x--")
     except Exception as e:
-        r.fail("parse x--", str(e))
+        r.fail("parse x--", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     # For loop with compound update
     try:
@@ -198,7 +198,7 @@ def test_parser_v11(r: SubTestResult):
         assert loop.update.__class__.__name__ == "Assignment"
         r.ok("parse for with += update")
     except Exception as e:
-        r.fail("parse for with += update", str(e))
+        r.fail("parse for with += update", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 def test_parser_lvalue_clone(r: SubTestResult):

@@ -225,8 +225,9 @@ def test_cacheseam46_budget_status_query(r: SubTestResult):
 
 def test_cacheseam46_thread_stress(r: SubTestResult):
     """FIX-CACHE/K1 regression, adapted from the B3 audit's scratchpad stress scripts
-    (`cacheseam46_thread_stress*.py`). Fixed thread counts and a fixed seed: this is a
-    regression test, not a fuzzer, so a red must reproduce deterministically.
+    (`cacheseam46_thread_stress*.py`). Fixed thread counts and a fixed seed fix each
+    worker's op sequence; the interleaving of the threads is scheduler-dependent, so a red
+    may be intermittent.
 
     Several "cook" threads hammer put/evict_oldest/touch/delete on ONE budget-tracked
     cache (`_grid_buf`/`_grid_buf_budget`) while a "clearer" thread concurrently calls

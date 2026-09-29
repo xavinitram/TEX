@@ -12,7 +12,7 @@ from helpers import SubTestResult
 
 _PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # TEX_Wrangle/
 _BANNED = re.compile(r"\bimport\s+numpy\b|\bfrom\s+numpy\b|\.numpy\s*\(")
-_SKIP_DIRS = ("__pycache__", "editor_build", "node_modules", ".git")
+_SKIP_DIRS = ("__pycache__", "editor_build", "node_modules", ".git", "venv", ".venv", ".tox")
 _SELF = os.path.basename(__file__)
 
 
@@ -25,7 +25,7 @@ def _code_only(line: str) -> str:
 
 def test_no_numpy_ban(r: SubTestResult):
     print("\n--- LNT-1: numpy-ban lint ---")
-    hits = []
+    hits, unreadable = [], []
     for root, dirs, files in os.walk(_PKG):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for fn in files:
@@ -38,9 +38,12 @@ def test_no_numpy_ban(r: SubTestResult):
                         if _BANNED.search(_code_only(line)):
                             rel = os.path.relpath(path, _PKG)
                             hits.append(f"{rel}:{i}: {line.strip()}")
-            except (OSError, UnicodeDecodeError):
-                continue
-    if hits:
+            except (OSError, UnicodeDecodeError) as e:
+                unreadable.append(f"{os.path.relpath(path, _PKG)}: {type(e).__name__}")
+    if unreadable:
+        r.fail("numpy-ban lint", "could not scan (a file the lint cannot read is a file it "
+               "cannot clear):\n  " + "\n  ".join(unreadable[:20]))
+    elif hits:
         r.fail("numpy-ban lint", "numpy usage found (CI has no numpy):\n  " +
                "\n  ".join(hits[:20]))
     else:

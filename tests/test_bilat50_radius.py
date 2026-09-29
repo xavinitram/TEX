@@ -6,17 +6,22 @@ shape as the `erode`/`dilate` 256 clamp.
 The fix (D3 RECORDED, `stdlib_sample.py`'s `fn_bilateral_filter`): no clamp. At or below
 today's original window (radius<=3, i.e. spatial_sigma<=1.0) the ORIGINAL math runs
 untouched -- bit-identical, by construction (the code is the same code). Above it and up to
-`_BILATERAL_EXACT_RADIUS_MAX`, the SAME exact weighted-average math runs, row-tiled to keep
-peak memory bounded independent of resolution (`_bilateral_exact_bchw`). Past that measured
-limit, a downscale + detail-transfer approximation runs instead (`_bilateral_detail_transfer_
-bchw`) -- O(image size), independent of spatial_sigma.
+`_BILATERAL_EXACT_RADIUS_MAX`, the SAME exact weighted-average math runs, bounded in memory
+independent of resolution. Past that measured limit, the separable pass and then a downscale
++ detail-transfer approximation (`_bilateral_detail_transfer_bchw`, O(image size),
+independent of spatial_sigma) run instead.
 
-The footprint moved from a fixed `('halo', 3)` to `('halo_arg', 1, 8.0)` (invariant #5): the
-window's true reach now grows with `spatial_sigma`, so a windowed/tiled cook must widen its
-halo to match, or ROI narrowing would starve the filter of context it actually reads.
+The footprint moved from a fixed `('halo', 3)` to `('halo_arg', 1, 3.0, threshold)` (invariant
+#5): the window's true reach now grows with `spatial_sigma`, so a windowed/tiled cook must
+widen its halo to match, or ROI narrowing would starve the filter of context it actually
+reads. The tiers since then: radius <= 3 the untiled exact pass, radius <= 40 the tap-loop
+exact pass, radius <= 96 separable, then the detail-transfer approximation; the row-tiled
+`_bilateral_exact_bchw` is reachable only at radius <= 3 and is called directly where a row
+needs its tiling.
 """
 import math
 from helpers import *
+from helpers import windowed_vs_whole
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib  # populates REGISTRY
 from TEX_Wrangle.tex_runtime.stdlib_core import _get_bchw
 from TEX_Wrangle.tex_runtime import stdlib_registry as R
@@ -168,12 +173,15 @@ def test_bilat50_bit_identical_at_or_below_today_window(r: SubTestResult):
 def test_bilat50_tiling_does_not_change_the_exact_math(r: SubTestResult):
     print("\n--- BILAT-50: row-tiling the exact filter never changes any pixel's own value ---")
     img = make_img(1, 37, 41, 3)  # deliberately non-square, non-power-of-2
+    bchw = _get_bchw(img)
+    # radius 12 is served by the tap-loop tier through fn_bilateral_filter, which never
+    # reads the tile budget -- so the row-tiled implementation is called directly.
     orig_budget = TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS
     try:
         TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS = 40          # forces many tiny tiles
-        many_tiles = TEXStdlib.fn_bilateral_filter(img.clone(), 4.0, 0.2)
+        many_tiles = TEXStdlib._bilateral_exact_bchw(bchw.clone(), 4.0, 0.2, 12)
         TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS = 50_000_000  # forces a single tile
-        one_tile = TEXStdlib.fn_bilateral_filter(img.clone(), 4.0, 0.2)
+        one_tile = TEXStdlib._bilateral_exact_bchw(bchw.clone(), 4.0, 0.2, 12)
     finally:
         TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS = orig_budget
     if torch.equal(many_tiles, one_tile):
@@ -241,7 +249,12 @@ def test_bilat50_exact_tier_memory_grows_with_radius_then_stops(r: SubTestResult
         # untiled shape needing ~60GB at a slightly larger radius on a SMALLER canvas.
         # Tiling must keep the actually-observed peak far below that naive figure.
         peak["numel"] = 0
-        TEXStdlib.fn_bilateral_filter(img.clone(), 8.0, 0.2)
+        # The dispatch sends this radius to the tap-loop tier, which never unfolds; the
+        # row-tiled exact pass is the one whose unfold this row bounds, so call it directly.
+        TEXStdlib._bilateral_exact_bchw(_get_bchw(img), 8.0, 0.2, 24)
+        if peak["numel"] == 0:
+            r.fail("exact-tier tiling", "the spy saw no unfold -- the row measures nothing")
+            return
         naive_untiled = 200 * 200 * 3 * 49 * 49
         if peak["numel"] >= naive_untiled // 4:
             r.fail("exact-tier tiling", f"peak unfold output {peak['numel']} is not far "
@@ -385,15 +398,7 @@ def test_bilat50_a4_footprint_does_not_overpad_the_unchanged_regime(r: SubTestRe
 # ── 7. Windowed-vs-whole-frame pixel identity ────────────────────────────────────────────────
 
 def _windowed_vs_whole(code, params, image, roi):
-    x0, y0, w, h, W, H = roi
-    _R.clear_roi_memo()
-    full = tex_engine.cook(code, dict(params, A=image.clone()), device_mode="cpu").outputs["OUT"]
-    _R.clear_roi_memo()
-    res = tex_engine.cook(code, dict(params, A=image.clone()), device_mode="cpu",
-                           roi=roi, roi_exec=True)
-    win = res.outputs["OUT"]
-    crop = full[:, y0:y0 + h, x0:x0 + w]
-    return res.cooked_roi, win, crop
+    return windowed_vs_whole(code, image, roi, params=params)
 
 
 def test_bilat50_windowed_vs_whole_frame_exact_tier(r: SubTestResult):
@@ -499,18 +504,19 @@ def test_bilat50_a5_exact_bchw_matches_inline_and_degenerates_to_one_tile(r: Sub
         if radius > 3:
             r.fail("a5 precondition", f"ss={ss} gave radius={radius} > 3 -- wrong test row")
             return
-        via_fn = TEXStdlib.fn_bilateral_filter(img.clone(), ss, sr)  # today's inline branch
+        via_fn = _old_clamped_bilateral(img.clone(), ss, sr)  # the original inline math
         direct = TEXStdlib._bilateral_exact_bchw(bchw.clone(), ss, sr, radius).permute(0, 2, 3, 1)
         if not torch.equal(via_fn, direct):
-            r.fail(f"a5 bit-identity ss={ss}", "fn_bilateral_filter's inline regime-1 output "
-                   "is not torch.equal to _bilateral_exact_bchw at the same radius")
+            r.fail(f"a5 bit-identity ss={ss}", "the original inline math is not torch.equal "
+                   "to _bilateral_exact_bchw at the same radius")
             return
         # Cost-equality (structural, not wall-clock): at this radius, ksize=2*radius+1 is
         # tiny, so `_BILATERAL_TILE_BUDGET_ELEMS` (~8M) covers the whole image in one tile
         # -- `_bilateral_exact_bchw` degenerates to a single untiled pass, the same shape
         # the inline branch always was.
-        H = bchw.shape[-2]
-        tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, bchw.shape[-1] * (2 * radius + 1) ** 2))
+        B_, C_, H, W_ = bchw.shape
+        tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS
+                     // max(1, B_ * C_ * W_ * (2 * radius + 1) ** 2))
         if tile_h < H:
             r.fail(f"a5 cost-equality ss={ss}", f"tile_h={tile_h} < H={H} -- would tile, not "
                    "degenerate to one pass")

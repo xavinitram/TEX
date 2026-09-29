@@ -38,7 +38,7 @@ from helpers import SubTestResult
 # exactly the drift this file's own docstring says the generator lacked one layer up
 # ("nothing checked the generator against the source it harvests codes FROM"); a second,
 # separately-maintained copy here would recreate that same bug class one level down.
-from test_simp6_error_codes import _NOT_PRODUCT, _product_files  # noqa: F401 (re-used below)
+from test_simp6_error_codes import _product_files
 
 _PKG = Path(__file__).resolve().parent.parent
 
