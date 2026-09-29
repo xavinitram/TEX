@@ -59,6 +59,9 @@ def test_q2_purity_dce(r: SubTestResult):
     try:
         img = make_img(1, 8, 8, 3)
         code = "float m = sin(u*10.0); float n = sin(u*10.0); @OUT = vec4(@A * (m + n), 1.0);"
+        _i, _c = run_both(code, {"A": img})
+        assert _c is not None, "codegen declined the Q-2 program"
+        assert all(_i[k].shape == _c[k].shape for k in _i), "tier output shapes differ"
         assert_equiv(r, "Q-2 dedup bit-exact", code, {"A": img})
     except Exception as e:
         r.fail("Q-2 dedup bit-exact", str(e))
@@ -113,6 +116,9 @@ def test_uc4_const_prop(r: SubTestResult):
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         img = make_img(1, 4, 4, 3)
         # bit-exact vs interpreter after optimize (correctness under reassignment)
+        _i, _c = run_both(code, {"A": img})
+        assert _c is not None, "codegen declined the UC-4 program"
+        assert all(_i[k].shape == _c[k].shape for k in _i), "tier output shapes differ"
         assert_equiv(r, "UC-4 reassigned-local bit-exact", code, {"A": img})
     except Exception as e:
         r.fail("UC-4 reassigned-local bit-exact", str(e))

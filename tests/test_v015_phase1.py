@@ -85,12 +85,17 @@ def test_pc3_codegen_persistence(r: SubTestResult):
     # A stale-version sidecar must be rejected (deleted, returns None).
     try:
         import pickle
+        from TEX_Wrangle import tex_recovery
         cache._codegen_memory.pop(fp, None)
         with open(cache._cg_path(fp), "rb") as f:
             good = pickle.load(f)
         bad = dict(good); bad["version"] = "STALE_VERSION"
-        with open(cache._cg_path(fp), "wb") as f:
-            pickle.dump(bad, f)
+        # Both files are MAC-signed, so only the version differs: an unsigned file would
+        # be rejected by the trailer check and never reach the version comparison.
+        assert tex_recovery.sign_pickle(cache._cg_path(fp), good)
+        assert cache.get_codegen_fn(fp) is not None, "signed current-version sidecar rejected"
+        cache._codegen_memory.pop(fp, None)
+        assert tex_recovery.sign_pickle(cache._cg_path(fp), bad)
         got = cache.get_codegen_fn(fp)  # must reject + delete
         assert got is None, "stale-version sidecar was not rejected"
         assert not cache._cg_path(fp).exists(), "stale sidecar not deleted"
