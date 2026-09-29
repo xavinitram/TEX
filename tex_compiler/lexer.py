@@ -590,7 +590,7 @@ def offer_tokens(source: str, tokens: "list[Token]", *, dotted_bindings: bool) -
     try:
         _TOKEN_HANDOFF.move_to_end(key)
         while len(_TOKEN_HANDOFF) > _TOKEN_HANDOFF_MAX:
-            _TOKEN_HANDOFF.popitem(last=False)          # LRU, matching every memo in the engine
+            _TOKEN_HANDOFF.popitem(last=False)          # the oldest unclaimed offer goes
     except KeyError:
         pass                    # lost a race to a concurrent evict; a missed offer costs a lex
 
