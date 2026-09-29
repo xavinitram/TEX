@@ -134,7 +134,8 @@ def test_spill45_races_get_and_put(r):
     ordinary `get`/`put` traffic on the SAME keys exactly as `test_v033_cache8.py`'s own race
     test does for `touch`/`in`. Checked once every thread has stopped: nothing raised or hung,
     every hit was bit-exact for its own key, the per-device byte buckets agree with a fresh
-    recount, and the drain queue is empty (nothing left half-written)."""
+    recount, the drain queue is empty (nothing left half-written), and after the drain every
+    key still reads back bit-exact (a spill that silently dropped an entry would not)."""
     print("\n--- SPILL-45: spill() raced against get/put ---")
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -191,18 +192,29 @@ def test_spill45_races_get_and_put(r):
                 t.join(timeout=30.0)
             hung = [t.name for t in threads if t.is_alive()]
 
+            c._drain_spills()                  # settle any write still queued by the storm
             recount, buckets = _recount(c)
             with c._lock:
                 idle = len(c._pending_spills)
 
+            # No LOST data: every key was put, so every key must still be servable (from RAM
+            # or restored from disk) and bit-exact; a spill that dropped a resident entry
+            # without a file behind it reads back as None here.
+            lost = []
+            for k, f in zip(keys, frames):
+                got = c.get(k)
+                if got is None or not torch.equal(got, f):
+                    lost.append(k)
+
             progressed = all(n[k] > 0 for k in ("put", "get", "spill"))
             ok = (not errors and not hung and progressed and n["wrong"] == 0
-                  and recount == buckets and idle == 0)
+                  and recount == buckets and idle == 0 and not lost)
             r.ok(f"spill/get/put raced: {n['spill']} spills, {n['get']} gets, "
                  f"{n['put']} puts, no corruption") if ok else \
                 r.fail("SPILL-45 race",
                        f"errors={errors} hung={hung} progressed={progressed} "
-                       f"wrong={n['wrong']} recount={recount} buckets={buckets} idle={idle}")
+                       f"wrong={n['wrong']} recount={recount} buckets={buckets} idle={idle} "
+                       f"lost={lost}")
     except Exception as e:
         r.fail("SPILL-45 race (setup)", f"{type(e).__name__}: {e}")
 
