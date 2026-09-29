@@ -1313,8 +1313,9 @@ class ResultCache(_ResultCacheResidency):
     # ── introspection / lifecycle ──
     def sweep_temps(self) -> int:
         """Drop crash-orphaned `tex_recovery` temps from the spill dir. Called from
-        `reindex_disk` (i.e. on ENG-13 recovery), which is exactly when a previous
-        process's leftovers are known to be dead."""
+        `reindex_disk` (i.e. on ENG-13 recovery), when a previous process's leftovers are
+        expected. Which temps count as orphaned is `tex_recovery.sweep_temps`'s call; a
+        writer that is still live may own a recent one."""
         from .tex_recovery import sweep_temps as _sweep
         try:
             return _sweep(self._spill_dir())
@@ -1333,7 +1334,7 @@ class ResultCache(_ResultCacheResidency):
         # The directory walk runs OUTSIDE the lock (see the rule on __init__): it is pure
         # filesystem work over a dir this cache owns, and on a multi-GB spill tier it would
         # otherwise block every `get` and `put` for the length of a scandir.
-        self.sweep_temps()              # a crashed writer's leftovers are dead by definition
+        self.sweep_temps()              # clear a crashed writer's leftover temps
         # A3: the two facts that decide whether the scan's answer may be trusted as COMPLETE.
         # Read before the walk, compared after it.
         with self._lock:
