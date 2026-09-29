@@ -1521,7 +1521,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit(f"if isinstance({arr}, list):")
         self._indent += 1
         self._emit(f"_al = list({arr})")
-        self._emit(f"_al[max(0, min(int(round({idx}.item() if _torch.is_tensor({idx}) else float({idx}))), len(_al) - 1))] = {value_expr} if isinstance({value_expr}, str) else str({value_expr})")
+        # floor+clamp, NaN -> 0: the read's rule (interpreter_values._list_index)
+        self._emit(f"_iw = float({idx}.item() if _torch.is_tensor({idx}) else {idx})")
+        self._emit(f"_al[0 if not _iw >= 0.0 else (max(len(_al) - 1, 0) if _iw >= len(_al) else int(_math.floor(_iw)))] = {value_expr} if isinstance({value_expr}, str) else str({value_expr})")
         if isinstance(target.array, Identifier):
             self._emit(f"{self._var_target(target.array.name)} = _al")
         self._indent -= 1

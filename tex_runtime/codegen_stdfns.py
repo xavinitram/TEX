@@ -9,7 +9,10 @@ handlers they register); `codegen.py` imports the registry to build `_fn_dispatc
 """
 import math
 
+import torch
+
 from ..tex_compiler.ast_nodes import BindingRef, FunctionCall, NumberLiteral
+from .stdlib_core import ZERO_GUARD_EPS
 
 
 _IMG_REDUCE_OPS = {
@@ -23,6 +26,13 @@ def _num_src(value) -> str:
     since a bare `inf`/`nan` is an undefined name in the generated module."""
     v = float(value)
     return repr(v) if math.isfinite(v) else f"float({repr(v)!r})"
+
+
+def _eps_src(x: str) -> str:
+    """Source for the interpreter's epsilon guard of `x`'s dtype (`stdlib_math._eps`):
+    `_SAFE_EPS`, or the fp16-representable one where 1e-8 would round to 0."""
+    fp16 = ZERO_GUARD_EPS[torch.float16]
+    return f"({fp16!r} if getattr({x}, 'dtype', None) is _torch.float16 else _SAFE_EPS)"
 
 
 _EMIT_DISPATCH: dict[str, str] = {}  # STR-6: stdlib name -> _CodeGen handler attr
@@ -121,11 +131,11 @@ class _EmitStdFnsMixin:
         if name == "sqrt":
             self._emit(f"{tmp} = _torch.sqrt(_torch.clamp({args[0]}, min=0.0))")
         elif name == "log":
-            self._emit(f"{tmp} = _torch.log(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            self._emit(f"{tmp} = _torch.log(_torch.clamp({args[0]}, min={_eps_src(args[0])}))")
         elif name == "log2":
-            self._emit(f"{tmp} = _torch.log2(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            self._emit(f"{tmp} = _torch.log2(_torch.clamp({args[0]}, min={_eps_src(args[0])}))")
         elif name == "log10":
-            self._emit(f"{tmp} = _torch.log10(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            self._emit(f"{tmp} = _torch.log10(_torch.clamp({args[0]}, min={_eps_src(args[0])}))")
         elif name == "fract":
             self._emit(f"{tmp} = {args[0]} - _torch.floor({args[0]})")
         elif name == "isnan":
@@ -170,7 +180,7 @@ class _EmitStdFnsMixin:
         elif name == "distance" and len(args) == 2:
             self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]} - {args[1]}, dim=-1)")
         elif name == "normalize" and len(args) == 1:
-            self._emit(f"{tmp} = {args[0]} / (_torch.linalg.vector_norm({args[0]}, dim=-1, keepdim=True) + _SAFE_EPS)")
+            self._emit(f"{tmp} = {args[0]} / (_torch.linalg.vector_norm({args[0]}, dim=-1, keepdim=True) + {_eps_src(args[0])})")
         elif name == "length" and len(args) == 1:
             self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]}, dim=-1)")
         elif name == "cross" and len(args) == 2:
@@ -211,13 +221,13 @@ class _EmitStdFnsMixin:
                          else args[0])
             self._emit(f"{tmp} = ({args[1]} >= {threshold}).float()")
         elif name == "smoothstep" and len(args) == 3:
-            num, den = self._emit_bp(f"{args[2]} - {args[0]}", f"{args[1]} - {args[0]} + _SAFE_EPS")
+            num, den = self._emit_bp(f"{args[2]} - {args[0]}", f"{args[1]} - {args[0]} + {_eps_src(args[2])}")
             tt = self._tmp()
             self._emit(f"{tt} = _torch.clamp({num} / {den}, 0.0, 1.0)")
             self._emit(f"{tmp} = {tt} * {tt} * (3.0 - 2.0 * {tt})")
         elif name == "fit" and len(args) == 5:
             tt = self._tmp()
-            self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + _SAFE_EPS)")
+            self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + {_eps_src(args[0])})")
             # fused lerp (interp fn_fit uses _lerp_f32(n_min, n_max, t)) — see _cg_lerp
             self._emit(f"{tmp} = _lerp({args[3]}, {args[4]}, {tt})")
         else:
@@ -243,11 +253,12 @@ class _EmitStdFnsMixin:
             at = self._tmp()
             self._emit(f"{at} = _torch.abs({args[0]})")
             mask = self._tmp()
-            self._emit(f"{mask} = {at} < _SAFE_EPS")
-            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), _torch.sign({args[0]}) * _torch.pow(_torch.clamp({at}, min=_SAFE_EPS), {args[1]}))")
+            eps = _eps_src(args[0])
+            self._emit(f"{mask} = {at} < {eps}")
+            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), _torch.sign({args[0]}) * _torch.pow(_torch.clamp({at}, min={eps}), {args[1]}))")
         elif name == "sdiv" and len(args) == 2:
             mask = self._tmp()
-            self._emit(f"{mask} = _torch.abs({args[1]}) < _SAFE_EPS")
+            self._emit(f"{mask} = _torch.abs({args[1]}) < {_eps_src(args[1])}")
             self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), {args[0]} / _tw({mask}, _torch.ones_like({args[1]}), {args[1]}))")
         elif name == "smin" and len(args) == 3:
             h = self._tmp()
