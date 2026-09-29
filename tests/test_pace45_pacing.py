@@ -160,7 +160,8 @@ class _StatementTripToken:
     `on_progress=self.on_progress` to `tex_engine.cook`. This still exercises the real
     regression this ask answers: the trip is observed by `paced_check`'s `token.check()` at
     the NEXT poll point after it fires, exactly the yield-point mechanism under test -- it
-    is only the ARMING that is now deterministic, not the poll/raise path."""
+    is only the ARMING that is now deterministic, not the poll/raise path. Because the unpaced
+    statement loop polls too, a row using this token cannot distinguish paced from unpaced."""
     def __init__(self, trip_after: int, pace: bool = True):
         self.pace = pace
         self._trip_after = trip_after
@@ -216,21 +217,20 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
     else:
         r.fail("PACE-45 CUDA bit-exactness", f"maxdiff {md}")
 
-    # -- The repro itself: a token armed for pacing, tripped after a quarter of the
-    #    statements have DISPATCHED (PACE-462: `_StatementTripToken` -- deterministic,
-    #    immune to the wall-clock/GPU-clock variance a `threading.Timer` calibrated against
-    #    a separately-measured `full` turned out to have on this box; see its docstring),
-    #    must raise well before the whole program finishes. At v0.45.1 this never raised at
-    #    all (the whole queue -- 64 statements at 8K there -- was already launched in
-    #    ~15ms, long before a mid-cook trip had anything left to reach).
+    # -- A paced cook is cancellable: a token armed for pacing, tripped after a quarter of
+    #    the statements have DISPATCHED (`_StatementTripToken` -- deterministic, immune to
+    #    the wall-clock/GPU-clock variance a `threading.Timer` had), must raise before the
+    #    whole program finishes. This is a smoke row, not the regression detector: the
+    #    same-thread trip is also observed by the unpaced statement loop, so only
+    #    `test_pace45_cuda_repro_latency` (a trip landing while the host is parked in a
+    #    wait) can tell paced from unpaced.
     tok = _StatementTripToken(trip_after=_N_STATEMENTS // 4, pace=True)
     t0 = time.perf_counter()
     try:
         tex_engine.cook(_PROGRAM, _pace45_bindings(920), device_mode="cuda", cancel=tok,
                         on_progress=tok.on_progress)
-        r.fail("PACE-45 repro", f"cook completed without raising (full={full * 1000:.0f}ms, "
-               f"trip after statement {tok._trip_after}/{_N_STATEMENTS}) -- the regression "
-               f"is back")
+        r.fail("PACE-45 paced cancel", f"cook completed without raising (full="
+               f"{full * 1000:.0f}ms, trip after statement {tok._trip_after}/{_N_STATEMENTS})")
         return
     except CookCancelled:
         elapsed = time.perf_counter() - t0
@@ -241,7 +241,7 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
              f"{full * 1000:.0f}ms uncancelled runtime (tripped after statement "
              f"{tok._trip_after}/{_N_STATEMENTS})")
     else:
-        r.fail("PACE-45 repro", f"raised, but only after {elapsed * 1000:.0f}ms -- not before "
+        r.fail("PACE-45 paced cancel", f"raised, but only after {elapsed * 1000:.0f}ms -- not before "
                f"the {full * 1000:.0f}ms uncancelled runtime")
 
 

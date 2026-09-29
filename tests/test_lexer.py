@@ -53,7 +53,7 @@ def test_lexer(r: SubTestResult):
     try:
         tokens = Lexer("a == b && c != d || e >= f").tokenize()
         ops = [t.type for t in tokens if t.type in (TokenType.EQ, TokenType.AND, TokenType.NEQ, TokenType.OR, TokenType.GTE)]
-        assert len(ops) == 5
+        assert ops == [TokenType.EQ, TokenType.AND, TokenType.NEQ, TokenType.OR, TokenType.GTE], ops
         r.ok("compound operators")
     except Exception as e:
         r.fail("compound operators", str(e))
@@ -61,8 +61,12 @@ def test_lexer(r: SubTestResult):
     # Numbers
     try:
         tokens = Lexer("42 3.14 0xFF .5 1e3").tokenize()
-        num_tokens = [t for t in tokens if t.type in (TokenType.INT_LIT, TokenType.FLOAT_LIT)]
-        assert len(num_tokens) == 5, f"Got {len(num_tokens)}: {num_tokens}"
+        num_tokens = [(t.type, t.value) for t in tokens
+                      if t.type in (TokenType.INT_LIT, TokenType.FLOAT_LIT)]
+        assert num_tokens == [(TokenType.INT_LIT, "42"), (TokenType.FLOAT_LIT, "3.14"),
+                              (TokenType.INT_LIT, "0xFF"), (TokenType.FLOAT_LIT, ".5"),
+                              (TokenType.FLOAT_LIT, "1e3")], num_tokens
+        assert not [t for t in tokens if t.type == TokenType.IDENT], "a literal was split"
         r.ok("number literals")
     except Exception as e:
         r.fail("number literals", str(e))

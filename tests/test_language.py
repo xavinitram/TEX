@@ -120,7 +120,7 @@ def test_output_types(r: SubTestResult):
         raw = torch.rand(1, 4, 4, 3) * 2.0  # values up to 2.0
         result = _prepare_output(raw, "IMAGE")
         assert result.shape == (1, 4, 4, 3)
-        assert result.max() <= 1.0
+        assert torch.allclose(result, raw.clamp(0, 1), atol=1e-6)
         r.ok("output: IMAGE from vec3")
     except Exception as e:
         r.fail("output: IMAGE from vec3", f"{e}\n{traceback.format_exc()}")
@@ -299,7 +299,7 @@ def test_if_without_else(r: SubTestResult):
         code = "@OUT = @A;\nif (u > 0.5) {\n    @OUT = vec3(1.0, 0.0, 0.0);\n}"
         result = compile_and_run(code, {"A": test_img})
         # Left half should match @A
-        assert torch.allclose(result[0, :, 0, :], test_img[0, :, 0, :], atol=0.1)
+        assert torch.allclose(result[0, :, 0, :], test_img[0, :, 0, :], atol=1e-5)
         # Right half should be red
         assert result[0, 0, W - 1, 0].item() > 0.9
         assert result[0, 0, W - 1, 1].item() < 0.1
@@ -559,6 +559,9 @@ def test_ternary_exhaustive(r: SubTestResult):
             float x = u > 0.5 ? u : v;
             @OUT = vec4(x);
         """, {"A": img})
+        xs = torch.linspace(0, 1, 4).view(1, 1, 4).expand(1, 4, 4)
+        ys = torch.linspace(0, 1, 4).view(1, 4, 1).expand(1, 4, 4)
+        assert torch.allclose(result[..., 0], torch.where(xs > 0.5, xs, ys), atol=1e-5)
         r.ok("ternary: in variable declaration with u/v")
     except Exception as e:
         r.fail("ternary: in variable declaration with u/v", str(e))
@@ -663,6 +666,9 @@ def test_ternary_exhaustive(r: SubTestResult):
         result = compile_and_run("""
             @OUT = u > 0.5 ? @A : vec4(0.0);
         """, {"A": img})
+        xs = torch.linspace(0, 1, 4).view(1, 1, 4, 1).expand(1, 4, 4, 4)
+        assert torch.allclose(result, torch.where(xs > 0.5, img, torch.zeros_like(img)),
+                              atol=1e-5)
         r.ok("ternary: with binding access")
     except Exception as e:
         r.fail("ternary: with binding access", str(e))
@@ -760,7 +766,18 @@ def test_scope_and_shadowing(r: SubTestResult):
         """, {"A": img})
         v = result[0, 0, 0, 0].item()
         assert abs(v - 10.0) < 1e-5, f"Expected 10.0, got {v}"
-        r.ok("scope: while loop inner not leaked")
+        try:
+            compile_and_run("""
+                int count = 0;
+                while (count < 3) {
+                    float inner = 1.0;
+                    count++;
+                }
+                @OUT = vec4(inner);
+            """, {"A": img})
+            r.fail("scope: while loop inner not leaked", "inner is readable after the loop")
+        except (TypeCheckError, TEXMultiError):
+            r.ok("scope: while loop inner not leaked")
     except Exception as e:
         r.fail("scope: while loop inner not leaked", str(e))
 

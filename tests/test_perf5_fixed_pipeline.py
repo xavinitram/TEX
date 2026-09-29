@@ -143,8 +143,9 @@ def test_perf5_fingerprint_and_param_only_names_are_byte_stable(r: SubTestResult
 def test_perf5_the_golden_catches_a_one_character_recipe_change(r: SubTestResult):
     """MUTATION, both halves of the recipe.
 
-    (a) The DIGEST: the same recipe with one character changed — the length prefix written
-        big-endian instead of little — must disagree with the golden.
+    (a) The DIGEST: the SHIPPED `fingerprint` with one character changed — the length prefix
+        written big-endian instead of little, via a hasher shim patched over
+        `tex_cache.hashlib` — must disagree with the golden.
     (b) The PARAM DROP: `fingerprint` excludes param-only names by asking
         `param_only_names`. Neutralise that call and the golden must notice, on a program
         that actually has a param-only name.
@@ -153,20 +154,37 @@ def test_perf5_the_golden_catches_a_one_character_recipe_change(r: SubTestResult
     look exactly like a stable one."""
     rows, src = _golden(), _sources()
 
-    def mutant(code, binding_types):
-        drop = param_only_names(code)
-        key = tuple(sorted((k, v.value) for k, v in binding_types.items() if k not in drop))
-        h = hashlib.sha256()
-        b = code.encode()
-        h.update(len(b).to_bytes(8, "big"))          # the one character: "little" -> "big"
-        h.update(b)
-        h.update(json.dumps(key).encode())
-        return h.hexdigest()
+    class _BigEndianPrefix:
+        """`hashlib.sha256()` whose first 8-byte update (the length prefix) is byte-reversed."""
+        def __init__(self):
+            self._h, self._first = hashlib.sha256(), True
 
-    caught = sum(1 for row in rows
-                 if row["key"] in src
-                 and mutant(src[row["key"]], _types(row["wires"]["binding_types"]))
-                 != row["wires"]["fingerprint"])
+        def update(self, b):
+            if self._first and len(b) == 8:
+                b = b[::-1]                          # the one character: "little" -> "big"
+            self._first = False
+            self._h.update(b)
+
+        def hexdigest(self):
+            return self._h.hexdigest()
+
+    class _HashlibShim:
+        sha256 = staticmethod(lambda *a: _BigEndianPrefix())
+
+    saved_hashlib = tex_cache.hashlib
+    caught = 0
+    try:
+        tex_cache.hashlib = _HashlibShim
+        for row in rows:
+            if row["key"] not in src:
+                continue
+            tex_cache._FINGERPRINT_MEMO.clear()
+            if TEXCache.fingerprint(src[row["key"]], _types(row["wires"]["binding_types"])) \
+                    != row["wires"]["fingerprint"]:
+                caught += 1
+    finally:
+        tex_cache.hashlib = saved_hashlib
+        tex_cache._FINGERPRINT_MEMO.clear()
     r.ok(f"(a) a one-character digest change moves {caught}/{len(rows)} golden rows") \
         if caught == len(rows) else \
         r.fail("PERF-5 golden mutation (digest)",

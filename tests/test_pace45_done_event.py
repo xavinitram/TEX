@@ -29,8 +29,9 @@ def test_pace45_done_event_cuda(r: SubTestResult):
     if not torch.cuda.is_available():
         r.skip("PACE-45 done event (CUDA)", "no CUDA on this box")
         return
-    res = tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": make_img(1, 8, 8, 4, seed=453).cuda()},
-                          device_mode="cuda")
+    img = make_img(1, 8, 8, 4, seed=453)
+    res = tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": img.cuda()}, device_mode="cuda")
+    expected = tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": img}, device_mode="cpu")
     if not isinstance(res.done, torch.cuda.Event):
         r.fail("PACE-45 done event (CUDA)", f"expected a torch.cuda.Event, got {res.done!r}")
         return
@@ -39,4 +40,11 @@ def test_pace45_done_event_cuda(r: SubTestResult):
     except Exception as e:
         r.fail("PACE-45 done event (CUDA)", f".synchronize() raised: {e}")
         return
-    r.ok("CookResult.done is a torch.cuda.Event on CUDA, and .synchronize() returns cleanly")
+    if not res.done.query():
+        r.fail("PACE-45 done event (CUDA)", "the event still reports pending after synchronize()")
+        return
+    if not torch.allclose(res.outputs["OUT"].cpu(), expected.outputs["OUT"], atol=1e-5):
+        r.fail("PACE-45 done event (CUDA)", "the cook output changed because a fence was recorded")
+        return
+    r.ok("CookResult.done is a torch.cuda.Event on CUDA, synchronizes, reports done, and the "
+         "cook output matches the CPU cook")
