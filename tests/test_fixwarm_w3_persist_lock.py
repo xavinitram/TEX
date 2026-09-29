@@ -30,7 +30,6 @@ def test_fixwarm_w3_persist_serializes_concurrent_callers(r: SubTestResult):
         active = {"n": 0}
         max_active = {"n": 0}
         active_lock = threading.Lock()
-        orig_write = None
 
         import TEX_Wrangle.tex_recovery as tex_recovery
         orig_atomic_write_json = tex_recovery.atomic_write_json

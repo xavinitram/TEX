@@ -79,14 +79,22 @@ def test_fixgate_g4_knob_is_off_by_default(r: SubTestResult, monkeypatch):
     which process it happens to run inside."""
     print("\n--- G4(b): with no env var set, behaviour is unchanged ---")
     try:
+        import shutil as _shutil
         monkeypatch.delenv("TEX_GATE_NO_INDUCTOR", raising=False)
+        # A findable compiler makes the real probe's answer True on any box; the probe's
+        # cache-dir side effect on the env is undone by the monkeypatch.
+        monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", os.environ.get("TORCHINDUCTOR_CACHE_DIR", ""))
+        orig_which = _shutil.which
+        monkeypatch.setattr(_shutil, "which",
+                            lambda name, *a, **k: "C:/fake/cl.exe" if name == "cl"
+                            else orig_which(name, *a, **k))
         orig_cache = dict(noise._inductor_available)
         try:
             noise._inductor_available.clear()
-            # Whatever this box's real answer is, it must come from the real probe, not a
-            # hard-coded False -- just prove no exception and a bool comes back.
             result = noise._can_inductor_compile("cpu")
-            assert isinstance(result, bool), result
+            assert result is True, (
+                f"absent the knob, a findable compiler must read True (a hard-coded False "
+                f"or a stuck knob reads False), got {result}")
         finally:
             noise._inductor_available.clear()
             noise._inductor_available.update(orig_cache)
@@ -117,14 +125,17 @@ def test_fixgate_g4_run_ci_shape_sets_the_env_knob(r: SubTestResult):
 
         orig_run = gate._run
         orig_comfy_check = gate._ci_interpreter_can_import_comfy_api
+        orig_count = gate._count_timing
         gate._run = spy_run
         gate._ci_interpreter_can_import_comfy_api = lambda ci_python: False
+        gate._count_timing = lambda *a, **k: 0    # else it launches a real full-suite collect
         try:
             fake_python = sys.executable   # any existing file; the real launch is spied out
             gate.run_ci_shape(fake_python, scratch=".", verbose=False)
         finally:
             gate._run = orig_run
             gate._ci_interpreter_can_import_comfy_api = orig_comfy_check
+            gate._count_timing = orig_count
 
         assert len(captured) == 1, f"expected run_ci_shape to reach _run once, got {len(captured)}"
         assert captured[0].get("TEX_GATE_NO_INDUCTOR") == "1", (
@@ -161,6 +172,8 @@ def test_fixgate_g4_run_ci_exact_does_not_set_the_env_knob(r: SubTestResult):
         orig_run = gate._run
         orig_comfy_check = gate._ci_interpreter_can_import_comfy_api
         orig_missing = gate._ci_exact_missing_deps
+        orig_count = gate._count_timing
+        gate._count_timing = lambda *a, **k: 0
         gate._run = spy_run
         gate._ci_interpreter_can_import_comfy_api = lambda ci_python: False
         gate._ci_exact_missing_deps = lambda ci_python: []
@@ -171,6 +184,7 @@ def test_fixgate_g4_run_ci_exact_does_not_set_the_env_knob(r: SubTestResult):
             gate._run = orig_run
             gate._ci_interpreter_can_import_comfy_api = orig_comfy_check
             gate._ci_exact_missing_deps = orig_missing
+            gate._count_timing = orig_count
 
         assert len(captured) == 1, f"expected run_ci_exact to reach _run once, got {len(captured)}"
         assert "TEX_GATE_NO_INDUCTOR" not in captured[0], (

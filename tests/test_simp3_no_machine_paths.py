@@ -103,7 +103,11 @@ def tracked_paths():
     uses, so a lint's view of "the pushed set" and the gate's own hash of it can no longer
     quietly diverge) -- or `None` when this tree is not a git checkout."""
     paths = _gate().enumerate_paths(str(_PKG))
-    return None if paths is None else paths[:_MAX_TRACKED]
+    if paths is not None and len(paths) > _MAX_TRACKED:
+        raise AssertionError(f"git listed {len(paths)} paths (> {_MAX_TRACKED}): the command "
+                             "answered about the wrong directory, and truncating would leave "
+                             "the tail unscanned")
+    return paths
 
 
 def _spell(sep: str, *segments) -> str:

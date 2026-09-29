@@ -126,6 +126,17 @@ def test_fixgate_g2_reap_background_cook_still_detects_a_real_hang(r: SubTestRes
 
 # ── io_playback_bench: measure_overlapped's writer thread ───────────────────────────
 
+_PRIOR_BUDGET: dict = {}
+
+
+def _disarm(ipb):
+    """Undo `_arm`: drop the provider AND put the process-wide media cache budget back (it is
+    process-global, and a budget left at 0 starves every later test that relies on the pool)."""
+    ipb.tex_provider.reset_provider()
+    if "bytes" in _PRIOR_BUDGET:
+        ipb.tex_provider.set_media_budget_mb(_PRIOR_BUDGET["bytes"] / (1024 * 1024))
+
+
 def _arm(ipb, res: int, device: str, in_stall: float):
     """Mirror `main()`'s own `arm()` closure (module-level provider setup + `_CODE`), the
     minimum this file's functions need to run outside the CLI -- `measure_overlapped`'s own
@@ -134,6 +145,7 @@ def _arm(ipb, res: int, device: str, in_stall: float):
     `tex_provider` itself, exactly like `main()` does."""
     if getattr(ipb, "_CODE", None) is None:
         ipb._CODE = ipb._code(1)   # one grade is enough; these tests are about the threads
+    _PRIOR_BUDGET.setdefault("bytes", ipb.tex_provider.get_media_cache()._budget)
     ipb.tex_provider.reset_provider()
     p = ipb.tex_provider.SyntheticFrameProvider(res=res, rate=1.0, device=device,
                                                 latency_s=in_stall)
@@ -172,7 +184,7 @@ def test_fixgate_g2_measure_overlapped_surfaces_a_writer_crash(r: SubTestResult)
             r.ok(f"a crashing writer now surfaces at measure_overlapped: {raised}")
         finally:
             ipb._write = orig_write
-            ipb.tex_provider.reset_provider()
+            _disarm(ipb)
     except Exception as e:
         r.fail("G2 measure_overlapped surfaces writer crash", str(e))
 
@@ -197,6 +209,6 @@ def test_fixgate_g2_measure_overlapped_still_works_cleanly(r: SubTestResult):
         r.fail("G2 measure_overlapped clean run", str(e))
     finally:
         try:
-            ipb.tex_provider.reset_provider()
+            _disarm(ipb)
         except Exception:
             pass

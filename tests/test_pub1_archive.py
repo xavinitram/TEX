@@ -83,8 +83,8 @@ _DIR_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+/$")
 # into this LINE census via a `_JS_ONLY` pattern (PUB-2, 2026-09-19); that fold is GONE (NEG-5):
 # a line count over a 405 KB single-line minified bundle can only ever say "at least one", never
 # how many, so it could not see an added call move at all. JS network-token coverage now lives
-# in its own occurrence-counted-per-file ratchet, below `_ALLOWED_IGNORED_IMPORTS` — see
-# `_NETWORK_JS_RE`. `network` keeps its Python-shaped regex here for `.py`/other non-JS sources
+# in its own occurrence-counted-per-file ratchet, `_NETWORK_JS_RE` / `_NETWORK_JS_PINS`,
+# defined above `_ALLOWED_IGNORED_IMPORTS`. `network` keeps its Python-shaped regex here for `.py`/other non-JS sources
 # only, pinned at 0 (there are none), so a stray `socket.connect(`/`requests.get(` etc. anywhere
 # in the shipped surface still reds.
 _FAMILIES = {
@@ -411,15 +411,18 @@ def test_pub1_no_shipped_module_imports_an_ignored_directory(r: SubTestResult):
                                 "module that lives in one)")
             # `TEX_Wrangle.tests.x` / `from TEX_Wrangle.benchmarks import`
             for node in ast.walk(tree):
-                mod = None
+                mods = []
                 if isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                    mod = node.module
-                elif isinstance(node, ast.Import):
-                    mod = ".".join(a.name for a in node.names)
-                if mod and mod.startswith("TEX_Wrangle."):
-                    nxt = mod.split(".")[1]
-                    if nxt in ignored_dirs:
-                        hits.append(f"{rel}:{node.lineno}: imports `{mod}`")
+                    mods = [node.module]
+                    if node.module == "TEX_Wrangle":       # `from TEX_Wrangle import benchmarks`
+                        mods = [f"TEX_Wrangle.{a.name}" for a in node.names]
+                elif isinstance(node, ast.Import):         # `import os, TEX_Wrangle.benchmarks`
+                    mods = [a.name for a in node.names]
+                for mod in mods:
+                    if mod.startswith("TEX_Wrangle."):
+                        nxt = mod.split(".")[1]
+                        if nxt in ignored_dirs:
+                            hits.append(f"{rel}:{node.lineno}: imports `{mod}`")
         if hits:
             r.fail("PUB-1 ignored-directory import", "\n  ".join(hits))
         else:

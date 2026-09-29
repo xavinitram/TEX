@@ -16,6 +16,7 @@ never touches it, so LINT-46's contract is unaffected (re-checked here too, stru
 import ast
 import builtins
 import pathlib
+import threading
 
 import torch
 
@@ -122,16 +123,13 @@ def test_r3_tensor_touching_functions_still_work(r):
         tex_marshalling._torch = saved
 
 
-def test_r3_check_still_never_imports_torch(r):
-    """The other half of the contract this fix must not disturb: caching `torch` on a
-    module global must not make `tex_api.check()`'s pure-lint path reach it — that end-to-
-    end, fresh-subprocess proof lives in LINT-46's own
-    `test_lint46_check_torch_free.py::test_lint46_tex_api_check_stays_torch_free`, which
-    this fix does not touch. This test just confirms `infer_binding_type` (a function this
-    fix left untouched — it already resolved torch unconditionally, for its
-    `isinstance(value, torch.Tensor)` checks, before and after R3) still behaves correctly
-    against the module-global cache."""
-    print("\n--- FIX-OBSROUTE R3: check()'s own torch-free contract is undisturbed ---")
+def test_r3_infer_binding_type_works_against_the_torch_cache(r):
+    """Does NOT check that `tex_api.check()` stays torch-free: that fresh-subprocess proof
+    lives in `test_lint46_check_torch_free.py::test_lint46_tex_api_check_stays_torch_free`.
+    This test only confirms `infer_binding_type` (which already resolved torch
+    unconditionally, for its `isinstance(value, torch.Tensor)` checks) still behaves
+    correctly against the module-global cache."""
+    print("\n--- FIX-OBSROUTE R3: infer_binding_type works against the torch cache ---")
     saved = tex_marshalling._torch
     try:
         tex_marshalling._torch = None
@@ -165,10 +163,11 @@ def test_r3_cached_lookup_performs_no_reimport(r):
 
         real_import = builtins.__import__
         import_count = 0
+        me = threading.get_ident()   # `__import__` is patched process-wide; count only this thread
 
         def _counting_import(name, *args, **kwargs):
             nonlocal import_count
-            if name == "torch":
+            if name == "torch" and threading.get_ident() == me:
                 import_count += 1
             return real_import(name, *args, **kwargs)
 
@@ -181,11 +180,11 @@ def test_r3_cached_lookup_performs_no_reimport(r):
             builtins.__import__ = real_import
 
         if import_count != 0:
-            r.fail("FIX-OBSROUTE R3 microbenchmark", f"_torch_mod() re-imported torch "
+            r.fail("FIX-OBSROUTE R3 cached lookup", f"_torch_mod() re-imported torch "
                    f"{import_count} time(s) across 500 post-warm calls — the cache is not "
                    f"doing its job")
         elif last is not torch:
-            r.fail("FIX-OBSROUTE R3 microbenchmark", "a post-warm _torch_mod() call did not "
+            r.fail("FIX-OBSROUTE R3 cached lookup", "a post-warm _torch_mod() call did not "
                    "return the real torch module")
         else:
             r.ok("500 post-warm _torch_mod() calls performed 0 imports and returned the "

@@ -14,7 +14,7 @@ nothing, and "behaviour" here is five values (`reads`, `blocked`, `halo`, `fold_
 PRE-CHANGE implementation is kept below, verbatim in the one line that matters — a fresh
 `parse_and_split` per call — and the two are run against each other over every shipped
 `examples/*.tex`, the ten-stage host-demo comp, and a hand-written corpus of the shapes where
-a VALUE is known to move the answer. `_ORACLE_SENSITIVE_ROWS` pins that the corpus really does
+a VALUE is known to move the answer. `test_perf1_oracle_sensitive_rows` pins that the corpus really does
 contain such shapes, so the comparison cannot pass by being vacuous.
 
 BOTH DIRECTIONS. `test_perf1_the_clone_is_load_bearing` breaks the clone (hands the fold the
@@ -192,7 +192,7 @@ def _canon(walked):
 # ── the corpus ───────────────────────────────────────────────────────────────
 
 #: Sources whose walk is KNOWN to move with a value. Named, not discovered, so the oracle's
-#: sensitivity is a pin rather than a hope: `_ORACLE_SENSITIVE_ROWS` requires each of these to
+#: sensitivity is a pin rather than a hope: `test_perf1_oracle_sensitive_rows` requires each of these to
 #: produce at least two distinct answers across `_VALUATIONS`.
 _SENSITIVE = {
     # ROI-2's own erasure case: `k = 0` folds `@B` out of `reads` and into `fold_erased`.
@@ -241,6 +241,12 @@ _SENSITIVE = {
 #: a negative, and two radii that differ in their ceil.
 _VALUATIONS = (0.0, 1.0, 0.5, 2.0, 2, True, -1.0, 3.0, 7.0, 0.25, float("nan"),
                float("inf"), 1e-8)
+
+
+#: Floor on the corpus size: 118 shipped `examples/*.tex` plus the host-demo stages and
+#: `_SENSITIVE` at the time of writing. A tree without `examples/` (or a glob that silently
+#: matches nothing) would otherwise run a much smaller oracle and still pass.
+_MIN_CORPUS_ROWS = 100
 
 
 def _corpus():
@@ -353,6 +359,10 @@ def test_perf1_walk_answers_are_identical(r: SubTestResult):
     per-class allowance, not a blanket re-pin — see the module docstring."""
     print("\n--- PERF-1: the memoized-parse walk vs the pre-change walk ---")
     rows = _corpus()
+    if len(rows) < _MIN_CORPUS_ROWS:
+        r.fail("PERF-1 walk identity", f"only {len(rows)} corpus sources (floor "
+               f"{_MIN_CORPUS_ROWS}): examples/ or host_demo.py went missing")
+        return
     bad, classified, checked = [], Counter(), 0
     for label, code in rows:
         for params in _valuations_for(code):

@@ -32,8 +32,8 @@ from TEX_Wrangle import tex_engine
 from TEX_Wrangle.tex_cache import get_cache
 from TEX_Wrangle.tex_runtime import tier_trace
 
-_CUDA = torch.cuda.is_available()
-_DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]
+_DEVICES = devices()
+_CUDA = "cuda" in _DEVICES
 
 _GAIN = "f$gain = 1.0;\n@OUT = @image * $gain;"
 

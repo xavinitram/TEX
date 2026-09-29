@@ -108,7 +108,6 @@ def test_fix481b_child_starts_under_a_renamed_package(tmp_path, r: SubTestResult
 
 # ── 2. the other half: a genuine child failure falls back, and is surfaced ─────────────
 
-@pytest.mark.timing
 def test_fix481b_subprocess_failure_falls_back_to_thread_and_surfaces_error(r: SubTestResult):
     print("\n--- FIX-481B: a failed warm subprocess must fall back to the in-process warm "
           "and surface the failure, never silently warm nothing ---")

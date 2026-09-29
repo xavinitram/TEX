@@ -5,14 +5,14 @@ registry tag, separate from `footprint`'s `mult` (a `('halo_arg', i, mult)` reac
 answers "how far does this arg reach in pixels", not "should this arg's VALUE scale with the
 cook's resolution". Before BILAT-50, `bilateral_filter` was the case that forced the split:
 its footprint was a FIXED `('halo', 3)` with no `halo_arg`, yet `spatial_sigma` still needed
-scaling. BILAT-50 removed the window's own fixed cap, so its footprint is now
-`('halo_arg', 1, 8.0)` like the other three -- the two tags
-happen to agree on every builtin registered today, though they still answer different
-questions (see `stdlib_registry.py`'s own field comment).
+scaling. BILAT-50 removed the window's own fixed cap, so its footprint is now a
+`('halo_arg', 1, mult, ...)` like the other three; the two tags happen to agree on every
+builtin registered today, though they still answer different questions (see
+`stdlib_registry.py`'s own field comment).
 
 This file proves the tag exists, is validated the same loud way `footprint` is (AGENTS.md
 invariant #5 — a malformed descriptor must fail at import, never silently mis-tag), and is
-attached to exactly the five §1 builtins whose sigma/radius argument is a pixel magnitude:
+attached to exactly the four §1 builtins whose sigma/radius argument is a pixel magnitude:
 `gauss_blur`, `erode`, `dilate`, `bilateral_filter` (spatial_sigma only, NOT range_sigma).
 """
 from helpers import *
@@ -69,7 +69,7 @@ def test_scale47b_pixel_args_by_name(r: SubTestResult):
         if got != want:
             r.fail(f"pixel_args_by_name[{name}]", f"expected {want!r}, got {got!r}")
             return
-    r.ok(f"pixel_args_by_name() reports the five §1 builtins correctly: {sorted(expected)}")
+    r.ok(f"pixel_args_by_name() reports the four §1 builtins correctly: {sorted(expected)}")
 
 
 def test_scale47b_bilateral_range_sigma_not_tagged(r: SubTestResult):

@@ -18,9 +18,8 @@ asked to prove it means nothing.
   * `tex_lazy.lazy_required_bindings` answers the same set with and without the pragma, and
     with the engine at either level, because it never reads the language at all.
 
-**The two seams.** `LANGUAGE_VERSION` is `"0.24"` at this head (L7 moves it), and the gate is
-`min(pragma, LANGUAGE_VERSION)`, so no program can reach the `0.25` rules through any engine
-call site. Where the tier has an entry point of its own, the rules are asked for through the
+**The two seams.** The gate is `min(pragma, LANGUAGE_VERSION)`, so a program reaches the
+`0.25` rules only when both the pragma and the engine ask for them. Where the tier has an entry point of its own, the rules are asked for through the
 same leading-underscore `_masked_flow` keyword LANG-L4/L5 gave `Interpreter.execute` and
 `codegen.try_compile` (`None` = the engine's gate). The executors have no such seam — they
 call `Interpreter.execute` with the default — so the characterization rows open the engine's
@@ -504,8 +503,8 @@ def test_l6_split_triple_equals_the_whole_frame_under_025(r: SubTestResult):
 
 def test_l6_split_triple_still_differs_below_025(r: SubTestResult):
     print("\n--- L6: the same programs under 0.23/0.24 rules: declined, and they differ ---")
-    # Three ways to be below 0.25: no pragma, an older pragma, and — at THIS head — the
-    # 0.25 pragma itself, since the engine is at 0.24 and the gate is the minimum.
+    # Ways to be below 0.25: no pragma, an older pragma, and (only on an engine still below
+    # 0.25) the 0.25 pragma itself, since the gate is the minimum.
     headers = [("no pragma", ""), ("//!tex 0.23", "//!tex 0.23\n"),
                ("//!tex 0.24", "//!tex 0.24\n")]
     if tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) < tex_roi.MASKED_FLOW_SINCE:
@@ -579,13 +578,18 @@ def test_l6_lazy_analysis_never_reads_the_language(r: SubTestResult):
     programs.update({f"never-sever:{k}": v for k, v in _NEVER_SEVER.items()})
     try:
         clear_lazy_memo()
-        plain = {k: lazy_required_bindings(v, {"t": 0.0}) for k, v in programs.items()}
-        pragma = {k: lazy_required_bindings(PRAGMA + v, {"t": 0.0}) for k, v in programs.items()}
+        def _sets(header):
+            return {k: lazy_required_bindings(header + v, {"t": 0.0}) for k, v in programs.items()}
+
+        plain = _sets("")
+        pragma = _sets(PRAGMA)
+        with _engine_at("0.24"):
+            at24 = _sets(PRAGMA)
         with _engine_at("0.25"):
-            at25 = {k: lazy_required_bindings(PRAGMA + v, {"t": 0.0}) for k, v in programs.items()}
+            at25 = _sets(PRAGMA)
         none = [k for k, v in plain.items() if v is None]
         assert not none, f"the analysis failed on {none}"
-        moved = [k for k in programs if not (plain[k] == pragma[k] == at25[k])]
+        moved = [k for k in programs if not (plain[k] == pragma[k] == at24[k] == at25[k])]
         assert not moved, f"the pragma or the engine level moved the required set of {moved}"
         assert all("A" in plain[k] for k in programs if "@A" in programs[k])
         assert all("B" in plain[k] for k in programs if "@B" in programs[k])

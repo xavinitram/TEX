@@ -26,6 +26,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from helpers import SubTestResult
 
 from TEX_Wrangle.tex_runtime import compiled_capability as _CC
@@ -169,6 +171,7 @@ _CC.compile_capability_async()      # kicks off the background probe, returns No
 '''
 
 
+@pytest.mark.timing
 def test_fixgate_a2_process_exit_never_waits_on_an_in_flight_probe(r: SubTestResult):
     print("\n--- A2: a slow in-flight probe must never delay process exit ---")
     custom_nodes = str(Path(__file__).resolve().parents[2])
@@ -195,9 +198,11 @@ def test_fixgate_a2_process_exit_never_waits_on_an_in_flight_probe(r: SubTestRes
         return
 
     delta = probed_s - baseline_s
-    assert delta < 1.5, (
-        f"a 3s in-flight probe added {delta:.2f}s to process exit (baseline {baseline_s:.2f}s, "
-        f"probed {probed_s:.2f}s) -- a non-daemon probe thread is blocking interpreter "
-        f"shutdown (B3#2)")
+    if delta >= 1.5:
+        r.fail("A2 exit stall",
+               f"a 3s in-flight probe added {delta:.2f}s to process exit (baseline "
+               f"{baseline_s:.2f}s, probed {probed_s:.2f}s) -- a non-daemon probe thread is "
+               f"blocking interpreter shutdown (B3#2)")
+        return
     r.ok(f"in-flight probe added only {delta:.2f}s to process exit "
          f"(baseline {baseline_s:.2f}s, probed {probed_s:.2f}s)")

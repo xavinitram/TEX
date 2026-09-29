@@ -6,8 +6,8 @@ folded literal -- exactly why the SAME cached codegen fn (keyed only by the prog
 `scale` is deliberately excluded, `tex_runtime/compiled._get_or_make_codegen_fn`'s own docstring)
 can serve every scale value without recompiling. `tex_engine_tiers._run_tier` now routes a
 scale-active cook to codegen when `_should_stencil_route` (UC-2's own "would codegen otherwise be
-chosen" test for the "default" tier) says yes; `torch_compile`/`auto`/`cuda_graph` remain forced
-to the interpreter, unchanged (SCALE-COMPILED-48 is a v0.49+ item).
+chosen" test for the "default" tier) says yes. The compiled and graphed tiers key their own
+artifacts by scale (SCALECX-49; `test_scalecx49_compiled_graphed_scale.py`).
 
 Red-first per the brief: (a) the SAME fingerprint serves two scale values without recompiling;
 (b) codegen vs interpreter stay bit-exact under scale (the codegen-equivalence suite's own
@@ -138,6 +138,9 @@ def test_scalecg48_same_fingerprint_no_recompile_across_scale_values(r: SubTestR
     """Red-first (a): the SAME fingerprint serves two DIFFERENT scale values without
     recompiling -- a counts/structural test, never timing (GATE-47's own ratchet shape)."""
     print("\n--- SCALE-CG-48: one compile serves scale=0.5 AND scale=0.25 (same fingerprint) ---")
+    # A salted source is a fingerprint no earlier test or disk-cache entry can have compiled,
+    # so the counts are exact: one emit for the first scale, none for the second.
+    salted = _STENCIL_PLUS_BLUR + f"\n// scalecg48 salt {time.time_ns()}\n"
     calls = {"n": 0}
     real_try_codegen = _compiled._try_codegen
 
@@ -148,17 +151,18 @@ def test_scalecg48_same_fingerprint_no_recompile_across_scale_values(r: SubTestR
     _compiled._try_codegen = _counting_try_codegen
     try:
         A = make_img(1, 20, 20, 3, seed=11)
-        out1 = tex_engine.cook(_STENCIL_PLUS_BLUR, dict(_bindings(20), A=A.clone()),
+        out1 = tex_engine.cook(salted, dict(_bindings(20), A=A.clone()),
                                device_mode="cpu", compile_mode="none", scale=0.5)
-        out2 = tex_engine.cook(_STENCIL_PLUS_BLUR, dict(_bindings(20), A=A.clone()),
+        first = calls["n"]
+        out2 = tex_engine.cook(salted, dict(_bindings(20), A=A.clone()),
                                device_mode="cpu", compile_mode="none", scale=0.25)
     finally:
         _compiled._try_codegen = real_try_codegen
 
-    if calls["n"] > 1:
-        r.fail("no-recompile-across-scale", f"codegen emitted/compiled {calls['n']} times for "
-               "two scale values of the SAME program -- expected at most 1 (fingerprint cache "
-               "hit on the second)")
+    if first != 1 or calls["n"] != 1:
+        r.fail("no-recompile-across-scale", f"codegen emitted/compiled {first}x for the first "
+               f"scale and {calls['n']}x in total; expected exactly 1 then no more (a fresh "
+               "fingerprint compiles once, and the second scale must hit it)")
         return
     md = (out1.outputs["BLUR"].float() - out2.outputs["BLUR"].float()).abs().max().item()
     if md < 1e-5:
@@ -166,8 +170,8 @@ def test_scalecg48_same_fingerprint_no_recompile_across_scale_values(r: SubTestR
                f"scale=0.5 and scale=0.25 produced the SAME BLUR pixels (maxdiff {md:.2e}) -- "
                "the multiply is not actually varying with scale, this test would pass vacuously")
         return
-    r.ok(f"codegen emit+compile called {calls['n']}x total for scale=0.5 then scale=0.25 of the "
-         f"SAME program (fingerprint cache reused), and the two scales produced DIFFERENT "
+    r.ok(f"codegen emit+compile called once for a cold program at scale=0.5 and not again at "
+         f"scale=0.25 (fingerprint cache reused), and the two scales produced DIFFERENT "
          f"pixels (maxdiff {md:.2e}) -- proving the reused fn still reads scale as a value")
 
 
@@ -222,7 +226,6 @@ def test_scalecg48_scale_none_emits_no_new_bytes_without_pixel_args(r: SubTestRe
     """Invariant #7: a program with NO `pixel_args=` call is untouched -- `__tex_scale` never
     appears in its emitted source at all, scale-active or not."""
     print("\n--- SCALE-CG-48: a stencil-only program (no gauss_blur) never emits __tex_scale ---")
-    box_only = _STENCIL_PLUS_BLUR.split("@BLUR")[0] + "@STENCIL2 = @STENCIL;\n"
     # (kept minimal: just prove the marker string is absent from a program with no
     # pixel_args=-tagged call anywhere in it)
     from TEX_Wrangle.tex_runtime import codegen as _cg
@@ -268,6 +271,10 @@ def test_scalecg48_refusal_contract_unchanged_on_new_route(r: SubTestResult):
         refusal_code = getattr(getattr(e, "tex_refusal", None), "code", None)
     if not threw:
         r.fail("scale refusal", "prepare() did not raise for a scale-unsafe program at scale=0.5")
+        return
+    if refusal_code != "scale-unsafe":
+        r.fail("scale refusal", f"prepare() raised, but with refusal code {refusal_code!r}, "
+               "not 'scale-unsafe'")
         return
     r.ok(f"prepare(..., scale=0.5) on a scale-unsafe program still raises "
          f"(refusal code={refusal_code!r}) -- unchanged by SCALE-CG-48's tier-dispatch-only edit")

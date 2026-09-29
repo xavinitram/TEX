@@ -188,15 +188,14 @@ def scan_bare_words(text: str) -> list:
 #: The down-only budget this ratchet INHERITS: every tracked *.py file that already carried
 #: the local-only-artifact word above at the moment this row landed (v0.47.0 Phase C,
 #: FIX-GATE), named explicitly rather than swept behind a blanket allowlist. A file's number
-#: may only move DOWN from here (FIX-PACE's own rewrite of `pacing.py`'s ten occurrences is
-#: exactly that kind of move) -- raising one, or a file absent from this table carrying any
-#: hit at all, is what reds. No machine name has a nonzero budget: none was found in a
-#: tracked *.py file when this landed, so any future one is a leak from day one, not a debt
-#: to inherit.
+#: may only move DOWN from here (FIX-PACE's own rewrite of `pacing.py` is exactly that kind
+#: of move) -- raising one, or a file absent from this table carrying any hit at all, is what
+#: reds, and so is a file that has dropped BELOW its number: the table is lowered in the same
+#: change, so slack can never be spent on a new leak. No machine name has a nonzero budget:
+#: none was found in a tracked *.py file when this landed, so any future one is a leak from
+#: day one, not a debt to inherit.
 _BAREWORD_BUDGET = {
-    "tex_runtime/pacing.py": 10,
     "tools/gate.py": 1,
-    "tex_runtime/stdlib_core.py": 1,
     "tex_runtime/graphed.py": 1,
     "tests/test_v044_cancel44.py": 1,
     "tests/test_v043_rider_a_capture_pending.py": 1,
@@ -219,7 +218,7 @@ def test_lint1_g5_no_new_bare_word_leak(r: SubTestResult):
         r.skip("LINT-1 G5 bare-word budget",
                "this tree is not a git checkout, so the tracked set cannot be enumerated")
         return
-    overs, seen = [], 0
+    overs, slack, seen = [], [], 0
     for rel in paths:
         if not rel.endswith(".py"):
             continue
@@ -231,13 +230,20 @@ def test_lint1_g5_no_new_bare_word_leak(r: SubTestResult):
         except (UnicodeDecodeError, OSError):
             continue
         hits = scan_bare_words(text)
+        budget = _BAREWORD_BUDGET.get(rel, 0)
+        if len(hits) < budget:
+            slack.append(f"{rel}: {len(hits)} occurrence(s) against a budget of {budget}")
         if not hits:
             continue
         seen += 1
-        budget = _BAREWORD_BUDGET.get(rel, 0)
         if len(hits) > budget:
             lines = [n for n, _ in hits]
             overs.append(f"{rel}: {len(hits)} occurrence(s) (budget {budget}, lines {lines})")
+    if slack:
+        r.fail("LINT-1 G5 bare-word budget",
+               f"{len(slack)} budget(s) can be lowered; lower them in this change so the "
+               f"ratchet tightens:\n  " + "\n  ".join(slack))
+        return
     if overs:
         r.fail("LINT-1 G5 bare-word budget",
                f"{len(overs)} tracked .py file(s) exceed their down-only bare-word budget "
@@ -290,11 +296,8 @@ _TRACKER_PREFIX = _frag("C", "O")
 _TRACKER_ID_RE = re.compile(r"\b" + _TRACKER_PREFIX + r"-?\d{2,4}(?:-T\d{1,3})?\b")
 
 #: Down-only budget: zero, unconditionally. Unlike G5's per-file table above, there is no
-#: inherited allowance to preserve -- every occurrence found at the moment this landed is a
-#: leak to remove, not a debt to grandfather. The one exception is a single tracked file
-#: this fix does not itself edit (a concurrent fix removes its one id in the same release);
-#: it is named here, not budgeted, so the reason travels with the code instead of a bare
-#: number.
+#: inherited allowance to preserve -- every occurrence is a leak to remove, not a debt to
+#: grandfather. The allowlist is empty; a file named here would be skipped outright.
 _TRACKER_ID_ALLOWLIST: set = set()
 
 
@@ -391,7 +394,7 @@ _REVIEW_WHOLE_NAMES = (_frag("CONSOLIDATED", ".md"), _frag("orchestrator", "-not
 #: Down-only budget: zero, unconditionally, same reasoning as H1's -- every occurrence found
 #: at the moment this landed is a leak to remove, not a debt to grandfather. No concurrent
 #: fix in this same batch owns a file that carries one, so there is no by-name exception to
-#: record here (contrast `_TRACKER_ID_ALLOWLIST` above, which does have one).
+#: record here (`_TRACKER_ID_ALLOWLIST` above is empty for the same reason).
 _REVIEW_NOTE_ALLOWLIST: set = set()
 
 

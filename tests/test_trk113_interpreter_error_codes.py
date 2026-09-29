@@ -12,12 +12,12 @@ Of the eleven, seven turn out reachable through the ordinary front door — `che
 passes the program, and the failure only shows up once `Interpreter.execute` runs it, which
 is a call every one of these rows makes directly (`_run` below), the same three-step
 pipeline `tests/helpers.py::compile_and_run` uses, just with `bindings` handed separately
-from the declared binding TYPES so a row can omit one at execute() time. One more
-(`E6001`) is the multi-output surface asking for a name the program never assigned — also
-no bypass needed. One (`E6020`'s OTHER raise site, an undefined variable) needs the type
-checker skipped outright, because the checker forecloses that exact mistake from any real
-source; `_run_unchecked` below does that the same way existing interpreter tests reach the
-tree without going through `TypeChecker.check` first.
+from the declared binding TYPES so a row can omit one at execute() time. `E6001` (the
+multi-output surface asking for a name the program never assigned) is among the seven and
+needs no bypass either. `E6020` has two raise sites and so two rows; the second (an
+undefined variable) needs the type checker skipped outright, because the checker forecloses
+that exact mistake from any real source; `_run_unchecked` below does that the same way
+existing interpreter tests reach the tree without going through `TypeChecker.check` first.
 
 The remaining four are genuinely DEFENSIVE: a checker code forecloses the mistake from any
 parsed source before the interpreter's branch could ever run, so there is no program to

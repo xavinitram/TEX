@@ -12,7 +12,7 @@ another happy-path assertion.
 from helpers import *
 from failure_harness import (
     run_tier, assert_tier_equiv, sweep_precision, preflight_via_endpoint,
-    drive_auto, simulate_restart, max_diff, TierUnavailable,
+    drive_auto, simulate_restart, max_diff,
 )
 
 
@@ -21,8 +21,8 @@ def test_fm_class_a_auto_lifecycle(r: SubTestResult):
     print("\n--- PROC-1 [A]: auto-tier lifecycle (correctness every cook) ---")
     # The v0.15 auto test never advanced past the first sync cook, so it never
     # reached the crashing TRIAL. drive_auto cooks repeatedly; the invariant that
-    # MUST hold regardless of which internal tier serves each cook is: output is
-    # bit-equal to the interpreter. (The stricter "reaches COMMITTED" assertion
+    # MUST hold regardless of which internal tier serves each cook is: output matches
+    # the interpreter within tolerance (invariant 2). (The stricter "reaches COMMITTED" assertion
     # lands with the CC-2 hardening in Phase 2.)
     img = make_img(seed=11)
     code = "@OUT = vec4(sin(@A * 3.14159) * 0.5 + 0.5, 1.0);"
@@ -31,7 +31,7 @@ def test_fm_class_a_auto_lifecycle(r: SubTestResult):
         cooks = drive_auto(code, {"A": img}, cooks=3)
         worst = max(max_diff(ref, c) for c in cooks)
         assert worst < 1e-5, f"auto diverged from interpreter across cooks (max {worst:.3e})"
-        r.ok(f"auto tier bit-matches interpreter across 3 cooks (max {worst:.2e})")
+        r.ok(f"auto tier matches interpreter across 3 cooks (max {worst:.2e})")
     except Exception as e:
         r.fail("[A] auto lifecycle correctness", f"{type(e).__name__}: {e}")
 
@@ -41,7 +41,7 @@ def test_fm_class_b_restart(r: SubTestResult):
     print("\n--- PROC-1 [B]: restart reconstruction stays correct ---")
     # A loop-heavy program routes through codegen and persists a sidecar. After a
     # simulated restart (in-memory caches dropped) the reconstructed path must
-    # produce output bit-identical to the interpreter — persistence must never
+    # produce output matching the interpreter within tolerance — persistence must never
     # silently corrupt (the class that hid the M-2 eviction corruption).
     img = make_img(seed=13)
     code = ("vec3 acc = vec3(0.0); for (int i = 0; i < 4; i = i + 1) "
@@ -54,7 +54,7 @@ def test_fm_class_b_restart(r: SubTestResult):
         cold = run_tier(code, {"A": img}, "codegen")           # reconstruct from disk
         md = max_diff(ref, cold)
         assert md < 1e-6, f"post-restart codegen diverged (max {md:.3e})"
-        r.ok(f"codegen output identical before/after restart (max {md:.2e})")
+        r.ok(f"codegen output matches the interpreter before/after restart (max {md:.2e})")
     except Exception as e:
         r.fail("[B] restart reconstruction", f"{type(e).__name__}: {e}")
 
@@ -93,7 +93,7 @@ def test_fm_class_c_entrypoint(r: SubTestResult):
 
 # ── Class D — cross-tier equivalence ──────────────────────────────────
 def test_fm_class_d_cross_tier(r: SubTestResult):
-    print("\n--- PROC-1 [D]: opt-in tiers bit-match the interpreter ---")
+    print("\n--- PROC-1 [D]: opt-in tiers match the interpreter within tolerance ---")
     img = make_img(seed=17)
     # Includes the two shapes whose tier bugs slipped v0.15: a vec/color param
     # (UC-1 graph staging) and a fractional-bound loop (UC-3 floor).
@@ -107,7 +107,7 @@ def test_fm_class_d_cross_tier(r: SubTestResult):
     for nm, code, binds in corpus:
         assert_tier_equiv(r, nm, code, binds, tiers=("codegen",), tol=1e-5)
 
-    # GPU: the graph tier is the real UC-1 regression surface — compare bitwise
+    # GPU: the graph tier is the real UC-1 regression surface — compare within tolerance
     # where CUDA exists; a decline is acceptable (not every program is graphable).
     if torch.cuda.is_available():
         for nm, code, binds in corpus:

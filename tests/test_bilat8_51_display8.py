@@ -4,9 +4,9 @@ cherry-picked from GAUSS8-51's `e7796e9`, common brief).
 Fast tier only: a small plate (64x64, not 1080p) with the SAME spatial_sigma /
 radius the 1080p sweep uses (radius does not need to shrink with the plate --
 cost is O(image size x radius), so shrinking the image alone already buys the
-speedup, and keeps the separable code path's own regime, radius in
-(_BILATERAL_EXACT_RADIUS_MAX, _BILATERAL_SEPARABLE_RADIUS_MAX], genuinely
-exercised). The 1080p table itself lives in `docs/resolution-scale.md`
+speedup, and keeps the separable code path's own regime, radius above
+_BILATERAL_EXACT_RADIUS_MAX (40) and up to _BILATERAL_SEPARABLE_RADIUS_MAX, genuinely
+exercised: ss=14/16 gives radius 42/48). The 1080p table itself lives in `docs/resolution-scale.md`
 (the BILAT8-51 write-up) -- this file is the ratchet, not the evidence.
 """
 from __future__ import annotations
@@ -28,8 +28,7 @@ aces_srgb8, code_diff_stats, plate_day, plate_night = (
 def _old_separable_bchw(bchw, ss, sr, radius):
     """Pre-BILAT8-51 math: the column pass's range weight compared the row
     pass's OWN output against itself -- kept here only as the fast tier's own
-    before/after baseline (a byte-for-byte copy, same as
-    test_bilat50_radius.py's copy of the same math)."""
+    before/after baseline (a byte-for-byte copy of that math)."""
     row_passed = TEXStdlib._bilateral_separable_1d_pass(bchw, 3, radius, ss, sr, range_ref=bchw)
     return TEXStdlib._bilateral_separable_1d_pass(row_passed, 2, radius, ss, sr, range_ref=row_passed)
 
@@ -37,11 +36,11 @@ def _old_separable_bchw(bchw, ss, sr, radius):
 def test_bilat8_51_display8_fast_rows_do_not_regress(r: SubTestResult):
     print("\n--- BILAT8-51 fast tier: a630685's range-vs-original fix never scores more "
           "changed/>=2/max codes than the pre-fix separable path against the exact filter, "
-          "on the shared harness's day/night plates at a small size, ss=8.5/16 ---")
+          "on the shared harness's day/night plates at a small size, ss=14/16 ---")
     H = W = 64
     device = torch.device("cpu")
     plates = {"day": plate_day(H, W, device), "night": plate_night(H, W, device)}
-    for ss in (8.5, 16.0):
+    for ss in (14.0, 16.0):
         radius = int(math.ceil(3 * ss))
         for pname, p in plates.items():
             exact = TEXStdlib._bilateral_exact_bchw(p, ss, 0.2, radius)
@@ -60,7 +59,7 @@ def test_bilat8_51_display8_fast_rows_do_not_regress(r: SubTestResult):
                 return
     r.ok("a630685's separable fix is never worse (>=2-code fraction, max code, within a "
          "1-pixel sampling-noise tolerance) than the pre-fix path on the shared harness's "
-         "own plates at ss=8.5/16, radius 26/48")
+         "own plates at ss=14/16, radius 42/48")
 
 
 def test_bilat8_51_display8_fast_rows_exact_tier_untouched(r: SubTestResult):

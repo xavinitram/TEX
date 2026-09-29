@@ -1,37 +1,32 @@
-import tempfile
-import shutil
 import time
-from pathlib import Path
 
 import pytest
 from helpers import *
 
 
 @pytest.mark.slow
+@pytest.mark.timing
 def test_performance(r: SubTestResult):
     print("\n--- Performance Tests ---")
 
     B, H, W = 1, 512, 512
     perf_img = torch.rand(B, H, W, 3)
 
-    # Cold compile (fresh cache)
+    # Cold path: lex, parse, type-check and first execute, no cache involved
     try:
-        tmp_dir = tempfile.mkdtemp()
-        cold_cache = TEXCache(cache_dir=Path(tmp_dir))
         code = "float g = luma(@A);\n@OUT = vec3(g, g, g);"
 
+        start = time.perf_counter()
         tokens = Lexer(code).tokenize()
         prog = Parser(tokens).parse()
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
         checker = TypeChecker(binding_types=bt)
         type_map = checker.check(prog)
 
-        start = time.perf_counter()
         interp = Interpreter()
         interp.execute(prog, {"A": perf_img}, type_map, device="cpu")
         cold_ms = (time.perf_counter() - start) * 1000
 
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         assert cold_ms < 2000, f"Cold compile took {cold_ms:.1f}ms (limit: 2000ms)"
         r.ok(f"perf: cold compile ({cold_ms:.1f}ms)")
     except Exception as e:

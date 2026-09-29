@@ -221,7 +221,7 @@ _LINT = {
 
 
 _NODE_SCRUB = {
-    # BENCH-3, from PERF-4's finding F5. The seven scenarios above drive `tex_api` /
+    # BENCH-3, from PERF-4's finding F5. The scenarios above drive `tex_api` /
     # `tex_engine` directly, where `forgive_dead_refs` is False — and that flag is the ONLY
     # door to the lazy tier, so a regression on the ComfyUI node's own per-tick cost could not
     # move any row above. This scenario drives what a user's slider drives: two
@@ -655,7 +655,7 @@ _PLAYBACK_FRAMES = {
 
 
 def test_bench2_interactive_per_tick_counts(r: SubTestResult):
-    """The gate: the device-independent per-tick counts of the seven interactive paths."""
+    """The gate: the device-independent per-tick counts of the interactive paths."""
     print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
     for label, pins in (("terminal", _TERMINAL), ("midgraph", _MIDGRAPH), ("pan", _PAN),
                         ("all_dirty", _ALL_DIRTY), ("lint", _LINT),
@@ -742,8 +742,9 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
 
     Counted with the CALLER's file, so the demo host's own end-of-frame barrier
     (`RoiComp.cook`, which is host policy) is a different row and does not mask this one.
-    The row is zero on CPU too — nothing calls it — so the assertion is portable; the CUDA
-    reading that gives it teeth is in the CUDA test below."""
+    This reads the CPU pass, where nothing can call `torch.cuda.synchronize`, so it pins the
+    spy's wiring (the row is reported, and stays zero) and not a CUDA reading; no CUDA row
+    gates this count yet."""
     print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
     for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub",
                  "checkpoint_serve", "interp_chain_scrub",
@@ -898,7 +899,7 @@ _FREE_MEM_CUDA = {
     # NOT the tile planner's, and the reason this row cannot be read as "the planner's
     # queries": a prewarm asks `_cuda_headroom_ok` (tex_runtime/compiled.py) once per program
     # before submitting a background compile. It is also this row's NON-INERT witness — a pin
-    # of 0 on five of the seven scenarios above would otherwise be satisfied by a dead spy.
+    # of 0 on most of the scenarios above would otherwise be satisfied by a dead spy.
     "prewarm":    10,
 }
 

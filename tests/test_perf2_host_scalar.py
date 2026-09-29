@@ -586,7 +586,8 @@ def test_trk69_gauss_blur_and_bilateral_filter_agree_on_a_bare_float(r: SubTestR
         assert math.ceil(3.0 * sig) != math.ceil(3.0 * rounded), (
             "the chosen sigma no longer separates the rounded reading from the raw double")
 
-        img = torch.rand(1, 12, 12, 3, dtype=torch.float32)
+        img = torch.rand(1, 12, 12, 3, dtype=torch.float32,
+                         generator=torch.Generator().manual_seed(69))
 
         # The MUTATION: force bilateral_filter's non-tensor fallback back to the raw
         # double (the bug this row reports) by disabling the rounding it now shares
@@ -615,8 +616,18 @@ def test_trk69_gauss_blur_and_bilateral_filter_agree_on_a_bare_float(r: SubTestR
         # not bit-exact (different formulas: `min(ceil(3*ss), 3)` vs an unclamped
         # radius), but the same ROUNDED sigma feeding both.
         _stdlib._gauss_kernel_cache_budget.clear(_stdlib._gauss_kernel_cache)
-        _ = TEXStdlib.fn_gauss_blur(img, sig)   # exercises the reference reading; no crash
-        r.ok("gauss_blur resolves the same bare float without error (reference reading)")
+        # Agreement means: handing either builtin the RAW double or the already-rounded
+        # value gives the same picture, i.e. both read the same rounded sigma.
+        gauss_raw = TEXStdlib.fn_gauss_blur(img, sig)
+        gauss_rounded = TEXStdlib.fn_gauss_blur(img, float(rounded))
+        bil_rounded = TEXStdlib.fn_bilateral_filter(img, float(rounded), 0.2)
+        if not torch.equal(gauss_raw, gauss_rounded):
+            r.fail("TRK-69 fp32 agreement", "gauss_blur reads the raw double, not the rounded one")
+        elif not torch.equal(fixed, bil_rounded):
+            r.fail("TRK-69 fp32 agreement", "bilateral_filter's sigma reading differs from the "
+                   "rounded value gauss_blur uses")
+        else:
+            r.ok("gauss_blur and bilateral_filter read the same fp32-rounded sigma")
     except Exception as e:
         r.fail("TRK-69 fp32 agreement", f"{type(e).__name__}: {e}")
 

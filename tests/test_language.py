@@ -120,7 +120,7 @@ def test_output_types(r: SubTestResult):
         raw = torch.rand(1, 4, 4, 3) * 2.0  # values up to 2.0
         result = _prepare_output(raw, "IMAGE")
         assert result.shape == (1, 4, 4, 3)
-        assert result.max() <= 1.0
+        assert torch.allclose(result, raw.clamp(0, 1), atol=1e-6)
         r.ok("output: IMAGE from vec3")
     except Exception as e:
         r.fail("output: IMAGE from vec3", f"{e}\n{traceback.format_exc()}")
@@ -299,7 +299,7 @@ def test_if_without_else(r: SubTestResult):
         code = "@OUT = @A;\nif (u > 0.5) {\n    @OUT = vec3(1.0, 0.0, 0.0);\n}"
         result = compile_and_run(code, {"A": test_img})
         # Left half should match @A
-        assert torch.allclose(result[0, :, 0, :], test_img[0, :, 0, :], atol=0.1)
+        assert torch.allclose(result[0, :, 0, :], test_img[0, :, 0, :], atol=1e-5)
         # Right half should be red
         assert result[0, 0, W - 1, 0].item() > 0.9
         assert result[0, 0, W - 1, 1].item() < 0.1
@@ -559,6 +559,9 @@ def test_ternary_exhaustive(r: SubTestResult):
             float x = u > 0.5 ? u : v;
             @OUT = vec4(x);
         """, {"A": img})
+        xs = torch.linspace(0, 1, 4).view(1, 1, 4).expand(1, 4, 4)
+        ys = torch.linspace(0, 1, 4).view(1, 4, 1).expand(1, 4, 4)
+        assert torch.allclose(result[..., 0], torch.where(xs > 0.5, xs, ys), atol=1e-5)
         r.ok("ternary: in variable declaration with u/v")
     except Exception as e:
         r.fail("ternary: in variable declaration with u/v", str(e))
@@ -663,6 +666,9 @@ def test_ternary_exhaustive(r: SubTestResult):
         result = compile_and_run("""
             @OUT = u > 0.5 ? @A : vec4(0.0);
         """, {"A": img})
+        xs = torch.linspace(0, 1, 4).view(1, 1, 4, 1).expand(1, 4, 4, 4)
+        assert torch.allclose(result, torch.where(xs > 0.5, img, torch.zeros_like(img)),
+                              atol=1e-5)
         r.ok("ternary: with binding access")
     except Exception as e:
         r.fail("ternary: with binding access", str(e))
@@ -701,8 +707,8 @@ def test_scope_and_shadowing(r: SubTestResult):
     except Exception as e:
         r.fail("scope: loop var not visible after loop", str(e))
 
-    # Variable re-declaration in if block — TEX if-blocks share the enclosing
-    # scope, so re-declaring x inside an if-block overwrites the outer x.
+    # Assignment inside an if block writes the outer variable (a declaration made inside
+    # the block, by contrast, is not visible after it: see the rows above).
     try:
         result = compile_and_run("""
             float x = 1.0;
@@ -760,7 +766,18 @@ def test_scope_and_shadowing(r: SubTestResult):
         """, {"A": img})
         v = result[0, 0, 0, 0].item()
         assert abs(v - 10.0) < 1e-5, f"Expected 10.0, got {v}"
-        r.ok("scope: while loop inner not leaked")
+        try:
+            compile_and_run("""
+                int count = 0;
+                while (count < 3) {
+                    float inner = 1.0;
+                    count++;
+                }
+                @OUT = vec4(inner);
+            """, {"A": img})
+            r.fail("scope: while loop inner not leaked", "inner is readable after the loop")
+        except (TypeCheckError, TEXMultiError):
+            r.ok("scope: while loop inner not leaked")
     except Exception as e:
         r.fail("scope: while loop inner not leaked", str(e))
 
@@ -1071,7 +1088,7 @@ def test_casting_exhaustive(r: SubTestResult):
     except Exception as e:
         r.fail("cast: float(int)", str(e))
 
-    # int(float) — truncation
+    # int(float) — floors (see the negative row below)
     try:
         result = compile_and_run("""
             float f = 1.7;
@@ -1079,10 +1096,10 @@ def test_casting_exhaustive(r: SubTestResult):
             @OUT = vec4(float(n));
         """, {"A": img})
         v = result[0, 0, 0, 0].item()
-        assert abs(v - 1.0) < 1e-5, f"Expected 1.0 (truncated), got {v}"
-        r.ok("cast: int(1.7) truncates")
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0 (floored), got {v}"
+        r.ok("cast: int(1.7) floors to 1")
     except Exception as e:
-        r.fail("cast: int(1.7) truncates", str(e))
+        r.fail("cast: int(1.7) floors to 1", str(e))
 
     # vec3(float) — broadcast
     try:
@@ -1159,7 +1176,7 @@ def test_casting_exhaustive(r: SubTestResult):
     except Exception as e:
         r.fail("cast: to_float(string)", str(e))
 
-    # int(3.9) — should truncate to 3
+    # int(3.9) — floors to 3
     try:
         result = compile_and_run("""
             int n = int(3.9);
@@ -1167,11 +1184,11 @@ def test_casting_exhaustive(r: SubTestResult):
         """, {"A": img})
         v = result[0, 0, 0, 0].item()
         assert abs(v - 3.0) < 1e-5, f"Expected 3.0, got {v}"
-        r.ok("cast: int(3.9) truncates to 3")
+        r.ok("cast: int(3.9) floors to 3")
     except Exception as e:
-        r.fail("cast: int(3.9) truncates to 3", str(e))
+        r.fail("cast: int(3.9) floors to 3", str(e))
 
-    # int(-1.5) — negative truncation
+    # int(-1.5) — floors to -2, not -1
     try:
         result = compile_and_run("""
             int n = int(-1.5);
@@ -1180,9 +1197,9 @@ def test_casting_exhaustive(r: SubTestResult):
         v = result[0, 0, 0, 0].item()
         # TEX uses floor-based int cast: int(-1.5) -> -2
         assert abs(v - (-2.0)) < 1e-5, f"Expected -2.0, got {v}"
-        r.ok("cast: int(-1.5) negative truncation")
+        r.ok("cast: int(-1.5) floors to -2")
     except Exception as e:
-        r.fail("cast: int(-1.5) negative truncation", str(e))
+        r.fail("cast: int(-1.5) floors to -2", str(e))
 
     # Cast in expression
     try:

@@ -9,8 +9,9 @@ item 6 names for `all_dirty` (ten stages, ten guaranteed-no-op calls).
 
 Fixed with a one-line guard at the `tex_engine.py` call site: skip calling `_halo_tile_plan`
 when `tex_memory.is_tile_safe_cached(ctx.program, ctx.fp)` already reads True. This is a memo
-HIT, not a second AST walk — `_tile_plan`, called immediately before on the same fingerprint,
-already populated the exact same `tex_memory._tile_safe_memo` entry — and it is provably the
+HIT, not a second AST walk, on a CUDA non-latent cook (`_tile_plan`, called immediately
+before on the same fingerprint, has just populated the exact same `tex_memory._tile_safe_memo`
+entry); elsewhere (CPU, latents) the guard itself warms it once per fingerprint. It is provably the
 same answer `_halo_tile_plan` itself would have returned via its own identical check, so the
 served picture cannot move: the guard only ever removes a call whose return value was
 already guaranteed to be `None`.
@@ -86,18 +87,29 @@ def test_trk83_non_tile_safe_stage_still_reaches_halo_tile_plan(r: SubTestResult
 
 
 def test_trk83_pictures_are_unchanged(r: SubTestResult):
-    """The guard must never move a served pixel: both programs cook to the SAME result with
-    and without the spy installed (i.e. the guard's decision is deterministic and harmless)."""
+    """The guard must never move a served pixel: each program cooks to the SAME result with
+    the guard live and with it defeated (`is_tile_safe_cached` reading False at the call
+    site, so `_halo_tile_plan` is reached for every stage)."""
     print("\n--- TRK-83: output is unaffected by the guard ---")
+    from TEX_Wrangle import tex_memory
     try:
-        with cold_engine_state():
-            a1 = _cook(_POINTWISE)
-        with cold_engine_state():
-            a2 = _cook(_POINTWISE)
-        out1 = a1.outputs["OUT"]
-        out2 = a2.outputs["OUT"]
-        r.ok("pointwise cook: two independent cooks agree bit-exactly") \
-            if torch.equal(out1, out2) else \
-            r.fail("TRK-83 picture stability", "two cooks of the same pointwise program differ")
+        for label, code in (("pointwise", _POINTWISE), ("blur", _BLUR)):
+            with cold_engine_state():
+                guarded = _cook(code).outputs["OUT"]
+            real = tex_memory.is_tile_safe_cached
+            tex_memory.is_tile_safe_cached = lambda *a, **k: False
+            try:
+                with cold_engine_state():
+                    with _CallSpy("_halo_tile_plan") as halo:
+                        unguarded = _cook(code).outputs["OUT"]
+            finally:
+                tex_memory.is_tile_safe_cached = real
+            if halo.n < 1:
+                r.fail("TRK-83 picture stability",
+                       f"{label}: the defeated guard never reached _halo_tile_plan")
+            elif torch.equal(guarded, unguarded):
+                r.ok(f"{label} cook: guard live and guard defeated agree bit-exactly")
+            else:
+                r.fail("TRK-83 picture stability", f"{label}: the guard changed a pixel")
     except Exception as e:
         r.fail("TRK-83 picture stability", str(e))

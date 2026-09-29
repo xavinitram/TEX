@@ -96,7 +96,7 @@ def test_sampling(r: SubTestResult):
     try:
         code = "@OUT = sample_cubic(@A, u, v);"  # identity resample
         result = compile_and_run(code, {"A": test_img})
-        assert result.shape == test_img.shape or result.shape[-1] == test_img.shape[-1], \
+        assert result.shape == test_img.shape, \
             f"Shape mismatch: {result.shape} vs expected {test_img.shape}"
         r.ok("sampling: cubic shape preservation")
     except Exception as e:
@@ -121,9 +121,8 @@ def test_sampling(r: SubTestResult):
     try:
         code = "@OUT = sample_lanczos(@A, u, v);"
         result = compile_and_run(code, {"A": test_img})
-        assert result.dim() == 4, f"Expected 4D result, got {result.dim()}D"
-        assert result.shape[-1] == test_img.shape[-1], \
-            f"Channel mismatch: {result.shape[-1]} vs {test_img.shape[-1]}"
+        assert result.shape == test_img.shape, \
+            f"Shape mismatch: {result.shape} vs expected {test_img.shape}"
         r.ok("sampling: lanczos shape preservation")
     except Exception as e:
         r.fail("sampling: lanczos shape preservation", f"{e}\n{traceback.format_exc()}")
@@ -742,16 +741,15 @@ def test_sample_mip(r: SubTestResult):
         r.fail("mip: integer LOD fast path", f"{e}\n{traceback.format_exc()}")
 
     # Fractional LOD: should interpolate between two levels
+    # The checkerboard is already flat at LOD 1, so this row needs an image whose levels differ.
     try:
-        result = compile_and_run("@OUT = sample_mip(@A, u, v, 1.5);", {"A": checker})
-        # Should be between LOD 1 and LOD 2 variance
-        r1 = compile_and_run("@OUT = sample_mip(@A, u, v, 1.0);", {"A": checker})
-        r2 = compile_and_run("@OUT = sample_mip(@A, u, v, 2.0);", {"A": checker})
-        var_1 = r1.var().item()
-        var_15 = result.var().item()
-        var_2 = r2.var().item()
-        # Variance at 1.5 should be between 1 and 2 (or close)
-        assert var_15 <= var_1 + 0.01, f"LOD 1.5 should be blurrier than LOD 1"
+        noisy = torch.rand(B, H, W, 3, generator=torch.Generator().manual_seed(3))
+        result = compile_and_run("@OUT = sample_mip(@A, u, v, 1.5);", {"A": noisy})
+        r1 = compile_and_run("@OUT = sample_mip(@A, u, v, 1.0);", {"A": noisy})
+        r2 = compile_and_run("@OUT = sample_mip(@A, u, v, 2.0);", {"A": noisy})
+        assert not torch.allclose(r1, r2, atol=1e-3), "LOD 1 and LOD 2 must differ for this row"
+        assert torch.allclose(result, 0.5 * (r1 + r2), atol=1e-5), \
+            "LOD 1.5 must be the midpoint of the LOD 1 and LOD 2 levels"
         r.ok("mip: fractional LOD trilinear")
     except Exception as e:
         r.fail("mip: fractional LOD trilinear", f"{e}\n{traceback.format_exc()}")
@@ -896,11 +894,13 @@ def test_gauss_blur_and_mip_gauss(r: SubTestResult):
 
     # sample_mip_gauss: fractional LOD trilinear works
     try:
-        result = compile_and_run("@OUT = sample_mip_gauss(@A, u, v, 1.5);", {"A": checker})
-        r1 = compile_and_run("@OUT = sample_mip_gauss(@A, u, v, 1.0);", {"A": checker})
-        var_1 = r1[..., :3].var().item()
-        var_15 = result[..., :3].var().item()
-        assert var_15 <= var_1 + 0.01, "LOD 1.5 should be blurrier than LOD 1"
+        noisy = torch.rand(B, H, W, 3, generator=torch.Generator().manual_seed(3))
+        result = compile_and_run("@OUT = sample_mip_gauss(@A, u, v, 1.5);", {"A": noisy})
+        r1 = compile_and_run("@OUT = sample_mip_gauss(@A, u, v, 1.0);", {"A": noisy})
+        r2 = compile_and_run("@OUT = sample_mip_gauss(@A, u, v, 2.0);", {"A": noisy})
+        assert not torch.allclose(r1, r2, atol=1e-3), "LOD 1 and LOD 2 must differ for this row"
+        assert torch.allclose(result, 0.5 * (r1 + r2), atol=1e-5), \
+            "LOD 1.5 must be the midpoint of the LOD 1 and LOD 2 levels"
         r.ok("mip_gauss: fractional LOD trilinear")
     except Exception as e:
         r.fail("mip_gauss: fractional LOD trilinear", f"{e}\n{traceback.format_exc()}")

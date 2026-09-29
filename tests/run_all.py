@@ -23,6 +23,9 @@ and now guards the derivation itself: it censuses the tree independently and ass
 
 Adding a test therefore needs NO edit here. If a row must be skipped, it goes in
 `_EXCLUDE` with a reason — an empty `_EXCLUDE` is the healthy state.
+
+This runner does not read pytest markers: `timing` and `slow` rows run like any other. To
+leave them out on a busy box, use `python -m pytest tests -m "not timing and not slow"`.
 """
 # CACHE-0: point the disk cache at a scratch dir BEFORE any TEX import — get_cache()
 # resolves the location once, on first call — so a test run never writes compiled

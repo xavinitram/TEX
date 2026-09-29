@@ -14,8 +14,14 @@ Every row here is RED against base `7477a93` (v0.48.0): that `pacing.py` has no
 `_COST_TABLE`, no `pace_budget_ms`, and `paced_check` takes no `call_site_id` keyword at all
 (TypeError) -- so every assertion below has nothing matching to read.
 """
+import contextlib
+import types
+import functools
+import inspect
+
 import pytest
 
+from helpers import FakeClock
 from TEX_Wrangle.tex_runtime import pacing as _pace
 from TEX_Wrangle.tex_testkit import DeviceSpy, FakeCudaEvent
 
@@ -51,24 +57,15 @@ class _Token:
         self.checks += 1
 
 
-class _FakeClock:
-    def __init__(self, t=0.0):
-        self.t = t
-
-    def __call__(self):
-        return self.t
-
-    def advance(self, dt):
-        self.t += dt
-
-
-@pytest.fixture
-def clock():
-    c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
-    yield c
-    _pace._time.perf_counter = real
+@contextlib.contextmanager
+def _clock_ctx():
+    c = FakeClock(0.0)
+    real = _pace._time
+    _pace._time = types.SimpleNamespace(perf_counter=c)
+    try:
+        yield c
+    finally:
+        _pace._time = real
 
 
 # ── §4: the default (unpaced) path touches nothing this ask adds ─────────────────
@@ -119,6 +116,10 @@ def test_call_site_id_omitted_is_byte_identical_to_pre_pace49(r):
     with DeviceSpy() as spy, _clock_ctx() as clock:
         tok = _Token(pace=True, pace_depth=8, pace_stride_ms=10.0, pace_budget_ms=0.001)
         _pace.reset(tok, "cuda")
+        # Pre-warm the key an omitted id would use with an estimate far over the budget: were
+        # the gate consulted for `None`, the second poll would fall through and record.
+        for _ in range(_pace._COST_WARMUP_SAMPLES + 1):  # noqa: SLF001
+            _pace._cost_feed((None, _pace._state.device_idx, _pace._state.px_bucket), 1e6)  # noqa: SLF001
         _pace.paced_check(tok, "cuda")            # records (no call_site_id)
         clock.advance(0.001)
         _pace.paced_check(tok, "cuda")             # inside window, tail done -> should skip
@@ -129,20 +130,6 @@ def test_call_site_id_omitted_is_byte_identical_to_pre_pace49(r):
     else:
         r.fail("PACE-49 opt-out", f"constructed={constructed} outstanding={outstanding} "
                f"(expected 1/1 -- an omitted call_site_id must never force a record)")
-
-
-import contextlib  # noqa: E402
-
-
-@contextlib.contextmanager
-def _clock_ctx():
-    c = _FakeClock(0.0)
-    real = _pace._time.perf_counter
-    _pace._time.perf_counter = c
-    try:
-        yield c
-    finally:
-        _pace._time.perf_counter = real
 
 
 # ── §6.1: the table updates only at a fresh peek-confirm or a wait, never a cache hit ──
@@ -250,8 +237,6 @@ def test_warm_call_site_over_budget_forces_a_fallthrough(r):
             _pace._cost_feed(key, 50.0)                     # far above the 5ms budget, warm
         _pace.paced_check(tok, "cuda", call_site_id="loop")    # records E1 (1/8)
         clock.advance(0.001)
-        waits_before = sum(ev.sync_calls for ev in
-                            list(_pace._state.pool["outstanding"]) + _pace._state.pool["free"])  # noqa: SLF001
         _pace.paced_check(tok, "cuda", call_site_id="loop", heavy=False)   # tail done, but
                                                                             # WARM + over
                                                                             # budget -> record
@@ -401,3 +386,23 @@ def test_cost_table_is_bounded(r):
         r.ok(f"table holds exactly {size} entries after {_pace._COST_TABLE_MAX + 50} feeds")  # noqa: SLF001
     else:
         r.fail("PACE-49 bounded table", f"expected {_pace._COST_TABLE_MAX}, got {size}")  # noqa: SLF001
+
+
+def _isolated(fn):
+    """Give an `(r)` row the same pacing-state isolation the autouse fixture gives it
+    under pytest, so `run_all.py` (which calls rows directly) sees it too."""
+    @functools.wraps(fn)
+    def run(*a, **k):
+        _pace._state.__dict__.clear()
+        _pace._COST_TABLE.clear()
+        try:
+            return fn(*a, **k)
+        finally:
+            _pace._state.__dict__.clear()
+            _pace._COST_TABLE.clear()
+    return run
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("test_") and list(inspect.signature(_fn).parameters) == ["r"]:
+        globals()[_name] = _isolated(_fn)

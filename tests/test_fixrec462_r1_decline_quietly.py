@@ -12,6 +12,7 @@ here — the proof is that all three sites still classify FUTURE_TRAILER and UNR
 before (miss, file survives), and that `_UNVERIFIED` is unaffected (still a miss that MAY delete).
 """
 from helpers import *
+from helpers import scratch_dir
 
 import builtins
 
@@ -70,7 +71,7 @@ def test_r1_predicate_never_raises_on_a_tensor(r: SubTestResult):
 def test_r1_pkl_site_declines_future_trailer_quietly(r: SubTestResult):
     print("\n--- FIX-REC R1: _load_from_disk leaves a FUTURE_TRAILER .pkl on disk, as a miss ---")
     try:
-        d = Path(tempfile.mkdtemp())
+        d = scratch_dir()
         cache = TEXCache(cache_dir=d)
         bt = {"A": TEXType.VEC4}
         fp = cache.fingerprint("@OUT = @A * 0.7 + 0.1;", bt)
@@ -89,7 +90,7 @@ def test_r1_pkl_site_declines_future_trailer_quietly(r: SubTestResult):
 def test_r1_cg_site_declines_future_trailer_quietly(r: SubTestResult):
     print("\n--- FIX-REC R1: _load_codegen_from_disk leaves a FUTURE_TRAILER .cg on disk ---")
     try:
-        d = Path(tempfile.mkdtemp())
+        d = scratch_dir()
         cache = TEXCache(cache_dir=d)
         fp = "cafef00d" * 8
         path = cache._cg_path(fp)
@@ -107,7 +108,7 @@ def test_r1_cg_site_declines_future_trailer_quietly(r: SubTestResult):
 def test_r1_frame_site_declines_future_trailer_quietly(r: SubTestResult):
     print("\n--- FIX-REC R1: _restore leaves a FUTURE_TRAILER .frame on disk, as a miss ---")
     try:
-        d = Path(tempfile.mkdtemp())
+        d = scratch_dir()
         c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
         path = Path(c._disk_path("k"))
         path.write_bytes(_future_trailer_bytes())
@@ -131,7 +132,7 @@ def test_r1_pkl_and_cg_sites_still_decline_unreadable_quietly(r: SubTestResult):
     print("\n--- FIX-REC R1: the .pkl/.cg sites also leave an UNREADABLE file on disk ---")
     real_open = builtins.open
     try:
-        d = Path(tempfile.mkdtemp())
+        d = scratch_dir()
         cache = TEXCache(cache_dir=d)
         bt = {"A": TEXType.VEC4}
         fp = cache.fingerprint("@OUT = @A * 0.7 + 0.1;", bt)

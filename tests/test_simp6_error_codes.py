@@ -348,11 +348,13 @@ def test_simp7_unreachable_codes_stay_in_the_untested_backlog(r: SubTestResult):
     "untested" — cannot silently disagree: a code that is truly unreachable from source can
     never have a test triggering it, so it must always be inside the pinned backlog above.
     """
-    import sys as _sys
-    if _PKG_DIR not in _sys.path:
-        _sys.path.insert(0, _PKG_DIR)
+    import importlib.util
     try:
-        from tools import gen_error_codes as gen
+        # By path: `tools/` is not a package, and putting it on sys.path would leak.
+        spec = importlib.util.spec_from_file_location(
+            "_simp6_gen_error_codes", os.path.join(_PKG_DIR, "tools", "gen_error_codes.py"))
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
     except Exception as e:
         r.fail("SIMP-7 import generator", f"{type(e).__name__}: {e}")
         return

@@ -56,9 +56,9 @@ reason is MANDATORY and is itself linted: a bare marker, or one with a reason to
 to say anything, fails this test. A suppression with no reason is how a lint becomes
 noise, and noise is how a lint gets switched off.
 
-Stdlib only, no numpy (invariant 1), no torch. The lint READS sources -- it never
-imports the modules it lints, so it costs no import time and cannot be defeated by an
-import-time side effect.
+No numpy (invariant 1). The lint READS sources -- it never imports the modules it lints,
+so it cannot be defeated by an import-time side effect. (This test module itself imports
+`helpers` for `SubTestResult`, which loads torch and the TEX front end.)
 """
 import ast
 import os
@@ -439,7 +439,9 @@ def _bad_markers_in(src, filename):
 
 # ── the tests ────────────────────────────────────────────────────────────────
 
-def _test_sources():
+def _test_sources(unreadable):
+    """Yield `(filename, source)` for every test file; a file that cannot be read is
+    appended to `unreadable` instead of silently dropped."""
     for fn in sorted(os.listdir(_TESTS)):
         if not fn.endswith(".py") or fn == _SELF:
             continue
@@ -448,7 +450,7 @@ def _test_sources():
             with open(path, encoding="utf-8") as f:
                 yield fn, f.read()
         except (OSError, UnicodeDecodeError):
-            continue
+            unreadable.append(fn)
 
 
 def test_no_unportable_equality_ban(r: SubTestResult):
@@ -466,10 +468,12 @@ def test_no_unportable_equality_ban(r: SubTestResult):
          f"{len(language)} language name(s) {sorted(language)}")
 
     findings, suppressed, marker_problems, scanned = [], [], [], 0
-    for fn, src in _test_sources():
+    unreadable = []
+    for fn, src in _test_sources(unreadable):
         try:
             s = _scan_source(src, fn, tiered, language)
         except SyntaxError:
+            unreadable.append(fn)
             continue
         scanned += 1
         findings += s.findings
@@ -479,6 +483,10 @@ def test_no_unportable_equality_ban(r: SubTestResult):
         marker_problems += _bad_markers_in(src, fn)
 
     marker_problems = sorted(set(marker_problems))
+    if unreadable:
+        r.fail("LNT-2 unscanned sources",
+               f"{len(unreadable)} test file(s) could not be read or parsed, so the lint "
+               f"did not cover them: {unreadable}")
 
     rule_a = [f for f in findings if f["rule"] == "A"]
     rule_b = [f for f in findings if f["rule"] == "B"]

@@ -110,10 +110,14 @@ class TestStageCodegenParamValueShapes:
     """Unit coverage for `_stage_codegen_param`'s four value shapes — no Dynamo needed."""
 
     def test_genuine_scalar_gets_tagged_with_the_rounded_value(self):
-        minted = torch.as_tensor(2.5)
-        out = _stage_codegen_param(2.5, minted)
+        # 0.1 is not exactly representable in fp32, so a tag of the raw Python float would
+        # differ from the rounded value the tensor really carries.
+        rounded = torch.scalar_tensor(0.1, dtype=torch.float32).item()
+        assert rounded != 0.1
+        minted = torch.as_tensor(0.1)
+        out = _stage_codegen_param(0.1, minted)
         assert out is minted
-        assert getattr(out, "_tex_host_scalar", None) == 2.5
+        assert getattr(out, "_tex_host_scalar", None) == rounded
 
     def test_bool_scalar_gets_tagged(self):
         minted = torch.as_tensor(True)

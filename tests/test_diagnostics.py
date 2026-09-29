@@ -9,8 +9,11 @@ def test_error_paths(r: SubTestResult):
         Lexer("x /* no end").tokenize()
         r.fail("error: unterminated block comment", "Should have raised LexerError")
     except LexerError as e:
-        assert "unterminated" in str(e).lower() or "Unterminated" in str(e)
-        r.ok("error: unterminated block comment")
+        try:
+            assert "unterminated" in str(e).lower() or "Unterminated" in str(e)
+            r.ok("error: unterminated block comment")
+        except AssertionError as _ae:
+            r.fail("error: unterminated block comment", str(_ae))
     except Exception as e:
         r.fail("error: unterminated block comment", f"{e}\n{traceback.format_exc()}")
 
@@ -28,8 +31,11 @@ def test_error_paths(r: SubTestResult):
         check_code("float x = 1.0;\nfloat x = 2.0;")
         r.fail("error: variable redeclaration", "Should have raised TypeCheckError")
     except TypeCheckError as e:
-        assert "already" in str(e).lower() or "redeclar" in str(e).lower()
-        r.ok("error: variable redeclaration")
+        try:
+            assert "already" in str(e).lower() or "redeclar" in str(e).lower()
+            r.ok("error: variable redeclaration")
+        except AssertionError as _ae:
+            r.fail("error: variable redeclaration", str(_ae))
     except Exception as e:
         r.fail("error: variable redeclaration", f"{e}\n{traceback.format_exc()}")
 
@@ -38,8 +44,11 @@ def test_error_paths(r: SubTestResult):
         check_code("float x = bogus(1.0);")
         r.fail("error: unknown function", "Should have raised TypeCheckError")
     except TypeCheckError as e:
-        assert "can't find" in str(e).lower() or "unknown" in str(e).lower()
-        r.ok("error: unknown function")
+        try:
+            assert "can't find" in str(e).lower() or "unknown" in str(e).lower()
+            r.ok("error: unknown function")
+        except AssertionError as _ae:
+            r.fail("error: unknown function", str(_ae))
     except Exception as e:
         r.fail("error: unknown function", f"{e}\n{traceback.format_exc()}")
 
@@ -48,8 +57,11 @@ def test_error_paths(r: SubTestResult):
         check_code("float x = sin(1.0, 2.0);")
         r.fail("error: wrong arg count", "Should have raised TypeCheckError")
     except TypeCheckError as e:
-        assert "expect" in str(e).lower() or "argument" in str(e).lower()
-        r.ok("error: wrong arg count")
+        try:
+            assert "expect" in str(e).lower() or "argument" in str(e).lower()
+            r.ok("error: wrong arg count")
+        except AssertionError as _ae:
+            r.fail("error: wrong arg count", str(_ae))
     except Exception as e:
         r.fail("error: wrong arg count", f"{e}\n{traceback.format_exc()}")
 
@@ -65,8 +77,11 @@ def test_error_paths(r: SubTestResult):
         check_code("vec3 c = @A.rrr;", {"A": TEXType.VEC4})
         r.fail("error: invalid swizzle .rrr", "Should have raised TypeCheckError")
     except (TypeCheckError, TEXMultiError) as e:
-        assert "swizzle" in str(e).lower() or "Invalid" in str(e)
-        r.ok("error: invalid swizzle .rrr")
+        try:
+            assert "swizzle" in str(e).lower() or "Invalid" in str(e)
+            r.ok("error: invalid swizzle .rrr")
+        except AssertionError as _ae:
+            r.fail("error: invalid swizzle .rrr", str(_ae))
     except Exception as e:
         r.fail("error: invalid swizzle .rrr", f"{e}\n{traceback.format_exc()}")
 
@@ -83,12 +98,15 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: structured fields (clampp)", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert diag is not None, "diagnostic should not be None"
-        assert diag.code.startswith("E"), f"Error code should start with E, got {diag.code}"
-        assert len(diag.suggestions) > 0, "Should have suggestions for typo"
-        assert diag.source_line != "", "source_line should be set"
-        r.ok("diag: structured fields (clampp)")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert diag is not None, "diagnostic should not be None"
+            assert diag.code.startswith("E"), f"Error code should start with E, got {diag.code}"
+            assert len(diag.suggestions) > 0, "Should have suggestions for typo"
+            assert diag.source_line != "", "source_line should be set"
+            r.ok("diag: structured fields (clampp)")
+        except AssertionError as _ae:
+            r.fail("diag: structured fields (clampp)", str(_ae))
     except Exception as e:
         r.fail("diag: structured fields (clampp)", f"{e}\n{traceback.format_exc()}")
 
@@ -98,10 +116,13 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: severity and message", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert diag.severity == "error", f"Expected severity 'error', got {diag.severity}"
-        assert len(diag.message) > 0, "message should not be empty"
-        r.ok("diag: severity and message")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert diag.severity == "error", f"Expected severity 'error', got {diag.severity}"
+            assert len(diag.message) > 0, "message should not be empty"
+            r.ok("diag: severity and message")
+        except AssertionError as _ae:
+            r.fail("diag: severity and message", str(_ae))
     except Exception as e:
         r.fail("diag: severity and message", f"{e}\n{traceback.format_exc()}")
 
@@ -113,8 +134,11 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: multi-error reporting", "Should have raised an error")
     except TEXMultiError as e:
-        assert len(e.diagnostics) >= 2, f"Expected 2+ diagnostics, got {len(e.diagnostics)}"
-        r.ok("diag: multi-error reporting")
+        try:
+            assert len(e.diagnostics) >= 2, f"Expected 2+ diagnostics, got {len(e.diagnostics)}"
+            r.ok("diag: multi-error reporting")
+        except AssertionError as _ae:
+            r.fail("diag: multi-error reporting", str(_ae))
     except TypeCheckError:
         # If only one error surfaced, that's a partial pass but not ideal
         r.fail("diag: multi-error reporting", "Only got single TypeCheckError, expected TEXMultiError with 2+")
@@ -127,11 +151,16 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: multi-error codes", "Should have raised an error")
     except TEXMultiError as e:
-        all_have_codes = all(d.code.startswith("E") for d in e.diagnostics)
-        assert all_have_codes, "All diagnostics should have error codes starting with E"
-        r.ok("diag: multi-error codes")
-    except TypeCheckError:
-        r.ok("diag: multi-error codes")  # single error still has a code
+        try:
+            all_have_codes = all(d.code.startswith("E") for d in e.diagnostics)
+            assert all_have_codes, "All diagnostics should have error codes starting with E"
+            r.ok("diag: multi-error codes")
+        except AssertionError as _ae:
+            r.fail("diag: multi-error codes", str(_ae))
+    except TypeCheckError as e:
+        code_ok = e.diagnostic.code.startswith("E")     # a single error still carries a code
+        r.ok("diag: multi-error codes") if code_ok else r.fail(
+            "diag: multi-error codes", f"single error has no E-code: {e.diagnostic.code}")
     except Exception as e:
         r.fail("diag: multi-error codes", f"{e}\n{traceback.format_exc()}")
 
@@ -148,10 +177,13 @@ def test_diagnostic_quality(r: SubTestResult):
             check_code(code)
             r.fail(f"diag: did-you-mean {typo}", "Should have raised an error")
         except (TypeCheckError, TEXMultiError) as e:
-            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-            assert expected in diag.suggestions, \
-                f"Expected '{expected}' in suggestions {diag.suggestions} for typo '{typo}'"
-            r.ok(f"diag: did-you-mean {typo}")
+            try:
+                diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+                assert expected in diag.suggestions, \
+                    f"Expected '{expected}' in suggestions {diag.suggestions} for typo '{typo}'"
+                r.ok(f"diag: did-you-mean {typo}")
+            except AssertionError as _ae:
+                r.fail(f"diag: did-you-mean {typo}", str(_ae))
         except Exception as e:
             r.fail(f"diag: did-you-mean {typo}", f"{e}\n{traceback.format_exc()}")
 
@@ -163,16 +195,19 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code, {"A": TEXType.VEC4})
         r.fail("diag: return outside function", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        if hasattr(e, "_build_diagnostic"):
-            if e.diagnostic is None:
-                e._build_diagnostic()
-            diag = e.diagnostic
-        else:
-            diag = e.diagnostics[0]
-        hint_text = (diag.hint + " " + diag.message).lower()
-        assert "function" in hint_text or "@out" in hint_text or "assign" in hint_text, \
-            f"Hint for 'return' should mention function or @OUT, got hint='{diag.hint}'"
-        r.ok("diag: return outside function")
+        try:
+            if hasattr(e, "_build_diagnostic"):
+                if e.diagnostic is None:
+                    e._build_diagnostic()
+                diag = e.diagnostic
+            else:
+                diag = e.diagnostics[0]
+            hint_text = (diag.hint + " " + diag.message).lower()
+            assert "function" in hint_text or "@out" in hint_text or "assign" in hint_text, \
+                f"Hint for 'return' should mention function or @OUT, got hint='{diag.hint}'"
+            r.ok("diag: return outside function")
+        except AssertionError as _ae:
+            r.fail("diag: return outside function", str(_ae))
     except Exception as e:
         r.fail("diag: return outside function", f"{e}\n{traceback.format_exc()}")
 
@@ -182,13 +217,16 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code, {"A": TEXType.VEC4})
         r.fail("diag: foreign func texture2D", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        if hasattr(e, "_build_diagnostic") and e.diagnostic is None:
-            e._build_diagnostic()
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        full_text = (diag.hint + " " + diag.message + " " + str(e)).lower()
-        assert "sample" in full_text, \
-            f"Hint for 'texture2D' should mention sample(), got hint='{diag.hint}'"
-        r.ok("diag: foreign func texture2D")
+        try:
+            if hasattr(e, "_build_diagnostic") and e.diagnostic is None:
+                e._build_diagnostic()
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            full_text = (diag.hint + " " + diag.message + " " + str(e)).lower()
+            assert "sample" in full_text, \
+                f"Hint for 'texture2D' should mention sample(), got hint='{diag.hint}'"
+            r.ok("diag: foreign func texture2D")
+        except AssertionError as _ae:
+            r.fail("diag: foreign func texture2D", str(_ae))
     except Exception as e:
         r.fail("diag: foreign func texture2D", f"{e}\n{traceback.format_exc()}")
 
@@ -198,13 +236,16 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: foreign func print", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        if hasattr(e, "_build_diagnostic") and e.diagnostic is None:
-            e._build_diagnostic()
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        full_text = (diag.hint + " " + diag.message + " " + str(e)).lower()
-        assert "print" in full_text or "@out" in full_text, \
-            f"Hint for 'print' should mention no print or @OUT, got hint='{diag.hint}'"
-        r.ok("diag: foreign func print")
+        try:
+            if hasattr(e, "_build_diagnostic") and e.diagnostic is None:
+                e._build_diagnostic()
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            full_text = (diag.hint + " " + diag.message + " " + str(e)).lower()
+            assert "print" in full_text or "@out" in full_text, \
+                f"Hint for 'print' should mention no print or @OUT, got hint='{diag.hint}'"
+            r.ok("diag: foreign func print")
+        except AssertionError as _ae:
+            r.fail("diag: foreign func print", str(_ae))
     except Exception as e:
         r.fail("diag: foreign func print", f"{e}\n{traceback.format_exc()}")
 
@@ -217,12 +258,12 @@ def test_diagnostic_quality(r: SubTestResult):
         Parser(tokens, source=code).parse()
         r.fail("diag: parser recovery", "Should have raised an error")
     except TEXMultiError as e:
-        assert len(e.diagnostics) >= 2, \
-            f"Parser should recover and report 2+ errors, got {len(e.diagnostics)}"
-        r.ok("diag: parser recovery")
-    except ParseError:
-        # Even a single error is acceptable if parser doesn't recover
-        r.ok("diag: parser recovery (single)")
+        try:
+            assert len(e.diagnostics) >= 2, \
+                f"Parser should recover and report 2+ errors, got {len(e.diagnostics)}"
+            r.ok("diag: parser recovery")
+        except AssertionError as _ae:
+            r.fail("diag: parser recovery", str(_ae))
     except Exception as e:
         r.fail("diag: parser recovery", f"{e}\n{traceback.format_exc()}")
 
@@ -233,11 +274,12 @@ def test_diagnostic_quality(r: SubTestResult):
         Parser(tokens, source=code).parse()
         r.fail("diag: parser recovery 3 errors", "Should have raised an error")
     except TEXMultiError as e:
-        assert len(e.diagnostics) >= 2, \
-            f"Expected 2+ diagnostics from parser recovery, got {len(e.diagnostics)}"
-        r.ok("diag: parser recovery 3 errors")
-    except ParseError:
-        r.ok("diag: parser recovery 3 errors (single)")
+        try:
+            assert len(e.diagnostics) >= 3, (
+                f"Expected all 3 diagnostics from parser recovery, got {len(e.diagnostics)}")
+            r.ok("diag: parser recovery 3 errors")
+        except AssertionError as _ae:
+            r.fail("diag: parser recovery 3 errors", str(_ae))
     except Exception as e:
         r.fail("diag: parser recovery 3 errors", f"{e}\n{traceback.format_exc()}")
 
@@ -251,10 +293,13 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: error code pattern (type)", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert error_code_pattern.match(diag.code), \
-            f"Error code '{diag.code}' doesn't match E[1-6]xxx pattern"
-        r.ok("diag: error code pattern (type)")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert error_code_pattern.match(diag.code), \
+                f"Error code '{diag.code}' doesn't match E[1-6]xxx pattern"
+            r.ok("diag: error code pattern (type)")
+        except AssertionError as _ae:
+            r.fail("diag: error code pattern (type)", str(_ae))
     except Exception as e:
         r.fail("diag: error code pattern (type)", f"{e}\n{traceback.format_exc()}")
 
@@ -265,10 +310,13 @@ def test_diagnostic_quality(r: SubTestResult):
         Parser(tokens, source=code).parse()
         r.fail("diag: error code pattern (parser)", "Should have raised an error")
     except (ParseError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert error_code_pattern.match(diag.code), \
-            f"Error code '{diag.code}' doesn't match E[1-6]xxx pattern"
-        r.ok("diag: error code pattern (parser)")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert error_code_pattern.match(diag.code), \
+                f"Error code '{diag.code}' doesn't match E[1-6]xxx pattern"
+            r.ok("diag: error code pattern (parser)")
+        except AssertionError as _ae:
+            r.fail("diag: error code pattern (parser)", str(_ae))
     except Exception as e:
         r.fail("diag: error code pattern (parser)", f"{e}\n{traceback.format_exc()}")
 
@@ -279,10 +327,13 @@ def test_diagnostic_quality(r: SubTestResult):
         Parser(tokens, source=code).parse()
         r.fail("diag: foreign keyword error code", "Should have raised an error")
     except (ParseError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert diag.code.startswith("E2"), \
-            f"Foreign keyword error should be E2xxx, got {diag.code}"
-        r.ok("diag: foreign keyword error code")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert diag.code.startswith("E2"), \
+                f"Foreign keyword error should be E2xxx, got {diag.code}"
+            r.ok("diag: foreign keyword error code")
+        except AssertionError as _ae:
+            r.fail("diag: foreign keyword error code", str(_ae))
     except Exception as e:
         r.fail("diag: foreign keyword error code", f"{e}\n{traceback.format_exc()}")
 
@@ -294,10 +345,13 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: source snippet present", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert "unknownFunc" in diag.source_line, \
-            f"source_line should contain the offending code, got: '{diag.source_line}'"
-        r.ok("diag: source snippet present")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert "unknownFunc" in diag.source_line, \
+                f"source_line should contain the offending code, got: '{diag.source_line}'"
+            r.ok("diag: source snippet present")
+        except AssertionError as _ae:
+            r.fail("diag: source snippet present", str(_ae))
     except Exception as e:
         r.fail("diag: source snippet present", f"{e}\n{traceback.format_exc()}")
 
@@ -307,13 +361,16 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: rendered snippet", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        rendered = diag.render()
-        assert "missingFn" in rendered, \
-            f"Rendered diagnostic should include source text, got:\n{rendered}"
-        assert "|" in rendered, \
-            f"Rendered diagnostic should include gutter '|', got:\n{rendered}"
-        r.ok("diag: rendered snippet")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            rendered = diag.render()
+            assert "missingFn" in rendered, \
+                f"Rendered diagnostic should include source text, got:\n{rendered}"
+            assert "|" in rendered, \
+                f"Rendered diagnostic should include gutter '|', got:\n{rendered}"
+            r.ok("diag: rendered snippet")
+        except AssertionError as _ae:
+            r.fail("diag: rendered snippet", str(_ae))
     except Exception as e:
         r.fail("diag: rendered snippet", f"{e}\n{traceback.format_exc()}")
 
@@ -323,11 +380,14 @@ def test_diagnostic_quality(r: SubTestResult):
         check_code(code)
         r.fail("diag: location info", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
-        assert diag.loc is not None, "Diagnostic should have location info"
-        assert diag.loc.line >= 1, f"Line number should be >= 1, got {diag.loc.line}"
-        assert diag.loc.col >= 1, f"Column number should be >= 1, got {diag.loc.col}"
-        r.ok("diag: location info")
+        try:
+            diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+            assert diag.loc is not None, "Diagnostic should have location info"
+            assert diag.loc.line >= 1, f"Line number should be >= 1, got {diag.loc.line}"
+            assert diag.loc.col >= 1, f"Column number should be >= 1, got {diag.loc.col}"
+            r.ok("diag: location info")
+        except AssertionError as _ae:
+            r.fail("diag: location info", str(_ae))
     except Exception as e:
         r.fail("diag: location info", f"{e}\n{traceback.format_exc()}")
 

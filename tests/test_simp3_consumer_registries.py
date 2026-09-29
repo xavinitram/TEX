@@ -232,7 +232,9 @@ _ROUTES = {
          "path-traversal refusal the whitelist owes"),
 }
 
-_FETCH_RE = re.compile(r"/tex_wrangle/([A-Za-z0-9_]+)")
+# A real call, not a mention: a route named only in a comment must not keep its "frontend"
+# row green.
+_FETCH_RE = re.compile(r"""\bfetch(?:Api)?\(\s*["'`]/tex_wrangle/([A-Za-z0-9_]+)""")
 
 
 def census_routes() -> dict:
@@ -251,7 +253,7 @@ def census_routes() -> dict:
     return out
 
 
-def frontend_paths() -> set:
+def frontend_paths() -> "set | None":
     """The first path segment of every `/tex_wrangle/...` the shipped extension fetches."""
     if not _FRONTEND.is_file():
         return None

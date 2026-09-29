@@ -41,9 +41,9 @@ _CUDA = torch.cuda.is_available()
 _DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]
 
 
-def _both_tiers(code, bindings, B=1, H=4, W=4):
+def _both_tiers(code, bindings):
     """(interp OUT, codegen OUT). A decline is a failure: these rows pin BOTH tiers."""
-    interp, cg = run_both(code, bindings, B=B, H=H, W=W)
+    interp, cg = run_both(code, bindings)
     if cg is None:
         raise AssertionError("codegen declined the program, so only one tier was measured")
     return interp["OUT"], cg["OUT"]
@@ -131,7 +131,7 @@ def _run_rows(r, rows, tag, B=1):
     for label, code, params, want in rows:
         try:
             binds = {"A": make_img(B, 4, 5, 3, seed=11), **params}
-            oi, oc = _both_tiers(code, binds, B=B)
+            oi, oc = _both_tiers(code, binds)
             if not torch.equal(oi, oc):
                 raise AssertionError(
                     f"interp != codegen, maxdiff {(oi - oc).abs().max().item():.3e}; "

@@ -11,25 +11,17 @@ measurement script used) is correct.
 Loaded by path, like `helpers.load_counts_harness` loads `host_path_counts.py`:
 `benchmarks/` is `.comfyignore`d and not a package, so there is no import name.
 """
-import importlib.util
 import os
 import sys
 import tempfile
 
 import pytest
 
+from helpers import load_benchmark
+
 
 def _load_roi_codegen_ab_bench():
-    mod = sys.modules.get("_trk133_roi_codegen_ab_bench")
-    if mod is not None:
-        return mod
-    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(pkg_dir, "benchmarks", "roi_codegen_ab_bench.py")
-    spec = importlib.util.spec_from_file_location("_trk133_roi_codegen_ab_bench", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["_trk133_roi_codegen_ab_bench"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    return load_benchmark("roi_codegen_ab_bench.py")
 
 
 @pytest.fixture(scope="module")
@@ -93,7 +85,11 @@ def test_trk133_no_machine_or_host_path_literal_in_the_source(b):
     # Derived, not hard-coded (the same principle this whole test file checks the SCRIPT
     # for): whatever this box's own username is must not appear in the script's source,
     # but the username itself is never spelled out in this pushed file either.
+    # (path-shaped, so a common short account name -- `root`, `user` -- cannot match the
+    # ordinary words in the source)
     username = Path.home().name.lower()
     if username:
-        assert username not in src.lower()
+        import re
+        assert not re.search(r"(?:users|home)[\\/]" + re.escape(username) + r"(?:[\\/]|$)",
+                             src.lower())
     assert "comfyui_windows_portable" not in src.lower()

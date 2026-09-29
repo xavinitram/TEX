@@ -119,8 +119,6 @@ def test_prewarm481_heartbeat_bounded_during_prewarm_async(r: SubTestResult):
             programs = _five_programs()
             handle = tex_api.prewarm_async(programs, device="cuda", precision="fp32",
                                            compile_mode="auto")
-            while not handle.done:
-                time.sleep(0.005)
             summary = handle.wait(timeout=30)
 
             # Drain any NEW background futures the (base-shaped) "thread" mechanism left

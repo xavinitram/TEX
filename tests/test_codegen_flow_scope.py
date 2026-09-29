@@ -20,7 +20,7 @@ and runs the update either way). Each emitter now pins the mode for its own body
 byte-identical code (the general emitter pins the mode only when its body holds a `continue`).
 
 Rows. `test_flow_scope_emission` is the in-process pin: no bare `continue` may be emitted inside
-a general loop's body. The other two rows RUN programs, in a CHILD PROCESS with a per-program
+a general loop's body. The other three rows RUN programs, in a CHILD PROCESS with a per-program
 timeout, because the defect's signature is non-termination: a timeout is the failure, and it can
 never hang the suite. Every row reads the serving tier from `tier_trace` before comparing pixels
 (a parity check against a silent interpreter fallback compares the interpreter with itself), then
@@ -347,6 +347,7 @@ def _run_jobs(jobs):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 encoding="utf-8", errors="replace", env=env)
             lines: "queue.Queue" = queue.Queue()
+            err_lines: list = []
 
             def _pump(stream=proc.stdout):
                 try:
@@ -355,25 +356,36 @@ def _run_jobs(jobs):
                 finally:
                     lines.put(None)
 
+            def _pump_err(stream=proc.stderr):
+                # Drained continuously: a chatty child would otherwise block on a full stderr
+                # pipe and be misreported as a non-terminating loop.
+                try:
+                    for line in stream:
+                        err_lines.append(line)
+                except Exception:
+                    pass
+
             threading.Thread(target=_pump, daemon=True).start()
+            err_thread = threading.Thread(target=_pump_err, daemon=True)
+            err_thread.start()
 
             done_through = -1          # index (within `remaining`) of the last finished job
             budget = _IMPORT_TIMEOUT   # the first line waits for the child's imports
+            started = False            # True once the child reports READY (imports done)
             stalled = False
             while done_through + 1 < len(remaining):
                 try:
                     line = lines.get(timeout=budget)
                 except queue.Empty:
-                    results[remaining[done_through + 1]] = {"timeout": True, "after": budget}
+                    results[remaining[done_through + 1]] = {
+                        "timeout": True, "after": budget, "importing": budget == _IMPORT_TIMEOUT
+                        and not started}
                     done_through += 1
                     stalled = True
                     break
                 if line is None:       # the child exited without reporting this job
-                    err = ""
-                    try:
-                        err = proc.stderr.read() or ""
-                    except Exception:
-                        pass
+                    err_thread.join(timeout=5)
+                    err = "".join(err_lines)
                     results[remaining[done_through + 1]] = {
                         "error": f"child exited (rc={proc.poll()}): {err.strip()[-300:]}"}
                     done_through += 1
@@ -382,6 +394,7 @@ def _run_jobs(jobs):
                 line = line.strip()
                 if line == "READY":
                     budget = _TIMEOUT       # imports are done; the rest is per-program work
+                    started = True
                     continue
                 if not line.startswith("{"):
                     continue                # anything else a library printed to stdout
@@ -411,8 +424,12 @@ def _check(r, label, expect, mode, res):
         r.fail(label, "no result recorded")
         return
     if res.get("timeout"):
-        r.fail(label, f"did NOT terminate under codegen within {res['after']:.0f}s "
-                      "(native flow control leaked into a general loop)")
+        if res.get("importing"):
+            r.fail(label, f"the child produced no READY line within {res['after']:.0f}s "
+                          "(interpreter start-up / imports, not a program)")
+        else:
+            r.fail(label, f"did NOT terminate under codegen within {res['after']:.0f}s "
+                          "(native flow control leaked into a general loop)")
         return
     if res.get("error"):
         r.fail(label, res["error"])

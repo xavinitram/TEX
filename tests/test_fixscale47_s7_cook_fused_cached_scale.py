@@ -48,11 +48,23 @@ def test_s7_cache_hit_path_also_accepts_scale(r: SubTestResult):
     stages = _two_stage(_img(), "@OUT = vec4(@X.rgb + 0.1, 1.0);")
     rc = tex_results.ResultCache()
     out1 = tex_chain.cook_fused_cached(stages, 1, rc, device="cpu", upstream=("k1",), scale=0.5)
+    hits0, misses0 = rc.hits, rc.misses
     out2 = tex_chain.cook_fused_cached(stages, 1, rc, device="cpu", upstream=("k1",), scale=0.5)
     if "OUT" not in out1 or "OUT" not in out2:
         r.fail("cook shape", f"expected OUT in both: {out1.keys()} / {out2.keys()}")
         return
-    r.ok("both the cache-MISS and cache-HIT cook_fused_cached calls honour scale=0.5")
+    if (rc.hits, rc.misses) != (hits0 + 1, misses0) or not torch.equal(out1["OUT"], out2["OUT"]):
+        r.fail("cache hit", f"the second scale=0.5 call was not served from the cache "
+               f"(hits {hits0}->{rc.hits}, misses {misses0}->{rc.misses})")
+        return
+    # The key must carry the scale: the same stages and upstream at no scale are a MISS, not
+    # the scale=0.5 entry served back.
+    tex_chain.cook_fused_cached(stages, 1, rc, device="cpu", upstream=("k1",))
+    if rc.misses != misses0 + 1:
+        r.fail("scale in the cache key", "a scale=1.0 call was served the scale=0.5 entry "
+               f"(misses {misses0}->{rc.misses})")
+        return
+    r.ok("the cache-MISS call cooks, the repeat scale=0.5 call HITS, and an unscaled call misses")
 
 
 def test_s7_cook_fused_cached_refuses_unsafe_program_at_scale(r: SubTestResult):

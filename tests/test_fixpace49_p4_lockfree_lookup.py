@@ -15,10 +15,9 @@ for ITS lock-free read. Only `_cost_feed` (the write side, still guarding `_COST
 own structural mutations -- `popitem`/insertion/`move_to_end`) keeps the lock.
 
 Proven here by holding `_COST_LOCK` on another thread and confirming `_cost_lookup` still
-returns promptly on the calling thread -- a real would-be deadlock/stall probe, not a timing
-assertion (no `@pytest.mark.timing` needed; this is a counts/behaviour test that would HANG
-were it not for a bounded `join(timeout=...)`, matching this file's own no-real-CUDA-needed
-style). RED at base `32f6917` (after P1-P3 land, `_cost_lookup` still holds `_COST_LOCK`):
+completes on the calling thread while it is held -- a would-be deadlock/stall probe. It is an
+event handshake with a generous bound (5 s), not a timing assertion: a lock-free lookup
+finishes in microseconds, so the bound is only ever reached by a blocked one. RED at base `32f6917` (after P1-P3 land, `_cost_lookup` still holds `_COST_LOCK`):
 the lookup thread does not finish before the lock-holder releases.
 """
 import threading
@@ -47,21 +46,21 @@ def test_cost_lookup_never_blocks_on_a_concurrently_held_cost_lock(r):
 
     result = {}
 
+    lookup_done = threading.Event()
+
     def _do_lookup():
         result["value"] = _pace._cost_lookup(key, anchor)
-        result["done"] = True
+        lookup_done.set()
 
     looker = threading.Thread(target=_do_lookup)
     looker.start()
-    # A lock-free read finishes in microseconds; 0.2s is generous slack for a shared,
-    # possibly-busy box while still being far shorter than the lock-holder's own hold time
-    # below, so a genuinely BLOCKED lookup reliably fails this join.
-    looker.join(timeout=0.2)
-    finished_promptly = not looker.is_alive()
+    # The lock stays held until the lookup reports, so a lookup that needs it cannot finish.
+    finished_promptly = lookup_done.wait(timeout=5.0)
 
     release_now.set()
     looker.join(timeout=5.0)
     holder.join(timeout=5.0)
+    _pace._COST_TABLE.pop(key, None)
 
     if not got_lock:
         r.fail("FIX-PACE49 P4 setup", "the lock-holder thread never acquired _COST_LOCK")
@@ -97,14 +96,22 @@ def test_cost_feed_still_holds_the_lock_for_its_own_structural_mutations(r):
     holder.start()
     got_lock = holder_acquired.wait(timeout=5.0)
 
-    feeder = threading.Thread(target=_pace._cost_feed, args=(key, 1.0, anchor))
+    feeder_started = threading.Event()
+
+    def _feed():
+        feeder_started.set()
+        _pace._cost_feed(key, 1.0, anchor)
+
+    feeder = threading.Thread(target=_feed)
     feeder.start()
-    feeder.join(timeout=0.2)
-    blocked_as_expected = feeder.is_alive()
+    feeder_started.wait(timeout=5.0)
+    feeder.join(timeout=0.2)         # the feeder has begun; give it a window to (wrongly) finish
+    blocked_as_expected = feeder.is_alive() and key not in _pace._COST_TABLE
 
     release_now.set()
     feeder.join(timeout=5.0)
     holder.join(timeout=5.0)
+    _pace._COST_TABLE.pop(key, None)
 
     if not got_lock:
         r.fail("FIX-PACE49 P4 write-side setup", "lock-holder never acquired _COST_LOCK")

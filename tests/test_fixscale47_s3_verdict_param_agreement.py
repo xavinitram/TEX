@@ -73,5 +73,10 @@ def test_s3_prepare_still_refuses_when_the_unsafe_arm_is_live(r: SubTestResult):
     if v.safe:
         r.fail("premise", "expected mode=0.0 to keep the unsafe (ix-reading) arm live")
         return
+    refusal = getattr(raised, "tex_refusal", None)
+    if getattr(refusal, "code", None) != "scale-unsafe":
+        r.fail("scale-unsafe refusal",
+               f"prepare() raised something, but not the scale-unsafe refusal: {raised!r}")
+        return
     r.ok("prepare(scale=0.5) with mode=0.0 agrees with scale_verdict(code, {'mode': 0.0}): "
          "both refuse")

@@ -162,21 +162,19 @@ def test_first_attempt_falls_through_and_succeeds(monkeypatch):
     assert FC.verdict("fp-ok", "cpu", "fp32") is True
 
 
-def test_second_call_same_fingerprint_never_recompiles(monkeypatch):
+def test_adopted_true_verdict_skips_fall_through_bookkeeping(monkeypatch):
     """Once a fingerprint's verdict is True, a LATER call (e.g. after `_compiled_cache`
     was evicted/cleared, or a fresh process adopted the persisted verdict) skips the
-    fall-through machinery entirely and goes straight to a real `torch.compile` attempt --
-    it must still be exactly ONE more `torch.compile` call for that call, never a repeat of
-    the same "first attempt" bookkeeping. This test pins that a resolved-True verdict does
-    not re-invoke `begin_attempt`/`_pending` bookkeeping (no assertion error from a stale
-    pending entry) and that the codegen-only eager path is never taken for it."""
+    fall-through machinery entirely and goes straight to a real `torch.compile` attempt:
+    exactly ONE `torch.compile` call, with no `begin_attempt`/`_pending` bookkeeping
+    (no stale pending entry) and no codegen-only eager path."""
     calls = {"n": 0}
 
     def _fake_torch_compile(fn, **kw):
         calls["n"] += 1
         return fn
 
-    monkeypatch.setattr(C, "_select_backend", _stand_in_select_backend(tries=2))
+    monkeypatch.setattr(C, "_select_backend", _stand_in_select_backend())
     monkeypatch.setattr(C.torch, "compile", _fake_torch_compile)
     monkeypatch.setattr(C, "_get_or_make_codegen_fn", lambda *a, **k: _fake_cg_fn())
 

@@ -174,8 +174,8 @@ def test_tex_node_widget_defaults_unchanged(r: SubTestResult):
 
     `define_schema()` is a v3-API (`comfy_api`) surface: `tex_node.IO` is None and
     `TEXWrangleNode.define_schema` cannot be called at all when comfy_api is not on
-    the path (CI's lane: no ComfyUI, per invariant... this file has no v1
-    `INPUT_TYPES()` fallback to fall back to). So the defaults are pinned two ways:
+    the path (CI's lane has no ComfyUI, and `tex_node.py` has no v1
+    `INPUT_TYPES()` fallback, so `define_schema()` cannot be called there). So the defaults are pinned two ways:
     an AST read of the literal `default=` kwargs in the source (works with or without
     comfy_api — this is what actually protects the test's purpose everywhere), plus
     a live `define_schema()` call against the real schema object when `_V3_AVAILABLE`
