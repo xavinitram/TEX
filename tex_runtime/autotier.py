@@ -103,7 +103,8 @@ def make_key(fingerprint: str, device_type: str, precision: str,
     re-derived here. The two tables MUST agree: PRED-1 prices a program from PROF-1's
     bucket and the tier verdict is committed at autotier's, so an octave rule that
     changed in one place would have the cost table and the tier table describing
-    different cooks. Both modules are pure stdlib; no cycle.
+    different cooks. `profile` imports only `pacing`, never this module, so the lazy import
+    cannot cycle.
 
     `scale` (SCALECX-49): appended as an explicit, trailing component only when it is not
     `None` — a `scale=None` cook (every ordinary ComfyUI cook) keys exactly as before this
@@ -274,8 +275,8 @@ def _persist_path() -> str | None:
 def _version_tag() -> str:
     try:
         from ..tex_cache import verdict_epoch   # CACHE-4: verdicts gated by the verdict epoch
-        import torch
-        return f"{verdict_epoch()}_{torch.__version__.split('+')[0]}"
+        from .xfer import _version_tag as _device_tag   # GPU name + torch version
+        return f"{verdict_epoch()}_{_device_tag()}"
     except Exception:
         return "0"
 
@@ -370,8 +371,3 @@ def reload() -> int:
     load()
     return max(0, len(_STATE) - before)
 
-
-def seed_from_disk(key: tuple) -> None:
-    """Adopt any persisted terminal verdicts into the live table (so a restart
-    skips MEASURING/TRIAL). Loads the whole file once — verdicts are terminal."""
-    load()

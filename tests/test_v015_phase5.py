@@ -133,7 +133,7 @@ def test_cc2_state_machine(r: SubTestResult):
             AT.mark_submitted(k); AT.mark_ready(k)
             AT.record_trial(k, 4.0)  # commit → persists to disk
             AT.reset(); AT._loaded = False  # simulate restart
-            AT.seed_from_disk(k)
+            AT.load()
             assert AT.verdict(k) == AT.COMMITTED, "verdict not restored from disk"
         finally:
             try:

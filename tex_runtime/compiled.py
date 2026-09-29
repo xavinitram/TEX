@@ -1144,7 +1144,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     # a cache that persists to disk.
     sp = _consensus_extent(bindings, program)
     key = autotier.make_key(fingerprint, device_type, precision, sp, scale=scale)
-    autotier.seed_from_disk(key)
+    autotier.load()   # adopt persisted verdicts once (a latched no-op afterwards)
     state = autotier.verdict(key)
 
     def _codegen(bind):

@@ -176,3 +176,17 @@ def test_the_convergence_bound_is_not_persisted():
         assert key in AT._NON_DURABLE
     finally:
         AT.reset()
+
+
+def test_persisted_tier_verdicts_are_tagged_with_the_gpu(monkeypatch):
+    from TEX_Wrangle.tex_runtime import autotier as AT
+    from TEX_Wrangle.tex_runtime import xfer
+    monkeypatch.setattr(xfer, "_version_tag", lambda: "GPU-A_2.12")
+    tag_a = AT._version_tag()
+    monkeypatch.setattr(xfer, "_version_tag", lambda: "GPU-B_2.12")
+    assert AT._version_tag() != tag_a
+
+
+def test_autotier_has_no_per_key_seed_alias():
+    from TEX_Wrangle.tex_runtime import autotier as AT
+    assert not hasattr(AT, "seed_from_disk")
