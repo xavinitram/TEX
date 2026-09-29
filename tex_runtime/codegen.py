@@ -97,6 +97,7 @@ _CMP_OPS = {
 
 from .codegen_persist import (
     _cg_filename, _register_codegen_linecache, _codegen_exec_namespace,
+    materialize_codegen,  # re-exported: the STR-7 split keeps the old import path
 )
 
 
