@@ -542,11 +542,14 @@ def _fold_function(node: FunctionCall) -> ASTNode:
             return args[0]
         # pow(x, 2) -> x * x (strength reduction). Deep-copy the repeated uses so
         # the same subtree is not aliased into multiple positions (later passes
-        # mutate in place and assume no shared subtrees).
-        if exp == 2.0:
+        # mutate in place and assume no shared subtrees). Only for an operand that is
+        # safe to evaluate twice: a blur, a sample or a user call stays one pow call.
+        if _has_side_effects(args[0]):
+            pass
+        elif exp == 2.0:
             return BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
         # pow(x, 3) -> x * x * x
-        if exp == 3.0:
+        elif exp == 3.0:
             x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
             return BinOp(loc=node.loc, op="*", left=x_sq, right=_clone_expr(args[0]))
         # pow(x, 0.5) -> sqrt(x) is NOT applied: fn_sqrt clamps its arg to min 0

@@ -423,6 +423,14 @@ def test_fold_keeps_a_dropped_operands_shape(expr):
     assert out.flatten()[:3].tolist() == [16.0, 16.0, 16.0]
 
 
+def test_pow_square_does_not_duplicate_an_expensive_operand():
+    prog = _optimized("@OUT = pow(gauss_blur(@A, 3.0), 2.0);")
+    call = prog.statements[0].value
+    assert type(call).__name__ == "FunctionCall" and call.name == "pow"
+    prog = _optimized("@OUT = pow(@A * 0.5, 2.0);")
+    assert type(prog.statements[0].value).__name__ == "BinOp"
+
+
 def test_unroll_leaves_a_loop_that_writes_its_counter():
     # Unrolling used to substitute the counter into `i = i + 1`'s target (an assignment
     # to a literal). The loop is now left a loop; both tiers agree on it.
