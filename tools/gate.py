@@ -13,7 +13,7 @@ allowlist applied by eye. Two consequences, both measured over thirteen lanes:
   * the same pair of whole-suite runs was re-run after a rebase for information the second
     run superseded, about 15 % of all the suite time spent.
 
-So: one entry point, two tiers, the allowlist held as DATA next to the tests it names, and a
+So: one entry point, three tiers, the allowlist held as DATA next to the tests it names, and a
 verdict keyed on the tree so an unchanged tree is not re-measured. The exit code is the
 verdict:
 
@@ -25,13 +25,13 @@ verdict:
 
 TIERS — and what each one actually proves
 -----------------------------------------
-`--tier cheap` runs the eight ratchets that answer in seconds: the no-numpy ban, the LOC and
+`--tier cheap` runs the ratchets that answer in seconds (`_CHEAP` is the list): the no-numpy ban, the LOC and
 headroom ratchets, the archive-surface ratchet, the host-path counts pins, TST-7's runner
 drift check, the private-root lint over the tracked set, the shared-stash law, and the
-local-only-path lint over the tracked set (LINT-1). Every one of them is a strict
+local-only-path lint over the tracked set (LINT-1), and the wall-clock assertion ratchet. Every one of them is a strict
 SUBSET of the full tier; they are kept for feedback latency, not for coverage, and this tool
 says so out loud. It also excludes `timing` (below) — belt and braces, since none of the
-eight ratchet files carries that marker today, but a future one might.
+ratchet files carries that marker today, but a future one might.
 
 **The `timing` marker** (v0422-gatehyg / TRK-168, TRK-14, TRK-75). A test asserting a
 wall-clock ratio, a speedup or a deadline belongs to a sitting on a quiet, dedicated
@@ -79,7 +79,7 @@ importable on that interpreter; otherwise it reports precisely what is missing r
 failing the gate over an environment gap this tool does not install its way out of.
 
 `--tier touched` (SPLIT-E) is a THIRD, standalone tier — a lane's own gate, run before handing
-back, in between `cheap`'s eight-ratchet feedback latency and `full`'s whole-suite landing
+back, in between `cheap`'s ratchet-only feedback latency and `full`'s whole-suite landing
 cost. It selects, on the canonical harness, the full test files whose NAMES or IMPORTS relate
 to what this branch touched against `--base` (default `origin/main`): every file `git diff
 <base>..HEAD --name-only` names that is itself under `tests/` (its own name IS the relation —
@@ -122,7 +122,7 @@ same path twice.
 `TORCHINDUCTOR_CACHE_DIR` (its torch.compile/Inductor kernel sub-cache) is pinned to a PERSISTENT
 per-leg directory instead (`_inductor_cache_dir`, next to the verdict cache above), reused across
 runs: fewer never-before-seen compiled DLLs per run is fewer chances for an OS reputation check
-(Windows Application/Smart App Control) to block one (V045-FIX; `GATE-SAC.md`). It is pruned to a
+(Windows Application/Smart App Control) to block one (V045-FIX). It is pruned to a
 size cap (`_prune_inductor_cache_root`, `--tier`-independent, once per invocation, oldest files
 first) rather than left to grow without bound (G5).
 
@@ -205,8 +205,8 @@ _ALWAYS_TOUCHED = [
     ("LOC + headroom floors (REG-2/ENG-14)", "tests/test_v017_phase2.py"),
 ]
 
-#: Product source directories a touched path can resolve a dotted module name under (root-level
-#: `tex_*.py` needs no entry -- see `_touched_module`). `tests/`, `tools/`, `benchmarks/`,
+#: Product source directories a touched path can resolve a dotted module name under (a root-level
+#: `.py` needs no entry -- see `_touched_module`). `tests/`, `tools/`, `benchmarks/`,
 #: `docs/`, `.github/`, `examples/`, `assets/`, `editor_build/` and dotfiles/markdown are
 #: deliberately NOT product modules a test would import as `TEX_Wrangle.<dotted>`; a change
 #: confined to those is caught by the ALWAYS set above, never by the import-matching below.
@@ -218,7 +218,7 @@ def _touched_module(path: str) -> str | None:
     (never carrying the `TEX_Wrangle.` package prefix — e.g. `tex_engine`,
     `tex_runtime.compiled`), or `None` when the path is not an importable product module."""
     p = path.replace("\\", "/")
-    if not p.endswith(".py") or p in ("__init__.py",):
+    if not p.endswith(".py") or p == "__init__.py":
         return None
     if "/" not in p:
         return p[:-3]                      # root-level tex_*.py -> tex_*
@@ -413,7 +413,12 @@ def tree_hash() -> str:
     and a cache that could not see it would hand that lane a stale GREEN. Ignored paths (the
     orchestration material in `.git/info/exclude`) are deliberately invisible, so writing a
     hand-back does not invalidate a verdict."""
-    paths = enumerate_paths(_PKG) or []
+    paths = enumerate_paths(_PKG)
+    if paths is None:
+        # git could not list the tree: hash nothing shared, so no two runs ever share a key
+        # (an empty file list would make every tree the same tree, and the cache would replay
+        # the first verdict forever).
+        return "unhashable-" + os.urandom(16).hex()
     h = hashlib.sha256()
     for rel in paths:
         h.update(rel.encode("utf-8"))
@@ -461,7 +466,8 @@ def interpreter_identity(path: str) -> tuple:
     return hit
 
 
-def cache_key(tree: str, tier: str, interpreters, with_counts: bool, ci_exact: bool = False) -> str:
+def cache_key(tree: str, tier: str, interpreters, with_counts: bool, ci_exact: bool = False,
+              counts_digest: str = "") -> str:
     """The key a verdict is stored under: the tree, the tier, WHO measured it, and UNDER WHAT
     CUDA VISIBILITY.
 
@@ -470,14 +476,14 @@ def cache_key(tree: str, tier: str, interpreters, with_counts: bool, ci_exact: b
     in the key; the basename alone does not distinguish them (see `interpreter_identity`).
     `CUDA_VISIBLE_DEVICES` belongs in it for the same reason (G3/B6#2): a GPU-present run and a
     `-1` CPU-only run can red or green different rows of the same tree (a CUDA-only test on one
-    side, a host-absent assumption on the other), and `judge()`'s own allowlist evaluation reads
-    this exact variable (`cuda = os.environ.get("CUDA_VISIBLE_DEVICES") != "-1"`) to decide which
-    `when` entries apply — so a verdict taken under one setting is not just stale but a claim
+    side, a host-absent assumption on the other), and `main()` derives `cuda`
+    from this exact variable (`os.environ.get("CUDA_VISIBLE_DEVICES") != "-1"`) and passes it to `judge()`,
+    which uses it to decide which `when` entries apply — so a verdict taken under one setting is not just stale but a claim
     about a DIFFERENT allowlist evaluation if served under another. Hashed, so the cache file's
     keys stay one line whatever the paths look like — the readable identities travel in the
     record and are printed with the cached verdict."""
     parts = [f"tree={tree}", f"tier={tier}", f"counts={int(bool(with_counts))}",
-             f"ci_exact={int(bool(ci_exact))}",
+             f"ci_exact={int(bool(ci_exact))}", f"counts_digest={counts_digest}",
              f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"]
     for role, path in interpreters:
         real, version = interpreter_identity(path)
@@ -512,7 +518,7 @@ def _inductor_cache_dir(leg_name: str) -> str:
     doubled as a fresh `TORCHINDUCTOR_CACHE_DIR` too: every leg that forces a CPU/CUDA compile
     (the tiered-noise promotion tests) therefore built and loaded a never-before-seen native
     kernel on EVERY gate run, which is exactly the shape a Windows Application/Smart App
-    Control policy's reputation check can intermittently block (`GATE-SAC.md`; three
+    Control policy's reputation check can intermittently block (three
     occurrences the same day). Reusing compiled kernels across runs means far fewer
     never-seen DLLs for that check to see, so this lives next to the verdict cache above:
     same convention (`TEX_GATE_CACHE`-style env override, else a fixed name under the OS temp
@@ -685,6 +691,23 @@ def _mark_infra_red(leg: "Leg", detail: str) -> None:
     leg.failure_text[infra_id] = detail[:300]
 
 
+def _has_infra_red(legs: list) -> bool:
+    """True when any leg carries a synthetic id (`<leg:infra-rc1>`, a missing interpreter, ...):
+    a failure of the environment rather than of the tree."""
+    return any(f.startswith("<") and f.endswith(">") for leg in legs for f in leg.failures)
+
+
+def _file_digest(path) -> str:
+    """sha256 of a file's bytes, or "" when there is no such file (or no path)."""
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return "<unreadable>"
+
+
 def _stdout_detail(stdout: str) -> str:
     """The last non-blank line of a process's stdout, or a fixed note when there is none --
     the one-line explanation `_mark_infra_red` attaches to its synthetic id."""
@@ -765,6 +788,8 @@ def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose:
     shutil.rmtree(cache, ignore_errors=True)
     os.makedirs(cache, exist_ok=True)
     junit = os.path.join(scratch, f"junit-{leg.name}.xml")
+    if os.path.exists(junit):
+        os.remove(junit)                    # a reused --scratch must not feed a stale report
     # V045-FIX: TEX_CACHE_DIR stays fresh every run (the verdict's cold-cache promise is
     # unchanged) -- only TORCHINDUCTOR_CACHE_DIR is pinned to the PERSISTENT per-leg dir, so a
     # tiered-noise test that forces a compile reuses last run's kernel instead of building and
@@ -1181,7 +1206,8 @@ def main(argv=None) -> int:
     # different files on an unchanged tree), so it rides the cache key -- folded into the tier
     # string rather than a new cache_key parameter, since it is the only tier this applies to.
     cache_tier = f"{a.tier}:{base_ref}" if a.tier == "touched" else a.tier
-    key = cache_key(th, cache_tier, interpreters, bool(a.counts_baseline), bool(a.ci_exact))
+    key = cache_key(th, cache_tier, interpreters, bool(a.counts_baseline), bool(a.ci_exact),
+                    _file_digest(a.counts_baseline))
     who = describe_interpreters(interpreters)
     if not a.no_cache:
         hit = _cache_read(key)
@@ -1203,7 +1229,7 @@ def main(argv=None) -> int:
         _inductor_cache_root(),
         int(os.environ.get("TEX_GATE_INDUCTOR_CACHE_CAP_BYTES", _INDUCTOR_CACHE_CAP_BYTES)))
 
-    lines, codes = [], []
+    lines, codes, ran = [], [], []
     print(f"  interpreters: {who}")
 
     if a.tier == "touched":
@@ -1211,12 +1237,14 @@ def main(argv=None) -> int:
         # partly overlap via `test_v017_phase2.py`); it is a lane's OWN gate, run instead of
         # (or beside) `cheap`, never a replacement for the orchestrator's landing `full`.
         touched = run_touched(a.python, base_ref, scratch, a.verbose)
+        ran.append(touched)
         jt = judge([touched], allowlist, cuda)
         _report("touched", [touched], jt, head)
         lines.append(_line("touched", [touched], jt, head))
         codes.append(jt["code"])
     else:
         cheap = run_cheap(a.python, scratch, a.verbose)
+        ran.append(cheap)
         jc = judge([cheap], allowlist, cuda)
         _report("cheap", [cheap], jc, head)
         lines.append(_line("cheap", [cheap], jc, head))
@@ -1234,6 +1262,7 @@ def main(argv=None) -> int:
             full.append(run_counts(a.python, a.counts_baseline, scratch, a.verbose))
         if a.ci_exact:
             full.append(run_ci_exact(ci_python, scratch, a.verbose, ci_source))
+        ran.extend(full)
         jf = judge(full, allowlist, cuda)
         _report("full", full, jf, head)
         lines.append(_line("full", full, jf, head))
@@ -1244,8 +1273,9 @@ def main(argv=None) -> int:
     at = datetime.datetime.now().replace(microsecond=0).isoformat(" ")
     final = f"GATE {head} | OVERALL {overall} | tree {th[:12]} | {at}"
     print(final)
-    _cache_write(key, {"at": at, "verdict": overall, "code": code, "who": who,
-                       "lines": lines + [final]})
+    if not _has_infra_red(ran):     # an environment fault must not be replayed once it is fixed
+        _cache_write(key, {"at": at, "verdict": overall, "code": code, "who": who,
+                           "lines": lines + [final]})
     if not a.scratch:
         shutil.rmtree(scratch, ignore_errors=True)
     return code
