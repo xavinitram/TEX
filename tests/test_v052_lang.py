@@ -469,5 +469,13 @@ def test_deep_nesting_is_a_compile_error_not_a_crash():
     assert _compile_error_code("float x = " + " + ".join(["@A.r"] * 1500) + "; @OUT = vec4(x);") == "E2000"
 
 
+def test_lexer_skips_a_leading_bom_and_reads_leading_dot_exponents():
+    from TEX_Wrangle.tex_compiler.lexer import Lexer, TokenType
+    toks = Lexer("\ufeff@OUT = vec4(.5e1);").tokenize()
+    floats = [t.value for t in toks if t.type == TokenType.FLOAT_LIT]
+    assert floats == [".5e1"]
+    assert _parse_error_code("\ufeff@OUT = vec4(1.0);") is None
+
+
 def test_select_condition_must_be_a_scalar():
     assert "E5003" in check_errors("float a[2] = {0.0, 1.0}; @OUT = vec4(select(a, 1.0, 0.0));", _V4)
