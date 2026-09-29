@@ -39,7 +39,7 @@ WORKED = [
     ("Horizontal box blur via neighbour sampling",
      "vec3 acc = vec3(0.0);\n"
      "for (int i = -2; i <= 2; i = i + 1) {\n"
-     "    acc = acc + sample(@A, u + float(i) / iw, v).rgb;\n"
+     "    acc = acc + sample(@A, u + float(i) / max(iw - 1.0, 1.0), v).rgb;\n"
      "}\n"
      "@OUT = vec4(acc / 5.0, 1.0);"),
 ]
@@ -84,7 +84,8 @@ def render():
         "## Built-in variables",
         "",
         "- `ix`, `iy` — integer pixel coordinates. `iw`, `ih` — image width/height (floats).",
-        "- `u`, `v` — normalized coordinates in `[0,1]` (`u` = x/width, `v` = y/height).",
+        "- `u`, `v` — normalized pixel-centre coordinates in `[0,1]`, both ends included: "
+        "`u` = ix/(iw-1), `v` = iy/(ih-1).",
         "- `PI`, `E` — the constants.",
         "- **⚠ `v` is reserved** (the normalized y-coordinate). This is the #1 pitfall: do NOT "
         "name a variable `v` — it silently shadows the built-in. Same care for `u`/`ix`/`iy`.",
@@ -92,7 +93,8 @@ def render():
         "## Types & operators",
         "",
         "- Scalars `float`/`int`; vectors `vec2`/`vec3`/`vec4`; matrices `mat3`/`mat4`; also "
-        "`string` and arrays. Swizzle like GLSL: `.xyz`, `.rgb`, `.bgr`, `.xy`, `.wzyx`.",
+        "`string` and arrays. Swizzle like GLSL: `.xyz`, `.rgb`, `.bgr`, `.xy` (only a fixed set of patterns is "
+        "accepted; `.wzyx` is not).",
         "- Arithmetic `+ - * /`, comparisons, `&&`/`||`/`!`. Vectors operate component-wise; "
         "`vec3 * float` broadcasts. `mat3 * vec3` is a transform.",
         "- Control flow: `if (cond) { … } else { … }` (vectorized per-pixel), `for`/`while` "
@@ -103,11 +105,12 @@ def render():
         "1. **`v` (and `u`/`ix`/`iy`) are reserved built-ins** — never use them as variable names.",
         "2. **IMAGE output is clamped to `[0,1]` and RGB-only** — return `vec3`/`vec4`; alpha and "
         "out-of-range values are dropped/clamped.",
-        "3. **Divide safely:** raw `/` by a possibly-zero value gives `NaN` (paints magenta with "
-        "`debug_nan_highlight`). Use `sdiv(a, b)` (returns 0 when `b≈0`) when the denominator "
-        "can vanish.",
+        "3. **Divide safely:** raw `/` is epsilon-guarded, so a zero denominator gives a huge "
+        "finite value (and `0/0` gives 0) rather than `NaN` or `inf`. Use `sdiv(a, b)` (returns "
+        "0 when `b≈0`) when the denominator can vanish.",
         "4. **Spatial reads use `sample(@A, u, v)`** — indexing another pixel means sampling by "
-        "normalized coordinate, not array indexing. Offsets are in `1/iw`, `1/ih` units.",
+        "normalized coordinate, not array indexing. A one-pixel offset is `1/(iw-1)` in `u` "
+        "and `1/(ih-1)` in `v` (write `max(iw - 1.0, 1.0)` to survive a 1-pixel-wide image).",
         "5. **`precision=\"auto\"` is accuracy-safe, not a speedup** — leave `precision=fp32` "
         "unless you know you want the fp16 path.",
         "",
@@ -137,8 +140,10 @@ def main():
         try:
             existing = open(_OUT, encoding="utf-8").read()
         except FileNotFoundError:
-            print("LLM-Cheatsheet.md missing — run tools/gen_llm_cheatsheet.py")
-            return 1
+            # wiki/ is a separate, gitignored checkout: without it there is nothing to compare.
+            print("LLM-Cheatsheet.md not checked: no wiki/ checkout here "
+                  "(run tools/gen_llm_cheatsheet.py to create it)")
+            return 0
         if existing != content:
             print("LLM-Cheatsheet.md is stale — regenerate with tools/gen_llm_cheatsheet.py")
             return 1

@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(ROOT))  # custom_nodes on path
 
-from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib  # noqa: E402,F401  (populates REGISTRY)
+from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib  # noqa: E402,F401  (imported for its side effect: it populates REGISTRY)
 from TEX_Wrangle.tex_runtime import stdlib_registry as R  # noqa: E402
 
 _OUT = os.path.join(ROOT, "tex_help.json")
@@ -46,7 +46,8 @@ def render(data) -> str:
 
 
 def main():
-    text = render(build())
+    data = build()
+    text = render(data)
     check = "--check" in sys.argv
     if check:
         try:
@@ -61,7 +62,7 @@ def main():
         return 0
     with open(_OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
-    print(f"wrote {_OUT} ({build()['function_count']} functions)")
+    print(f"wrote {_OUT} ({data['function_count']} functions)")
     return 0
 
 
