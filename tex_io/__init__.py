@@ -24,13 +24,9 @@ import torch
 
 
 def _read_source(src) -> bytes:
-    """`src` -> its raw bytes: unchanged if already `bytes`/`bytearray` (content already
-    read), else read in BINARY mode from the path it names. The one place a `tex_io`
-    reader turns `src` into bytes (COLOR-1 simplify: `exr.py` and `tex_io/lut.py` shared
-    this exact dispatch, once each) — a path is always read in binary, never text mode,
-    so the platform's universal-newline translation never touches a byte a binary format
-    (EXR) must see verbatim. `tex_io/lut.py`'s text formats don't need that translation
-    either: `str.splitlines()` already treats `\\r\\n` as one line break."""
+    """`src` -> its raw bytes. `bytes`/`bytearray` are taken as the file's content (a
+    bytearray is copied to `bytes`); anything else is a path, read in BINARY mode so no
+    newline translation touches a byte a binary format (EXR) must see verbatim."""
     if isinstance(src, (bytes, bytearray)):
         return bytes(src)
     with open(src, "rb") as f:
@@ -101,4 +97,6 @@ def encode_from_fp32(t: torch.Tensor, desc: BufferDesc) -> torch.Tensor:
     if desc.is_float:
         return t.to(_STORAGE_TORCH[desc.storage])
     maxval = _INT_MAXVAL[desc.storage]
-    return (t.to(torch.float32).clamp(0.0, 1.0) * maxval).round().to(_STORAGE_TORCH[desc.storage])
+    # NaN has no defined float->int cast (it differs by backend), so it is mapped to 0 first.
+    clean = torch.nan_to_num(t.to(torch.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    return (clean.clamp(0.0, 1.0) * maxval).round().to(_STORAGE_TORCH[desc.storage])
