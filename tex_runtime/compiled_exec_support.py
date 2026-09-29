@@ -66,24 +66,6 @@ def _maybe_triton_hint(err_str_lower: str, device_type: str) -> None:
         )
 
 
-_STALE_STORE_S = 24 * 3600.0
-
-
-def _recently_written(path, within_s: float = _STALE_STORE_S) -> bool:
-    """True when any file under `path` changed within `within_s` seconds. Stops at the first
-    recent file, so a store that is in use is cheap to recognise."""
-    import time
-    cutoff = time.time() - within_s
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                if os.stat(os.path.join(root, name)).st_mtime >= cutoff:
-                    return True
-            except OSError:
-                pass
-    return False
-
-
 def _ensure_inductor_cache_dir() -> None:
     """Point TorchInductor's on-disk cache at TEX's owned cache dir.
 
@@ -108,8 +90,7 @@ def _ensure_inductor_cache_dir() -> None:
         os.makedirs(tc_dir, exist_ok=True)
         # PC-1: a TEX or torch upgrade mints a new {ver} subdir; the old one
         # (30–60 MB/program of inductor artifacts) would otherwise accumulate
-        # forever. Sweep sibling version dirs that don't match the current tag, except one
-        # another live process (a second install on the same cache root) is still writing to.
+        # forever. Sweep sibling version dirs that don't match the current tag, unless written recently.
         # Runs once per process (the env guard above makes this idempotent).
         try:
             import shutil
@@ -302,6 +283,24 @@ def _capture_in_flight() -> bool:
         return is_capturing()
     except Exception:
         return False
+
+
+_STALE_STORE_S = 24 * 3600.0
+
+
+def _recently_written(path, within_s: float = _STALE_STORE_S) -> bool:
+    """True when any file under `path` changed within `within_s` seconds. Stops at the first
+    recent file, so a store that is in use is cheap to recognise."""
+    import time
+    cutoff = time.time() - within_s
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                if os.stat(os.path.join(root, name)).st_mtime >= cutoff:
+                    return True
+            except OSError:
+                pass
+    return False
 
 
 # A loop-iteration or call-depth limit is the program's own bug, not a compile failure. These are
