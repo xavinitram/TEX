@@ -16,7 +16,9 @@ pins that every reader of a binding's name as its wire agrees with the productio
     tex_marshalling.sigil_names       the sigil scan (greedy by contract; bases compared)
     failure_harness.compile_program   the suite's tier harness
     helpers.check_code                the suite's checker harness
-    test_integration._prepare_example the corpus harness (pass 1 splits with `{}`)
+
+`test_integration._prepare_example` (the corpus harness; pass 1 splits with `{}`) is not a
+consumer: it supplies the corpus bindings the reference reading is asserted against.
 
 THE PROOF IS A MUTATION, NOT A GREEN RUN: at the base every consumer was non-greedy and agreed
 by construction, so this file is green there too. What it buys is that reverting ANY ONE
@@ -174,7 +176,6 @@ def _consumers(src, bt, bindings, wires, assigned, params):
          lambda: frozenset(_base(n) for n in sigil_names(src)[0]) - assigned - params),
         ("failure_harness.compile_program", lambda: _harness_reads(src, bindings, assigned, params)),
         ("helpers.check_code", lambda: _check_code_reads(src, bt, assigned, params)),
-        ("test_integration._prepare_example", lambda: frozenset(bindings) - params),
     ]
 
 
