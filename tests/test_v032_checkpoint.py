@@ -28,6 +28,8 @@ the note names:
 Shapes: DIFFERENTIAL ORACLE (the equality rows), NEVER-SEVER ROWS (the placement refusals),
 CANARY (the invariant-#7 contract), and one REGRESSION row for the resolution hole.
 """
+import os
+import tempfile
 import threading
 
 from helpers import *
@@ -44,26 +46,6 @@ _POOL = [
     "float y = luma(@IN);\n@OUT = vec4(mix(vec3(y), @IN.rgb, 1.10), 1.0);",
     "@OUT = vec4((@IN.rgb - vec3(0.5)) * 1.08 + vec3(0.5), 1.0);",
 ]
-# A pointwise-only pool, kept as the fallback for any environment whose fp16 halo kernels are
-# missing (torch 2.5 has no CPU `replication_pad2d_channels_last` for Half; 2.10 does). The
-# fp16 rows try the full pool first and fall back rather than skipping, so the coverage
-# follows the toolchain instead of being permanently narrowed by the weakest one.
-_POOL_POINTWISE = [c for c in _POOL if "gauss_blur" not in c]
-
-
-def _fp16_pool(device):
-    """The richest fp16 pool this box can actually cook — with the halo op if its kernels
-    exist, pointwise otherwise."""
-    try:
-        tex_engine.cook_stage_list(
-            [{"code": "@OUT = gauss_blur(@IN, 4.0);", "chain_input": None,
-              "bindings": {"IN": torch.rand(1, 16, 16, 3, device=device)}}],
-            device=device, precision="fp16")
-        return _POOL, "with-halo"
-    except Exception:
-        return _POOL_POINTWISE, "pointwise-only"
-
-
 def _stages(src, n, pool=None, tap_at=()):
     pool = pool or _POOL
     out = []
@@ -114,7 +96,7 @@ def test_v032_cache7_differential_oracle(r: SubTestResult):
                 r.fail(f"CACHE-7 oracle {device} cuts={cuts}", f"maxdiff {d:.3e}")
 
 
-def test_v032_cache7_fp16_gate_is_lifted_and_exact(r: SubTestResult):
+def test_v032_cache7_fp16_taps_are_refused(r: SubTestResult):
     """P0-2 (v0.33). This row used to assert the OPPOSITE — that fp16 taps are admitted and
     bit-exact — on the strength of a 22-row measurement. The measurement was real; its
     conclusion was not, because every row in it produced an fp16-REPRESENTABLE boundary.
@@ -276,7 +258,8 @@ def test_v032_cache7_placement_refuses_rather_than_guesses(r: SubTestResult):
     # A threshold BELOW the materialization floor must not place a tap per stage: at 1024² a
     # `put` is ~4.5 ms, so a 0.1 ms threshold would otherwise make the chain slower while
     # reporting success. The floor is a MULTIPLE of the put, so a stage that merely breaks
-    # even against it is refused too.
+    # even against it does not get a tap of its own: a tap must cover the cumulative cost of
+    # at least two such stages.
     floor_px = 1024 * 1024
     cheap = {i: 1.0 for i in range(6)}          # every stage far below the floor
     if CK.plan_checkpoints(S, costs=cheap, threshold_ms=0.1, px=floor_px, settled=True) == []:
@@ -286,11 +269,12 @@ def test_v032_cache7_placement_refuses_rather_than_guesses(r: SubTestResult):
 
     marginal = {i: 5.0 for i in range(6)}       # ~break-even against a 4.5 ms put
     dense = CK.plan_checkpoints(S, costs=marginal, threshold_ms=0.1, px=floor_px, settled=True)
-    if len(dense) <= 3:
-        r.ok(f"CACHE-7 floor: break-even stages placed {len(dense)} tap(s), not 5")
+    if len(dense) <= 3 and all(b - a >= 2 for a, b in zip(dense, dense[1:])):
+        r.ok(f"CACHE-7 floor: break-even stages placed {len(dense)} tap(s) {dense}, "
+             f"never one per stage")
     else:
         r.fail("CACHE-7 materialization floor",
-               f"placed {len(dense)} taps on break-even stages at 1024²")
+               f"placed {len(dense)} taps {dense} on break-even stages at 1024²")
 
     # And the positive control, so none of the above passes vacuously.
     placed = CK.plan_checkpoints(S, costs=costs, threshold_ms=100.0, px=px, settled=True)
@@ -438,7 +422,11 @@ def test_v032_cache7_result_cache_is_thread_safe(r: SubTestResult):
     `get`s on the main thread. Before the lock that was concurrent `move_to_end`/`popitem` on
     one OrderedDict — a corrupted LRU or a RuntimeError, not a stale read."""
     print("\n--- v0.32 CACHE-7: ResultCache is thread-safe ---")
-    cache = tex_results.ResultCache(budget_mb=2)      # tight, so eviction races too
+    # A scratch cache_dir: the tight budget spills continuously, and the default would be the
+    # user's real cache directory.
+    scratch = tempfile.TemporaryDirectory(prefix="tex_v032_ts_", ignore_cleanup_errors=True)
+    cache = tex_results.ResultCache(budget_mb=2,     # tight, so eviction races too
+                                    cache_dir=os.path.join(scratch.name, "results"))
     frame = torch.rand(1, 128, 128, 4)
     errors = []
     stop = threading.Event()
@@ -471,16 +459,24 @@ def test_v032_cache7_result_cache_is_thread_safe(r: SubTestResult):
     for t in threads:
         t.join(timeout=5.0)
 
-    if errors:
+    hung = [t.name for t in threads if t.is_alive()]
+    if hung:
+        r.fail("CACHE-7 ResultCache thread safety", f"threads still running after stop: {hung}")
+    elif errors:
         r.fail("CACHE-7 ResultCache thread safety", "; ".join(errors[:3]))
     else:
         r.ok("CACHE-7: 2 writers + 1 reader for 0.6 s raised nothing")
     st = cache.stats()
-    if st["ram_bytes"] >= 0 and st["ram_entries"] >= 0:
+    truth = sum(e.nbytes for e in cache._ram.values())
+    if st["ram_bytes"] == truth and st["ram_entries"] == len(cache._ram):
         r.ok(f"CACHE-7: byte accounting survived the race "
-             f"({st['ram_entries']} entries, {st['ram_bytes']} B)")
+             f"({st['ram_entries']} entries, {st['ram_bytes']} B == the entries' own total)")
     else:
-        r.fail("CACHE-7 accounting", f"negative accounting after the race: {st}")
+        r.fail("CACHE-7 accounting",
+               f"counter says {st['ram_bytes']} B / {st['ram_entries']} entries, the entries "
+               f"hold {truth} B / {len(cache._ram)}")
+    cache.clear(disk=True)
+    scratch.cleanup()
 
 
 def test_v032_cache7_harvest_respects_the_tap_budget(r: SubTestResult):
@@ -757,5 +753,7 @@ def test_v032_cache7_profile_costs_and_confidence_agree(r: SubTestResult):
         r.ok(f"CACHE-7: the two bucket filters genuinely differ here ({loose} vs {n}) — "
              "so the row is not vacuous")
     else:
-        r.ok("CACHE-7: bucket filters agree on this table (row still valid)")
+        r.fail("CACHE-7 snapshot agreement",
+               f"the two bucket filters no longer differ ({loose} vs {n}): the table does "
+               f"not reproduce the mixed-bucket hazard, so the row above is vacuous")
     _profile.reset()
