@@ -95,9 +95,12 @@ def test_house50_h4_collection_from_a_junctioned_no_git_checkout(r: SubTestResul
             r.fail("H4 junctioned collection",
                    f"collection hit ModuleNotFoundError from this checkout shape "
                    f"(rc={proc.returncode}): {out[-1500:]}")
-        elif proc.returncode not in (0, 5):   # 5 = pytest's own "no tests collected"
+        elif proc.returncode != 0:
             r.fail("H4 junctioned collection",
                    f"unexpected collection rc={proc.returncode}: {out[-1500:]}")
+        elif sum(1 for ln in out.splitlines() if "::" in ln) == 0:
+            r.fail("H4 junctioned collection",
+                   f"rc=0 but no test items were collected: {out[-1500:]}")
         else:
             n = sum(1 for ln in out.splitlines() if "::" in ln)
             r.ok(f"the whole suite collects cleanly from a junctioned, no-.git, "

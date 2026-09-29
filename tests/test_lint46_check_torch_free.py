@@ -165,7 +165,7 @@ def test_lint46_real_cook_path_unaffected(r: SubTestResult):
 
 
 def test_lint46_tex_runtime_lazy_names_resolve(r: SubTestResult):
-    """`tex_runtime/__init__.py`'s four names are now PEP 562 lazy attributes (the PORT-6
+    """`tex_runtime/__init__.py`'s five names are now PEP 562 lazy attributes (the PORT-6
     pattern) rather than eager imports. Confirms each still resolves to the real object —
     a host or test importing them off the package (rather than the submodule directly)
     must see the identical objects it saw before this change."""
@@ -196,6 +196,6 @@ def test_lint46_tex_runtime_lazy_names_resolve(r: SubTestResult):
         r.ok("an unrelated missing attribute still raises AttributeError")
     if {"Interpreter", "InterpreterError", "TEXStdlib", "execute_compiled",
         "clear_compiled_cache"} <= set(dir(tr)):
-        r.ok("dir(tex_runtime) still lists the four lazy names")
+        r.ok("dir(tex_runtime) still lists the five lazy names")
     else:
         r.fail("LINT-46 lazy attribute dir()", f"dir(tex_runtime) is missing a lazy name: {dir(tr)}")

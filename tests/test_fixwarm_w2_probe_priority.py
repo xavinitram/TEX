@@ -14,12 +14,11 @@ Red at 5ae6288 (B3's own structural repro, deterministic via a block/release ren
 no wall-clock race): a THREE-program `prewarm_async` job with the middle program's own warm
 step blocked; a `compile_capability_async()` probe submitted once the FIRST program has
 already completed (so the probe is queued strictly behind only the STILL-PENDING remainder
-of the batch, never behind work already done) must not have to wait for the LAST program too
--- it should resolve once its own probe work runs, which the fix must schedule ahead of the
-not-yet-submitted remaining programs rather than behind all of them.
+of the batch, never behind work already done) must not have to wait for the batch at all.
+The shipped fix gives `prewarm_async` its own pool (`_get_prewarm_pool()`), so the probe
+resolves on the capability pool while the prewarm worker is still blocked inside program 1.
 """
 import threading
-import time
 
 import pytest
 
@@ -76,28 +75,26 @@ def test_fixwarm_w2_probe_not_blocked_by_whole_batch(r: SubTestResult):
 
             probe_future = CC._get_capability_pool().submit(lambda: "PROBE_RAN")
 
-            # Give the probe a real but small grace window. If the probe is queued behind
-            # the REST of the batch (program 1's still-blocked emission + program 2), it
-            # cannot possibly finish in this window -- program 1 alone is gated open-ended
-            # until we release it below, well past this wait.
-            probe_done_early = probe_future.done()
-            time.sleep(0.3)
-            probe_done_after_grace = probe_future.done()
+            # Wait for the probe while program 1 is STILL gated (the gate is released only
+            # below). A probe queued behind the batch cannot resolve until then, so it times
+            # out here; one on its own pool resolves at once. No sleep, no early-done check.
+            probe_result = None
+            try:
+                probe_result = probe_future.result(timeout=10)
+            except Exception:
+                pass
+            probe_resolved_while_blocked = probe_result == "PROBE_RAN"
 
             program1_gate.set()   # let the rest of the batch finish
             summary = handle.wait(timeout=30)
-            probe_result = probe_future.result(timeout=10)
         finally:
             C._get_or_make_codegen_fn = orig
 
         try:
-            assert not probe_done_early, "probe resolved before it was even submitted (bug in the repro itself)"
-            assert probe_done_after_grace, (
-                "the capability probe did not resolve within a short grace window while "
-                "program 1 (2 of 3) was still blocked -- it is queued behind the REMAINING "
-                "prewarm batch instead of getting a turn once the in-flight program's "
-                "current work yields")
-            assert probe_result == "PROBE_RAN"
+            assert probe_resolved_while_blocked, (
+                "the capability probe did not resolve while program 1 (2 of 3) was still "
+                "blocked in the prewarm worker -- it is queued behind the prewarm batch "
+                "instead of running on its own pool")
             assert summary["programs"] == 3 and summary["errors"] == 0, summary
             r.ok(f"probe resolved during the batch, not after it; summary={summary}")
         except AssertionError as e:

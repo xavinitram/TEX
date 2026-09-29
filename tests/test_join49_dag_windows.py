@@ -19,7 +19,6 @@ MUST refuse) are pixel-proven too — the case is "this window is silently wrong
 """
 from __future__ import annotations
 
-import itertools
 import random
 
 from helpers import *
@@ -363,7 +362,7 @@ def _run_pixel_identity(r: SubTestResult, device: str):
     _, _, whole_out = _cook_whole(src, device)
     roi = (30, 30, 12, 12, W, H)
     win_out, served = _cook_windowed(src, device, roi)
-    x0, y0, w, h = served[:4] if served is not None else roi[:4]
+    x0, y0, w, h = served[:4]
     ref_crop = whole_out[:, y0:y0 + h, x0:x0 + w]
     if torch.equal(win_out, ref_crop):
         r.ok(f"JOIN-49 pixel identity [{device}]: windowed 3-stage join DAG cook == "

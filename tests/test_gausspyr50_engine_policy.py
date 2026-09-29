@@ -34,13 +34,14 @@ from TEX_Wrangle.tex_runtime.stdlib_core import (
     _gauss_blur_pyramid_approx,
 )
 
-# Measured worst-case bands (this file's own fuzzer sweep, box (avg_pool2d) cascading
-# pyramid, quality_cap=8.0, sigma up to 2000, 512x512 CPU corpora) with headroom for a
-# different image size/shape than the sweep used. A regression past either band is a
-# loud decision to re-measure and re-band (the same R1 promise `docs/resolution-scale.md`
-# already makes for `scale=`), never a silently loosened tolerance.
-_SMOOTH_EDGES_BAND = 0.16
-_CHECKER_BAND = 0.17
+# Bands for the shipped path: one area reduction plus the edge-padded residual blur
+# (quality cap 96). Measured on the 512x512 corpora below, sigma 257..2000: worst maxdiff
+# 4e-5 (smooth+edges) and 2e-5 (checker); the 1e-3 bands leave ~25x headroom while still
+# failing a fall back to a cruder pyramid. A regression past either band is a loud decision
+# to re-measure and re-band (the same R1 promise `docs/resolution-scale.md` already makes
+# for `scale=`), never a silently loosened tolerance.
+_SMOOTH_EDGES_BAND = 1e-3
+_CHECKER_BAND = 1e-3
 
 
 def _checker(h, w, period=8):
@@ -101,9 +102,9 @@ def test_gausspyr50_fn_gauss_blur_end_to_end_below_threshold(r: SubTestResult):
     for sigma in (1.0, 16.0, 256.0):
         out = tex_engine.cook(f"@OUT = gauss_blur(@A, {sigma});", {"A": img.clone()},
                                device_mode="cpu").outputs["OUT"]
-        bchw = img[..., :3].permute(0, 3, 1, 2)
+        bchw = img.permute(0, 3, 1, 2)
         expect_rgb = _gauss_blur_bchw(bchw, sigma).permute(0, 2, 3, 1)
-        if not torch.equal(out[..., :3], expect_rgb):
+        if not torch.equal(out, expect_rgb):
             r.fail(f"fn_gauss_blur e2e sigma={sigma}", "diverged from the exact conv below threshold")
             return
     r.ok("tex_engine.cook(gauss_blur(...)) matches the exact conv bit-for-bit at sigma<=threshold")
@@ -113,10 +114,10 @@ def test_gausspyr50_fn_gauss_blur_end_to_end_below_threshold(r: SubTestResult):
 
 def test_gausspyr50_pyramid_accuracy_band(r: SubTestResult):
     print("\n--- GAUSSPYR-50: accuracy band above the threshold (checker + smooth+edges) ---")
-    h = w = 256
+    h = w = 512   # larger than the smallest threshold sigma, so the window is not the whole frame
     corpora = {"checker": _checker(h, w), "smooth+edges": _smooth_edges(h, w)}
     bands = {"checker": _CHECKER_BAND, "smooth+edges": _SMOOTH_EDGES_BAND}
-    sigmas = (THRESHOLD + 1.0, 512.0, 1024.0, 2000.0)
+    sigmas = (THRESHOLD + 1.0, 400.0, 512.0, 1024.0, 2000.0)
     worst = {}
     for name, img in corpora.items():
         bchw = _sc._get_bchw(img)

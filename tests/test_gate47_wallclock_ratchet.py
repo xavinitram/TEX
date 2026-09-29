@@ -565,7 +565,10 @@ def _unused_helper(r, elapsed, bound):
 
 
 def test_g1_neighbour_unused_helper(r):
+    import time
+    t0 = time.perf_counter()
     result = compute_ratio()
+    _ = time.perf_counter() - t0
     if result > 2.0:
         r.ok("good ratio")
     else:
