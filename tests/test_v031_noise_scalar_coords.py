@@ -143,8 +143,9 @@ _FORMS_3D = [
 # (torch 2.5.0+cu118): every other 3D form lands under 2.3e-06 CPU-vs-CUDA, curl at
 # 5.7e-04 — and it reads 5.7e-04 for all-grid coords too, i.e. that is the honest
 # hardware floor for curl and not something a constant coord introduces. The budgets
-# below sit ~40x over each measured value: far under the O(0.1) a genuine value bug
-# would show, far over ordinary hardware noise.
+# below sit about 43x over the 3D forms' measured value and about 9x over curl's (curl's
+# margin is the thin one on another GPU or torch build): far under the O(0.1) a genuine
+# value bug would show, over ordinary hardware noise. Measured on that older torch.
 _TOL = 1e-4
 _TOL_CURL = 5e-3
 
@@ -471,16 +472,26 @@ def test_v031_noise_scalar_coord_batched_equals_per_octave(r: SubTestResult):
         for zshape in ((), (_W,), (_H, _W), (1, _H, _W)):
             z = (torch.scalar_tensor(0.7, dtype=torch.float32, device=dev) if not zshape
                  else (torch.rand(zshape, generator=gen) * 3.0).to(dev))
-            batched = _noise._octave_perlins(_noise._perlin3d_fast, (x, y, z), len(freqs))
             ref = [_noise._perlin3d_fast(x * f, y * f, z * f) for f in freqs]
+            # `_octave_perlins` only batches on CUDA, so on CPU it IS the per-octave loop and
+            # comparing it to `ref` proves nothing. `forced` builds the batch by hand through
+            # the same `_stack_coord` padding, so the batched arm is exercised on every device.
+            widest = _noise._widest((x, y, z))
+            aligned = _noise._align_coords((x, y, z), widest)
+            stacked = tuple(_noise._stack_coord([c * f for f in freqs], c, widest.dim())
+                            for c in aligned)
+            n = _noise._perlin3d_fast(*stacked)
+            forced = [n[i] for i in range(len(freqs))]
+            public = _noise._octave_perlins(_noise._perlin3d_fast, (x, y, z), len(freqs))
             checked += 1
-            for i, (a, b) in enumerate(zip(batched, ref)):
-                if a.shape != b.shape:
-                    bad.append("%s z%s octave %d: shape %s vs %s"
-                               % (dev, zshape or "()", i, tuple(a.shape), tuple(b.shape)))
-                elif not torch.equal(a, b):
-                    bad.append("%s z%s octave %d: not bit-exact, maxdiff=%.3e"
-                               % (dev, zshape or "()", i, float((a - b).abs().max())))
+            for label, batched in (("forced batch", forced), ("public", public)):
+                for i, (a, b) in enumerate(zip(batched, ref)):
+                    if a.shape != b.shape:
+                        bad.append("%s %s z%s octave %d: shape %s vs %s"
+                                   % (dev, label, zshape or "()", i, tuple(a.shape), tuple(b.shape)))
+                    elif not torch.equal(a, b):
+                        bad.append("%s %s z%s octave %d: not bit-exact, maxdiff=%.3e"
+                                   % (dev, label, zshape or "()", i, float((a - b).abs().max())))
     if bad:
         r.fail("batched == per-octave", "\n  " + "\n  ".join(bad[:12]))
     else:

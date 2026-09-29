@@ -14,6 +14,7 @@ SCHED-3 the bridge: the ComfyUI adapter passes the host's own interrupt into the
 FUS-1b  multi-injection: one external producer may feed >1 region member (Load ->
         [blur, sharpen] -> merge) — the detector groups external edges by producer and the
         source spec carries a list of injection points (GraphSpec schema 1 -> 2).
+        (Not covered in this file: test_v021_phase1.py and test_v022_phase1.py pin it.)
 small   the sweep: count_var's outer-counter route declined (falls back to the interpreter
         oracle, never a wrong divisor); the spatial-scalar `.r`/`.x` runtime mis-slice fixed
         with an interpreter-side base-rank check.
@@ -77,8 +78,10 @@ def test_eng4_recut_single_raiser(r: SubTestResult):
         tex_engine._compile_or_raise("@OUT = badfn(@A) + alsobad(@A);", {"A": TEXType.VEC3})
         r.fail("ENG-4 multi", "no raise")
     except TEXCompileError as e:
+        names = " ".join(d.message for d in e.diagnostics)
         r.ok(f"multi-error -> one TEXCompileError with {len(e.diagnostics)} diagnostics") \
-            if len(e.diagnostics) >= 1 else r.fail("ENG-4 multi", "lost diagnostics")
+            if len(e.diagnostics) >= 2 and "badfn" in names and "alsobad" in names \
+            else r.fail("ENG-4 multi", f"lost diagnostics: {names!r}")
 
     # 4) the node still surfaces a compile error as RuntimeError + the TEX_DIAG: JSON suffix
     #    (the frontend contract) — built from .diagnostics, not the raw per-phase types.

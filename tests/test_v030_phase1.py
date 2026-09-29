@@ -586,14 +586,20 @@ def test_v030_comfy_never_arms_roi(r: SubTestResult):
     # CANARY, the ENG-4/5/6 contract-key-set shape: "a ComfyUI cook is unaffected" must be a
     # red test, not a promise. tex_node builds its prepare() kwargs explicitly; assert the two
     # ROI keys are absent from the source of that call, so adding one is a deliberate act.
-    import re
+    import ast
     from pathlib import Path
     try:
         src = (Path(__file__).resolve().parent.parent / "tex_node.py").read_text(encoding="utf-8")
-        # every prepare(...) call in the node, flattened
-        calls = re.findall(r"prepare\((.*?)\)\s*$", src, re.S | re.M)
-        joined = " ".join(calls)
-        offenders = [k for k in ("roi=", "roi_exec=") if k in joined]
+        # every prepare(...) call in the node, by AST (a comment or docstring cannot match)
+        calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)
+                 and (getattr(n.func, "attr", None) or getattr(n.func, "id", None)) == "prepare"]
+        if not calls:
+            raise AssertionError("no prepare(...) call found in tex_node.py (renamed? the canary "
+                                 "would pass vacuously)")
+        if any(k.arg is None for c in calls for k in c.keywords):
+            raise AssertionError("prepare(**kwargs) in tex_node.py: the canary cannot see "
+                                 "which keys it passes")
+        offenders = [k.arg for c in calls for k in c.keywords if k.arg in ("roi", "roi_exec")]
         if offenders:
             r.fail("v0.30 comfy-never-arms", f"tex_node passes {offenders} to prepare()")
         else:
@@ -734,7 +740,8 @@ def test_v030_pm6_roi_viewport(r: SubTestResult):
     import sys as _sys
     from pathlib import Path
     ex = str(Path(__file__).resolve().parent.parent / "examples")
-    if ex not in _sys.path:
+    added = ex not in _sys.path
+    if added:
         _sys.path.insert(0, ex)
     try:
         import host_demo as _H
@@ -822,6 +829,9 @@ def test_v030_pm6_roi_viewport(r: SubTestResult):
             r.ok(f"revisiting a scrubbed value is a CACHE-2 hit ({first} cook(s) cold → {revisit} warm)")
     except Exception as e:
         r.fail("PM-6 ROI viewport", f"{type(e).__name__}: {e}")
+    finally:
+        if added and ex in _sys.path:
+            _sys.path.remove(ex)
 
 
 def test_v030_codegen_roi_defaults_off(r: SubTestResult):

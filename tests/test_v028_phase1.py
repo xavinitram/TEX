@@ -18,7 +18,9 @@ Everything here ships OFF the default ComfyUI cook path (invariant #7): the tags
 host-armed, array wires need the engine profile, and EXR/PNG are opt-in I/O. CPU-pinned; CUDA
 looped where present. Any test that flips the egress profile restores 'comfy' in a finally.
 """
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 
@@ -122,16 +124,23 @@ def test_data2_storage_exr(r: SubTestResult):
     print("\n--- DATA-2: storage descriptor + EXR + 16-bit PNG ---")
 
     # BufferDesc round-trips per storage dtype (uint8/16 quantise, float exact/half-precise)
-    ok = True
-    for st, tol in [("uint8", 4e-3), ("uint16", 3e-5), ("float16", 1e-3), ("float32", 0.0)]:
+    # Bounds are round-to-nearest (half a step: 1/510, 1/131070); a truncating encoder or one
+    # that scales by 256 exceeds them. The endpoints must come back exactly.
+    bad = []
+    ends = torch.tensor([0.0, 1.0])
+    for st, tol in [("uint8", 2e-3), ("uint16", 8e-6), ("float16", 1e-3), ("float32", 0.0)]:
         x = torch.rand(4, 5, 3)
         d = BufferDesc(st)
         err = (decode_to_fp32(encode_from_fp32(x, d), d) - x).abs().max().item()
-        ok = ok and err <= tol + 1e-7
-    r.ok("BufferDesc encode/decode round-trips (uint8/16/half/float)") if ok \
-        else r.fail("DATA-2 bufferdesc", f"{st} err too high")
+        if err > tol + 1e-7:
+            bad.append(f"{st} err {err:.2e} > {tol:.0e}")
+        if not torch.equal(decode_to_fp32(encode_from_fp32(ends, d), d), ends):
+            bad.append(f"{st} endpoints 0/1 not exact")
+    r.ok("BufferDesc encode/decode round-trips (uint8/16/half/float)") if not bad \
+        else r.fail("DATA-2 bufferdesc", "; ".join(bad))
 
     td = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, td, True)
     # EXR: float exact, half ~1e-3, across NONE/ZIPS/ZIP and channel counts + a non-square frame
     ok = True
     cases = [(64, 64, 3, False, "zip"), (64, 64, 3, True, "zip"),
@@ -143,7 +152,7 @@ def test_data2_storage_exr(r: SubTestResult):
         tex_exr.write_exr(p, x, half=half, compression=comp)
         img = tex_exr.read_exr(p)
         err = (img.pixels - x).abs().max().item()
-        ok = ok and list(img.pixels.shape) == [H, W, C] and err <= (5e-2 if half else 1e-6)
+        ok = ok and list(img.pixels.shape) == [H, W, C] and err <= (1e-3 if half else 1e-6)
     r.ok("EXR write/read round-trip: float exact, half ~1e-3 (NONE/ZIPS/ZIP, 1/3/4ch, non-square)") \
         if ok else r.fail("DATA-2 exr", "a round-trip diverged")
 
@@ -424,13 +433,14 @@ def test_port5_second_host(r: SubTestResult):
         except CookCancelled:
             r.ok("SCHED-3: a superseded cook aborts (CookCancelled)")
 
-        # PM-2: the warm 1024^2 cook budget. Assert the pass on CUDA; on CPU just require it runs.
+        # PM-2: the warm 1024^2 cook budget. The <50 ms gate names the sm_120 box, so it is
+        # asserted there only; any other device just has to run the benchmark.
         ok = host_demo.run_benchmark()
-        if _CUDA:
-            r.ok("PM-2: <50 ms/frame warm at 1024^2 (CUDA)") if ok \
-                else r.fail("PORT-5 pm2", "over 50 ms warm on CUDA")
+        if _CUDA and torch.cuda.get_device_capability(0) == (12, 0):
+            r.ok("PM-2: <50 ms/frame warm at 1024^2 (sm_120)") if ok \
+                else r.fail("PORT-5 pm2", "over 50 ms warm on sm_120")
         else:
-            r.ok("PM-2 benchmark runs (CPU; the <50 ms gate is the sm_120 box)")
+            r.ok("PM-2 benchmark runs (the <50 ms gate is asserted on sm_120 only)")
     finally:
         # host_demo.Host.__init__ flips two process globals (the engine egress profile and the host
         # services to Null); restore both so a comfy box is unperturbed for anything after.
@@ -440,6 +450,8 @@ def test_port5_second_host(r: SubTestResult):
         for m in list(sys.modules):
             if m not in saved_modules and (m == "host_demo" or m.startswith("host_demo.")):
                 del sys.modules[m]
+        if ex in sys.path:
+            sys.path.remove(ex)
 
 
 # ── BRIEF-5: the embedding guide's bring-up, exercised ────────────────────────

@@ -19,7 +19,9 @@ Everything here ships OFF the default ComfyUI cook path (invariant #7): the sche
 + tap are host-armed, halo tiling engages only under memory pressure, and cancel/progress are
 None unless a host passes them. CPU-pinned; CUDA looped when present.
 """
+import atexit
 import os
+import shutil
 import tempfile
 
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img)
@@ -28,6 +30,13 @@ from TEX_Wrangle import tex_engine, tex_api, tex_fusion, tex_scheduler, tex_memo
 from TEX_Wrangle.tex_runtime.host import CookCancelled
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 from TEX_Wrangle.tex_results import ResultCache, lineage_key
+
+
+def _scratch_dir(prefix):
+    """A temp directory that is removed when the process exits (these tests spill frames)."""
+    d = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(shutil.rmtree, d, True)
+    return d
 from TEX_Wrangle.tex_scheduler import SchedNode, plan_placement, graph_from_spec, Scheduler
 from TEX_Wrangle.tex_compiler.types import TEXType
 
@@ -212,7 +221,7 @@ def test_cache5_governor(r: SubTestResult):
     r.ok("graph pool CPU no-op (CUDA-only)") if tex_memory._graph_pool_bytes("cpu") == 0 \
         and tex_memory._evict_graphs("cpu", 1 << 30) == 0 else r.fail("CACHE-5 graphs", "cpu graph pool nonzero")
 
-    d = tempfile.mkdtemp(prefix="tex_c5_")
+    d = _scratch_dir("tex_c5_")
     rc = ResultCache(budget_mb=1000, cache_dir=d)   # high self-budget: only the governor evicts
     for i in range(20):
         rc.put(lineage_key(program_fp=f"p{i}", device="cpu", precision="fp32"),
@@ -242,9 +251,21 @@ def test_cache5_governor(r: SubTestResult):
         reg.unregister("results_v027")
     r.ok("unregister removes pool") if "results_v027" not in reg.stats("cpu") else r.fail("CACHE-5 unreg", "still present")
 
-    # enforce_cache_budget default path intact (unchanged per-cook call)
-    tex_memory.enforce_cache_budget("cpu")
-    r.ok("enforce_cache_budget default path intact")
+    # enforce_cache_budget (the per-cook call) leaves the caches alone while under budget
+    prev_budget = os.environ.get("TEX_CACHE_BUDGET_MB")
+    os.environ["TEX_CACHE_BUDGET_MB"] = "1000000"
+    try:
+        before = tex_memory._running_cache_bytes("cpu")
+        ret = tex_memory.enforce_cache_budget("cpu")
+        after = tex_memory._running_cache_bytes("cpu")
+    finally:
+        if prev_budget is None:
+            os.environ.pop("TEX_CACHE_BUDGET_MB", None)
+        else:
+            os.environ["TEX_CACHE_BUDGET_MB"] = prev_budget
+    r.ok("enforce_cache_budget under budget: returns None, caches untouched") \
+        if ret is None and before == after \
+        else r.fail("CACHE-5 enforce", f"ret={ret!r} cache bytes {before} -> {after}")
 
 
 # ── ROI-5 ─────────────────────────────────────────────────────────────────────
@@ -347,7 +368,7 @@ def test_cache6_fusion_recook(r: SubTestResult):
         src, S = _c6_stages()
         full = tex_engine.cook_stage_list(S, device=dev, precision="fp32")["OUT"]
         for k in (1, 2):
-            rc = ResultCache(budget_mb=100, cache_dir=tempfile.mkdtemp(prefix="tex_c6_"))
+            rc = ResultCache(budget_mb=100, cache_dir=_scratch_dir("tex_c6_"))
             out = tex_engine.cook_fused_cached(S, k, rc, device=dev, precision="fp32", upstream=UP)["OUT"]
             # The claim is BIT-EXACT (fp32 suffix-recook from the exact cached fp32 boundary is
             # deterministic), so assert torch.equal — not a <1e-5 tolerance the docstring never promised.
@@ -356,7 +377,7 @@ def test_cache6_fusion_recook(r: SubTestResult):
 
     # boundary cache HIT on repeat; hot downstream param reuses boundary; upstream busts it
     src, S = _c6_stages(g=0.9)
-    rc = ResultCache(budget_mb=100, cache_dir=tempfile.mkdtemp(prefix="tex_c6h_"))
+    rc = ResultCache(budget_mb=100, cache_dir=_scratch_dir("tex_c6h_"))
     _ = tex_engine.cook_fused_cached(S, 2, rc, device="cpu", upstream=UP)["OUT"]
     hits0, miss0 = rc.hits, rc.misses
     tex_engine.cook_fused_cached(S, 2, rc, device="cpu", upstream=UP)
@@ -389,7 +410,7 @@ def test_cache6_fusion_recook(r: SubTestResult):
     # BUST the boundary (never a stale serve); and NO upstream must fall back to a full cook (a raw
     # data_ptr is unsafe — a reused/overwritten frame buffer keeps its address).
     A, Bimg = make_img(1, 32, 32, 3, seed=11), make_img(1, 32, 32, 3, seed=22)
-    rc2 = ResultCache(budget_mb=100, cache_dir=tempfile.mkdtemp(prefix="tex_c6src_"))
+    rc2 = ResultCache(budget_mb=100, cache_dir=_scratch_dir("tex_c6src_"))
     _, sA = _c6_stages(src=A)
     _, sB = _c6_stages(src=Bimg)
     tex_engine.cook_fused_cached(sA, 2, rc2, device="cpu", upstream=("srcA",))
@@ -401,7 +422,7 @@ def test_cache6_fusion_recook(r: SubTestResult):
         else r.fail("CACHE-6 source-key", f"stale boundary served (maxdiff {md(outB, fullB)}, miss {m0}->{rc2.misses})")
     # in-place overwrite of the SAME source buffer without a new upstream key would be a stale
     # serve under a data_ptr key — the no-upstream default refuses to cache, so it can't happen.
-    rc3 = ResultCache(budget_mb=100, cache_dir=tempfile.mkdtemp(prefix="tex_c6np_"))
+    rc3 = ResultCache(budget_mb=100, cache_dir=_scratch_dir("tex_c6np_"))
     Csrc = make_img(1, 32, 32, 3, seed=33)
     _, sC = _c6_stages(src=Csrc)
     tex_engine.cook_fused_cached(sC, 2, rc3, device="cpu")           # no upstream -> not cached
