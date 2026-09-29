@@ -6,19 +6,17 @@ exactly as before — no new call layer, no cross-module lookup added to any per
 This module owns if/else (scalar short-circuit AND the vectorized `torch.where` spatial-if),
 for-loops (including the static-range and UC-3 uniform-range fast paths) and while-loops.
 
-`_Break`/`_Continue`, `InterpreterError` and `MAX_LOOP_ITERATIONS` are `interpreter.py`
-module-level names; `_tensor_where`, `_collect_expr_names` and `_int_valued_scalar` are
-`interpreter.py` module-level helpers defined after the `Interpreter` class. Both are
-imported back lazily (inside the methods that need them) rather than at module load time —
-`interpreter.py` imports this module before any of those names exist in its own namespace,
-so a top-level `from .interpreter import ...` here would be a load-time cycle. This is the
-same deferred-import shape `masked_flow.py` already uses for its own back-references.
-
-No behaviour changed by this move: every body below is byte-identical to the code it replaced
-in `interpreter.py`.
+`_Break`/`_Continue`, `InterpreterError` and `MAX_LOOP_ITERATIONS` are defined in
+`interpreter.py`; `_tensor_where`, `_collect_expr_names` and `_int_valued_scalar` live in
+`interpreter_values.py` / `interpreter_analysis.py` and are re-exported by `interpreter.py`.
+All of them are imported back lazily (inside the methods that need them) rather than at module
+load time — `interpreter.py` imports this module before its own namespace holds them, so a
+top-level `from .interpreter import ...` here would be a load-time cycle. This is the same
+deferred-import shape `masked_flow.py` uses for its own back-references.
 """
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import torch
@@ -42,6 +40,15 @@ from ..tex_compiler.ast_nodes import (
 # repeating the same formula inline, so there is exactly one spelling for both language
 # tiers and both runtime backends (see codegen.py's mirroring edit for the other half).
 from . import masked_flow as _masked_flow_mod
+
+
+def _trip_count(r: range) -> int:
+    """`len(r)`, saturating at `sys.maxsize` for a range too long for a C ssize_t (a bound
+    like 1e19), where `len` would raise OverflowError instead of the loop-limit error."""
+    try:
+        return len(r)
+    except OverflowError:
+        return sys.maxsize
 
 
 class _ControlFlowMixin:
@@ -244,9 +251,11 @@ class _ControlFlowMixin:
         if static_range is not None:
             loop_var, iter_range = static_range
 
-            if len(iter_range) > MAX_LOOP_ITERATIONS:
+            n = _trip_count(iter_range)
+            if n > MAX_LOOP_ITERATIONS:
                 raise InterpreterError(
-                    f"This for loop would run {len(iter_range)} iterations, which exceeds the limit of {MAX_LOOP_ITERATIONS}",
+                    f"This for loop would run {n if n < sys.maxsize else 'more than ' + str(sys.maxsize)} "
+                    f"iterations, which exceeds the limit of {MAX_LOOP_ITERATIONS}",
                     node.loc, source=self._source, code="E6010",
                     hint=f"Loops are capped at {MAX_LOOP_ITERATIONS} iterations to prevent hangs. "
                          "Consider reducing your range or processing in smaller batches.",
@@ -256,7 +265,6 @@ class _ControlFlowMixin:
             # torch.arange + unbind is faster than per-iteration torch.tensor().
             dtype = self._dtype
             device = self.device
-            n = len(iter_range)
             start = iter_range.start
             step = iter_range.step
             loop_tensors = torch.arange(start, start + n * step, step,
@@ -275,16 +283,13 @@ class _ControlFlowMixin:
             # General case — execute init, evaluate condition each iteration
             self._exec_stmt(node.init)
             iteration = 0
-            while iteration < MAX_LOOP_ITERATIONS:
-                if not self._loop_cond_true(node.condition):
-                    break
+            while self._loop_cond_true(node.condition):
+                if iteration >= MAX_LOOP_ITERATIONS:
+                    self._raise_loop_limit("for", node.loc)
                 if self._exec_loop_body(node.body):
                     break
                 self._exec_stmt(node.update)
                 iteration += 1
-
-            if iteration >= MAX_LOOP_ITERATIONS:
-                self._raise_loop_limit("for", node.loc)
 
     def _try_extract_static_range(self, node: ForLoop) -> tuple[str, range] | None:
         """Try to extract a fully static loop as a Python range().
@@ -338,10 +343,14 @@ class _ControlFlowMixin:
         forbidden = body_assigned | {loop_var}
         names: set[str] = set()
         bind_names: set[str] = set()
+        called: set[str] = set()
         from .interpreter import _collect_expr_names
         for e in (start_e, end_e, step_e):
-            _collect_expr_names(e, names, bind_names)
+            _collect_expr_names(e, names, bind_names, called)
         if (names & forbidden) or (bind_names & body_bindings):
+            return False
+        # A user function reads the caller's variables without naming them in the bound.
+        if any(f in self._user_functions for f in called):
             return False
         return (loop_var, start_e, cond.op, end_e, step_e, step_sign)
 
@@ -383,13 +392,10 @@ class _ControlFlowMixin:
         """Execute a bounded while loop. Hard limit of MAX_LOOP_ITERATIONS."""
         from .interpreter import MAX_LOOP_ITERATIONS
         iteration = 0
-        while iteration < MAX_LOOP_ITERATIONS:
-            if not self._loop_cond_true(node.condition):
-                break
+        while self._loop_cond_true(node.condition):
+            if iteration >= MAX_LOOP_ITERATIONS:
+                self._raise_loop_limit("while", node.loc)
             if self._exec_loop_body(node.body):
                 break
             iteration += 1
-
-        if iteration >= MAX_LOOP_ITERATIONS:
-            self._raise_loop_limit("while", node.loc)
 

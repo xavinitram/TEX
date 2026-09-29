@@ -7,14 +7,11 @@ per-pixel path. This module owns variable/array declaration, plain and channel/a
 assignment (including the in-place-reuse fast path), and the scatter write
 (`@OUT[px, py] = value`, including the LANG-L4 masked-write compaction).
 
-`InterpreterError` and the spatial/index helpers `_ensure_spatial` / `_safe_array_index` /
-`_const_index` / `_host_index` are `interpreter.py` module-level names defined after the
-`Interpreter` class, so they are imported back lazily (inside the methods that need them)
-rather than at module load time — the same deferred-import shape `masked_flow.py` already
-uses for its own back-references into `interpreter.py`.
-
-No behaviour changed by this move: every body below is byte-identical to the code it replaced
-in `interpreter.py`.
+`InterpreterError` (defined in `interpreter.py`) and the spatial/index helpers `_ensure_spatial` /
+`_safe_array_index` / `_const_index` / `_host_index` / `_list_index` (defined in
+`interpreter_values.py`, re-exported by `interpreter.py`) are imported back from
+`interpreter.py` lazily, inside the methods that need them, because `interpreter.py` imports
+this module before those names exist — the same deferred-import shape `masked_flow.py` uses.
 """
 from __future__ import annotations
 

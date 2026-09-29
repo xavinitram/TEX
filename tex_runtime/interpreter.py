@@ -14,10 +14,10 @@ Execution model:
   4. Return the value of @OUT
 """
 from __future__ import annotations
+import math
 import torch
 import time
 from collections import OrderedDict
-from typing import Any
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
@@ -25,19 +25,16 @@ from ..tex_compiler.ast_nodes import (
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, SourceLoc,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
     BindingIndexAccess, BindingSampleAccess,
-    try_extract_static_range,
-    collect_assigned_vars,
 )
-from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
+from ..tex_compiler.types import TEXType, CHANNEL_MAP, base_is_vector
 from .host import _report_progress, CookCancelled   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from . import pacing as _pace                        # PACE-45: bounds queue-ahead when a token opts in
 from .pacing_heavy import heavy_stmt_ids as _heavy_stmt_ids   # PACE-47d: registry-derived classification
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS,
-                     _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
+                     _scalar_from_tensor, _tag_host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
-from .masked_flow import (MaskedFlowMixin, enabled_for as _masked_flow_enabled_for,
-                          scatter_keep as _masked_flow_scatter_keep)
+from .masked_flow import MaskedFlowMixin, enabled_for as _masked_flow_enabled_for
 # SPLIT-47 (TRK-210): re-exported so `interpreter.NAME` and `from .interpreter import NAME`
 # keep resolving unchanged for every external caller, and so `Interpreter`'s own bare-name
 # calls below (e.g. `vec_list_to_tensor(...)`, `_ensure_spatial(...)`) still find these
@@ -146,12 +143,11 @@ class _ReturnSignal(Exception):
         self.value = value
 
 
-# SPLIT-I (v0.44 Phase A1): the tree-walk's three execution seams, extracted into
-# sibling mixins (mechanical move, STR-7's pattern). Each does its own deferred
-# (function-local) import back into this module for the few names defined below
-# this point (`_consensus_extent`, `_collect_identifiers`, the builtin-name sets,
-# `_tensor_where`, `_ensure_spatial` and the array-index helpers) — the same shape
-# `masked_flow.py` already uses for its own back-references.
+# The tree-walk's three execution seams live in sibling mixins. Each imports the names it
+# needs back from this module inside the method that uses them (`InterpreterError`,
+# `MAX_LOOP_ITERATIONS`, `_Break`/`_Continue`, the builtin-name sets, `_consensus_extent`,
+# and the helpers re-exported above), because a module-level import would be a load-time
+# cycle; `masked_flow.py` does the same.
 from .interpreter_spatial import _SpatialContextMixin
 from .interpreter_control_flow import _ControlFlowMixin
 from .interpreter_binding import _BindingExecMixin
@@ -165,9 +161,11 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         interp = Interpreter()
         result = interp.execute(ast, bindings, type_map)
 
-    The interpreter is reusable across executions. State is fully reset
-    at the start of each execute() call. The dispatch tables and stdlib
-    function registry are built once per instance and reused.
+    The interpreter is reusable across executions. Per-cook state (variables, bindings,
+    arrays, user functions) is reset at the start of each execute() call and dropped when it
+    ends; the literal cache, the builtins LRU and the coordinate-ramp LRU persist across
+    cooks on purpose. The dispatch tables and stdlib function registry are built once per
+    instance and reused.
     """
 
     # ── Class-level caches (built once, shared across all instances) ──
@@ -210,8 +208,8 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         self._call_depth: int = 0
         # LANG-L4: masked per-pixel control flow (language 0.25, `masked_flow.py`). Declared
         # here so a direct `_create_builtins`/`_exec_stmt` caller never trips over a missing
-        # attribute; `_masked` is False for every cook the language gate does not flag, and
-        # while `tex_api.LANGUAGE_VERSION` is below 0.25 that is every cook there is.
+        # attribute; `_masked` is False for every cook the language gate does not flag
+        # (a program without a `//!tex 0.25` pragma or later).
         self._masked: bool = False
         self._live = True                     # the current region's per-pixel live mask
         self._frames: list = []               # loop / pass / call regions a transfer exits
@@ -317,11 +315,9 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             _masked_flow: LANG-L4 test seam, and NOT a host-facing switch. `None` (the
                 default, and the only value any engine call site passes) derives the
                 answer from `masked_flow.enabled_for` — the engine's own language gate,
-                `min(pragma, LANGUAGE_VERSION) >= MASKED_FLOW_SINCE`, which is False for
-                every program while `LANGUAGE_VERSION` is below `0.25`. It exists because
-                the masking rules and the oracle that proves them land before the version
-                moves (`docs/masked-control-flow.md` §8, stages L4/L5 vs L7), so the
-                harness needs a way to ask for the rules the engine already implements.
+                `min(pragma, LANGUAGE_VERSION) >= MASKED_FLOW_SINCE`, so only a program
+                that asks for language 0.25 or later gets the masking rules. Tests use it
+                to force the rules on or off.
 
         Returns:
             If output_names is None: the value of @OUT (backward compat)
@@ -330,14 +326,21 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         self._source = source
         # Always use inference_mode — eliminates gradient tracking overhead
         # even for internal tensor ops (coordinate builtins, constants, etc.)
-        with torch.inference_mode():
-            return self._execute_inner(program, bindings, type_map, device,
-                                       latent_channel_count, output_names,
-                                       precision, used_builtins=used_builtins,
-                                       tile=tile, roi=roi, batch_slice=batch_slice,
-                                       time_context=time_context,
-                                       cancel=cancel, on_progress=on_progress,
-                                       _masked_flow=_masked_flow, scale=scale)
+        try:
+            with torch.inference_mode():
+                return self._execute_inner(program, bindings, type_map, device,
+                                           latent_channel_count, output_names,
+                                           precision, used_builtins=used_builtins,
+                                           tile=tile, roi=roi, batch_slice=batch_slice,
+                                           time_context=time_context,
+                                           cancel=cancel, on_progress=on_progress,
+                                           _masked_flow=_masked_flow, scale=scale)
+        finally:
+            # The per-thread instance outlives the cook: drop the cook's inputs,
+            # intermediates and outputs (returned values keep their own references), on the
+            # error and OOM path too. The builtins LRU and literal cache persist by design.
+            self.env = {}
+            self.bindings = {}
 
 
 
@@ -565,16 +568,15 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             _stdlib_mod.restore_cook_ctx(_grid_token)
             if _mf_token is not None:
                 self._mf_leave(_mf_token)
-
-        # XPU fence (see above): guarantee the ingest DMA has landed before the
-        # cook returns, so a downstream host-side writer of the shared pinned
-        # source can never race an in-flight copy. By now the cook's Python work
-        # has long overlapped the DMA — this is ~always an already-signaled event.
-        if ingest_event is not None:
-            try:
-                ingest_event.synchronize()
-            except Exception:
-                pass
+            # XPU fence (see above): guarantee the ingest DMA has landed before the cook
+            # returns OR raises, so a downstream host-side writer of the shared pinned source
+            # can never race an in-flight copy. By now the cook's Python work has long
+            # overlapped the DMA — this is ~always an already-signaled event.
+            if ingest_event is not None:
+                try:
+                    ingest_event.synchronize()
+                except Exception:
+                    pass
 
         # Collect outputs — skip precision conversion for the common fp32 case
         needs_upcast = self._dtype != torch.float32
@@ -751,7 +753,10 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         )
 
     def _eval_number_literal(self, node: NumberLiteral) -> torch.Tensor:
-        key = (node.value, self._device_str, self._dtype)
+        v = node.value
+        # -0.0 == 0.0 as a dict key, so a signed zero carries its sign in the key.
+        key = (v, self._device_str, self._dtype) if v else (v, self._device_str, self._dtype,
+                                                            math.copysign(1.0, v))
         cached = self._literal_cache.get(key)
         if cached is not None:
             return cached
@@ -1451,43 +1456,18 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
 
 # -- AST scanning for lazy builtins ------------------------------------
 
-# ENG-7 (v0.22): the HOST TIME context. `fi`/`fn` are batch-relative (where am I in this
-# tensor); these are timeline-absolute (where is the host's playhead). ComfyUI has no
-# playhead, so its adapter feeds 0 / a wired INT; an engine host feeds the real one.
+# ENG-7: the HOST TIME builtins (`frame`, `fps`, `time`). `fi`/`fn` say where a frame sits in
+# its batch; these say where the host's playhead is on the timeline (ComfyUI feeds 0 or a
+# wired INT). They are builtins, not $params, so an animating value never changes a
+# program's memo key or compile fingerprint.
 #
-# They are BUILTINS, deliberately, not $params: a $param is part of the tex_lazy memo key
-# and the compile fingerprint, so an animating value would mint a new key every frame and
-# churn both (roadmap ENG-7). As builtins they are pure per-cook VALUES — the program's
-# identity does not move when the playhead does.
-#
-# They are also the first builtins whose value is NOT derived from the binding shapes.
-# That single fact breaks an assumption in FIVE places, because everything between a
-# playhead and a pixel is keyed on — or re-derived from — things that do not move when
-# the playhead does. Each had to be taught separately, and each fails identically: the
-# cook SUCCEEDS and the animation sits still. There is no error to notice.
-#   * this module's builtins LRU (LAT-4) keys on the spatial config -> `_set_time_builtins`
-#     rewrites them every cook, on the hit path too.
-#   * codegen caches per program fingerprint (a closure + `_env_cached`) -> codegen
-#     declines these programs outright (codegen.try_compile).
-#   * a captured CUDA graph replays the tensor it captured -> graphed._capturable bars them.
-#   * ComfyUI's own result cache keys on `fingerprint_inputs` -> tex_node hashes `_tex_time`.
-#   * M-4 strip tiling re-enters execute() per strip, and the playhead is per-execute
-#     state -> tex_memory.run_tiled forwards `time_context` to every strip.
-#   * `compiled._plain_execute` is where a codegen-DECLINED program actually lands: the
-#     decline happens inside execute_compiled / run_auto / _codegen_only_execute, which
-#     RETURN rather than raise, so the engine's `_interp_fallback` never sees them.
-#   * `run_auto`'s internal codegen closure is a third route to the same place.
-#
-# Only the first four were found by design. Tiling came from review; the last two from a
-# bug hunt — and one of them froze the playhead on the SHIPPED DEFAULT path (an exact
-# stencil at compile_mode="none"), which is to say the design was wrong about where a
-# declined program goes. The lesson is the shape of the mistake, not the count: a bar is
-# worth nothing unless the path it forces you onto is itself checked, END TO END, by
-# cooking and looking at the pixel. `test_eng7_time_barred_from_frozen_tiers` now does
-# that on all six tier routes; the unit assertions it started as proved only that the bar
-# existed. If a seventh route appears it will look like none of these either — the
-# question to ask is "does this re-enter execute(), or reuse anything keyed by the
-# fingerprint?", and then to go and cook one.
+# Their value is per cook and NOT derived from the binding shapes, so nothing keyed on the
+# shapes or the fingerprint may hold one: the builtins LRU below rewrites them every cook
+# (`_set_time_builtins`, hit path too); codegen declines programs that read them; a
+# captured CUDA graph refuses them; ComfyUI's result cache hashes the time context; tiled
+# execution forwards `time_context` to every strip; and every route a declined program
+# falls back to must re-enter `execute()` with it. A miss cooks fine and the animation
+# sits still, so `test_eng7_time_barred_from_frozen_tiers` cooks each route end to end.
 _TIME_BUILTIN_NAMES = frozenset({"frame", "fps", "time"})
 
 # SIMP-45: `fetch_time`/`sample_time` read the playhead like the three names above, but as

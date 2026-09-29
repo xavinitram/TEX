@@ -133,3 +133,69 @@ def test_lru_sweep_between_lookup_and_touch_does_not_fail_the_cook():
     it._coord_ramp_lru = Sweeping(it._coord_ramp_lru)
     out = _cook("@OUT = vec4(u, v, 0.0, 1.0);", {"A": img}, interp=it)
     assert out.shape == (1, 4, 5, 4)
+
+
+# -- loops -------------------------------------------------------------------------------
+
+def test_static_range_too_long_for_ssize_t_is_the_loop_limit_error():
+    src = "float s = 0.0; for (int i = 0; i < @N; i++) { s += 1.0; } @OUT = vec4(s, 0.0, 0.0, 1.0);"
+    with pytest.raises(InterpreterError) as ei:
+        _cook(src, {"A": _img(), "N": 1e19})
+    assert ei.value.code == "E6010"
+
+
+def test_while_needing_exactly_the_limit_runs():
+    src = ("int n = 0; while (n < 1024) { n = n + 1; } "
+           "@OUT = vec4(float(n) / 1024.0, 0.0, 0.0, 1.0);")
+    assert _cook(src, {"A": _img()})[0, 0, 0, 0].item() == 1.0
+
+
+def test_while_needing_one_more_than_the_limit_fails():
+    src = "int n = 0; while (n < 1025) { n = n + 1; } @OUT = vec4(float(n), 0.0, 0.0, 1.0);"
+    with pytest.raises(InterpreterError) as ei:
+        _cook(src, {"A": _img()})
+    assert ei.value.code == "E6010"
+
+
+def test_general_for_needing_exactly_the_limit_runs():
+    # `lim` is written in the body, so the bound is not uniform and the general path runs
+    src = ("int lim = 1024; float s = 0.0; "
+           "for (int i = 0; i < lim; i++) { lim = 1024; s += 1.0; } "
+           "@OUT = vec4(s / 1024.0, 0.0, 0.0, 1.0);")
+    assert _cook(src, {"A": _img()})[0, 0, 0, 0].item() == 1.0
+
+
+def test_uniform_range_is_not_used_when_a_bound_calls_a_function_that_reads_a_written_var():
+    src = """
+float lim = 4.0;
+float getlim() { return lim; }
+float s = 0.0;
+for (int i = 0; i < getlim(); i++) { lim = 2.0; s += 1.0; }
+@OUT = vec4(s / 10.0, 0.0, 0.0, 1.0);
+"""
+    assert _cook(src, {"A": _img()})[0, 0, 0, 0].item() == pytest.approx(0.2)
+
+
+# -- literals and per-cook state ---------------------------------------------------------
+
+def test_signed_zero_literals_do_not_share_a_cache_entry():
+    from TEX_Wrangle.tex_compiler.ast_nodes import NumberLiteral
+    it = Interpreter()
+    it.device = torch.device("cpu")
+    it._device_str = "cpu"
+    it._dtype = torch.float32
+    pos = it._eval_number_literal(NumberLiteral(value=0.0))
+    neg = it._eval_number_literal(NumberLiteral(value=-0.0))
+    assert torch.signbit(neg).item() and not torch.signbit(pos).item()
+    assert torch.signbit(it._eval_number_literal(NumberLiteral(value=-0.0))).item()
+
+
+def test_interpreter_drops_a_cooks_tensors_when_it_ends():
+    it = Interpreter()
+    out = _cook("vec3 c = @A.rgb * 2.0; @OUT = vec4(c, 1.0);", {"A": _img()}, interp=it)
+    assert it.env == {} and it.bindings == {}
+    assert out.shape == (1, 4, 5, 4)
+    with pytest.raises(Exception):
+        _cook("float y = @P[0, 0]; @OUT = vec4(y, 0.0, 0.0, 1.0);", {"A": _img(), "P": 1.0},
+              interp=it)
+    assert it.env == {} and it.bindings == {}

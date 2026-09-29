@@ -243,20 +243,12 @@ def _tensor_where(cond: torch.Tensor, then_val: torch.Tensor, else_val: torch.Te
     return torch.where(cond, then_val, else_val)
 
 
-# RT-b (v0.43): the single ingest-event fence helper. Was duplicated — this exact body in
-# `compiled.py`, and an inline hand-rolled equivalent (detect-during-the-binding-loop,
-# record-after-builtins) right here in `_execute_inner`. Moved here (compiled.py already
-# imports names from this module, so this introduces no new import cycle) and both call
-# shapes now call this one function. Same record-on-H2D detection, same `.synchronize()`
-# fence, same stream — `compiled.py` calls it immediately after its own bindings are made
-# contiguous (unchanged), and `_execute_inner` calls it once the binding loop has already
-# enqueued every H2D copy (also unchanged) — recording an event any time after those
-# copies are enqueued correctly bounds their completion, since a CUDA stream is FIFO; only
-# recording BEFORE they are all enqueued would be wrong, and neither call site does that.
-# `_execute_inner` keeps its own cheap `async_ingest` flag (the detect half of the old
-# inline code) purely to GATE this call, so a cook with nothing pinned skips this helper's
-# scan instead of re-walking every binding a second time; the helper itself is still the
-# only place that does the detecting+recording, so there is one implementation, not two.
+# The single ingest-event fence helper. `compiled.py` calls it right after making its bindings
+# contiguous and `_execute_inner` calls it once its binding loop has enqueued every H2D copy;
+# recording any time after the copies are enqueued bounds their completion (a CUDA stream is
+# FIFO), and only recording BEFORE they were all enqueued would be wrong. `_execute_inner`
+# keeps a cheap `async_ingest` flag purely to gate the call, so a cook with nothing pinned
+# skips the helper's scan.
 def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
     """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
     an event AT THE COPY POINT on the stream. The caller synchronizes it before
