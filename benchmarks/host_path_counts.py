@@ -996,7 +996,8 @@ class CheckpointServeScenario(Scenario):
          that shape under a checkpoint's name.
 
     PROF-1 is armed ONLY for the settling loop and disarmed again before the first counted
-    tick (`self._profile.disable()` in `build()`), so a steady tick here costs no engine-side
+    tick (`self._profile.disable()` in `build()`; `teardown()` re-arms it when the caller had
+    it armed), so a steady tick here costs no engine-side
     `torch.cuda.synchronize` — same contract every other interactive scenario in this file
     holds, and `tests/test_bench2_counts.py` pins it the same way.
 
@@ -1063,7 +1064,12 @@ class CheckpointServeScenario(Scenario):
         pkey = _profile.make_key(f"bench4-checkpoint-serve-{self._salt}-{self.epoch}",
                                  dev, "fp32")
         spatial = (1, self.res, self.res)
-        _profile.reset()
+        # A caller that armed PROF-1 (`run_all(prof1=True)`) gets it back at teardown; its
+        # sampling table is not wiped, since `pkey` above is salted per pass anyway.
+        if not hasattr(self, "_caller_armed"):
+            self._caller_armed = _profile.enabled()
+        if not self._caller_armed:
+            _profile.reset()
         _profile.enable()
         warm = 0
         try:
@@ -1097,6 +1103,11 @@ class CheckpointServeScenario(Scenario):
 
     def prime(self, comp):
         pass                                   # `build` primes; there is no separate warm-up
+
+    def teardown(self):
+        super().teardown()
+        if getattr(self, "_caller_armed", False):
+            self._profile.enable()
 
     def tick(self, comp, i):
         knob = 0.5 + self._seq(i) * 1e-6        # never repeats — node_scrub's discipline
