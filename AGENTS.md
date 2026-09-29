@@ -18,7 +18,7 @@ the **oracle** every other tier must match bit-for-bit. Full map: `ARCHITECTURE.
 | 1 | **No numpy.** Never `import numpy` or `.numpy()`. | CI runs torch **without** numpy; `.numpy()` raises there. Has already bitten the project. Use `struct.pack`/`.tolist()`. | `tests/test_no_numpy_ban.py` (LNT-1) |
 | 2 | **interp ↔ codegen are bit-exact** (`tol=1e-5` fp32). | The crown-jewel contract; codegen falls back to interp. | `test_codegen_equivalence` + the differential fuzzer (TST-1) |
 | 3 | **The optimizer re-typechecks its output AST.** | CSE/LICM synthesize nodes outside the `id()`-keyed `type_map`; dropping the re-check silently corrupts types. | `tex_cache` calls it; optimizer/type_map contract |
-| 4 | **Coordinate/spatial builtins are forced fp32** (never `self._dtype`). | The M-3 fp16 contract; fp16 coords mis-address rows at large H. | `interpreter.py` (~line 368) — do not "unify" the dtype |
+| 4 | **Coordinate/spatial builtins are forced fp32** (never `self._dtype`). | The M-3 fp16 contract; fp16 coords mis-address rows at large H. | `interpreter_spatial.py` `_create_builtins` / `_coord_ramps` — do not "unify" the dtype |
 | 5 | **A non-pixel-local stdlib fn MUST carry a `footprint=`** (`('halo', r)` / `('halo_arg', i[, mult])` / `'image'` / `('frame', i)`) in its `@stdlib(...)` decorator (ROI-1; default `'point'`). The `('halo_arg', i, mult)` **reach multiplier** (default `1.0`) converts arg `i` to a *pixel* reach when it isn't already one — `gauss_blur`'s radius is `3·sigma`, so it is `('halo_arg', 1, 3.0)`; omitting a needed multiplier under-pads by that factor. | The footprint *derives* `_NON_LOCAL_FNS` (`footprint != 'point'`) and the ROI-2 cook halo; leaving it `'point'` (or dropping a needed `mult`) is **wrong output only when tiled / ROI-narrowed** (passes non-tiled tests). | TST-3 taxonomy test (derivation + name-prefix heuristic) + ROI-4 reach-pinning; see recipe below |
 | 6 | **GPU timing wraps `torch.cuda.synchronize()`.** | Unsynced CUDA timing measures only kernel-launch enqueue. Has bitten benchmarks before. | benchmark harness convention |
 | 7 | **Every change is behavior-preserving + perf-neutral** on the DEFAULT path. | v0.18 adds one opt-in perf lever (`precision="auto"`, default fp32); everything else is still structure/UX. A refactor that risks bit-exactness or a hot path is a **bad trade** — see §"Trades to refuse". | full suite green + benchmark neutral |
@@ -36,9 +36,13 @@ the **oracle** every other tier must match bit-for-bit. Full map: `ARCHITECTURE.
 > invariant; TST-3 machine-checks registry↔`FUNCTION_SIGNATURES` parity).
 
 For a **pixel-local** function (output at a pixel depends only on that pixel):
-1. `tex_runtime/stdlib.py` — add the impl with a co-located decorator:
+1. `tex_runtime/stdlib_<domain>.py` — add the impl to the leaf whose domain it belongs to
+   (`stdlib_math`, `stdlib_color`, `stdlib_sample`, `stdlib_noise`, `stdlib_sdf`,
+   `stdlib_string`, `stdlib_array`) with a co-located decorator:
    `@stdlib("NAME")` / `@staticmethod` / `def fn_NAME(...)`. (This one line replaces
-   the old `get_functions()` row **and** the taxonomy-table edits.)
+   the old `get_functions()` row **and** the taxonomy-table edits.) `tex_runtime/stdlib.py`
+   is only the facade that composes the leaves; a new domain is a new leaf, composed there
+   and added to `tex_cache._CODEGEN_FILES`.
 2. `tex_compiler/stdlib_signatures.py` — add `"NAME": {"args": (lo,hi), "return": <rule>}`
    to `FUNCTION_SIGNATURES` (compiler-side type contract; keep `return` a **named**
    helper, not a lambda).
@@ -126,11 +130,11 @@ silent-wrong result.
   a frame *is*, slot 6 where it *belongs*; they differ exactly while a frame is demoted to host
   RAM. `_spill` must persist slot **6**, or a demoted-then-spilled CUDA frame restores as a CPU
   frame and the residency ladder becomes a one-way trip, visible only under memory pressure.
-- `tex_results._defer_drain` (v0.33) — `patch_region` holds `_lock` across a nested `put` for
+- `tex_results._DepthLock.depth` (v0.33) — `patch_region` holds `_lock` across a nested `put` for
   atomicity, so that `put`'s drains would run a disk write and a D2H **under the lock**, which is
-  precisely what the lock rule forbids. The thread-local defers them; `patch_region` drains after
-  releasing. Removing it does not fail a test — it silently reintroduces the 327–496 ms stalls.
-- `tex_runtime/streams.egress(staging=False)` (v0.33 XPU-2) — not a perf hint. A **retained**
+  precisely what the lock rule forbids. The lock's re-entrancy depth defers them; `patch_region`
+  drains after releasing. Removing it does not fail a test — it silently reintroduces the 327–496 ms stalls.
+- `tex_runtime/streams.egress(retained=True)` (v0.33 XPU-2) — not a perf hint. A **retained**
   destination must not be page-locked (unswappable pages + torch's caching host allocator holds
   freed blocks for the process lifetime); the pinned-then-clone alternative costs a second full
   host memcpy of the frame. The demote path passes it deliberately.
@@ -208,10 +212,10 @@ Currently over the hard budget — status as of v0.37.0 (drift-checked by
 
 | Module | LOC | Status |
 |--------|-----|--------|
-| `tex_runtime/codegen.py` | ~3350 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven. **Language 0.25 (L5) took it to 3312**, and it kept that verdict: the masked-emission leaf went to a new `codegen_masked.py` rather than into the emitter, which is the domain-driven cut the verdict asks for. CG-1's type-map liveness fix took it to ~3350. `tex_runtime/stdlib.py`'s planned split shipped as LIB-1: it is now a 126-line facade over `stdlib_core.py` and seven per-domain `stdlib_*.py` leaves, none near either budget |
+| `tex_runtime/codegen.py` | ~3700 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven. **Language 0.25 (L5) took it to 3312**, and it kept that verdict: the masked-emission leaf went to a new `codegen_masked.py` rather than into the emitter, which is the domain-driven cut the verdict asks for. CG-1's type-map liveness fix took it to ~3350, and it has since grown to ~3700. `tex_runtime/stdlib.py`'s planned split shipped as LIB-1: it is now a 142-line facade over `stdlib_core.py` and seven per-domain `stdlib_*.py` leaves, none near either budget |
 
-`tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**. `tex_runtime/interpreter.py`
-(~1593, back under *soft* — SPLIT-47 below took it further down) had STR-3/STR-4's
+`tex_compiler/optimizer.py` (~1550) is over *soft*; STR-5 (the `PASSES` list) **shipped**. `tex_runtime/interpreter.py`
+(~1680, back under *soft* — SPLIT-47 below took it further down) had STR-3/STR-4's
 `ExecContext` + shared `NodeVisitor` extraction, then SPLIT-I (v0.44 Phase A1) took its planned split:
 the spatial-context setup (coordinate ramps, the LAT-4 cached builtins, ENG-7's time builtins) moved to
 `interpreter_spatial.py`, if/for/while execution to `interpreter_control_flow.py`, and variable/binding
@@ -230,7 +234,7 @@ involved this time): the static-program-analysis leaf (`_collect_binding_reads`/
 SPLIT-E used), so no call site or external `from .interpreter import NAME` changed. `_consensus_extent`
 and `vec_list_to_tensor` stayed in `interpreter.py` for the same mutation-anchor reason as above.
 
-`tex_runtime/compiled.py` (~1635, back under the 2000-line hard budget it had also reached) took its own
+`tex_runtime/compiled.py` (~1900, back under the 2000-line hard budget it had also reached) took its own
 SPLIT-47 (TRK-210) split the same way: the toolchain-capability probe (`compile_capability`/
 `_select_backend`/the op-count-and-loop-depth routing gate) moved to `compiled_capability.py`, and the
 per-cook execution support (the timing wrappers, binding preparation, one-time diagnostics) moved to
