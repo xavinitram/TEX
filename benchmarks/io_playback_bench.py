@@ -128,8 +128,12 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
             for i in range(frames):
                 while not slots.acquire(timeout=0.05):
                     if stop.is_set():
-                        return
+                        break
                 if stop.is_set():
+                    # A crashed thread aborted the run: fail what is left so no cook waits
+                    # on a frame that will never land. The crash is reported below.
+                    for j in range(i, frames):
+                        promises[j].fail(RuntimeError("run aborted by a background thread error"))
                     return
                 try:
                     promises[i].land(tex_provider.materialize("plate", float(i), "fetch"))
@@ -170,7 +174,12 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
         jobs.append(q.submit(cook_one, klass=Q.COMMITTED, inputs=[promises[i]]))
 
     for j in jobs:
-        j.result(timeout=300)
+        try:
+            j.result(timeout=300)
+        except Exception:
+            if not stop.is_set():
+                raise                       # a genuine cook failure
+            # else: a background thread crashed and aborted the run; reported below
     tw.join(300)
     elapsed = time.perf_counter() - t0
     stop.set()
