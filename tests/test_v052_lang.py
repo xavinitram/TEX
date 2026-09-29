@@ -187,6 +187,22 @@ def test_for_update_assignment_does_not_leak_out_of_per_pixel_if(pragma):
     assert ref["OUT"][0, :, :, 0].tolist() == [[0.0, 3.0], [0.0, 3.0]]
 
 
+# ── int / int is a float quotient, in the checker as at run time ───────────────────────────
+
+def test_int_div_int_is_typed_float():
+    # Both tiers and the constant folder divide as float; the checker agrees, so the
+    # program is valid (or not) independently of whether the operands fold.
+    assert check_errors("int a = 7; int b = 2; float x = a / b; @OUT = vec4(x);") == []
+    assert check_errors("int a = 7; int b = 2; int x = a / b; @OUT = vec4(float(x));") == ["E3200"]
+    assert check_errors("int x = 7 / 2; @OUT = vec4(float(x));") == ["E3200"]
+    assert check_errors("int f(int a){ return a / 2; } @OUT = vec4(float(f(3)));") == ["E3013"]
+
+
+def test_int_div_int_floored_by_int_cast():
+    code = "int n = int(@A.r * 0.0 + 7.0); int c = int(n / 2); float q = n / 2; @OUT = vec4(float(c), q, 0.0, 1.0);"
+    run_both(code, {"A": _a()}, torch.tensor([3.0, 3.5, 0.0, 1.0]).expand(1, 4, 4, 4))
+
+
 def test_vec_array_literal_elements_widen():
     A = _a()
     run_both("vec4 a[2] = {@A.rgb, vec4(0.5)}; @OUT = a[0];", {"A": A},

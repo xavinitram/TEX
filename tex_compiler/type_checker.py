@@ -447,7 +447,8 @@ class TypeChecker:
                     f"Expected '{node.type_name}' for variable '{node.name}', but the initializer is '{init_type.value}'.",
                     node.loc,
                     code="E3200",
-                    hint=f"The right-hand side produces a {init_type.value}, which doesn't fit into {node.type_name}.",
+                    hint=f"The right-hand side produces a {init_type.value}, which doesn't fit into {node.type_name}."
+                         + self._int_hint(declared_type, init_type),
                 )
             else:
                 node.initializer = self._widen(node.initializer, declared_type, init_type)
@@ -785,7 +786,8 @@ class TypeChecker:
                     f"Expected '{target_type.value}', but found '{value_type.value}'.",
                     node.loc,
                     code="E3200",
-                    hint=f"The target is {target_type.value}, which isn't compatible with {value_type.value}.",
+                    hint=f"The target is {target_type.value}, which isn't compatible with {value_type.value}."
+                         + self._int_hint(target_type, value_type),
                 )
             elif not isinstance(node.target, ChannelAccess):
                 node.value = self._widen(node.value, target_type, value_type)
@@ -953,7 +955,7 @@ class TypeChecker:
             self._error(
                 f"Function expects to return '{expected.value}', but this returns '{value_type.value}'.",
                 node.loc, code="E3013",
-                hint=f"The declared return type is {expected.value}.",
+                hint=f"The declared return type is {expected.value}." + self._int_hint(expected, value_type),
             )
         else:
             node.value = self._widen(node.value, expected, value_type)
@@ -1245,8 +1247,11 @@ class TypeChecker:
             self._set_type(node, result)
             return result
 
-        # Arithmetic: promote
+        # Arithmetic: promote. '/' is a float quotient on every tier and in the constant
+        # folder, so int / int is FLOAT; int(a / b) floors it back to an int.
         result = self._promote(lt, rt)
+        if node.op == "/" and result == TEXType.INT:
+            result = TEXType.FLOAT
         self._set_type(node, result)
         return result
 
@@ -1670,6 +1675,13 @@ class TypeChecker:
         return ret
 
     # -- Assignment compatibility ---------------------------------------
+
+    @staticmethod
+    def _int_hint(target: TEXType, value: TEXType) -> str:
+        """The E3200/E3013 hint tail for a float bound to an int (e.g. an int / int quotient)."""
+        if target == TEXType.INT and value == TEXType.FLOAT:
+            return " '/' always gives a float; wrap the value in int(...) to floor it."
+        return ""
 
     def _widen(self, expr: ASTNode, target: TEXType, value: TEXType) -> ASTNode:
         """Make an accepted widening explicit in the AST, so both tiers run it.
