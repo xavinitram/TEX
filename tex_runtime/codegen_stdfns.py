@@ -406,6 +406,9 @@ class _EmitStdFnsMixin:
             self._indent -= 1
             self._emit(f"else:")
             self._indent += 1
+            # A 0-dim or [H,W] coordinate spans the frame, as fn_fetch's _expand_to_bhw does.
+            for c in (px, py):
+                self._emit(f"if {c}.dim() in (0, 2): {c} = {c}.expand(*{img_var}.shape[:3])")
             self._emit(f"{tmp} = {img_var}[_torch.arange({img_var}.shape[0], device=_dev).view(-1,1,1), {py}, {px}]")
             self._indent -= 1
             return tmp

@@ -680,3 +680,10 @@ _FLOAT_CAST_ROWS = [
 @pytest.mark.parametrize("label,code", _FLOAT_CAST_ROWS, ids=[r[0] for r in _FLOAT_CAST_ROWS])
 def test_float_cast_of_an_int_param_matches_interpreter(label, code):
     assert_parity(code, {"A": _img(), "n": 3})
+
+
+# ── a hoisted fetch at batch > 1 spans the frame for 0-dim coordinates ──────────────────
+
+def test_hoisted_fetch_batch_gt_one_scalar_coords():
+    code = "vec4 c = vec4(0.0);\nfloat t = 0.5;\nwhile (t < 3.0) { c = fetch(@A, 3, 4); t = t + 1.0; }\n@OUT = c;"
+    assert_parity(code, {"A": _img(B=3, H=5, W=5)}, atol=0.0)
