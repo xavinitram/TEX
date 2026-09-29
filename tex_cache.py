@@ -1,13 +1,17 @@
 """
-TEX Cache — two-tier compilation cache for TEX programs.
+TEX Cache: the compile cache for TEX programs, in three layers.
 
-Tier 1 (memory): OrderedDict with LRU eviction. Stores ready-to-execute
-(program, type_map, referenced_bindings, assigned_bindings,
-param_declarations, used_builtins) tuples.
+Memory: two LRU OrderedDicts (guarded by one lock) for ready-to-execute compile tuples
+(program, type_map, referenced_bindings, assigned_bindings, param_declarations,
+used_builtins) and for materialized codegen functions.
 
-Tier 2 (disk): Pickle files in .tex_cache/. Stores a dict
-{version, program, binding_types, timestamp}. On load, re-runs the type
-checker to regenerate type_map with valid id() keys (~0.1ms, negligible).
+Disk .pkl: a signed pickle {version, program, sets} per program in the cache dir. On load
+the type checker is re-run to regenerate type_map with valid id() keys (~0.1 ms).
+
+Disk .cg: a signed sidecar holding the marshalled codegen function for a program.
+
+Each disk artifact is gated by an epoch (see the CACHE-4 block below): the .pkl by the AST
+epoch, the .cg by the codegen epoch, and measured verdicts by the verdict epoch.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import logging
 import marshal
 import os
 import shutil
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -63,71 +68,27 @@ _AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py"
               # The fused-chain splicer builds the AST that `compile_fused` stores in the same
               # .pkl tier, so a splicer fix must retire those entries as well as the .cg.
               Path(__file__).parent / "tex_fusion.py"]
-# Codegen / interpreter — a change alters emitted code or interpreter semantics (the .cg).
-# CT-1: tex_fusion is in the AST list above; the CODEGEN epoch nests it, so fused .cg entries
-# are retired with it.
-# LANG-L5: `masked_flow.py` and `codegen_masked.py` are here for the same reason the two
-# above them are — they are the language-0.25 halves of the interpreter's semantics and of
-# the emitter, so an edit to either changes what a flagged program computes and must not
-# leave a stale `.cg` behind. They are added now, while no program can reach them, rather
-# than at the release that makes them reachable.
-# LIB-1: `stdlib.py`'s per-domain split. The facade still carries the module-level caches
-# and helpers (now re-exported from `stdlib_core.py`), and every `fn_*` impl moved onto one
-# of the seven domain leaves — a change to any of them alters emitted code or interpreter
-# semantics exactly as a `stdlib.py` edit used to, so each leaf is watched here too.
+# Codegen / interpreter: a change alters emitted code or interpreter semantics (the .cg).
+# `tex_fusion.py` is in the AST list above, and the codegen epoch nests that list, so fused
+# .cg entries retire with it. Every interpreter mixin, stdlib leaf, emitter and the .cg writer
+# (`codegen_persist.py`) is listed: an edit to any of them must not leave a stale .cg behind.
 _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "codegen_stdfns.py",
-                  # SPLIT-I: `interpreter.py`'s three mixins hold interpreter code the split
-                  # moved out of it, so an edit to any of them alters interpreter semantics
-                  # exactly as an `interpreter.py` edit does and must invalidate the same .cg.
                   _R_DIR / "interpreter_spatial.py", _R_DIR / "interpreter_control_flow.py",
                   _R_DIR / "interpreter_binding.py",
-                  # SPLIT-47 (TRK-210): `interpreter.py`'s static-program-analysis leaf
-                  # (`interpreter_analysis.py`) and shared tensor-value helpers
-                  # (`interpreter_values.py`) — pure moves out of `interpreter.py`, so an
-                  # edit to either alters interpreter semantics exactly as before and must
-                  # invalidate the same `.cg` (TRK-189 derives and enforces this from disk).
                   _R_DIR / "interpreter_analysis.py", _R_DIR / "interpreter_values.py",
                   _R_DIR / "stdlib.py", _R_DIR / "stdlib_core.py", _R_DIR / "stdlib_math.py",
                   _R_DIR / "stdlib_color.py", _R_DIR / "stdlib_sample.py", _R_DIR / "stdlib_noise.py",
                   _R_DIR / "stdlib_sdf.py", _R_DIR / "stdlib_string.py", _R_DIR / "stdlib_array.py",
                   _R_DIR / "noise.py", _R_DIR / "stdlib_registry.py",
                   _R_DIR / "masked_flow.py", _R_DIR / "codegen_masked.py",
-                  # CG-1: the STR-7 split's other two emitters. `codegen_stencil.py` owns the whole
-                  # stencil detection-and-lowering route, so an edit there changes emitted code.
-                  _R_DIR / "codegen_stencil.py",
-                  # `codegen_persist.py` writes and authenticates the `.cg` bytes themselves;
-                  # watched defensively so a format change can never be read by the old reader.
-                  _R_DIR / "codegen_persist.py"]
-# Tier-policy — a change moves a measured win/lose verdict (autotier.json / warm_state.json).
-# NEW under CACHE-4: previously a compiled.py tiering change kept stale verdicts.
+                  _R_DIR / "codegen_stencil.py", _R_DIR / "codegen_persist.py"]
+# Tier-policy: a change moves a measured win/lose verdict (autotier.json / warm_state.json).
+# This includes the modules `compiled.py` was split into and the per-fingerprint memos whose
+# contents are verdicts (`fncalls_compile.py`, the precompile scoping in `compiled_precompile.py`).
 _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
                   _R_DIR / "compiled.py", _R_DIR / "graphed.py",
-                  # SPLIT-47 (TRK-210): `compiled.py`'s toolchain-capability probe
-                  # (`compiled_capability.py`) and per-cook execution support — the timing
-                  # wrappers that MEASURE a verdict (`compiled_exec_support.py`) — are pure
-                  # moves out of `compiled.py`, so an edit to either can move a measured
-                  # win/lose verdict exactly as a `compiled.py` edit could (TRK-189 derives
-                  # and enforces this from disk).
                   _R_DIR / "compiled_capability.py", _R_DIR / "compiled_exec_support.py",
-                  # K0 (v0.50.0 Phase C split, R2#3): `compiled.py`'s promotion-TRIAL domain
-                  # (`compiled_promotion.py`) is a third pure move out of `compiled.py`, so
-                  # an edit to it can move a measured win/lose verdict exactly as the two
-                  # SPLIT-47 siblings above already can (TRK-189 derives and enforces this
-                  # from disk).
-                  _R_DIR / "compiled_promotion.py",
-                  # VERDICTFILES-50: `fncalls_compile.py`'s own memo (`_memo`: a composite
-                  # fingerprint/device/precision key -> real-compile-succeeded bool) is
-                  # exactly such a measured win/lose verdict — persisted via
-                  # `warm_state.json` under this same epoch. It was never added here, so an
-                  # edit to its gating logic (what counts as `ok=True`) moved no epoch, and
-                  # a stale on-disk verdict from before the edit could be adopted after it.
-                  _R_DIR / "fncalls_compile.py",
-                  # FIX-COMPILE51 C0: `compiled.py`'s precompile-scoping domain
-                  # (`compiled_precompile.py`) is a fourth pure move out of `compiled.py`,
-                  # so an edit to it can move a measured win/lose verdict (the
-                  # `caching_precompile` blacklist-vs-attach-recovery outcome) exactly as
-                  # the three SPLIT-47/K0 siblings above already can (TRK-189 derives and
-                  # enforces this from disk).
+                  _R_DIR / "compiled_promotion.py", _R_DIR / "fncalls_compile.py",
                   _R_DIR / "compiled_precompile.py"]
 
 
@@ -237,9 +198,9 @@ def splitback_dotted_bindings(program, binding_types: dict, *, source: str = "")
     """DATA-6: resolve every dotted `@name.seg` in `program` — a plane read stays a dotted
     `BindingRef`, everything else is put back to the `ChannelAccess` swizzle it always was.
     In place; returns `program`. Runs in `compile_ast` ahead of the first `TypeChecker`, and is
-    THE SEAM the plane-expansion step shares: expansion rewrites `binding_types` (per-plane rows
-    for the planes the source mentions) immediately before this call, and this pass reads the
-    expanded map. Rules: `_DottedBindingSplitback`."""
+    THE SEAM the plane-expansion step shares: the host has already rewritten `binding_types`
+    (per-plane rows for the planes the source mentions) before this call, and this pass reads
+    the expanded map. Rules: `_DottedBindingSplitback`."""
     return _DottedBindingSplitback(binding_types, source).visit(program)
 
 
@@ -443,6 +404,9 @@ class TEXCache:
         # programs grew it without limit; the disk sidecar backs evicted entries).
         self._codegen_memory: OrderedDict[str, Any] = OrderedDict()
         self._last_cg_census = 0.0  # CACHE-0: throttle timestamp for the orphan sweep
+        # Cook, pool, prewarm and route threads share this cache. The LRU dicts' check-then-act
+        # (get + move_to_end vs. an evicting put) is guarded by this lock; disk work stays outside.
+        self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -513,9 +477,11 @@ class TEXCache:
             fp = self.fingerprint(code, binding_types)
 
         # Tier 1: memory
-        if fp in self._memory:
-            self._memory.move_to_end(fp)
-            return self._memory[fp]
+        with self._lock:
+            hit = self._memory.get(fp)
+            if hit is not None:
+                self._memory.move_to_end(fp)
+                return hit
 
         # Tier 2: disk
         result = self._load_from_disk(fp, binding_types)
@@ -581,8 +547,7 @@ class TEXCache:
         # shared post-parse orchestration (STR-8: identical to the fusion path's).
         # DATA-6: the AST arriving at `compile_ast` is already split against THIS map; the
         # splitback there is an identity on it (a kept plane read is kept again, a swizzle
-        # has no dot left to split) and is the hook the expansion step will re-read once it
-        # adds per-plane rows.
+        # has no dot left to split).
         program = parse_and_split(code, binding_types)
         program, type_map, referenced, assigned, params, used_builtins = \
             self.compile_ast(program, binding_types, source=code)
@@ -601,9 +566,9 @@ class TEXCache:
 
         DATA-6: the plane seam sits at the top, BEFORE the first TypeChecker — the parser
         never sees binding types, and the checker cannot replace a node it is typing. Two
-        steps, one owner, in this order: (1) [expansion — lands with the wire value] a PLANES
-        wire's per-plane rows are added to `binding_types` for the planes the source mentions;
-        (2) the splitback below resolves every dotted `@name.seg` against that map. Both
+        steps, one owner, in this order: (1) the host has already added a PLANES wire's
+        per-plane rows to `binding_types` for the planes the source mentions (prepare() and
+        the stage-list entry points do this); (2) the splitback below resolves every dotted `@name.seg` against that map. Both
         production entries and the test harnesses converge here, so nothing compiles an
         unresolved dotted binding.
         """
@@ -633,17 +598,20 @@ class TEXCache:
 
     def clear_memory(self):
         """Clear in-memory cache only (disk entries remain)."""
-        self._memory.clear()
+        with self._lock:
+            self._memory.clear()
 
     def clear_all(self):
         """Clear memory, disk, and torch.compile/inductor caches."""
-        self._memory.clear()
-        self._codegen_memory.clear()
+        with self._lock:
+            self._memory.clear()
+            self._codegen_memory.clear()
         try:
-            # *.tmp also sweeps autotier.json.tmp; the persisted-verdict/model JSONs
-            # (autotier.json = CC-2 tier verdicts, xfer.json = ENG-8 transfer model)
-            # are named explicitly.
-            for pat in ("*.pkl", "*.cg", "*.tmp", "autotier.json", "xfer.json"):
+            # *.tmp sweeps leaked `.tex-tmp-*.tmp` write temps. The persisted verdict/model
+            # files are named explicitly: autotier.json (tier verdicts), xfer.json (transfer
+            # model) and warm_state.json with its journal (capturability and fn-call verdicts).
+            for pat in ("*.pkl", "*.cg", "*.tmp", "autotier.json", "xfer.json",
+                        "warm_state.json", "warm_state.json.journal"):
                 for p in self._cache_dir.glob(pat):
                     p.unlink(missing_ok=True)
         except Exception as e:
@@ -660,10 +628,11 @@ class TEXCache:
 
     def _memory_put(self, fp: str, result: tuple):
         """Insert into memory cache with LRU eviction."""
-        self._memory[fp] = result
-        self._memory.move_to_end(fp)
-        while len(self._memory) > _MEMORY_MAX_ENTRIES:
-            self._memory.popitem(last=False)
+        with self._lock:
+            self._memory[fp] = result
+            self._memory.move_to_end(fp)
+            while len(self._memory) > _MEMORY_MAX_ENTRIES:
+                self._memory.popitem(last=False)
 
     # ── Internal: disk tier ───────────────────────────────────────────
 
@@ -672,10 +641,10 @@ class TEXCache:
 
     @staticmethod
     def _atomic_pickle(path: Path, data: Any) -> None:
-        """Pickle *data* to *path* atomically AND durably, so a concurrent reader — e.g. a
-        second ComfyUI instance sharing the dir — can never observe a half-written entry, and
-        a crash never leaves a torn artifact the next launch would load. ENG-13 routes every
-        persisted engine file through the one `tex_recovery.atomic_write`."""
+        """Pickle *data* to *path* atomically (temp + rename, deliberately not fsynced: see
+        below), so a concurrent reader, e.g. a second ComfyUI instance sharing the dir, never
+        observes a half-written entry. A torn file after a crash fails its MAC and is a miss.
+        ENG-13 routes every persisted engine file through the one `tex_recovery.atomic_write`."""
         from .tex_recovery import sign_pickle
         # Streamed, not blobbed: a compiled artifact is small next to a frame, but there is no
         # reason to build a second copy of it in memory to reach the same write.
@@ -709,11 +678,9 @@ class TEXCache:
             data = {
                 "version": _AST_EPOCH,          # CACHE-4: .pkl gated by the AST epoch only
                 "program": program,
-                "binding_types": {k: v.value for k, v in binding_types.items()},
                 "sets": None if referenced is None else (
                     set(referenced), {k: v.value for k, v in (assigned or {}).items()},
                     dict(params or {})),
-                "timestamp": time.time(),
             }
             self._atomic_pickle(self._disk_path(fp), data)
             self._evict_disk_if_needed()
@@ -728,30 +695,8 @@ class TEXCache:
         if not path.exists():
             return None
         try:
-            # BRIEF-10: AUTHENTICATE before deserialise. `load_verified` reads the file once,
-            # checks the keyed-MAC trailer, and unpickles the SAME buffer — so a `.pkl` with no
-            # valid trailer (a pre-integrity file, a foreign one, or a crafted one) is a MISS and
-            # its `__reduce__` never runs, with no re-read a writer could swap under. The
-            # version/epoch checks below are unchanged; the MAC is a gate in front, not a reorder.
-            # RESTORE-462: UNREADABLE (open/read itself failed — transient) is not UNVERIFIED
-            # (opened fine, content bad) — it says nothing about the content, so it is a silent
-            # miss that recompiles THIS time, left on disk for a retry to find good, not deleted.
-            # R1: FUTURE_TRAILER/UNREADABLE's shared "leave it, just miss" action is one place
-            # (`tex_recovery._is_decline_quietly`), not spelled out at each of the three sites.
-            from .tex_recovery import load_verified, _UNVERIFIED, _is_decline_quietly
-            data = load_verified(path)
-            if data is _UNVERIFIED:
-                try:
-                    path.unlink(missing_ok=True)     # unsigned/foreign/corrupt: recompile fresh
-                except OSError:
-                    pass                             # F6: an undeletable file is a silent miss
-                return None
-            if _is_decline_quietly(data):
-                return None                          # leave it, just miss (never destroy on either)
-
-            # Version check — stale entries are deleted (CACHE-4: AST epoch gates the .pkl)
-            if data.get("version") != _AST_EPOCH:
-                path.unlink(missing_ok=True)
+            data = self._load_verified_entry(path, _AST_EPOCH)   # CACHE-4: AST epoch gates the .pkl
+            if data is None:
                 return None
 
             program = data["program"]
@@ -768,8 +713,12 @@ class TEXCache:
                                   strict_redeclare=False)
             type_map = checker.check(program)
 
-            # Touch file to update access time for LRU eviction
-            os.utime(path, None)
+            # Touch file to update access time for LRU eviction. Best-effort: a read-only or
+            # shared cache dir must not veto a verified hit.
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
 
             from .tex_runtime.interpreter import _collect_identifiers
             referenced, assigned, params = sets
@@ -784,6 +733,31 @@ class TEXCache:
                 pass
             return None
 
+    @staticmethod
+    def _load_verified_entry(path: Path, epoch: str, magic: bytes | None = None):
+        """The authenticated payload dict of an on-disk artifact, or None for a miss.
+
+        BRIEF-10: authenticate BEFORE deserialising. `load_verified` reads the file once, checks
+        the keyed-MAC trailer and unpickles that same buffer, so a file with no valid trailer
+        (pre-integrity, foreign or crafted) is a miss and its `__reduce__` never runs. UNVERIFIED
+        content is deleted; UNREADABLE (a transient open/read failure) and FUTURE_TRAILER say
+        nothing about the content and are left on disk for a retry. A version (or bytecode
+        magic) mismatch is a stale artifact and is deleted."""
+        from .tex_recovery import load_verified, _UNVERIFIED, _is_decline_quietly
+        data = load_verified(path)
+        if data is _UNVERIFIED:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass                                 # an undeletable file is a silent miss
+            return None
+        if _is_decline_quietly(data):
+            return None
+        if data.get("version") != epoch or (magic is not None and data.get("magic") != magic):
+            path.unlink(missing_ok=True)
+            return None
+        return data
+
     def _evict_disk_if_needed(self):
         """Remove oldest disk entries if over the limit."""
         # CACHE-0: the orphan-.cg sweep runs FIRST, independent of the .pkl cap —
@@ -794,15 +768,18 @@ class TEXCache:
             entries = list(self._cache_dir.glob("*.pkl"))
             if len(entries) <= _DISK_MAX_ENTRIES:
                 return
-            # Sort by access time (oldest first)
-            entries.sort(key=lambda p: p.stat().st_atime)
-            to_remove = len(entries) - _DISK_MAX_ENTRIES
-            for p in entries[:to_remove]:
+            # Oldest access first. An entry another process removed since the glob is skipped
+            # rather than aborting the whole pass.
+            aged = []
+            for p in entries:
+                try:
+                    aged.append((p.stat().st_atime, p))
+                except OSError:
+                    pass
+            aged.sort(key=lambda t: t[0])
+            for _at, p in aged[:len(aged) - _DISK_MAX_ENTRIES]:
                 p.unlink(missing_ok=True)
-                p.with_suffix(".pkl.tmp").unlink(missing_ok=True)
-                # Drop the paired codegen sidecar (and any orphan .tmp).
-                p.with_suffix(".cg").unlink(missing_ok=True)
-                p.with_suffix(".cg.tmp").unlink(missing_ok=True)
+                p.with_suffix(".cg").unlink(missing_ok=True)   # the paired codegen sidecar
         except Exception as e:
             logger.warning("[TEX] Disk cache eviction failed: %s", e)
 
@@ -840,7 +817,6 @@ class TEXCache:
             for _mt, p in aged[:over]:
                 try:
                     p.unlink(missing_ok=True)
-                    p.with_suffix(".cg.tmp").unlink(missing_ok=True)
                 except OSError:
                     pass  # a concurrent reader/unlink on one file never aborts the rest
         except Exception as e:
@@ -854,19 +830,21 @@ class TEXCache:
     def _codegen_memory_put(self, fp: str, val) -> None:
         """Insert into the in-memory codegen tier as MRU, then LRU-evict to the
         bound (disk sidecar backs evictions). Mirrors the `_memory` tier's put."""
-        self._codegen_memory[fp] = val
-        self._codegen_memory.move_to_end(fp)
-        while len(self._codegen_memory) > _CODEGEN_MEMORY_MAX_ENTRIES:
-            self._codegen_memory.popitem(last=False)
+        with self._lock:
+            self._codegen_memory[fp] = val
+            self._codegen_memory.move_to_end(fp)
+            while len(self._codegen_memory) > _CODEGEN_MEMORY_MAX_ENTRIES:
+                self._codegen_memory.popitem(last=False)
 
     def get_codegen_fn(self, fp: str):
         """Return the codegen fn for *fp*: a callable, the _CG_UNSUPPORTED
         sentinel, or None (not yet generated — the caller should emit and then
         call store_codegen_fn). Memory tier first, then the marshal sidecar."""
-        cached = self._codegen_memory.get(fp)
-        if cached is not None:
-            self._codegen_memory.move_to_end(fp)
-            return cached
+        with self._lock:
+            cached = self._codegen_memory.get(fp)
+            if cached is not None:
+                self._codegen_memory.move_to_end(fp)
+                return cached
         fn = self._load_codegen_from_disk(fp)
         if fn is not None:
             self._codegen_memory_put(fp, fn)
@@ -922,28 +900,10 @@ class TEXCache:
         if not path.exists():
             return None
         try:
-            # BRIEF-10: the OUTER pickle is itself an execution sink, so authenticate the file
-            # before deserialising — the inner-blob sha below only ever guarded corruption of the
-            # marshal blob (and is attacker-recomputable), so it cannot stand in for this.
-            # `load_verified` reads once, checks the MAC, and unpickles that one buffer (no
-            # re-read window — F1).
-            # RESTORE-462: UNREADABLE (open/read itself failed — transient) is not UNVERIFIED
-            # (opened fine, content bad) — a silent miss left on disk, never deleted.
-            # R1: FUTURE_TRAILER/UNREADABLE's shared "leave it, just miss" action is one place
-            # (`tex_recovery._is_decline_quietly`), not spelled out at each of the three sites.
-            from .tex_recovery import load_verified, _UNVERIFIED, _is_decline_quietly
-            data = load_verified(path)
-            if data is _UNVERIFIED:
-                try:
-                    path.unlink(missing_ok=True)     # unsigned/foreign/corrupt: regenerate
-                except OSError:
-                    pass                             # F6: an undeletable file is a silent miss
-                return None
-            if _is_decline_quietly(data):
-                return None                          # leave it, just miss (never destroy on either)
-            if (data.get("version") != _CODEGEN_EPOCH
-                    or data.get("magic") != _BYTECODE_MAGIC):
-                path.unlink(missing_ok=True)
+            # The outer pickle is itself an execution sink, so it is authenticated before it is
+            # deserialised; the inner blob sha below only guards marshal-blob corruption.
+            data = self._load_verified_entry(path, _CODEGEN_EPOCH, _BYTECODE_MAGIC)
+            if data is None:
                 return None
             if data.get("unsupported"):
                 return _CG_UNSUPPORTED
