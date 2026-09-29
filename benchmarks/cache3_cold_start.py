@@ -66,13 +66,18 @@ def _phase_cold(cache_dir: str, n: int, device: str) -> None:
     t_import = time.perf_counter() - t_proc
     srcs = _programs(n)
     A = torch.rand(1, 512, 512, 4)
+    def _sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
     t0 = time.perf_counter()
     tex_engine.cook(srcs[0], {"A": A.clone()}, device_mode=device)   # the first frame
+    _sync()
     t_first = time.perf_counter() - t0
     t1 = time.perf_counter()
-    for s in srcs:
-        tex_engine.cook(s, {"A": A.clone()}, device_mode=device)     # all n first-frames
-    t_all = time.perf_counter() - t1
+    for s in srcs[1:]:                                # the other n-1 first-frames
+        tex_engine.cook(s, {"A": A.clone()}, device_mode=device)
+    _sync()
+    t_all = t_first + (time.perf_counter() - t1)      # all n first-frames, none cache-hot
     print(f"COLD  torch_import={t_import*1000:.0f}ms  first_frame={t_first*1000:.1f}ms  "
           f"all{n}={t_all*1000:.0f}ms  (TEX-side to-first-frame={t_first*1000:.1f}ms)")
 

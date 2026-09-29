@@ -56,6 +56,11 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)                      # .../TEX_Wrangle
 sys.path.insert(0, os.path.dirname(_PKG))           # .../custom_nodes (package parent)
+# Pin the cache dir before TEX starts: a sibling bench loaded later would otherwise mint a
+# temp dir and rewrite TEX_CACHE_DIR after TEX has already resolved its own.
+if not os.environ.get("TEX_CACHE_DIR"):
+    import tempfile
+    os.environ["TEX_CACHE_DIR"] = tempfile.mkdtemp(prefix="tex_artist_loops_")
 
 import torch                                        # noqa: E402
 from TEX_Wrangle import tex_engine                    # noqa: E402
