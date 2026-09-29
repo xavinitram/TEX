@@ -3,8 +3,8 @@ Pure-torch scanline OpenEXR reader/writer (DATA-2).
 
 WHY pure torch: the numpy-based OpenEXR / Imath bindings are banned (invariant #1 — TEX is
 torch-only so it stays embeddable). This implements the EXR container by hand: struct for the
-header, zlib for ZIP, and torch for the pixel plumbing (`.view(dtype)` reinterpret on read,
-`struct.pack` on write — verified bit-identical to torch's own half/float encoding).
+header and offset table, zlib for ZIP, and torch for the pixel plumbing (a `.view(dtype)`
+reinterpret on read, `tex_io._raw_bytes` on write).
 
 SCOPE (honest, roadmap): scanline images only — single-part, NONE / ZIPS / ZIP compression,
 HALF or FLOAT (UINT read-only). Layers — `layer.channel` channel names inside that one part —
@@ -36,6 +36,14 @@ _C_NONE, _C_ZIPS, _C_ZIP = 0, 2, 3
 _LINES_PER_BLOCK = {_C_NONE: 1, _C_ZIPS: 1, _C_ZIP: 16}
 _SUPPORTED_COMPRESSION = {"none": _C_NONE, "zips": _C_ZIPS, "zip": _C_ZIP}
 
+# Bounds on what a header may claim, checked before any plane is allocated. A deflate stream
+# cannot expand past 1032:1, so a compressed image cannot hold more raw bytes than that times
+# the file; an uncompressed one, no more than the file. `_MAX_SAMPLES` caps W*H*channels.
+_MAX_DEFLATE_RATIO = 1032
+_MAX_SAMPLES = 1 << 30
+# Flag bits (of version >> 8) this reader knows: tiled, long names, deep, multipart.
+_KNOWN_FLAGS = 0x2 | 0x4 | 0x8 | 0x10
+
 
 class EXRError(ValueError):
     """A malformed or out-of-scope EXR (tiled / multipart / unsupported compression)."""
@@ -57,12 +65,13 @@ class ExrImage:
 
 # ── ZIP codec (EXR's interleave + delta predictor, vectorized) ────────────────
 
-def _zip_decompress(data: bytes) -> torch.Tensor:
-    """Inflate one ZIP/ZIPS block → the raw scanline bytes as a uint8 tensor. Undoes EXR's two
-    reversible transforms (a delta predictor, then a two-half byte de-interleave) with torch
-    ops so a megabyte block is not a per-byte Python loop: the predictor is a prefix-sum
-    (`d[i] = Σb[..i] − 128·i mod 256`), the de-interleave two strided assigns."""
-    raw = zlib.decompress(data)
+def _zip_decompress(data, limit: int) -> torch.Tensor:
+    """Inflate one ZIP/ZIPS block → the raw scanline bytes as a uint8 tensor, at most `limit`+1
+    of them (the block's expected size is known, so a bomb is cut off, not inflated). Undoes
+    EXR's two reversible transforms (a delta predictor, then a two-half byte de-interleave)
+    with torch ops so a megabyte block is not a per-byte Python loop: the predictor is a
+    prefix-sum (`d[i] = Σb[..i] − 128·i mod 256`), the de-interleave two strided assigns."""
+    raw = zlib.decompressobj().decompress(data, limit + 1)
     b = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(torch.int64)
     n = b.numel()
     # Undo predictor: running (b[i-1] + b[i] - 128) mod 256 == cumsum(b) - 128*i, mod 256.
@@ -105,6 +114,8 @@ def _read_attr_header(buf: memoryview, pos: int):
             return attrs, pos                     # empty name terminates the header
         atype, pos = _read_cstr(buf, pos)
         (size,) = struct.unpack_from("<i", buf, pos); pos += 4
+        if size < 0 or pos + size > len(buf):
+            raise EXRError(f"EXR attribute '{name}' declares size {size}, outside the file")
         attrs[name] = (atype, bytes(buf[pos:pos + size])); pos += size
 
 
@@ -128,6 +139,8 @@ def _parse_channels(value: bytes):
         if xs != 1 or ys != 1:                      # every plane must be full-resolution: the
             raise EXRError(f"subsampled channel '{name}' (xSampling={xs}, ySampling={ys}) "
                            f"is out of scope")      # block byte-math assumes W×H samples/channel
+        if any(c[0] == name for c in chans):
+            raise EXRError(f"duplicate channel '{name}' in the EXR channel list")
         chans.append((name, ptype, _PT_BYTES[ptype]))
     return chans
 
@@ -154,11 +167,9 @@ def read_exr(src) -> ExrImage:
         return _decode_exr(memoryview(data))
     except EXRError:
         raise
-    except (struct.error, IndexError, zlib.error, ValueError) as e:   # ValueError subsumes
-        # ValueError covers torch.frombuffer choking on a zero-length block (a NONE/raw chunk
-        # whose declared dataSize is 0) and any other malformed-byte-count reinterpret — the
-        # docstring promises EXRError, never a raw error, so it must be in the net. (EXRError
-        # is itself a ValueError but is re-raised above, so a genuine out-of-scope message wins.)
+    except (struct.error, IndexError, zlib.error, ValueError, OverflowError, MemoryError) as e:
+        # ValueError covers torch.frombuffer choking on a zero-length block. EXRError is a
+        # ValueError too but is re-raised above, so a specific message wins.
         raise EXRError(f"malformed or truncated EXR: {e}") from e
 
 
@@ -167,11 +178,15 @@ def _decode_exr(buf: memoryview) -> ExrImage:
     if magic != _MAGIC:
         raise EXRError("not an EXR file (bad magic)")
     (version,) = struct.unpack_from("<i", buf, 4)
+    if version & 0xFF != 2:
+        raise EXRError(f"unsupported EXR version {version & 0xFF} (only 2)")
     flags = version >> 8
     if flags & 0x2:
         raise EXRError("tiled EXR is out of scope (scanline only)")
     if flags & 0x18:                               # multipart (0x10) or deep (0x8)
         raise EXRError("multipart / deep EXR is out of scope")
+    if flags & ~_KNOWN_FLAGS:
+        raise EXRError(f"unsupported EXR version flags {flags:#x}")
 
     attrs, pos = _read_attr_header(buf, 8)
     for req in ("channels", "compression", "dataWindow"):
@@ -179,42 +194,67 @@ def _decode_exr(buf: memoryview) -> ExrImage:
             raise EXRError(f"EXR missing required attribute '{req}'")
 
     channels = _parse_channels(attrs["channels"][1])
+    if not channels:
+        raise EXRError("EXR has no channels")
     compression = attrs["compression"][1][0]
     if compression not in _LINES_PER_BLOCK:
         raise EXRError(f"unsupported EXR compression {compression} "
                        f"(only none / zips / zip)")
     x_min, y_min, x_max, y_max = struct.unpack_from("<iiii", attrs["dataWindow"][1], 0)
     W, H = x_max - x_min + 1, y_max - y_min + 1
+    if W <= 0 or H <= 0:
+        raise EXRError(f"EXR dataWindow is empty or inverted ({W}x{H})")
 
     lines_per_block = _LINES_PER_BLOCK[compression]
+    row_stride = sum(W * bps for _, _, bps in channels)
+    ratio = 1 if compression == _C_NONE else _MAX_DEFLATE_RATIO
+    if W * H * len(channels) > _MAX_SAMPLES or H * row_stride > ratio * len(buf):
+        raise EXRError(f"EXR dataWindow {W}x{H} declares more pixel data than the file can hold")
     n_blocks = (H + lines_per_block - 1) // lines_per_block
+    table_end = pos + 8 * n_blocks
+    if table_end > len(buf):
+        raise EXRError("EXR offset table runs past the end of the file")
     offsets = struct.unpack_from("<%dQ" % n_blocks, buf, pos)
 
-    row_stride = sum(W * bps for _, _, bps in channels)
     planes = {name: torch.empty(H, W, dtype=torch.float32) for name, _, _ in channels}
 
     # Each block is placed by its ABSOLUTE chunk y-coordinate (`y0 - y_min`), and scanlines within
     # a block are always increasing-y — so orientation is correct regardless of the file's lineOrder
-    # (which is only the order chunks were *written*, a streaming hint). NO post-hoc flip.
+    # (which is only the order chunks were *written*, a streaming hint). NO post-hoc flip. The
+    # n_blocks offsets must name n_blocks DISTINCT aligned rows: that is what guarantees every
+    # row of the uninitialised planes above is written.
+    seen = set()
     for off in offsets:
-        (y0,) = struct.unpack_from("<i", buf, off)
-        (dsize,) = struct.unpack_from("<i", buf, off + 4)
-        payload = buf[off + 8:off + 8 + dsize]
+        if off < table_end or off + 8 > len(buf):
+            raise EXRError(f"EXR chunk offset {off} is outside the file")
+        y0, dsize = struct.unpack_from("<ii", buf, off)
         y0 -= y_min
+        if not 0 <= y0 < H or y0 % lines_per_block or y0 in seen:
+            raise EXRError(f"EXR block at y={y0 + y_min} is out of range, misaligned or repeated")
+        seen.add(y0)
+        if dsize < 0 or off + 8 + dsize > len(buf):
+            raise EXRError(f"EXR block at y={y0 + y_min} runs past the end of the file")
+        payload = buf[off + 8:off + 8 + dsize]
         L = min(lines_per_block, H - y0)
         expected = L * row_stride
         if dsize == expected or compression == _C_NONE:
             block = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
         else:
-            block = _zip_decompress(bytes(payload))
+            block = _zip_decompress(payload, expected)
         if block.numel() != expected:
-            raise EXRError(f"EXR block at y={y0 + y_min} decoded to {block.numel()} bytes, "
+            got = f"at least {block.numel()}" if block.numel() > expected else block.numel()
+            raise EXRError(f"EXR block at y={y0 + y_min} decoded to {got} bytes, "
                            f"expected {expected}")
         block = block.view(L, row_stride)
         col = 0
         for name, ptype, bps in channels:
             span = W * bps
-            samples = block[:, col:col + span].reshape(-1).view(_PT_VIEW[ptype])   # reshape(-1) is already contiguous
+            samples = block[:, col:col + span].reshape(-1)   # a one-row block: a view, not a copy
+            if samples.storage_offset() % bps:               # a wider-dtype `.view` needs alignment
+                samples = samples.clone()
+            samples = samples.view(_PT_VIEW[ptype])
+            if ptype == _PT_UINT:                            # unsigned: ids >= 2^31 stay positive
+                samples = samples.to(torch.int64) & 0xFFFFFFFF
             planes[name][y0:y0 + L] = samples.to(torch.float32).view(L, W)
             col += span
 
@@ -326,10 +366,9 @@ def write_exr(path, pixels: torch.Tensor, *, channels=None, half: bool = False,
         body += rec
         off += len(rec)
 
-    with open(path, "wb") as f:
-        f.write(header)
-        f.write(bytes(offsets))
-        f.write(bytes(body))
+    from ..tex_recovery import atomic_write          # lazy: a reader never needs it
+    if not atomic_write(path, header + bytes(offsets) + bytes(body)):
+        raise OSError(f"could not write EXR to {path!r}")
 
 
 def _exr_header(W: int, H: int, names, ptype: int, comp: int) -> bytes:
