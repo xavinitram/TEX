@@ -687,3 +687,25 @@ def test_float_cast_of_an_int_param_matches_interpreter(label, code):
 def test_hoisted_fetch_batch_gt_one_scalar_coords():
     code = "vec4 c = vec4(0.0);\nfloat t = 0.5;\nwhile (t < 3.0) { c = fetch(@A, 3, 4); t = t + 1.0; }\n@OUT = c;"
     assert_parity(code, {"A": _img(B=3, H=5, W=5)}, atol=0.0)
+
+
+# ── linecache: a rebuild's source replaces the old one; the cancel build has its own name ─
+
+def test_codegen_linecache_follows_the_newest_source():
+    import linecache
+    from TEX_Wrangle.tex_runtime import codegen_persist as cp
+    fp = "f" * 64
+    name = cp._cg_filename(fp)
+    assert cp._cg_filename(fp, cancel=True) != name
+    try:
+        cp._register_codegen_linecache(name, "a = 1\n")
+        cp._register_codegen_linecache(name, "a = 1\nb = 2\n")
+        assert linecache.getline(name, 2) == "b = 2\n"
+        assert list(cp._LINECACHE_KEYS).count(name) == 1
+        linecache.cache.pop(name, None)   # a clearcache() between builds
+        cp._register_codegen_linecache(name, "c = 3\n")
+        assert list(cp._LINECACHE_KEYS).count(name) == 1
+    finally:
+        linecache.cache.pop(name, None)
+        if name in cp._LINECACHE_KEYS:
+            cp._LINECACHE_KEYS.remove(name)

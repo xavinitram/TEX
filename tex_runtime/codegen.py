@@ -1212,7 +1212,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             f"{func_body}\n"
         )
         if fingerprint is not None:
-            filename = _cg_filename(fingerprint)
+            filename = _cg_filename(fingerprint, cancel=self._cancel_polls_on)
         else:
             _CodeGen._codegen_counter += 1
             filename = f"<tex_codegen_{_CodeGen._codegen_counter}>"
