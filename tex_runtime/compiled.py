@@ -1175,6 +1175,12 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         autotier.reopen(key)
         state = autotier.verdict(key)
 
+    if state == autotier.COMPILING and _bg_status(cache_key) == "ready":
+        # A compile that finished is promoted before the convergence bound below is judged:
+        # a pause between cooks must not turn a ready artifact into a REJECTED key.
+        autotier.mark_ready(key)
+        state = autotier.TRIAL
+
     if state == autotier.TRIAL and cache_key in _compiled_cache:
         # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation used to run
         # synchronously here (`_run_cached_compiled(...).result()`, no timeout) — a program

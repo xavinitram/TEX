@@ -37,6 +37,7 @@ compile — this box's Smart App Control policy forbids looping real `torch.comp
 and the mechanism under test (which thread pays the lazy first-call cost) does not need a
 real backend to prove.
 """
+import threading
 import time
 
 import pytest
@@ -410,7 +411,10 @@ def test_cc6_wired_into_run_auto(r: SubTestResult):
         names = output_names or ["OUT"]
         return {name: bindings["A"] for name in names}
 
+    compile_gate = threading.Event()   # holds the fake compile pending, like a slow real one
+
     def fake_try_compile(device_type, program, type_map, **kw):
+        compile_gate.wait(10)
         return fake_compiled_fn, "inductor"
 
     orig_try_compile = C._try_compile
@@ -438,6 +442,8 @@ def test_cc6_wired_into_run_auto(r: SubTestResult):
     except Exception as e:
         r.fail("CC-6 run_auto wiring", str(e))
     finally:
+        compile_gate.set()
+        C._drain_bg_for_test()
         C._try_compile = orig_try_compile
         C.compile_capability_async = orig_cap
         C._compiled_cache.pop(cache_key, None)

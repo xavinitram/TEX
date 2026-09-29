@@ -175,7 +175,10 @@ def enforce_convergence_bound(key: tuple) -> bool:
     wall-clock seconds without reaching one on its own. Returns True the one call that
     fires the bound (the caller then routes to codegen, same as any other REJECTED key);
     False every other call, including every call before a key is even eligible
-    (`ready_wall` stays `None` until `should_submit_compile` first returns True)."""
+    (`ready_wall` stays `None` until `should_submit_compile` first returns True).
+
+    The verdict holds for this process only: the clock counts idle time and queueing behind
+    other keys' compiles, which say nothing about the program, so it is never persisted."""
     st = _get(key)
     if st.state not in (MEASURING, COMPILING, TRIAL):
         return False
@@ -184,7 +187,7 @@ def enforce_convergence_bound(key: tuple) -> bool:
     if _time.monotonic() - st.ready_wall < _CONVERGENCE_BOUND_S:
         return False
     st.state = REJECTED
-    _persist()
+    _NON_DURABLE.add(key)   # a scheduling fact about this process, not about the program
     return True
 
 

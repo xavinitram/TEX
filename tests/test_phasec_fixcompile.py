@@ -13,6 +13,7 @@ would otherwise need a real torch.compile / CUDA / MSVC toolchain — this box's
 Control policy forbids looping real compiles (see test_compile_a_toolchain.py's own
 portability note, which this file follows).
 """
+import concurrent.futures
 import sys
 import threading
 import time
@@ -297,8 +298,10 @@ def test_c5_convergence_bound_evicts_compiled_cache(r: SubTestResult):
     `_bg_status` to promote autotier's own verdict from COMPILING to TRIAL), and THEN the
     bound fires because `ready_wall` is stale. `state == TRIAL` with the artifact already
     present is a DIFFERENT, earlier branch in `run_auto` (a normal timed trial) and never
-    reaches the bound at all in that cook — COMPILING-with-a-ready-artifact is the branch
-    that actually reaches `enforce_convergence_bound` while `_compiled_cache` is occupied."""
+    reaches the bound at all in that cook. So is a COMPILING key whose job has finished: it
+    is promoted to TRIAL first. What reaches the bound with `_compiled_cache` occupied is a
+    job that has stored the artifact but is still paying its warm call (its future is not
+    done), which is what the pending future below stands for."""
     print("\n--- C5: a convergence-bound rejection evicts the key's cached artifact ---")
     with cold_engine_state():
         prog, tm, used = _tiny_program()
@@ -312,6 +315,7 @@ def test_c5_convergence_bound_evicts_compiled_cache(r: SubTestResult):
         AT.should_submit_compile(key)
         AT.mark_submitted(key)   # -> COMPILING
         C._compiled_cache[cache_key] = (lambda *a, **k: None, "inductor")
+        C._bg_futures[cache_key] = concurrent.futures.Future()   # the warm call is still running
         C._verify_state[cache_key] = {"px": 100, "samples": []}
         AT._get(key).ready_wall -= (AT._CONVERGENCE_BOUND_S + 1.0)
         try:
@@ -326,6 +330,7 @@ def test_c5_convergence_bound_evicts_compiled_cache(r: SubTestResult):
             r.fail("C5 convergence bound eviction", str(e))
         finally:
             C._compiled_cache.pop(cache_key, None)
+            C._bg_futures.pop(cache_key, None)
             C._verify_state.pop(cache_key, None)
 
 
