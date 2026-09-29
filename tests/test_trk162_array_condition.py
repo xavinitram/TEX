@@ -23,8 +23,6 @@ is checked first, unchanged); only a program whose condition is ARRAY-typed is
 affected, and it used to crash uncontrolled, so the only visible change is that the
 crash is now a clear compile-time message instead of a bare RuntimeError.
 """
-from contextlib import nullcontext as _nullcontext
-
 from helpers import *
 
 from TEX_Wrangle import tex_api, tex_engine
@@ -36,20 +34,23 @@ def _codes(source):
 
 
 class _array_wires:
-    """Context manager: flip the engine profile on, restore whatever it was after —
-    mirrors the `_planes_enabled`/`array_wires` idiom already used elsewhere in the
-    suite (`tests/test_v037_frontend_parity.py`)."""
+    """Context manager: force the array-wires profile to `on` (default True), restore
+    whatever it was after — mirrors the `_planes_enabled`/`array_wires` idiom already used
+    elsewhere in the suite (`tests/test_v037_frontend_parity.py`)."""
+
+    def __init__(self, on: bool = True):
+        self._on = on
 
     def __enter__(self):
         self._prev = array_wires_enabled()
-        set_array_wires(True)
+        set_array_wires(self._on)
         return self
 
     def __exit__(self, *a):
         set_array_wires(self._prev)
 
 
-def test_trk162_premise_array_condition_crashes_uncontrolled(r: SubTestResult):
+def test_trk162_premise_array_condition_is_refused_at_check(r: SubTestResult):
     """Re-verify the row's own premise fresh (never carried): at the tree this lane
     started from, an ARRAY-typed `if` condition checks clean and crashes at cook with
     a bare RuntimeError. This test asserts the CURRENT (fixed) behaviour instead —
@@ -111,7 +112,7 @@ def test_trk162_array_wire_binding_condition_refused(r: SubTestResult):
     print("\n--- TRK-162: a wired ARRAY binding (a@cond) used as a condition is refused ---")
     src = "if (a@cond) { @OUT = vec4(1.0); } else { @OUT = vec4(0.0); }"
     for label, on in (("comfy (default)", False), ("engine", True)):
-        with _array_wires() if on else _nullcontext():
+        with _array_wires(on):
             codes = [c for c, sev, _ in _codes(src) if sev == "error"]
             if "E3501" in codes:
                 r.ok(f"[{label}] a wired ARRAY condition draws E3501 ({codes})")

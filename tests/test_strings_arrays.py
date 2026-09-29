@@ -226,10 +226,10 @@ def test_string(r: SubTestResult):
     # 22. Type error: string + number
     try:
         compile_and_run(
-            'string s = "hello" + 1;',
+            'string s = "hello" + 1; @OUT = s;',
             {}, out_type=TEXType.STRING)
         r.fail("string: type error string+number", "Expected TypeCheckError")
-    except (TypeCheckError, TEXMultiError, InterpreterError):
+    except (TypeCheckError, TEXMultiError):
         r.ok("string: type error string+number")
     except Exception as e:
         r.fail("string: type error string+number", f"Wrong error type: {e}")
@@ -1061,6 +1061,12 @@ samples = sort(samples);
 """
         result = compile_and_run(code, {"A": img})
         assert result.shape == (B, H, W, 4)
+        # Median of the three horizontal neighbours, checked on the interior columns (the
+        # border rule of fetch() is not this row's subject).
+        rr = img[..., 0]
+        want = torch.stack([rr[:, :, :-2], rr[:, :, 1:-1], rr[:, :, 2:]], dim=0).median(dim=0).values
+        assert torch.allclose(result[:, :, 1:-1, 0], want, atol=1e-6), "wrong median of 3"
+        assert torch.allclose(result[..., 3], torch.ones_like(result[..., 3])), "alpha"
         r.ok("array: spatial fetch+sort")
     except Exception as e:
         r.fail("array: spatial fetch+sort", f"{e}\n{traceback.format_exc()}")
@@ -1073,8 +1079,10 @@ samples = sort(samples);
         tc.check(program)
         r.fail("array: size mismatch error", "Expected TypeCheckError")
     except TypeCheckError as e:
-        assert "mismatch" in str(e).lower()
-        r.ok("array: size mismatch error")
+        if "mismatch" in str(e).lower():
+            r.ok("array: size mismatch error")
+        else:
+            r.fail("array: size mismatch error", f"wrong message: {e}")
     except Exception as e:
         r.fail("array: size mismatch error", f"{e}\n{traceback.format_exc()}")
 
@@ -1086,8 +1094,11 @@ samples = sort(samples);
         tc.check(program)
         r.fail("array: index non-array error", "Expected TypeCheckError")
     except TypeCheckError as e:
-        assert "doesn't work on" in str(e).lower() or "non-array" in str(e).lower() or "only arrays" in str(e).lower()
-        r.ok("array: index non-array error")
+        msg = str(e).lower()
+        if "doesn't work on" in msg or "non-array" in msg or "only arrays" in msg:
+            r.ok("array: index non-array error")
+        else:
+            r.fail("array: index non-array error", f"wrong message: {e}")
     except Exception as e:
         r.fail("array: index non-array error", f"{e}\n{traceback.format_exc()}")
 
@@ -1165,10 +1176,12 @@ vec4 arr[] = {vec4(3.0, 1.0, 2.0, 1.0), vec4(1.0, 3.0, 1.0, 3.0), vec4(2.0, 2.0,
 arr = sort(arr);
 @OUT = arr[0];
 """
-        result = compile_and_run(code, {"A": img})
-        # Per-channel sort: R sorted = [1,2,3], G sorted = [1,2,3], etc.
-        assert abs(result[0, 0, 0, 0].item() - 1.0) < 1e-4  # min R
-        assert abs(result[0, 0, 0, 1].item() - 1.0) < 1e-4  # min G
+        # Per-channel sort: every channel of the input holds {1, 2, 3}, so element i of the
+        # sorted array is vec4(i + 1) in all four channels.
+        for i in range(3):
+            result = compile_and_run(code.replace("arr[0]", f"arr[{i}]"), {"A": img})
+            for c in range(4):
+                assert abs(result[0, 0, 0, c].item() - (i + 1.0)) < 1e-4, (i, c)
         r.ok("vec4 array: sort per-channel")
     except Exception as e:
         r.fail("vec4 array: sort per-channel", f"{e}\n{traceback.format_exc()}")
@@ -1574,8 +1587,10 @@ for (int i = 0; i < 100; i++) {
         code = "float a[0]; @OUT = vec4(0,0,0,1);"
         compile_and_run(code, {"A": img})
         r.fail("array bounds: size 0 should error", "Expected error")
-    except (ParseError, TypeCheckError):
+    except (ParseError, TypeCheckError, TEXMultiError):
         r.ok("array bounds: size 0 errors")
+    except Exception as e:
+        r.fail("array bounds: size 0 should error", f"wrong error type: {type(e).__name__}: {e}")
 
     # String array bounds
     try:

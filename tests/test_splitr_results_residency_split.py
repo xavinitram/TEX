@@ -137,9 +137,10 @@ def test_splitr_host_seam_resolves(r: SubTestResult):
     import tempfile
     fails = []
     try:
-        c = tex_results.ResultCache(cache_dir=tempfile.mkdtemp())
-        c.set_vram_budget(64)           # arms it; nothing resident, so no demotion is queued
-        c.set_vram_budget(None)         # disarms it again
+        with tempfile.TemporaryDirectory() as tmp:
+            c = tex_results.ResultCache(cache_dir=tmp)
+            c.set_vram_budget(64)       # arms it; nothing resident, so no demotion is queued
+            c.set_vram_budget(None)     # disarms it again
     except Exception as e:
         fails.append(f"set_vram_budget(...) raised: {type(e).__name__}: {e}")
     if tex_results._dev_bucket("cuda:0") != "cuda":

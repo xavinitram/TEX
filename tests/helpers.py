@@ -411,6 +411,30 @@ def load_counts_harness():
     return mod
 
 
+def load_benchmark(filename):
+    """Load `benchmarks/<filename>` by path, once per process, under one `sys.modules` key.
+
+    Like `load_counts_harness`, and for the same reason: `benchmarks/` is not a package, and
+    hand-spelled copies of this incantation drift (two files once loaded the same script
+    under different names, so it ran twice). A failed exec leaves nothing behind in
+    `sys.modules`. Not in `__all__`; callers import it by name."""
+    import importlib.util
+    key = "_bench_" + os.path.splitext(filename)[0]
+    mod = sys.modules.get(key)
+    if mod is not None:
+        return mod
+    spec = importlib.util.spec_from_file_location(
+        key, os.path.join(_pkg_dir, "benchmarks", filename))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(key, None)
+        raise
+    return mod
+
+
 def load_display8_harness():
     """Load `tools/display8.py` by path, once per process (v0.51) --
     the same shape as `load_counts_harness` above, for the same reason: GAUSS8-51/

@@ -10,24 +10,13 @@ old table/call shape is untouched, and the new one produces the documented areas
 Loaded by path, like `test_trk133_roi_codegen_ab_bench.py` loads the same module —
 `benchmarks/` is `.comfyignore`d and not a package, so there is no import name.
 """
-import importlib.util
-import os
-import sys
-
 import pytest
+
+from helpers import load_benchmark
 
 
 def _load():
-    mod = sys.modules.get("_tierq48_roi_codegen_ab_bench")
-    if mod is not None:
-        return mod
-    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(pkg_dir, "benchmarks", "roi_codegen_ab_bench.py")
-    spec = importlib.util.spec_from_file_location("_tierq48_roi_codegen_ab_bench", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["_tierq48_roi_codegen_ab_bench"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    return load_benchmark("roi_codegen_ab_bench.py")
 
 
 @pytest.fixture(scope="module")
@@ -57,7 +46,7 @@ def test_tierq48_interactive1080p_and_4k_are_the_named_canvases(b):
     assert b.INTERACTIVE_SCENARIOS["4k"][2:4] == (3840, 2160)
 
 
-def test_tierq48_run_shape_square_wrapper_matches_run_shape_rect(b, monkeypatch):
+def test_tierq48_run_shape_square_wrapper_matches_run_shape_rect(b, monkeypatch, tmp_path):
     """`run_shape(roi_side, res, ...)` must still behave exactly like calling
     `run_shape_rect(roi_side, roi_side, res, res, ...)` — the refactor is a pure
     delegation, not a re-implementation that could silently drift."""
@@ -69,16 +58,22 @@ def test_tierq48_run_shape_square_wrapper_matches_run_shape_rect(b, monkeypatch)
         return real(roi_w, roi_h, canvas_w, canvas_h, *a, **kw)
 
     monkeypatch.setattr(b, "run_shape_rect", _spy)
-    import tempfile
-    cache_root = tempfile.mkdtemp()
-    b.run_shape(64, 256, "cpu", cache_root, "tierq48test", 3)
+    b.run_shape(64, 256, "cpu", str(tmp_path), "tierq48test", 3)
     assert calls == [(64, 64, 256, 256)]
 
 
-def test_tierq48_scenario_cli_flag_exists_and_defaults_to_square(b):
+def test_tierq48_scenario_cli_flag_exists_and_defaults_to_square(b, monkeypatch):
     import argparse
-    import inspect
-    src = inspect.getsource(b.main)
-    assert "--scenario" in src
-    assert '"square", "interactive1080p", "4k", "all"' in src.replace("'", '"') \
-        or "choices=(\"square\"" in src
+    captured = {}
+
+    def _capture(self, args=None, namespace=None):
+        captured["parser"] = self
+        raise SystemExit(0)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _capture)
+    with pytest.raises(SystemExit):
+        b.main([])
+    parser = captured["parser"]
+    assert parser.get_default("scenario") == "square"
+    choices = next(a.choices for a in parser._actions if a.dest == "scenario")
+    assert tuple(choices) == ("square", "interactive1080p", "4k", "all")

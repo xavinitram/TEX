@@ -6,7 +6,7 @@ else. The audit that opened this lane measured the cost — four of four spot-ch
 pointers in a document written *that same round* were already wrong, and three pointers in
 shipped docs landed on a blank line or past the end of a file.
 
-`tools/check_citations.py` is the check; this file is what puts it in the gate. Two rows:
+`tools/check_citations.py` is the check; this file is what puts it in the gate. Three rows:
 
   1. `test_simp5_shipped_doc_citations` — the real tree. Every citation resolves to a line
      that exists and is not blank (an ERROR, always), and the count of citations whose
@@ -17,6 +17,7 @@ shipped docs landed on a blank line or past the end of a file.
      its own it would pass just as happily against a checker that found nothing. This row
      builds a throwaway tree whose citations are wrong in each of the four ways that matter
      and proves the checker reds on every one, and passes the one citation that is right.
+     It ends by driving `main()` (the CLI's exit code) against the real tree.
 
   3. `test_neg4_citation_root_through_a_link` — NEG-4. `tracked_files()` asks git for the
      work tree's top and refuses to trust the answer unless it equals `root` under
@@ -42,6 +43,7 @@ pass when a platform can create neither a junction nor a symlink.
 import importlib.util
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -285,15 +287,21 @@ def test_neg4_citation_root_through_a_link(r: SubTestResult):
             return subprocess.run(["git", *args], cwd=str(real), capture_output=True,
                                    text=True, timeout=60)
 
-        _git("init", "-q")
-        _git("config", "user.email", "neg4@example.invalid")
-        _git("config", "user.name", "NEG-4")
-        _git("add", "mod.py", "docs/note.md")
-        commit = _git("commit", "-q", "-m", "init")
-        if commit.returncode != 0:
+        no_git = None
+        if shutil.which("git") is None:
+            no_git = "git is not installed on this box"
+        else:
+            _git("init", "-q")
+            _git("config", "user.email", "neg4@example.invalid")
+            _git("config", "user.name", "NEG-4")
+            _git("add", "mod.py", "docs/note.md")
+            commit = _git("commit", "-q", "-m", "init")
+            if commit.returncode != 0:
+                no_git = ("could not commit the scratch repo: "
+                          f"{commit.stderr.strip() or commit.stdout.strip()}")
+        if no_git is not None:
             r.skip("NEG-4 through-a-link reproduction",
-                   f"could not commit the scratch repo (no git on this box?): "
-                   f"{commit.stderr.strip() or commit.stdout.strip()}")
+                   f"no usable git for the scratch repo: {no_git}")
             return
 
         # An UNTRACKED doc beside the repository, carrying a citation to a line that does

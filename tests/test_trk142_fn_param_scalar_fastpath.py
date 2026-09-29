@@ -88,10 +88,10 @@ def test_trk142_codegen_actually_ran(r: SubTestResult):
         r.fail("codegen serves the TRK-142 program without raising", f"{type(e).__name__}: {e}")
 
 
-def test_trk142_fn_param_scalar_arg_still_scalar_fast_path(r: SubTestResult):
+def test_trk142_fn_param_scalar_arg_control(r: SubTestResult):
     """Control: the SAME function called with a purely scalar (non-spatial) argument
-    must still agree with the interpreter — the fix must not force every user-function
-    call onto the slower tensor path when the argument genuinely isn't spatial."""
+    still agrees with the interpreter. It says nothing about which path codegen took: the
+    fix seeds every parameter as spatial, so agreement is all this row can show."""
     print("\n--- TRK-142 control: a scalar argument still cooks correctly ---")
     code = """
     float f(float a) {
