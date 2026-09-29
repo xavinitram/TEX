@@ -315,7 +315,12 @@ class _BindingExecMixin:
             # read side exactly, including falling through to ONE shared raise.
             sp = self.spatial_shape
             result = None
-            if (sp is not None and base.dim() == len(sp)
+            if base.dim() == 0 and not base_is_vector(self.type_map, target.object):
+                # A uniform scalar: `a.r = v` means `a = v`, owning its buffer as below.
+                if idx == 0:
+                    result = value.clone() if isinstance(value, torch.Tensor) else value
+                nchan = 1
+            elif (sp is not None and base.dim() == len(sp)
                     and not base_is_vector(self.type_map, target.object)):
                 if idx == 0:
                     # `m.r = v` on a channel-less scalar means `m = v` — but it MUST own its

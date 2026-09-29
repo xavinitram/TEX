@@ -321,7 +321,7 @@ def test_not_of_a_vector_is_a_vector():
     ("float g = 2.0; float f(float x) { g = x; return x; } float r = f(7.0); @OUT = vec4(g + r);", "E3204"),
     ("vec4 c = vec4(0.0); float f(float x) { c.r = x; return x; } @OUT = c + f(1.0);", "E3204"),
     ("float a[2] = {0.0, 0.0}; float f(float x) { a[0] = x; return x; } @OUT = vec4(a[0] + f(1.0));", "E3204"),
-    ("float f = 0.0; f.x = 2.0; @OUT = vec4(f);", "E3301"),
+    ("float f = 0.0; f.y = 2.0; @OUT = vec4(f);", "E3301"),
 ], ids=["mat-array", "param-expr", "param-name", "PI", "ix", "u+=", "for-frame", "chan-vec3",
         "chan-str", "fn-after-if", "fn-outer-var", "fn-outer-chan", "fn-outer-array",
         "scalar-chan-write"])

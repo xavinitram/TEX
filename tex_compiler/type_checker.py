@@ -737,12 +737,6 @@ class TypeChecker:
                         f"assign to it (the write would be lost when the call returns).",
                         node.loc, code="E3204",
                         hint="Return the new value and assign it at the call site.")
-        elif (isinstance(node.target, ChannelAccess) and isinstance(node.target.object, Identifier)
-                and CHANNEL_MAP.get(node.target.channels) == 0
-                and self._lookup_var(root) in (TEXType.FLOAT, TEXType.INT)):
-            self._error(f"'{root}' is a scalar, so it has no channels to write.",
-                        node.loc, code="E3301",
-                        hint=f"Assign the whole value: {root} = ...;")
 
         # Reject assignment to const variables
         if isinstance(node.target, Identifier) and self._is_const(node.target.name):
