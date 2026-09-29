@@ -374,9 +374,11 @@ def test_v034_async_write_does_not_block_the_next_cook(r):
     holding, n1_started = threading.Event(), threading.Event()
     release = threading.Event()
     try:
-        frame_n = tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": _img(32)},
-                                  device_mode="cpu").outputs["OUT"]
+        # 4 MB: egress only goes asynchronous inside the pinned band (>= 1 MiB), on CUDA.
+        frame_n = _img(512, dev="cuda" if torch.cuda.is_available() else "cpu")
         handle = streams.egress(frame_n)
+        if frame_n.device.type == "cuda":
+            assert handle._event is not None, "a 4 MB CUDA frame did not take the async path"
 
         written = {}
 
@@ -417,9 +419,12 @@ def test_v034_async_write_bytes_are_bit_exact(r):
     from TEX_Wrangle.tex_runtime import streams
     for dev in _devices():
         try:
-            src = _img(64, dev=dev)
+            src = _img(512, dev=dev)         # 4 MB: inside the pinned band, so CUDA is async
             sync = src.detach().float().cpu().clone()
-            got = streams.egress(src).tensor()
+            handle = streams.egress(src)
+            if dev == "cuda":
+                assert handle._event is not None, "a 4 MB CUDA frame did not take the async path"
+            got = handle.tensor()
             assert torch.equal(got, sync), "a fenced handle's bytes differ from a sync copy"
 
             # host_demo's blit is the shipped consumer: handle and tensor must agree.

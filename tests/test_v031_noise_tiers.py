@@ -1276,7 +1276,7 @@ def test_trk193_unrelated_runtime_error_not_swallowed(r: SubTestResult):
              "of demoting the key to eager")
 
 
-def test_trk193_try_upgrade_disables_on_wrapped_inductor_error(r: SubTestResult, monkeypatch):
+def test_trk193_try_upgrade_disables_on_wrapped_inductor_error(r: SubTestResult):
     """`try_upgrade`'s own except clause (noise.py) used to gate
     `_disable_inductor_after_kernel_block` on `isinstance(e, (ImportError, OSError))` — the
     same TRK-193 gap, at the WARM-UP call site rather than `_settle`'s. `noise
@@ -1292,10 +1292,16 @@ def test_trk193_try_upgrade_disables_on_wrapped_inductor_error(r: SubTestResult,
     from TEX_Wrangle.tex_runtime import noise
 
     calls = []
-    monkeypatch.setattr(noise, "_disable_inductor_after_kernel_block",
-                        lambda exc: calls.append(exc))
-    monkeypatch.setattr(noise, "_can_inductor_compile", lambda device=None: True)
+    saved = (noise._disable_inductor_after_kernel_block, noise._can_inductor_compile)
+    noise._disable_inductor_after_kernel_block = lambda exc: calls.append(exc)
+    noise._can_inductor_compile = lambda device=None: True
+    try:
+        _trk193_try_upgrade_rows(r, noise, calls)
+    finally:
+        noise._disable_inductor_after_kernel_block, noise._can_inductor_compile = saved
 
+
+def _trk193_try_upgrade_rows(r, noise, calls):
     def _compile_wrapped():
         raise _make_wrapped_inductor_error(
             "DLL load failed while importing kernel: An Application Control policy has "

@@ -11,9 +11,9 @@ default is a footgun ... has noted").
 
 This does not change what gets stored — same key, same bytes, same `tex_packing.choose_storage`
 call with the same arguments — it only adds one process-lifetime log line so a host can catch
-the mistake in its own logs. `_reset_for_test` below (a new, test-only helper) exists because
-the warning is a global latch and a leaked "already warned" flag from an earlier test would
-make this test pass for the wrong reason.
+the mistake in its own logs. Each row resets the module-level latch
+(`_warned_put_kind_none_for_mask_shape`) itself, before and after, because a leaked "already
+warned" flag from an earlier test would make it pass for the wrong reason.
 """
 import logging
 
@@ -106,21 +106,37 @@ def test_hostaudit4b_no_warning_off_preview_or_off_mask_shape(r):
 
 def test_hostaudit4b_storage_decision_is_unaffected(r):
     """The whole point is additive: the warning changes nothing about what gets cached.
-    A kind=None mask at PREVIEW is packed exactly as it always was (choose_storage's own
-    documented "stays eligible" default), warning or no warning."""
+    A kind=None mask at PREVIEW is stored exactly as it always was (choose_storage's own
+    documented "stays eligible" default): the put that FIRES the warning, the put after the
+    latch is set, and the same tensor as kind="IMAGE" all charge the same bytes and return
+    the same values."""
     from TEX_Wrangle import tex_results
     from TEX_Wrangle import tex_packing
 
     tex_results._warned_put_kind_none_for_mask_shape = False
     try:
         mask = torch.rand(1, 8, 8, 1)
-        want_before = tex_packing.choose_storage(mask, quality=tex_packing.PREVIEW, kind=None)
-        _capture(lambda: None)   # no-op, just keeps the helper's shape consistent
-        want_after = tex_packing.choose_storage(mask, quality=tex_packing.PREVIEW, kind=None)
-        if want_before == want_after:
-            r.ok(f"choose_storage(kind=None) is unchanged by this ask: {want_before!r}")
-        else:
+        c_fired, c_latched, c_image = (tex_results.ResultCache() for _ in range(3))
+        fired = _capture(lambda: c_fired.put("m", mask, quality=tex_packing.PREVIEW, kind=None))
+        latched = _capture(lambda: c_latched.put("m", mask, quality=tex_packing.PREVIEW,
+                                                 kind=None))
+        c_image.put("m", mask, quality=tex_packing.PREVIEW, kind="IMAGE")
+        if not any("kind=None" in m for m in fired) or latched:
+            r.fail("HOSTAUDIT-4b premise", f"warning did not fire once then latch: "
+                   f"fired={fired} latched={latched}")
+            return
+        sizes = {n: c.stats()["ram_bytes"] for n, c in
+                 (("fired", c_fired), ("latched", c_latched), ("image", c_image))}
+        fp32_bytes = mask.numel() * mask.element_size()
+        if len(set(sizes.values())) != 1 or sizes["fired"] >= fp32_bytes:
             r.fail("HOSTAUDIT-4b storage decision changed",
-                   f"{want_before!r} -> {want_after!r}")
+                   f"stored bytes {sizes} (fp32 would be {fp32_bytes}); the warning must not "
+                   f"change the eligible-for-packing default")
+        elif not (torch.equal(c_fired.get("m"), c_latched.get("m"))
+                  and torch.equal(c_fired.get("m"), c_image.get("m"))):
+            r.fail("HOSTAUDIT-4b stored values changed", "get() differs across the three puts")
+        else:
+            r.ok(f"kind=None mask at PREVIEW stores the same {sizes['fired']} bytes and values "
+                 f"with the warning fired, latched, or as kind='IMAGE'")
     finally:
         tex_results._warned_put_kind_none_for_mask_shape = False
