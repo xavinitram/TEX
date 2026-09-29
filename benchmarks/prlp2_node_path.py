@@ -4,8 +4,9 @@ PR-LP2 node-path A/B (audit B1 / H7) — substantiates the `precision="auto"` sp
 path users actually invoke: `TEXWrangleNode.execute()`, NOT `Interpreter.execute` (the
 CHANGELOG's original number was measured off the latter and did not hold on the node path).
 
-Interleaved fp32/auto/fp16 through the node, sync-bracketed, median >=35, with a second
-fp32 read as a drift bracket. CUDA-only.
+Four sequential blocks per resolution (fp32, auto, fp16, fp32) through the node, sync-bracketed,
+median >=35 each; the two fp32 blocks are averaged as a drift bracket, which does not cancel
+drift inside a block. CUDA-only.
 
 Gate (must hold after B1): auto >= 1.3x @2048^2 AND auto >= 1.0x @1024^2.
 """

@@ -224,13 +224,12 @@ def _ni_chain(codes, first_src, device):
     return cur
 
 
-def bench_node_insert(res: int, ticks: int, device: str, insert_at: int = 3) -> dict:
-    """`insert_at` splits a 5-node chain (`_NI_PREFIX` + `_NI_SUFFIX`) into a warmed prefix and
-    suffix. Each insert tick splices a BRAND-NEW node (a fresh source string every tick, never
-    seen before — the property that forces the cold lex/parse/typecheck/compile path) between
-    them and cooks prefix -> new node -> suffix; `baseline` cooks the unmodified five-node
-    chain, already fully warm, for the same tick count — the number the insert is charged
-    against."""
+def bench_node_insert(res: int, ticks: int, device: str) -> dict:
+    """A 5-node chain is `_NI_PREFIX` + `_NI_SUFFIX`. Each insert tick splices a BRAND-NEW node
+    (a fresh source string every tick, never seen before — the property that forces the cold
+    lex/parse/typecheck path; cooks run with `compile_mode='none'`) between them and cooks
+    prefix -> new node -> suffix; `baseline` cooks the unmodified five-node chain, already
+    fully warm, for the same tick count — the number the insert is charged against."""
     torch.manual_seed(77)
     src = torch.rand(1, res, res, 4, device=device)
     full = _NI_PREFIX + _NI_SUFFIX
@@ -253,7 +252,7 @@ def bench_node_insert(res: int, ticks: int, device: str, insert_at: int = 3) -> 
         _ni_chain(_NI_SUFFIX, cur, device)
         _sync(device)
         inserts.append((time.perf_counter() - t0) * 1000.0)
-    return {"res": res, "insert_at": insert_at,
+    return {"res": res, "insert_at": len(_NI_PREFIX),
             "baseline_steady": _percentiles(baseline),
             "insert_first_result": _percentiles(inserts)}
 

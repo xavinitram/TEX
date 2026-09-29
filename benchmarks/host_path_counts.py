@@ -26,11 +26,14 @@ persistent per-stage canvas, a CACHE-2 `ResultCache` armed by the host, and CACH
 keys that carry the upstream chain. That is the pattern an embedding host ports, so a count
 that moves here is a count that moves in the host.
 
-Eight scenarios
----------------
-Seven of them drive the comp above. The eighth drives the ComfyUI NODE, because the other
-seven structurally cannot: they enter `tex_engine.prepare` with `forgive_dead_refs` off, and
-the whole lazy tier hangs off that flag (BENCH-3, from PERF-4's finding F5).
+Scenarios
+---------
+`SCENARIOS` is the registry (`--scenario` takes its names). Most drive the comp above; the
+first eight below are the original set. `node_scrub` drives the ComfyUI NODE, because the
+comp scenarios structurally cannot: they enter `tex_engine.prepare` with `forgive_dead_refs`
+off, and the whole lazy tier hangs off that flag (BENCH-3, from PERF-4's finding F5). The
+later ones (`checkpoint_serve`, `interp_chain_scrub`, `whole_frame_chain_d*`,
+`host_tick_exact_d*`, `playback_frames`) are described on their own classes.
 
     prewarm          `tex_api.prewarm` over the comp's ten programs, each tick in its OWN
                      cold cache dir (the project-load path; the only cold scenario)
@@ -306,7 +309,8 @@ SPY_TARGETS: "dict[str, tuple[str, ...]]" = {
 #: Counted with the CALLER's file, so a host-side sync and an engine-side sync are separate
 #: rows. With PROF-1 disarmed the ENGINE row must be 0 on an interactive tick: a sync the host
 #: did not ask for is a pipeline stall charged to somebody else's frame. The `[host-demo]` row
-#: is the demo's own per-frame barrier and the `[out-of-pkg]` row is this harness's.
+#: is the demo's own per-frame barrier; the `[out-of-pkg]` row is this harness's own file or
+#: any caller outside the package (torch, stdlib).
 SYNC_TARGET = "torch.cuda.synchronize"
 SYNC_ROWS = ("torch.cuda.synchronize[engine]", "torch.cuda.synchronize[host-demo]",
              "torch.cuda.synchronize[out-of-pkg]")
@@ -401,7 +405,9 @@ class CallSpies:
                     f = os.path.normcase(os.path.abspath(sys._getframe(1).f_code.co_filename))
                 except Exception:
                     f = ""
-                if f.startswith(_EXAMPLES_PREFIXES):
+                if f.startswith(_BENCH_PREFIXES):
+                    counts[SYNC_ROWS[2]] += 1
+                elif f.startswith(_EXAMPLES_PREFIXES):
                     counts[SYNC_ROWS[1]] += 1
                 elif f.startswith(_PKG_PREFIXES):
                     counts[SYNC_ROWS[0]] += 1
@@ -775,7 +781,7 @@ class Scenario:
         NOT rebuilt). Reusing pass A's positions in pass C served the coordinate tensors from
         that LRU and the pan tick reported 22 CUDA kernels instead of 26, i.e. the harness
         measured its own warm-up. The walk therefore has to be injective across passes, which
-        is what `_seq` gives it and what this stride keeps inside the span."""
+        is what `_pan_seq` gives it and what this stride keeps inside the span."""
         span = max(1, self.res - self.window)
         slots = 3 * (self.ticks + 2)          # three passes x (warm-up + ticks), with slack
         step = self.pan_step

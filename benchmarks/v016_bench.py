@@ -54,7 +54,7 @@ from TEX_Wrangle.tex_marshalling import infer_binding_type as _ibt
 
 # Programs chosen along doc-22's decision axes. Codegen/graph WIN on the first
 # three (pointwise/vector/math), LOSE on sample/noise, and passthrough is the
-# 0-kernel trivial case (PF-2). Sources match run_benchmarks' synthetic set.
+# 0-kernel trivial case (PF-2). Sources match run_benchmarks' synthetic set except noise_fbm (no `@ref` read here).
 PROGRAMS = {
     "passthrough":    "@OUT = @A;",
     "math_chain":     "@OUT = vec4(sin(u) * cos(v) + 0.5);",

@@ -3,14 +3,14 @@
 Stage-5 cast-cost probe (doc 28 Phase 1 gate) — the one unrun precision probe.
 
 Sets PR-LP2's input-dtype policy. ComfyUI hands TEX an **fp32** image. The interpreter's
-precision="fp16" path casts fp32 bindings -> fp16 on the way in (interpreter.py:285) and
+precision="fp16" path casts fp32 bindings -> fp16 on the way in (`Interpreter._PRECISION_DTYPES`) and
 upcasts the result back on the way out. Question: does that cast-in + fp16-compute +
 upcast-out round trip STILL beat plain fp32 on an fp32 source, or does the cast eat the
 measured fp16 compute gain? If it still wins -> auto mode may accept fp32 inputs and cast
 once; if not -> require fp16-native inputs (decline on fp32 source).
 
-Interleaved A/B (fp32 vs fp16 alternated each iteration to cancel this box's 10-30%/hr
-drift), sync-bracketed, median of N. CUDA-only.
+Bracketed blocks (fp32, fp16, fp32 again; the two fp32 reads are averaged as a drift bracket,
+which does not cancel drift inside a block), sync-bracketed, median of N. CUDA-only.
 """
 import statistics
 import sys
@@ -66,7 +66,7 @@ def main():
     print("-" * 68)
     for res in (1024, 2048, 4096):
         img = torch.rand(1, res, res, 3, device="cuda", dtype=torch.float32)
-        # interleave to cancel drift: median of alternating A/B is drift-robust
+        # three sequential blocks; the second fp32 read brackets drift between them
         f32 = _time(prog, tm, img, "fp32", iters)
         f16 = _time(prog, tm, img, "fp16", iters)
         # re-measure fp32 after fp16 and average the two fp32 reads (drift bracket)

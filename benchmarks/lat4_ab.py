@@ -199,9 +199,14 @@ if __name__ == "__main__":
     print("\n" + "=" * 68)
     print("INVARIANT #7 (steady default path):")
     print(f"  LAT-4 adds {ns21 - ns20:+.1f} ns to a {cook_ms * 1e6:.0f} ns cook = {delta_pct:+.4f}%")
-    print(f"  ...against a whole-cook noise floor of {floor:.2f}% -- ~{floor / max(abs(delta_pct), 1e-9):.0f}x")
-    print("  larger than the effect. Neutral by direct measurement of the CHANGED code,")
-    print("  not by an A/A comparison of v0.21 with itself.")
+    _mult = (f"~{floor / abs(delta_pct):.0f}x" if abs(delta_pct) >= 1e-9
+             else "unbounded (no measurable delta) x")
+    print(f"  ...against a whole-cook noise floor of {floor:.2f}% -- {_mult}")
+    if abs(delta_pct) < floor:
+        print("  larger than the effect. Neutral by direct measurement of the CHANGED code,")
+        print("  not by an A/A comparison of v0.21 with itself.")
+    else:
+        print("  NOT below the noise floor: the effect is measurable, so it is NOT neutral.")
     print("=" * 68)
     for dev in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
         altern_ab(dev)

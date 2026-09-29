@@ -36,9 +36,6 @@ def run_validation() -> dict:
         verdict["status"] = "no-cuda"
         return verdict
     try:
-        from run_benchmarks import (SYNTHETIC_PROGRAMS, generate_bindings,
-                                    compile_program, run_interpreter)  # noqa: F401
-        from TEX_Wrangle.tex_runtime.compiled import execute_compiled  # noqa: F401
         # To implement: (1) force compile_mode=torch_compile, (2) assert codegen parity
         # vs interpreter (tol 1e-5), (3) time compile vs interpreter, (4) A/B
         # max-autotune-no-cudagraphs (adopt only on >=1.2x).
