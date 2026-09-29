@@ -335,3 +335,46 @@ def test_guard_trace_reset_disarm_and_shape_change():
     finally:
         GT.disarm()
     assert GT.mask() is None and not GT.armed()
+
+
+def _run_child_source(src, stdin_text="{}", timeout=120):
+    import subprocess
+    return subprocess.run([sys.executable, "-c", src], input=stdin_text, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def test_prewarm_child_loads_the_package_under_a_path_style_name():
+    """ComfyUI registers a custom-node folder under its absolute path, which no sys.path entry
+    can import; the child loads the package by location under that same name."""
+    import json
+    import os
+    import TEX_Wrangle
+    from TEX_Wrangle.tex_runtime import prewarm_worker as PW
+    pkg_dir = os.path.dirname(os.path.abspath(TEX_Wrangle.__file__))
+    weird = "C:" + chr(92) + "ComfyUI" + chr(92) + "custom_nodes" + chr(92) + "TEX"
+    payload = {"jobs": [], "device": "cpu", "precision": "fp32", "compile_mode": "none"}
+    proc = _run_child_source(PW._child_source(weird, pkg_dir), json.dumps(payload))
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert json.loads(proc.stdout.strip().splitlines()[-1]).get("errors", 0) == 0
+
+
+def test_prewarm_boundary_reports_child_detail_timeout_and_undecodable_stderr(monkeypatch):
+    from TEX_Wrangle.tex_runtime import prewarm_worker as PW
+    jobs = [("@OUT = vec4(0.0);", {}, "fp")]
+    kw = dict(device="cpu", precision="fp32", compile_mode="none")
+
+    def use(script):
+        monkeypatch.setattr(PW, "_child_source", lambda name, path: script)
+
+    use("import sys, json; print(json.dumps({'error': 'ImportError: boom-detail'})); sys.exit(1)")
+    assert "boom-detail" in PW.warm_in_subprocess(jobs, **kw)["error"]
+
+    monkeypatch.setattr(PW, "_WORKER_TIMEOUT_S", 0.5)
+    use("import time; time.sleep(30)")
+    assert "timed out" in PW.warm_in_subprocess(jobs, **kw)["error"]
+    monkeypatch.setattr(PW, "_WORKER_TIMEOUT_S", 120.0)
+
+    use("import sys, json; sys.stderr.buffer.write(bytes([0x8f, 0x81])); "
+        "print(json.dumps({'programs': 1, 'bg_compile': 1, 'error': None}))")
+    out = PW.warm_in_subprocess(jobs, **kw)
+    assert out["error"] is None and out["bg_compile"] == 1, out
