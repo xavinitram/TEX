@@ -413,8 +413,9 @@ class MaskedEmitMixin:
         loop_var, start, stop, step = static_range
         # range(start, stop, step), exactly as the interpreter iterates it.
         n = len(range(start, stop, step))
-        if n > 1024:
-            self._emit("raise RuntimeError('For loop would exceed 1024 iterations')")
+        from .interpreter import MAX_LOOP_ITERATIONS
+        if n > MAX_LOOP_ITERATIONS:
+            self._emit(f"raise RuntimeError('For loop would exceed {MAX_LOOP_ITERATIONS} iterations')")
             return
         if n == 0:
             self._emit("pass")  # the body never runs; the prologue's `try:` needs a statement
