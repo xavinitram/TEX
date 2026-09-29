@@ -266,7 +266,7 @@ def test_joinwire50b_negative_control_windowed_output_would_corrupt_if_cached(r:
     # actually serves so we can steal its own genuinely-windowed output.
     roi = (3, 3, 4, 4, W, H)
     rc_real = tex_results.ResultCache()
-    up = ("jw50b-negctrl-src",)
+    up = ("jw50b-negctrl-a", "jw50b-negctrl-b")
     win = tex_chain.cook_stage_dag(stages, roi=roi, roi_exec=True, dirty_from=0,
                                    result_cache=rc_real, upstream=up)
     # Stage 2 (the plain "@B + 0.1" edit, no upstream halo) is windowed exactly to `roi`

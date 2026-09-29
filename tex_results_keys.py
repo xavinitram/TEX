@@ -54,22 +54,32 @@ def _code_epoch() -> str:
         return "0"
 
 
-def env_epoch() -> str:
+def env_epoch(device=None) -> str:
     """The execution-environment identity a cached result is only valid within: torch
     version + GPU identity (device name + compute capability) + the code epoch. Folding all
     three into every result key means a frame minted under one environment is never served
     under another — the silent cross-environment hit a result cache must not have. Mirrors
     and extends xfer._version_tag (device name + torch); adds compute capability + code epoch.
-    Memoized PER active CUDA device (torch/GPU identity is fixed per device, but a heterogeneous
-    multi-GPU host switches current_device between cooks — a single process-wide memo would freeze
-    the epoch to whichever GPU was active at the first call and stamp a cuda:1 frame with cuda:0's
-    identity)."""
+    Memoized PER CUDA device (torch/GPU identity is fixed per device, but a heterogeneous
+    multi-GPU host switches current_device between cooks — a single process-wide memo would
+    freeze the epoch to whichever GPU was active at the first call and stamp a cuda:1 frame
+    with cuda:0's identity).
+
+    `device` is the device the frame belongs to (a str or torch.device): a `cuda:N` frame is
+    stamped with GPU N's identity and a CPU frame with none, whichever thread asks. `None`
+    reads the ambient current CUDA device, which is right only for a caller that IS on the
+    frame's device."""
     parts = []
     dev = -1
     try:
         import torch
-        if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
+        if device is None:
+            if torch.cuda.is_available():
+                dev = torch.cuda.current_device()
+        else:
+            d = torch.device(device)
+            if d.type == "cuda" and torch.cuda.is_available():
+                dev = d.index if d.index is not None else torch.cuda.current_device()
     except Exception:
         pass
     cached = _ENV_EPOCH_CACHE.get(dev)
@@ -140,8 +150,9 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
                  only a frame number may pass `frame=` instead.
     quality      a preview/final quality tag (PREC-1), or None.
     flags        any extra keying flags (e.g. an output name for a per-output key).
-    canvas       a canvas / ROI descriptor (W,H[,x0,y0,w,h]); two cooks at different canvas
-                 sizes or ROIs are distinct results (keys carry it from day one).
+    canvas       a JSON-able canvas / ROI descriptor, normally the produced frame's
+                 {"shape": [B,H,W,C], "roi": [...]}; a legacy (W,H) tuple is still accepted.
+                 Two cooks at different canvas sizes or ROIs are distinct results.
     scale        SCALE-47b: the cook's resolution-scale multiplier, or None (a full-scale/
                  scale-unaware cook). Keyed by EXACT value, like `frame` — deliberately NOT
                  folded into `program_fp` (a scale-carrying sigma is a runtime scalar, not an
@@ -166,16 +177,15 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
     feed("fp", str(program_fp))
     feed("dev", str(device))
     feed("prec", str(precision))
-    feed("env", env_epoch())
+    feed("env", env_epoch(device))
     feed("par", _canon_params(params))
     feed("up", json.dumps([str(u) for u in upstream]))
     feed("frm", "n" if frame is None else repr(float(frame)))   # exact value, no int() collide
     feed("tc", _canon_time(time_context))                        # every playhead builtin keys
     feed("q", "n" if quality is None else str(quality))
     feed("flg", json.dumps(sorted(str(f) for f in flags)))
-    # canvas is any JSON-able shape/ROI descriptor (a dict {"shape":[B,H,W,C],"roi":[...]}, or a
-    # legacy (W,H) tuple) — the engine keys each output by its produced-frame shape, so a
-    # different batch/canvas/ROI mints a distinct key.
+    # The engine keys each output by its produced-frame shape, so a different batch/canvas/ROI
+    # mints a distinct key.
     feed("cnv", "n" if canvas is None else json.dumps(canvas, sort_keys=True, default=list))
     feed("scl", "n" if scale is None else repr(float(scale)))
     return h.hexdigest()

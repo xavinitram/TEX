@@ -209,15 +209,10 @@ def chain_windows_dag(stages, roi, dirty_from: int = 0, valid=None, declined=(),
 
 # ── JOINWIRE-50: per-stage DAG reach, resolved from source ────────────────────
 #
-# `StageSpec.arg_halo`'s own docstring names its resolution as the CALLER's job — "a
-# roi_plan/binding_footprints-shaped one" — and says no such resolver exists yet (JOIN-49:
-# "no caller does this today"). This is that resolver: the same two functions
-# `tex_roi.stage_halo` already calls (`roi_plan` for the executable gate, plus
-# `binding_footprints` for the PER-NAME numbers `stage_halo` never needed because a linear
-# stage has only one upstream) answer a join stage's per-input reach without any new AST
-# walk — `_accumulate` (the walker behind both) already tallies each wire binding's reach
-# separately; a linear caller just never asked for more than the one number
-# `roi_plan.halo` unions across all of them.
+# Resolves a stage's `StageSpec.arg_halo` from its source. `roi_plan` supplies the executable
+# gate and `binding_footprints` the per-name reach (the same two calls `tex_roi.stage_halo`
+# makes, which only needed one number because a linear stage has one upstream), so no new AST
+# walk is needed.
 
 def stage_dag_arg_halos(code: str, name_to_upstream: dict, param_values: dict | None = None,
                         binding_types: dict | None = None, scale: float = 1.0):

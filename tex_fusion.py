@@ -401,13 +401,17 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
 
     stages: ordered upstream -> terminal. Each:
         {"code": str,
-         "chain_input": str | None,   # the @binding fed by the previous stage
+         "chain_input": str | None,   # legacy: the @binding fed by the previous stage's @OUT
+         "chain_inputs": {binding: [src_stage, out_name]},   # DAG form; wins over chain_input
+         "exports": [str],            # extra named outputs this stage hands downstream
+         "tap": bool,                 # expose this stage's handoff as a terminal @_tap_s{i}
          "bindings": {name: value}}   # this stage's EXTERNAL inputs + params
-                                      # (the chain_input is internal, not listed)
+                                      # (the wired bindings are internal, not listed)
 
-    Returns the same shape as TEXCache.compile_tex plus the merged bindings:
+    Returns the compile result plus the merged bindings:
         (program, type_map, referenced, assigned, param_info, used_builtins,
          merged_bindings)
+    the first six being what TEXCache.compile_tex returns for a program.
     The caller runs the interpreter on `program` with `merged_bindings`.
     """
     if len(stages) < 2:
@@ -432,7 +436,8 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
         # compiles a fused terminal, and a lost key would raise KeyError that fails
         # the whole prompt. GIL-atomic per op, but get-then-move_to_end is not one
         # op — tolerate the eviction (the value is still valid; only its LRU
-        # recency is lost). ENG-9 will give the memo a real lock.
+        # recency is lost). The memo is lock-free by design (DEVELOPMENT.md, ENG-9
+        # "Concurrency & thread-safety").
         try:
             _FUSED_MEMO.move_to_end(memo_key)
         except KeyError:
@@ -449,7 +454,6 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
         return (*disk, _merged_bindings())
 
     fused_stmts: list[A.ASTNode] = []
-    merged_bindings: dict[str, Any] = {}
     n = len(stages)
     # Q-3 DAG: (handoff_local, type) produced by each (stage, output). Keyed by
     # (stage_idx, out_name); `_s{i}_out` for @OUT (back-compat), `_s{i}_{name}`
@@ -464,7 +468,7 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     for i, st in enumerate(stages):
         prefix = f"_s{i}_"
         is_terminal = (i == n - 1)
-        ext = st.get("bindings", {})
+        ext = st.get("bindings") or {}
 
         # Resolve wired inputs. Legacy `chain_input: str` == a single edge from the
         # previous stage's @OUT; Q-3 `chain_inputs: {binding: [src_stage, out]}`
@@ -625,8 +629,7 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
             _tag_stage(s, i)
         fused_stmts.extend(prog.statements)
 
-        for name, val in ext.items():
-            merged_bindings[_user_prefix(prefix) + name] = val
+    merged_bindings = _merged_bindings()
 
     # Q-3(c): observed-intermediate taps — expose a marked upstream handoff as a
     # terminal output @_tap_s{i} so a Preview can read it without breaking the
@@ -1138,19 +1141,18 @@ def unservable_prefix_taps(stages, k: int) -> list:
 # /detect_regions route, a standalone host, PORT-5) drives fusion by handing it the
 # graph topology, so fusion legality is decided ONCE and can't drift per host.
 #
-# v0.21 scope: single-terminal regions over @OUT (slot-0) handoffs, fed by exactly ONE
-# external image edge. A node folds iff EVERY consumer is an in-region TEX node
-# (generalizes the linear "sole TEX consumer" rule).
+# Scope: single-terminal regions over @OUT (slot-0) handoffs, fed by exactly ONE external
+# PRODUCER. A node folds iff EVERY consumer is an in-region TEX node (generalizes the linear
+# "sole TEX consumer" rule).
 #
 # What that does and does NOT cover — the distinction is INTERNAL vs EXTERNAL fan-out:
 #   covered:  a region member fans out to other members and they rejoin at the
-#             terminal (`src -> A -> [B, C] -> D`). The branch point is inside R, so
-#             the region still has one external edge: A's source.
-#   NOT yet:  one EXTERNAL producer feeding two members (`Load -> [blur, sharpen] ->
-#             merge`) — a common compositor shape. That's two external edges, so it
-#             needs multi-injection (a source spec per edge, splicer + transport work),
-#             not the single-source splice here. Left unfused: always safe, just not
-#             collapsed. Same for a genuine two-source merge.
+#             terminal (`src -> A -> [B, C] -> D`).
+#   covered:  one EXTERNAL producer feeding several members (`Load -> [blur, sharpen] ->
+#             merge`): multi-injection (FUS-1b, schema 2) — one injection per external
+#             edge, all fed the same transported tensor.
+#   refused:  two distinct external producers (a genuine two-source merge), and any external
+#             edge straight into the terminal. Left unfused: always safe, just not collapsed.
 # Multi-output (exports) / preview-tap detection stays a later cut; the compile_fused
 # machinery for them is untouched.
 
@@ -1200,10 +1202,11 @@ def detect_fusable_regions(nodes: dict, edges: list) -> list:
 
 
 def _grow_region(terminal, nodes, tex, out_by_src, in_by_dst):
-    """Fixpoint-grow R(terminal) upstream, validate the single-external-source
-    constraint, and emit the plan (or None if not fusably shaped in v0.21 scope):
+    """Fixpoint-grow R(terminal) upstream, validate the single-external-producer
+    constraint, and emit the plan (or None if the region is not fusably shaped):
         {"terminal", "order" (topo, source-first, terminal last), "delete",
-         "source": {"origin","origin_slot","stage","binding"},
+         "source": {"origin", "origin_slot", "type",
+                    "injections": [{"stage", "binding"}, ...]},
          "stages": [{"id","chain_inputs": {binding: [src_stage_idx, "OUT"]}}]}"""
     R = {terminal}
     changed = True
@@ -1318,8 +1321,8 @@ def region_to_stages(region: dict, node_code: dict, node_params: dict) -> list:
     """Turn a detect_fusable_regions plan into a compile_fused `stages` list (with
     DAG `chain_inputs`). `node_code`/`node_params` map node id -> code / {param:
     value}. The single external source is left OUT of the stage bindings here — the
-    caller injects its value at region['source'] (stage index, binding). Terminal is
-    the last stage (its assigned bindings are the real outputs)."""
+    caller injects its value at each of region['source']['injections'] (stage index,
+    binding). Terminal is the last stage (its assigned bindings are the real outputs)."""
     stages = []
     for st in region["stages"]:
         nid = st["id"]

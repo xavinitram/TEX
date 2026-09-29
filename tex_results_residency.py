@@ -69,7 +69,7 @@ class _ResultCacheResidency:
         demotion/promotion counts precisely so this can be revisited with a measurement instead
         of an opinion; a frequency-weighted victim choice is a change to this function alone.
 
-        Never demotes the MRU entry (`len > 1` and the front-first walk), for the same reason
+        Never demotes the MRU entry (`_queue_demotions` skips it by key), for the same reason
         `_enforce_ram_budget` does not: the frame just cooked is the one about to be read.
 
         Caller holds `_lock`."""
@@ -138,8 +138,8 @@ class _ResultCacheResidency:
         lifetime is a slow leak of unswappable memory. Copying into pinned and then cloning to
         pageable to release the lock would cost a second full host memcpy of the frame,
         which is more than the asynchrony saves on a copy that has almost nothing to overlap
-        with. The handle is still the seam: when v0.34's async-write path hands a demoted frame
-        to a writer thread, it does so through this same object.
+        with. The handle is still the seam: an async writer that takes a demoted frame
+        (the v0.34 async-write contract) reads it through this same object.
 
         A demotion that fails leaves the frame exactly where it was — over budget, and correct.
         The budget is a target; the pixels are not."""
@@ -196,10 +196,12 @@ class _ResultCacheResidency:
         """Move a demoted frame back to its home device and return the promoted master, or the
         entry's current tensor if it cannot be moved.
 
-        Called from `get` on a hit, and from `touch_promote` on a hint (CACHE-11) that is never
-        counted as one — both OUTSIDE the lock, since this is an H2D copy (11.1 ms at 4K),
-        exactly the class of work the lock rule excludes. The re-entry check under the lock is
-        what makes that safe: if the entry changed while we copied, the copy is discarded."""
+        Called from `get` on a hit, from `touch_promote` on a hint (CACHE-11) that is never
+        counted as one, and from `patch_region` at lock depth 1. The first two run OUTSIDE the
+        lock, since this is an H2D copy (11.1 ms at 4K), exactly the class of work the lock rule
+        excludes; the third holds it (see the comment below). The commit block's RLock re-entry
+        is correct at either depth, and its re-check is what makes the unlocked copy safe: if
+        the entry changed while we copied, the copy is discarded."""
         # A5(d) WITHDRAWN in v0.33.2 — the lock-depth early-out that stood here is deferred, not
         # forgotten (DEVELOPMENT.md carries the row). It read:
         #

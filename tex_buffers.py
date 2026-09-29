@@ -2,8 +2,7 @@
 ENG-14 / ENG-6 / ENG-12 — `tex_buffers`: what a cooked frame is, who may write it,
 and how it leaves.
 
-Two standing contracts, moved here whole out of `tex_engine` (ENG-14) with no body
-changed: ENG-6's zero-copy handoff (`to_dlpack` / `from_dlpack`, and the `copy=True`
+Two standing contracts: ENG-6's zero-copy handoff (`to_dlpack` / `from_dlpack`, and the `copy=True`
 ownership default that makes it safe) and ENG-12's buffer-ownership and immutability
 rules (`freeze` / `frozen_copy` / `is_frozen` / `frame_version` / `verify_unmutated`,
 plus the `_disown_inputs` input-alias net that upholds them at egress). The two banner
@@ -11,10 +10,8 @@ blocks below carry the standing arguments in full — "FROZEN IS A SIGNAL, NOT A
 and its torch-2.12 measurement, and the copy-on-read cache contract they imply.
 
 This module is a LEAF: it imports `torch` and nothing else from the package, so
-`tex_engine` imports it at load and re-exports every name. Every caller still reads
-these names off `tex_engine` (`tex_engine.freeze`, `tex_engine.to_dlpack`, …) — the
-move is invisible at every call site, and the moved bodies compile to byte-identical
-bytecode, so the per-cook cost is zero by construction rather than by measurement.
+`tex_engine` imports it at load and re-exports every name. Callers read these names off
+`tex_engine` (`tex_engine.freeze`, `tex_engine.to_dlpack`, ...).
 
 Pinned by `tests/test_v023_phase1.py` (the ENG-6 canary) and
 `tests/test_v025_phase1.py` (the ENG-12 block).
@@ -51,9 +48,8 @@ def _owned_copy(t):
     """An owned, contiguous copy of `t` that is NOT inference-flagged (so an ML consumer
     can attach it to an autograd graph). `empty_like`+`copy_` runs outside the cook's
     inference_mode, unlike `.clone()`, which would inherit the flag."""
-    src = t.contiguous()
-    out = torch.empty_like(src)
-    out.copy_(src)
+    out = torch.empty_like(t, memory_format=torch.contiguous_format)
+    out.copy_(t)
     return out
 
 
@@ -140,18 +136,17 @@ def verify_unmutated(t, stamp) -> bool:
 
 
 def frozen_copy(t):
-    """An immutable (inference-flagged) copy of `t`: any in-place write to the RESULT raises.
-    Made inside inference_mode so the clone carries the inference flag even when `t` is a
-    normal tensor — the exact inverse of _owned_copy (which strips the flag for autograd).
-    Use to store a tamper-PROOF frame when the source is a normal (mutable) buffer."""
+    """An inference-flagged copy of `t`: an in-place write to the RESULT raises (a tripwire,
+    not a fence: see the banner above). Made inside inference_mode so the clone carries the
+    flag even when `t` is a normal tensor, the inverse of _owned_copy (which strips it)."""
     with torch.inference_mode():
         return t.clone()
 
 
 def freeze(t):
-    """Idempotent hard-freeze: return `t` unchanged if it is already frozen (immutable),
-    else a frozen_copy. The one call a frame cache uses to guarantee an entry cannot be
-    written through, whatever the provenance of the tensor handed to it."""
+    """Idempotent freeze: return `t` unchanged if it is already frozen, else a frozen_copy.
+    The one call a frame cache uses to flag an entry it stores, whatever the provenance of
+    the tensor handed to it; consumers are protected by copy-on-read, not by this flag."""
     return t if is_frozen(t) else frozen_copy(t)
 
 

@@ -1,29 +1,33 @@
 """tex_results.py — results become first-class (v0.25 "Remember frames").
 
 This module is the engine's answer to "TEX persists *programs* superbly and *results* not
-at all." It has two halves, in dependency order:
+at all." The frame cache lives here; the pieces around it live next door:
 
-  CACHE-1  lineage keys (env_epoch / lineage_key). Every cooked output can carry the key
-           that produced it: H(program fp × param values × upstream result keys × frame ×
-           device × precision/quality × env_epoch × flags [× canvas/ROI]). Device and
-           precision are MANDATORY components — invariant #9's up-to-6.1e-2 CPU↔GPU envelope
-           makes placement visible, so a cross-device / precision / env-epoch cook mints a
-           DISTINCT key and is never served from a stale one. This is Nuke's op-hash; the
-           fused memo key (tex_fusion._fused_fp) already proved the value-independent half —
-           CACHE-1 adds the value-DEPENDENT half (params by value, tensor inputs by their
-           upstream lineage key, NEVER by content-hashing pixels — the sampling hash has an
-           admitted collision class that is fine for cache-BUSTing and wrong for cache-REUSE).
+  CACHE-1  lineage keys (`env_epoch` / `lineage_key`), in `tex_results_keys.py` and
+           re-exported below. Every cooked output can carry the key that produced it: H(program
+           fp × param values × upstream result keys × frame × device × precision/quality ×
+           env_epoch × flags [× canvas/ROI]). Device and precision are MANDATORY components —
+           invariant #9's up-to-6.1e-2 CPU↔GPU envelope makes placement visible, so a
+           cross-device / precision / env-epoch cook mints a DISTINCT key and is never served
+           from a stale one. Params go in by value and tensor inputs by their upstream lineage
+           key, NEVER by content-hashing pixels — the sampling hash has an admitted collision
+           class that is fine for cache-BUSTing and wrong for cache-REUSE.
 
-  CACHE-2  ResultCache — the engine frame cache (added below CACHE-1). RAM tier byte-budgeted
-           through the tex_memory seam, disk spill staged through tex_marshalling's pinned
-           helpers, keyed by CACHE-1, frames frozen per ENG-12 (tex_engine.freeze). The
-           ComfyUI node does NOT enable it (the host already caches); it is armed by an
-           engine host — so it ships measured, tested, and dormant, exactly as ROI-3 did.
+  CACHE-2  ResultCache — the engine frame cache (this file). RAM tier byte-budgeted through the
+           tex_memory seam, disk spill staged through tex_marshalling's pinned helpers, keyed by
+           CACHE-1, frames frozen per ENG-12 (tex_engine.freeze). The CACHE-8 residency ladder
+           is inherited from `tex_results_residency.py`. The ComfyUI node does NOT enable it
+           (the host already caches); it is armed by an engine host.
 
 Scope honesty (docs/results-caching.md): under ComfyUI CACHE-1's reach is TEX-internal edges
 (fused-stage handoffs, CACHE-6) — full lineage arrives with GRAPH-1's version counters. Here
 it is the persistence/disk identity a frame cache and a future disk spill are keyed by.
 """
+
+import os
+import threading
+from collections import OrderedDict, deque
+from dataclasses import dataclass
 
 from .tex_results_keys import (
     _ENV_EPOCH_CACHE, _code_epoch, env_epoch, _canon_params, _canon_time, lineage_key,
@@ -32,11 +36,6 @@ from .tex_results_residency import _dev_bucket, _ResultCacheResidency
 
 
 # ── CACHE-2: the engine frame cache (ResultCache) ─────────────────────────────
-
-import os
-import threading
-from collections import OrderedDict, deque
-from dataclasses import dataclass
 
 #: B5a — the `.frame` spill-record format version. ABSENCE reads as v0 (raw), which is exactly
 #: what every file written before v0.33.1 is; both formats stay DECODABLE across a version bump.
@@ -239,7 +238,8 @@ class ResultCache(_ResultCacheResidency):
     `move_to_end` and `popitem` on one OrderedDict, which is a corrupted LRU or a RuntimeError,
     not merely a stale read. Pushing that precondition onto every host would be unenforceable,
     so the guard lives here: an uncontended acquire measures 220 ns against a `put` of 1.13 ms
-    (512²×4 fp32) — 0.02%. RE-ENTRANT because `get` → `_restore` → `put` is a real call chain.
+    (512²×4 fp32) — 0.02%. RE-ENTRANT because `patch_region` calls `get` and `put` while it
+    holds the lock.
     Never on the default ComfyUI path either way (invariant #7): `tex_node.py` has no reference
     to this module.
 
@@ -270,8 +270,9 @@ class ResultCache(_ResultCacheResidency):
         # mean an interactive `get` waiting behind a CACHE-7 phase-2 `put` for a 1.1 ms memcpy
         # (512²×4) or a `torch.load` from the spill tier. `_remove` and `_enforce_ram_budget`
         # assume it is HELD; `_spill`/`_restore` deliberately run OUTSIDE it (they are the disk
-        # I/O the rule exists to exclude) and are single-writer by drain-path convention.
-        # RE-ENTRANT because `get` → `_restore` → `put` is a real call chain.
+        # I/O the rule exists to exclude). Concurrent spills of one key are ordered by
+        # `_spill_seq` and the per-key locks below, not by the lock.
+        # RE-ENTRANT because `patch_region` nests `get`/`put` while it holds the lock.
         self._lock = _DepthLock()
         self._ram: "OrderedDict[str, _Entry]" = OrderedDict()
         self._budget = (int(budget_mb * (1 << 20)) if budget_mb is not None
@@ -284,6 +285,9 @@ class ResultCache(_ResultCacheResidency):
         # of an O(entries) scandir every time. None = unknown (force a reconciling scan); set to
         # the scanned total after any census, invalidated (None) on any out-of-band removal.
         self._disk_bytes: int | None = None
+        # Bumped under the lock by every in-flight change to `_disk_bytes`, so a reconciling scan
+        # (which reads the directory unlocked) can tell its total went stale while it ran.
+        self._disk_mut = 0
         # Keys known to be on the spill tier, or None = NOT YET KNOWN. `_restore` opened with
         # an `os.path.exists` on every RAM miss — 19.1 us of syscall, and CACHE-7's deepest-first
         # serve probes up to one key per checkpoint per cook. A membership set removes that.
@@ -571,9 +575,9 @@ class ResultCache(_ResultCacheResidency):
         if frame is None:
             # OUTSIDE the lock: `_restore` is a file read plus an H2D copy — measured at
             # hundreds of ms for a large frame, and holding the lock across it stalls every
-            # concurrent `get` and `put` behind a disk seek. It re-admits through `put`, which
+            # concurrent `get` and `put` behind a disk seek. It re-admits through `_admit`, which
             # takes the lock itself, so the insert is still serialized. Two threads racing the
-            # same key both read and the second `put` simply replaces the first: a duplicated
+            # same key both read and the second admit simply replaces the first: a duplicated
             # read, never a corrupted table.
             # Returns (master, orig_dtype, fence) together — see A2 on `_restore`. Never re-look-up.
             frame, orig_dtype, fence = self._restore(key)
@@ -789,6 +793,8 @@ class ResultCache(_ResultCacheResidency):
             return None
         if frame.shape[1:3] != (int(tuple(window)[5]), int(tuple(window)[4])):
             return None                        # base is not the frame this window describes
+        if x0 < 0 or y0 < 0 or x0 + w > frame.shape[2] or y0 + h > frame.shape[1]:
+            return None                        # the window sits outside the frame it names
         # A5/PROBE-11: the window describes the SPATIAL extent only, so a base and a patch that
         # disagree on batch or channels reached the assignment below and raised a RuntimeError
         # out of a method whose whole contract is "refuse by returning None". Refusing is not a
@@ -819,12 +825,10 @@ class ResultCache(_ResultCacheResidency):
         """Write out entries evicted under the lock. Called by the PUBLIC methods, after they
         release it.
 
-        The lock rule on `__init__` says disk I/O happens outside it. That was a claim, not a
-        fact: `_enforce_ram_budget` -> `_spill` ran inside `put`'s lock and `_restore` inside
-        `get`'s, so a concurrent `get` could block for the length of a pickle write plus a D2H
-        copy — measured at 327-496 ms. Eviction still happens under the lock (it is pure
-        bookkeeping); only the write is deferred, so the entry is out of `_ram` and unreachable
-        by the time anyone waits on nothing.
+        Eviction is bookkeeping and happens under the lock; the pickle write and the D2H copy
+        happen here, after it is released, so a concurrent `get` never waits behind them (a
+        write under the lock stalled it 327-496 ms). An evicted entry is already out of `_ram`
+        when it is queued, so nothing can serve it in the meantime.
 
         A frame whose spill fails is simply gone, which is the pre-existing contract — a miss
         recooks."""
@@ -835,10 +839,11 @@ class ResultCache(_ResultCacheResidency):
                 if not self._pending_spills:
                     return
                 key, entry, seq = self._pending_spills.popleft()
-            # Both producers (`_enforce_ram_budget`, `evict_bytes`) queue only entries `_remove`
-            # returned non-None, so there is nothing to guard against here. The ticket travels
-            # WITH the victim: claiming it below, after this lock is released, would order the
-            # writes by which drain happens to start first rather than by which `put` evicted.
+            # Every producer (`_enforce_ram_budget`, `evict_bytes`, `spill`) queues only entries
+            # `_remove` returned non-None, so there is nothing to guard against here. The
+            # ticket travels WITH the victim: claiming it below, after this lock is released,
+            # would order the writes by which drain happens to start first rather than by
+            # which `put` evicted.
             self._spill(key, entry, seq)
 
     def _remove(self, key: str):
@@ -888,16 +893,16 @@ class ResultCache(_ResultCacheResidency):
             entry = self._remove(old_key)
             self.evictions += 1
             # QUEUED, not written — the caller must `_drain_spills()` after releasing the lock.
-            # Every public method that can reach here does: put, evict_bytes, set_budget.
+            # Every public method that can reach here does: put, evict_bytes, set_budget, spill.
             # The write ticket is claimed HERE, under this lock (see `_claim_spill_ticket`).
             self._pending_spills.append((old_key, entry, self._claim_spill_ticket(old_key)))
 
     # ── disk spill / restore ──
     def _spill(self, key: str, entry, seq: int) -> None:
-        """Write an evicted frame to disk (best-effort), then atomically pickle it under results/.
-        A failed spill just drops the frame — the cook reproduces it. (Page-locking is applied on
-        the RESTORE side, not here: pinning is not preserved through pickle, so a pinned spill
-        buffer would deserialize pageable anyway.)"""
+        """Write an evicted frame to `results/<key>.frame` as ONE atomic signed pickle
+        (temp-and-rename), best-effort. A failed spill just drops the frame — the cook
+        reproduces it. (Page-locking is applied on the RESTORE side: pinning is not preserved
+        through pickle, so a pinned spill buffer would deserialize pageable anyway.)"""
         try:
             import torch
             with self._lock:
@@ -953,7 +958,8 @@ class ResultCache(_ResultCacheResidency):
             if cpu_t.dtype is torch.uint16:
                 cpu_t, viewed = cpu_t.view(torch.int16), "uint16"
             rec = {"t": cpu_t, "fmt": _FRAME_FORMAT,
-                   "device": entry.home, "canvas": entry.canvas, "epoch": env_epoch(),
+                   "device": entry.home, "canvas": entry.canvas,
+                   "epoch": env_epoch(entry.home),
                    "orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed,
                    "quality": entry.quality}
             # A1: the check and the write are ONE critical section, per key. Outside it, a
@@ -992,6 +998,7 @@ class ResultCache(_ResultCacheResidency):
                     stale = False
                     if self._spilled is not None:
                         self._spilled.add(key)   # unknown (None) stays unknown, not {this key}
+                    self._disk_mut += 1
                     if self._disk_bytes is not None:    # keep the running total current
                         try:
                             self._disk_bytes += os.path.getsize(path) - prev
@@ -1078,15 +1085,7 @@ class ResultCache(_ResultCacheResidency):
             if _is_decline_quietly(rec):
                 return None, None, None            # leave it, just miss (never destroy on either)
             if rec is _UNVERIFIED:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                else:
-                    with self._lock:
-                        self._disk_bytes = None      # out-of-band removal: invalidate the total
-                        if self._spilled is not None:
-                            self._spilled.discard(key)
+                self._discard_frame_file(path, key)
                 return None, None, None
             if int(rec.get("fmt", 0) or 0) > _FRAME_FORMAT:
                 # A5/PROBE-8: the `fmt` field was write-only — a record from a NEWER TEX was
@@ -1095,22 +1094,8 @@ class ResultCache(_ResultCacheResidency):
                 # to decline. (Absence still reads as v0; that is the backward direction, which
                 # IS decodable.) Left on disk, not deleted: the newer TEX that wrote it can.
                 return None, None, None
-            if rec.get("epoch") != env_epoch():     # a prior-environment frame: discard
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                else:
-                    # A6: UNDER THE LOCK. These are the same two index fields P0-6 moved into
-                    # the lock inside `_spill`, reached through a door P0-6 did not close — and
-                    # unsynchronised they lose to a racing `_spill`, whose locked `+=` can land
-                    # after this `None` and leave `_disk_bytes` a definite WRONG value. The
-                    # file's convention is that an uncertain total is `None`, never a confident
-                    # lie; that only holds if the invalidation cannot be overwritten.
-                    with self._lock:
-                        self._disk_bytes = None      # out-of-band removal: invalidate the total
-                        if self._spilled is not None:
-                            self._spilled.discard(key)
+            if rec.get("epoch") != env_epoch(rec.get("device", "cpu")):   # prior environment: discard
+                self._discard_frame_file(path, key)
                 return None, None, None
             host = rec["t"]
             if rec.get("viewed") == "uint16":       # A4: undo the int16 storage view
@@ -1156,17 +1141,31 @@ class ResultCache(_ResultCacheResidency):
                                 quality=rec.get("quality"), pending_event=pending_event)
             if entry is None:
                 return None, None, None
-            # A2: the frame AND its representation, from the ONE locked re-admit. This used to
-            # return only the tensor and let `get` re-look-up `orig_dtype` in a second lock
-            # acquisition — a window in which a concurrent `clear()` or eviction drops the entry,
-            # `orig_dtype` reads `None`, and an fp16-STORED frame is served at storage dtype to a
-            # caller owed fp32. Reproduced without any patching, on the first iteration.
             # A2: the frame AND its representation, from the ONE locked re-admit. Re-looking
             # the entry up in a second acquisition is what let a `clear()` in between make
             # `orig_dtype` read None and serve fp16 to a caller owed fp32 (TRK-178: same for fence).
             return entry.tensor, entry.orig_dtype, entry.pending_event
         except Exception:
             return None, None, None
+
+    def _discard_frame_file(self, path: str, key: str) -> None:
+        """Delete a spilled `.frame` that must not be served (unverified, or from another
+        environment) and forget it in the disk index.
+
+        The index update is UNDER THE LOCK (A6). These are the same two fields P0-6 moved into
+        the lock inside `_spill`; unsynchronised they lose to a racing `_spill`, whose locked
+        `+=` can land after this `None` and leave `_disk_bytes` a definite WRONG value. The
+        file's convention is that an uncertain total is `None`, never a confident lie, and that
+        only holds if the invalidation cannot be overwritten."""
+        try:
+            os.remove(path)
+        except OSError:
+            return
+        with self._lock:
+            self._disk_mut += 1
+            self._disk_bytes = None              # out-of-band removal: invalidate the total
+            if self._spilled is not None:
+                self._spilled.discard(key)
 
     def _enforce_disk_budget(self) -> None:
         """Cap the spill directory's total bytes, deleting oldest-first (mtime). A separate cap
@@ -1179,6 +1178,9 @@ class ResultCache(_ResultCacheResidency):
         so the whole-dir walk is O(entries) at most once per budget-crossing, not per spill."""
         if self._disk_bytes is not None and self._disk_bytes <= self._disk_budget:
             return
+        with self._lock:
+            mut = self._disk_mut
+        total = None
         try:
             files, total = [], 0
             with os.scandir(self._spill_dir()) as it:
@@ -1188,25 +1190,29 @@ class ResultCache(_ResultCacheResidency):
                     st = e.stat()
                     files.append((e.path, st.st_mtime, st.st_size))
                     total += st.st_size
-            if total <= self._disk_budget:
-                self._disk_bytes = total        # reconcile: now known + under budget
-                return
-            for path, _mtime, size in sorted(files, key=lambda t: t[1]):
-                try:
-                    os.remove(path)
-                    # This loop evicts by PATH (oldest first), so the membership set can no
-                    # longer answer "was this key spilled" — drop to unknown and let `_restore`
-                    # pay the stat again. Cheap correctness beats a fast wrong answer: a stale
-                    # `True` costs one syscall, a stale ABSENCE silently loses a frame.
-                    self._spilled = None
-                    total -= size
-                except OSError:
-                    pass
-                if total <= self._disk_budget:
-                    break
-            self._disk_bytes = total            # reconcile to the post-eviction total
+            if total > self._disk_budget:
+                for path, _mtime, size in sorted(files, key=lambda t: t[1]):
+                    try:
+                        os.remove(path)
+                        # This loop evicts by PATH (oldest first), so the membership set can no
+                        # longer answer "was this key spilled" — drop to unknown and let
+                        # `_restore` pay the stat again. Cheap correctness beats a fast wrong
+                        # answer: a stale `True` costs one syscall, a stale ABSENCE silently
+                        # loses a frame.
+                        with self._lock:
+                            self._spilled = None
+                        total -= size
+                    except OSError:
+                        pass
+                    if total <= self._disk_budget:
+                        break
         except Exception:
-            self._disk_bytes = None             # scan failed: stay in the safe rescan-next-time state
+            total = None                        # scan failed: stay in the safe rescan-next-time state
+        with self._lock:
+            # The scan ran unlocked, so a concurrent `_spill` may have landed a file (and its
+            # locked `+=`) that `total` does not include. Writing `total` over that is a
+            # definite wrong figure; a moved counter means uncertain, i.e. None.
+            self._disk_bytes = total if self._disk_mut == mut else None
 
     # ── CACHE-5: governor hooks (the frame cache folded into the global arbitration) ──
     def governed_bytes(self, dev_type: str | None = None) -> int:
@@ -1307,8 +1313,9 @@ class ResultCache(_ResultCacheResidency):
     # ── introspection / lifecycle ──
     def sweep_temps(self) -> int:
         """Drop crash-orphaned `tex_recovery` temps from the spill dir. Called from
-        `reindex_disk` (i.e. on ENG-13 recovery), which is exactly when a previous
-        process's leftovers are known to be dead."""
+        `reindex_disk` (i.e. on ENG-13 recovery), when a previous process's leftovers are
+        expected. Which temps count as orphaned is `tex_recovery.sweep_temps`'s call; a
+        writer that is still live may own a recent one."""
         from .tex_recovery import sweep_temps as _sweep
         try:
             return _sweep(self._spill_dir())
@@ -1327,7 +1334,7 @@ class ResultCache(_ResultCacheResidency):
         # The directory walk runs OUTSIDE the lock (see the rule on __init__): it is pure
         # filesystem work over a dir this cache owns, and on a multi-GB spill tier it would
         # otherwise block every `get` and `put` for the length of a scandir.
-        self.sweep_temps()              # a crashed writer's leftovers are dead by definition
+        self.sweep_temps()              # clear a crashed writer's leftover temps
         # A3: the two facts that decide whether the scan's answer may be trusted as COMPLETE.
         # Read before the walk, compared after it.
         with self._lock:
@@ -1560,6 +1567,9 @@ class ResultCache(_ResultCacheResidency):
         landing in the gap has its frame deleted by a requalify that never saw it. Capturing
         the entry and re-checking it with `is` closes both with one line — `_admit` builds a
         fresh `_Entry` on every insert, so the in-place case falls out with no special case."""
+        import torch
+        if not isinstance(frame, torch.Tensor):
+            return False                        # `put` would store nothing; keep the preview entry
         with self._lock:
             prev = self._ram.get(preview_key)
             if prev is None:

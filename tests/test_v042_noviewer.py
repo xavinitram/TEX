@@ -272,7 +272,7 @@ def test_noviewer_lineage_key_byte_format_pinned(r: SubTestResult):
              flags=(), canvas={"shape": [2, 4, 4, 3], "roi": [0, 0, 4, 4, 8, 8]}),
     ]
     try:
-        tex_results_keys.env_epoch = lambda: fixed_env
+        tex_results_keys.env_epoch = lambda *_a, **_k: fixed_env
         for row in rows:
             expected = _feed_stream(env=fixed_env, **row)
             got = tex_results_keys.lineage_key(**row)

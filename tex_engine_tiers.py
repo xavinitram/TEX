@@ -34,8 +34,8 @@ through `tex_engine`'s namespace before the caller moved. `test_trk141` is exact
 class of test and is what proved the general form matters here, not just the four names
 ENG-14/NEG-2 relocated.
 
-So this module holds a deferred reference to the `tex_engine` module object
-(`_tex_engine`, bound once at import — safe under the circular import because nothing
+So this module holds a lazy proxy for the `tex_engine` module object (`_tex_engine`,
+resolved on the first attribute read — safe under the circular import because nothing
 calls through it until long after both modules have finished loading) and reads every one
 of those names off it — `_tex_engine._get_interpreter()`, `_tex_engine.execute_compiled(
 ...)`, `_tex_engine.CookCancelled`, etc. — rather than importing them directly. Only names
@@ -55,31 +55,17 @@ import torch
 
 logger = logging.getLogger("TEX")
 
-# ROUTE-45: a deferred reference to `tex_engine`, NOT a direct `from .tex_chain import
+# ROUTE-45: `tex_engine` is reached through a lazy proxy, NOT a direct `from .tex_chain import
 # _get_interpreter` / `from .tex_runtime.compiled import execute_compiled` / etc. — see the
-# module docstring. `tex_engine` is already in `sys.modules` (mid-import) the moment this
-# module is first imported (from inside `tex_engine.py`'s own top-level import statement),
-# so binding the module object costs nothing extra WHEN `tex_engine` is imported first — but
-# nothing here reads an attribute off it until a cook actually runs, long after both modules
-# have finished loading, in EITHER import order.
+# module docstring. Nothing here reads an attribute off it until a cook actually runs, long
+# after both modules have finished loading, in EITHER import order.
 #
-# R1 (v0.46, FIX-OBSROUTE): that "either order" half used to be false. Importing
-# `tex_engine_tiers` FIRST, in a fresh process, crashed with a circular ImportError: the
-# eager `from . import tex_engine as _tex_engine` below started `tex_engine.py`'s own body
-# running (it was not yet in `sys.modules`), which reaches `from .tex_engine_tiers import
-# (select_tier, ...)` (the SPLIT-E re-export) while THIS module's body is still stuck on its
-# own import line above — `tex_engine_tiers` is in `sys.modules` by then (added the moment
-# Python started running it) but none of its functions have been defined yet, so that
-# re-export raises ImportError. Binding eagerly needed `tex_engine`'s own import to finish;
-# `tex_engine.py` needed `tex_engine_tiers`'s import to have already finished — a genuine
-# cycle, not merely a name resolved too soon.
-#
-# The fix resolves `_tex_engine` LAZILY instead: nothing below imports `tex_engine` at
-# module scope, so importing `tex_engine_tiers` first no longer pulls it in at all. The
-# proxy's `__getattr__` performs the import on the first attribute read any `_run_*`
-# strategy makes — long after both modules have finished loading, whichever one was
-# imported first — and caches the result so every later attribute read is one dict lookup
-# plus one `getattr`, not a fresh import.
+# The proxy is lazy because an eager `from . import tex_engine as _tex_engine` made importing
+# `tex_engine_tiers` FIRST crash with a circular ImportError: it started `tex_engine.py`'s
+# body, which reaches `from .tex_engine_tiers import (select_tier, ...)` while this module's
+# body was still stuck on that import line, before any function here was defined. Now nothing
+# below imports `tex_engine` at module scope; the proxy's `__getattr__` imports it on the first
+# attribute read and caches it, so every later read is one dict lookup plus one `getattr`.
 class _LazyTexEngine:
     """A stand-in for the `tex_engine` module object, resolved on first ATTRIBUTE access
     rather than at import time. `_tex_engine.NAME` below reads exactly as it did when this
@@ -301,9 +287,9 @@ def _run_default(ctx):
     # pinned envelope instead, see `tests/test_v031_noise_tiers.py`). See the table in
     # CHANGELOG 0.30.0. Whole-frame on any run_roi error (never hard-fail the cook).
     if ctx.roi is not None and ctx.roi_plan is not None:
-        # Bind tier_trace OUTSIDE the try: it is imported function-locally per the SCC
-        # convention (see the F1 note below), and an import inside the try would leave the
-        # `except` branch's own record_roi raising NameError instead of reporting the failure.
+        # Bind tier_trace OUTSIDE the try (it is imported function-locally): an import inside
+        # the try would leave the `except` branch's own record_roi raising NameError instead
+        # of reporting the failure.
         from .tex_runtime import tier_trace
         try:
             from .tex_memory import run_roi
@@ -506,10 +492,10 @@ def _run_tier(ctx, tier_id):
 #
 # A public, side-effect-free query answering "which tier will a cook of THIS shape
 # run on, and why" — before a host cooks anything. It exists because scale/ROI are
-# SILENTLY interpreter-only past two separate choke points (`_run_tier`'s unconditional
-# `ctx.scale is not None` bypass above; `tex_engine.prepare`'s `roi is not None and
-# tier_id == "default"` gate), so a host previously had no way to learn that fact except
-# by timing a cook and noticing it was slow.
+# SILENTLY interpreter-only past two choke points (`_run_default`'s stencil-route decision
+# for a scale-active cook; `tex_engine.prepare`'s `roi is not None and tier_id == "default"`
+# gate; `_run_tier` itself has no scale bypass), so a host previously had no way to learn
+# that fact except by timing a cook and noticing it was slow.
 #
 # Read-only over tier selection: this calls `select_tier` (this module, unchanged) and
 # the existing `tex_roi` predicates (`scale_safe`/`roi_exec_enabled`/`validate_roi`/
@@ -548,7 +534,7 @@ TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict,
 TIER_REASON_TORCH_COMPILE_GRAPH_BREAK = "torch-compile-graph-break"
 # ^ `torch_compile`/`auto` selected, but the program's codegen has a non-inlined stdlib call
 # (`_has_fn_calls`) -- `_try_compile` returns the codegen-only eager adapter, backend=None,
-# never real Inductor tracing (`compiled.py:1623-1639`). Every one of today's four registered
+# never real Inductor tracing (`compiled._try_compile`'s `_has_fn_calls` branch). Every one of today's four registered
 # `pixel_args=` builtins hits this unconditionally (none inlines in codegen) -- reported tier is
 # `"codegen"`, matching what actually executes.
 TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE = "cuda-graph-not-capturable"
@@ -710,7 +696,7 @@ def _torch_compile_graph_break(code: str, binding_types: dict | None,
 def _cuda_graph_would_capture(code: str, binding_types: dict | None) -> bool | None:
     """FIX-SCALECX X1 (B2#1): best-effort, read-only mirror of `graphed._capturable` --
     the exact predicate `run_graphed` itself checks before ever computing a
-    `_capture_key` (a pure AST walk, `graphed.py:285-333`, needing no bindings). Every
+    `_capture_key` (a pure AST walk, `graphed._capturable` / `graphed._capture_key`, needing no bindings). Every
     one of today's four registered `pixel_args=` builtins is `sync=True` in
     `graphed._SYNC_STDLIB`, so `_capturable` always declines a program calling one,
     deterministically, on any box (CPU or CUDA) -- `run_graphed` then always returns
@@ -838,9 +824,9 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
 
     if scale is not None:
         # On the "default" tier, a scale-active cook routes to codegen instead when the
-        # UC-2 stencil gate would already choose it. Mirrors `_run_tier`'s own branch
-        # exactly (`tier_id == "default" and not fused_chain and
-        # _should_stencil_route(...)`), so the two can never disagree.
+        # UC-2 stencil gate would already choose it. Mirrors `_run_default`'s own branch
+        # exactly (`not fused_chain and _should_stencil_route(...)`), so the two can never
+        # disagree.
         if tier_id == "default" and not fused_chain:
             stencil = _stencil_route_would_apply(code, binding_types)
             if stencil:
@@ -850,8 +836,8 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
         # SCALECX-49: torch_compile/auto/cuda_graph now run a scale-active cook directly
         # (`_run_tier` dispatches every tier_id to its strategy unconditionally; each of
         # the three keys its compiled artifact / captured graph by an explicit `scale`
-        # component). Mirrors `_run_tier`'s own (lack of a) bypass exactly, so the two can
-        # never disagree. FIX-SCALECX X1: that dispatch can itself self-decline past
+        # component). `_run_tier` has no scale bypass, so the two can never disagree.
+        # FIX-SCALECX X1: that dispatch can itself self-decline past
         # `select_tier`'s own choice (B2#1) -- `_real_compiled_dispatch` names the tier
         # that actually runs, not merely the one `select_tier` picked.
         if tier_id in ("torch_compile", "auto", "cuda_graph"):
