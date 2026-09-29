@@ -199,3 +199,22 @@ def test_masked_call_reads_the_definition_scope():
 def test_loop_body_writing_its_counter(code, want):
     ref = run_tiers(code, {"A": _img(), "n": 8})
     assert torch.allclose(ref["OUT"], torch.full_like(ref["OUT"], want))
+
+
+# ── A scalar field bound to a vec2/vec3 variable broadcasts; it is never column-sliced ──
+
+@pytest.mark.parametrize("code,n", [
+    ("vec3 c = luma(@A); @OUT = vec4(c, 1.0);", 3),
+    ("vec2 c = @M; @OUT = vec4(c, 0.0, 1.0);", 2),
+    ("vec3 c = vec3(0.0); c = @M; @OUT = vec4(c, 1.0);", 3),
+    ("vec3 c = vec3(0.0); c += @M; @OUT = vec4(c, 1.0);", 3),
+    ("vec3 f(float x) { return x; } vec3 c = f(@M); @OUT = vec4(c, 1.0);", 3),
+], ids=["decl-luma", "decl-mask", "assign", "compound", "return"])
+def test_scalar_field_widens_to_the_declared_vector(code, n):
+    A = _img(W=6)
+    M = A[..., 1].clone()
+    ref = run_tiers(code, {"A": A, "M": M})
+    field = (A[..., 0] * 0.2126 + A[..., 1] * 0.7152 + A[..., 2] * 0.0722) if "luma" in code else M
+    assert tuple(ref["OUT"].shape) == (1, 4, 6, 4)
+    for ch in range(n):
+        assert torch.allclose(ref["OUT"][..., ch], field, atol=1e-5)
