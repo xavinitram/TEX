@@ -201,7 +201,9 @@ def test_codegen_spatial_builtins_match_interpreter_ranks(r: SubTestResult):
         interp = Interpreter()
         interp.execute(prog, {"A": make_img(2, 4, 5, 3, seed=13)}, tm,
                        device="cpu", output_names=["OUT"])
-        bound = {n: interp.env[n] for n in names if n in interp.env}
+        # the cook's own env is dropped when execute() returns; the cached builtins survive
+        cached = {k: v for entry in interp._builtins_lru.values() for k, v in entry.items()}
+        bound = {n: cached[n] for n in names if n in cached}
         missing = sorted(n for n in names if n not in bound)
         assert not missing, f"the interpreter bound none of {missing} — the probe is wrong"
         non_scalar = {n for n, t in bound.items() if torch.is_tensor(t) and t.dim() > 0}

@@ -61,6 +61,7 @@ from .compiled_exec_support import (_show_once, _maybe_triton_hint, _ensure_indu
 # AUTOSAFE-50 promotion-TRIAL state and its two functions are a self-contained domain
 # (mirrors `_bg_futures`/`_submit_bg_compile`'s own shape); re-exported the same way.
 from .compiled_promotion import (_trial_futures, _promotion_stats, promotion_stats,
+                                 _note_failure, _durable_failure,
                                  _reset_promotion_stats_for_test, _TRIAL_WAIT_BUDGET_S,
                                  _TRIAL_POLL_SLICE_S, _submit_trial, _await_trial)
 # FIX-COMPILE51 C0: compiled.py's precompile-scoping domain (COMPILE-51b) -- the
@@ -110,6 +111,17 @@ def _setup_msvc_env():
             _msvc_env_initialized = True
 
 
+def _parse_env_dump(text: str) -> dict[str, str]:
+    """Parse `set` output into {NAME: value}. Names are upper-cased: Windows prints `Path`,
+    and the PATH/INCLUDE/LIB lookups must not depend on that spelling."""
+    env: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k.upper()] = v
+    return env
+
+
 def _do_setup_msvc_env() -> None:
     """The actual search/subprocess/env-injection body, run under `_msvc_env_lock` by
     `_setup_msvc_env` with the initialised flag set only after this returns (C6)."""
@@ -152,11 +164,7 @@ def _do_setup_msvc_env() -> None:
             return
 
         # Parse and inject relevant environment variables
-        new_env: dict[str, str] = {}
-        for line in result.stdout.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                new_env[k] = v
+        new_env = _parse_env_dump(result.stdout)
 
         # Merge INCLUDE, LIB, LIBPATH, and extend PATH
         for var in ("INCLUDE", "LIB", "LIBPATH"):
@@ -990,7 +998,8 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
                     # worker — never on the cook thread's TRIAL invocation.
                     warm_call()
             return "ok"
-        except Exception:
+        except Exception as _exc:
+            _note_failure(cache_key, _exc)
             _compiled_cache.pop(cache_key, None)   # never hand a proven-broken artifact on
             fnc_backend = None   # a warm_call crash after a successful wrap is still a fail
             return "failed"
@@ -1075,9 +1084,10 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
 
     try:
         return _COMPILE_POOL.submit(_worker).result()
-    except Exception:
+    except Exception as _exc:
         # Crash — demote (do not blacklist forever). Reset dynamo on the calling
         # thread; the caller routes to codegen-only.
+        _note_failure(cache_key, _exc)
         _compiled_cache.pop(cache_key, None)
         try:
             torch._dynamo.reset()
@@ -1153,14 +1163,14 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                                       output_names, device_type, timed=False,
                                       scale=scale)
         if res is None:
-            autotier.record_trial(key, None)  # demote to rejected
+            autotier.record_trial(key, None, persist=_durable_failure(cache_key))  # demote
             return _codegen(bindings)
         return res
     # Committed but artifact gone (restart w/o PC-2 persistence, or evicted):
-    # re-establish by trialling again this cook.
+    # measure and compile it again (mark_ready cannot: the state is not COMPILING).
     if state == autotier.COMMITTED:
-        autotier.mark_ready(key)
-        state = autotier.TRIAL
+        autotier.reopen(key)
+        state = autotier.verdict(key)
 
     if state == autotier.TRIAL and cache_key in _compiled_cache:
         # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation used to run
@@ -1173,9 +1183,10 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         # duration, and a later cook's near-free poll picks up the result once it lands —
         # the cook keeps running on the safe (codegen) tier meanwhile, never idle and never
         # stalled waiting for the promotion.
+        own_job = cache_key not in _trial_futures    # a job already in flight ran an earlier cook
         if not _submit_trial(cache_key, program, bindings, type_map, device,
                              latent_channel_count, output_names, device_type, scale=scale):
-            autotier.record_trial(key, None)
+            autotier.record_trial(key, None, persist=False)   # a dead pool is not the program
             _promotion_stats["failed"] += 1
             tier_trace.record("codegen", fallback_from="torch_compile",
                               reason="promotion trial could not be submitted")
@@ -1188,7 +1199,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                               reason="promotion trial pending (bounded off the cook thread)")
             return res
         if status == "failed" or status == "absent":
-            autotier.record_trial(key, None)
+            autotier.record_trial(key, None,
+                                  persist=status == "failed" and _durable_failure(cache_key))
             _promotion_stats["failed"] += 1
             res = _codegen(bindings)
             tier_trace.record("codegen", fallback_from="torch_compile",
@@ -1196,7 +1208,9 @@ def run_auto(program, bindings, type_map, device, fingerprint,
             return res
         res, ms = payload
         autotier.record_trial(key, ms)
-        return res
+        # The job's output belongs to the cook that submitted it (its bindings, its size):
+        # a later cook may take the timing but must be served from its OWN inputs.
+        return res if own_job else _codegen(bindings)
 
     # CC-6: bounded trial convergence. A key that has been ELIGIBLE to compile (enough
     # interpreter samples — should_submit_compile's own bar) for too long without reaching
@@ -1289,7 +1303,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         if st == "ready":
             autotier.mark_ready(key)
         elif st in ("failed", "absent"):
-            autotier.record_trial(key, None)  # compile failed → reject, stay on codegen
+            autotier.record_trial(key, None, persist=_durable_failure(cache_key))  # reject, stay on codegen
             # AUTOSAFE-50 (TRK-231): a failed background compile must always be
             # VISIBLE, not just silently rejected — `res` above already served this cook
             # from codegen (the `_timed_deferred` call earlier in this branch), so this
@@ -1453,6 +1467,9 @@ def _build_codegen_env(
 
     if sp:
         B, H, W = sp
+        # Coordinate builtins are fp32 whatever the image precision (as in the interpreter):
+        # fp16 `u` cannot address every row of a tall frame.
+        cdt = torch.float32
         # The cook-region grid is H×W; coordinates are offset by the window origin and
         # normalized against the full image. Absent an ROI this collapses to the old
         # behaviour exactly (x0=y0=0, W_full=W, H_full=H), so the default path is untouched.
@@ -1461,39 +1478,39 @@ def _build_codegen_env(
         # ROI components join every cache key they affect, or a panning viewport would be
         # served the previous window's coordinates out of _ENV_TENSOR_CACHE.
         if "ix" in used or "u" in used:
-            ix = _env_cached(("ix", W, x0, dev_key, dtype),
-                             lambda: torch.arange(x0, x0 + W, dtype=dtype, device=device).view(1, 1, W))
+            ix = _env_cached(("ix", W, x0, dev_key, cdt),
+                             lambda: torch.arange(x0, x0 + W, dtype=cdt, device=device).view(1, 1, W))
             if "ix" in used:
                 env["ix"] = ix
             if "u" in used:
-                env["u"] = _env_cached(("u", B, H, W, x0, W_full, dev_key, dtype),
+                env["u"] = _env_cached(("u", B, H, W, x0, W_full, dev_key, cdt),
                                        lambda: (ix / max(W_full - 1, 1)).expand(B, H, W))
         if "iy" in used or "v" in used:
-            iy = _env_cached(("iy", H, y0, dev_key, dtype),
-                             lambda: torch.arange(y0, y0 + H, dtype=dtype, device=device).view(1, H, 1))
+            iy = _env_cached(("iy", H, y0, dev_key, cdt),
+                             lambda: torch.arange(y0, y0 + H, dtype=cdt, device=device).view(1, H, 1))
             if "iy" in used:
                 env["iy"] = iy
             if "v" in used:
-                env["v"] = _env_cached(("v", B, H, W, y0, H_full, dev_key, dtype),
+                env["v"] = _env_cached(("v", B, H, W, y0, H_full, dev_key, cdt),
                                        lambda: (iy / max(H_full - 1, 1)).expand(B, H, W))
         if "iw" in used:
-            env["iw"] = _env_cached(("iw", W_full, dev_key, dtype),
-                                    lambda: torch.tensor(float(W_full), dtype=dtype, device=device))
+            env["iw"] = _env_cached(("iw", W_full, dev_key, cdt),
+                                    lambda: torch.tensor(float(W_full), dtype=cdt, device=device))
         if "ih" in used:
-            env["ih"] = _env_cached(("ih", H_full, dev_key, dtype),
-                                    lambda: torch.tensor(float(H_full), dtype=dtype, device=device))
+            env["ih"] = _env_cached(("ih", H_full, dev_key, cdt),
+                                    lambda: torch.tensor(float(H_full), dtype=cdt, device=device))
         if "px" in used:
-            env["px"] = _env_cached(("px", W_full, dev_key, dtype),
-                                    lambda: torch.tensor(1.0 / max(W_full, 1), dtype=dtype, device=device))
+            env["px"] = _env_cached(("px", W_full, dev_key, cdt),
+                                    lambda: torch.tensor(1.0 / max(W_full, 1), dtype=cdt, device=device))
         if "py" in used:
-            env["py"] = _env_cached(("py", H_full, dev_key, dtype),
-                                    lambda: torch.tensor(1.0 / max(H_full, 1), dtype=dtype, device=device))
+            env["py"] = _env_cached(("py", H_full, dev_key, cdt),
+                                    lambda: torch.tensor(1.0 / max(H_full, 1), dtype=cdt, device=device))
         if "fi" in used:
-            env["fi"] = _env_cached(("fi", B, dev_key, dtype),
-                                    lambda: torch.arange(B, dtype=dtype, device=device).view(B, 1, 1))
+            env["fi"] = _env_cached(("fi", B, dev_key, cdt),
+                                    lambda: torch.arange(B, dtype=cdt, device=device).view(B, 1, 1))
         if "fn" in used:
-            env["fn"] = _env_cached(("fn", B, dev_key, dtype),
-                                    lambda: torch.tensor(float(B), dtype=dtype, device=device))
+            env["fn"] = _env_cached(("fn", B, dev_key, cdt),
+                                    lambda: torch.tensor(float(B), dtype=cdt, device=device))
     else:
         for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
             if name in used:

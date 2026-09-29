@@ -712,7 +712,8 @@ for (int i = 1; i <= 5; i = i + 1) {
     except Exception as e:
         r.fail("static for-loop: <= condition (1+2+3+4+5=15)", f"{e}\n{traceback.format_exc()}")
 
-    # Static loop with negative step (i = i - 1)
+    # Counting down under `<` never reaches the bound: not an (empty) static range, but the
+    # general loop, which runs to the iteration cap and says so
     try:
         code = """
 float sum = 0.0;
@@ -721,13 +722,14 @@ for (int i = 5; i < 10; i = i - 1) {
 }
 @OUT = vec3(sum);
 """
-        # Negative step with i < 10 should immediately have no iterations (or fall to general path)
-        # range(5, 10, -1) is empty
-        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
-        assert abs(result[0, 0, 0, 0].item() - 0.0) < 1e-5, f"Negative step empty: {result[0,0,0,0].item()}"
-        r.ok("static for-loop: negative step (empty range)")
+        try:
+            compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+            r.fail("static for-loop: negative step", "ran to completion instead of hitting the cap")
+        except InterpreterError as e:
+            assert "E6010" in str(getattr(e, "code", "")) or "1024 iterations" in str(e), str(e)
+            r.ok("static for-loop: negative step is the general loop (iteration cap)")
     except Exception as e:
-        r.fail("static for-loop: negative step (empty range)", f"{e}\n{traceback.format_exc()}")
+        r.fail("static for-loop: negative step", f"{e}\n{traceback.format_exc()}")
 
     # Break inside static loop
     try:

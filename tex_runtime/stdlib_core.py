@@ -44,11 +44,24 @@ VEC_CHANNELS = frozenset((2, 3, 4))
 
 
 def _has_channel_axis(t) -> bool:
-    """True when length/distance/normalize should reduce over the last (channel)
-    dim: a standard vec (last dim in {2,3,4}), or any 4D [B,H,W,C] tensor with
-    C>1 (channels are always last for 4D) — but never a lower-rank scalar field /
-    mask whose last dim is a spatial axis."""
-    return (t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS) or (t.dim() >= 4 and t.shape[-1] > 1)
+    """True when length/distance/normalize should reduce over the last (channel) dim: a bare
+    vec `[C]` or vec array `[N,C]` (last dim in {2,3,4}), or a spatial `[B,H,W,C]` with C>1.
+    A rank-3 tensor is always a `[B,H,W]` scalar field, whose last axis is the image width,
+    so it never reduces, whatever W is."""
+    d = t.dim()
+    if d == 3:
+        return False
+    return (d >= 1 and t.shape[-1] in VEC_CHANNELS) or (d >= 4 and t.shape[-1] > 1)
+
+
+def _align_field_rank(*ts):
+    """Give every `[B,H,W]` scalar field among `ts` a trailing channel axis when another
+    operand is a `[B,H,W,C]` vector, so a mixed vec/field builtin broadcasts like the
+    operators do. Operands of equal rank, and 0-dim scalars, pass through untouched."""
+    hi = max(t.dim() for t in ts)
+    if hi < 2 or all(t.dim() == hi for t in ts):
+        return ts
+    return tuple(t.unsqueeze(-1) if t.dim() == hi - 1 and t.dim() >= 1 else t for t in ts)
 
 
 # ── Host-resolved scalars (PERF-2) ────────────────────────────────────
@@ -234,8 +247,11 @@ def _scale_pixel_arg(value, scale):
     out = value * scale
     if out.__class__ is torch.Tensor:
         hv = _host_scalar(value)
-        if hv is not None:
-            _tag_host_scalar(out, hv * scale)
+        s32 = _dtype_rounded(scale, torch.float32)   # the multiply casts the scalar to fp32
+        if hv is not None and s32 is not None:
+            # both factors are fp32-exact, so the double product is exact; round it to
+            # fp32 as the device multiply does, and the tag equals what `.item()` reads
+            _tag_host_scalar(out, _dtype_rounded(hv * s32, torch.float32))
     return out
 
 
@@ -248,6 +264,9 @@ def _host_int(x) -> int:
     exactly as before."""
     if not isinstance(x, torch.Tensor):
         return int(x)
+    if x.numel() != 1:
+        raise ValueError("this argument needs one value for the whole image, but it varies "
+                         "per pixel. Compute it once (from a $param or a constant) instead.")
     v = _host_scalar(x)
     return int(v) if v is not None else int(x.item())
 
@@ -269,6 +288,9 @@ def _scalar_from_tensor(t: torch.Tensor, fn_name: str) -> float:
     if t.numel() == 1:
         v = _host_scalar(t)
         return v if v is not None else t.reshape(()).item()
+    if t.numel() == 0:
+        raise ValueError(f"{fn_name}() received an empty tensor, which has no value to turn "
+                         "into text.")
     flat = t.reshape(-1)
     if bool(torch.all(flat == flat[0])):
         return flat[0].item()
@@ -284,8 +306,8 @@ def _scalar_from_tensor(t: torch.Tensor, fn_name: str) -> float:
     return flat.float().mean().item()
 
 # ── Sampler tensor cache ──────────────────────────────────────────────
-# Caches reusable tensors for sampling functions keyed by (B, H, W, device).
-# Avoids recreating batch index tensors and Lanczos tap offsets per call.
+# Caches reusable tensors for sampling functions (batch index tensors, Lanczos tap offsets),
+# keyed by a tag string followed by the shape and device, e.g. ("bidx", B, H, W, device).
 # Bounded via LRU eviction to prevent memory leaks in long sessions.
 _sampler_cache: _OrderedDict[tuple, torch.Tensor] = _OrderedDict()
 _SAMPLER_CACHE_MAX = 32
@@ -525,7 +547,7 @@ def _get_grid_buf(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
 # to the source tensor so it won't be garbage-collected (which would let
 # Python reuse the id for a new tensor, causing stale cache hits).
 # OrderedDict gives LRU eviction to bound memory.
-_mip_cache: _OrderedDict[int, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
+_mip_cache: _OrderedDict[tuple, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
 _gauss_mip_cache: _OrderedDict[tuple, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
 _gauss_kernel_cache: _OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = _OrderedDict()
 _GAUSS_KERNEL_MAX_ENTRIES = 64  # max cached kernel pairs (tiny GPU tensors)
@@ -564,8 +586,7 @@ class _CacheBudget:
     `OrderedDict` (COMPILE-A's warm_call thread vs. a cook thread, or the aiohttp
     `/tex_wrangle/free_caches` route vs. either) corrupts the dict's internal state --
     reproduced as a hard access-violation crash pinned at `evict_oldest`'s
-    `cache.popitem` racing `clear`'s `cache.clear()` (B3 cache-seam finding K1;
-    `tests/test_cacheseam46_thread_stress.py`). One lock per cache (not a single global
+    `cache.popitem` racing `clear`'s `cache.clear()` (cache-seam finding K1). One lock per cache (not a single global
     lock across all five) keeps an unrelated cache's traffic from ever blocking this
     one's -- `BUDGET_TRACKED_CACHES` already pairs each cache with exactly one
     `_CacheBudget`, so no other object ever mutates this dict.
@@ -579,11 +600,18 @@ class _CacheBudget:
         self.lock = _threading.RLock()
 
     def _measure(self, entry) -> tuple:
-        total, dev = 0, None
+        total, dev, seen = 0, None, set()
         try:
             for t in self.extract(entry):
                 if isinstance(t, torch.Tensor):
-                    total += t.untyped_storage().nbytes()
+                    st = t.untyped_storage()
+                    # views of one storage (a pyramid's level 0 is a permute of the source
+                    # image it caches) are one allocation, counted once
+                    ptr = st.data_ptr()
+                    if ptr in seen and ptr:
+                        continue
+                    seen.add(ptr)
+                    total += st.nbytes()
                     if dev is None:
                         dev = t.device.type
         except Exception:
@@ -1153,8 +1181,8 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     # replicated row, and any mismatch in what value gets replicated becomes a
     # systematic, image-wide bias after a highlight-compressing tone curve amplifies
     # it (measured: a mean signed shift up to +12 codes on a scattered-highlight
-    # plate at sigma=1024, cap=8 -- see docs/resolution-scale.md). `_edge_strip`
-    # downsamples the border ONLY along the axis parallel to it (never mixing in the
+    # plate at sigma=1024, cap=8 -- see docs/resolution-scale.md). The four edge strips
+    # below downsample the border ONLY along the axis parallel to it (never mixing in the
     # perpendicular, into-the-image direction `reduced`'s own 2-D downsample does),
     # giving the true edge value at the coarse resolution -- cost is O(H)+O(W), not
     # O(sigma) or O(image area), so this stays on the flat-cost budget.
@@ -1351,24 +1379,27 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     # and the per-pixel general path always uses the tensor clamp regardless.
     lod_host = _host_scalar(lod_t) if lod_t.dim() == 0 else None
     if lod_host is not None:
-        lod_host = min(max(lod_host, 0.0), float(max_level))
-    lod_t = lod_t.clamp(0.0, float(max_level))
+        # a NaN level of detail reads as level 0, like a NaN coordinate lands on a valid pixel
+        lod_host = 0.0 if lod_host != lod_host else min(max(lod_host, 0.0), float(max_level))
+    lod_t = torch.nan_to_num(lod_t, nan=0.0).clamp(0.0, float(max_level))
 
     B, H, W, C = img.shape
 
-    # Detect identity UV (standard pixel grid) by checking corner values.
-    # When identity, use F.interpolate instead of grid_sample (avoids grid read).
+    # u and v may differ in rank (a per-pixel u with a scalar v): give both the joint shape.
+    if u.shape != v.shape:
+        joint = torch.broadcast_shapes(u.shape, v.shape)
+        u, v = u.expand(joint), v.expand(joint)
+
+    # Detect identity UV (standard pixel grid): EVERY texel of u and v must match the
+    # pixel ramp. When identity, use F.interpolate instead of grid_sample (avoids the grid
+    # read). A corner probe is not enough -- a warp that fixes the corners is still a warp.
+    # One max-abs reduction and ONE GPU->CPU sync (this runs inside sampling loops).
     identity_uv = False
     if u.dim() == 3 and u.shape == (B, H, W) and H > 1 and W > 1:
-        # Identity UV: u[0,0,0]=0, u[0,0,W-1]=1, v[0,0,0]=0, v[0,H-1,0]=1.
-        # Batch the four corner probes into ONE GPU->CPU sync instead of four
-        # (each .item() forces a sync; this runs inside sampling loops).
-        c0u, c1u, c0v, c1v = torch.stack(
-            [u[0, 0, 0], u[0, 0, -1], v[0, 0, 0], v[0, -1, 0]]
-        ).tolist()
-        if (abs(c0u) < 1e-5 and abs(c1u - 1.0) < 1e-5
-                and abs(c0v) < 1e-5 and abs(c1v - 1.0) < 1e-5):
-            identity_uv = True
+        ramp_u = torch.arange(W, dtype=torch.float32, device=u.device).div_(W - 1).view(1, 1, W)
+        ramp_v = torch.arange(H, dtype=torch.float32, device=v.device).div_(H - 1).view(1, H, 1)
+        dev = torch.maximum((u - ramp_u).abs().amax(), (v - ramp_v).abs().amax())
+        identity_uv = dev.item() < 1e-5
 
     if identity_uv:
         out_size = (H, W)

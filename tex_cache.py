@@ -59,9 +59,13 @@ _R_DIR = Path(__file__).parent / "tex_runtime"
 # AST pipeline — a change alters the parsed/optimized program (the .pkl).
 _AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py",
               _C_DIR / "type_checker.py", _C_DIR / "optimizer.py",
-              _C_DIR / "stdlib_signatures.py"]
+              _C_DIR / "stdlib_signatures.py", _C_DIR / "types.py",
+              # The fused-chain splicer builds the AST that `compile_fused` stores in the same
+              # .pkl tier, so a splicer fix must retire those entries as well as the .cg.
+              Path(__file__).parent / "tex_fusion.py"]
 # Codegen / interpreter — a change alters emitted code or interpreter semantics (the .cg).
-# CT-1: tex_fusion is here — a splicer change must invalidate fused .cg entries too.
+# CT-1: tex_fusion is in the AST list above; the CODEGEN epoch nests it, so fused .cg entries
+# are retired with it.
 # LANG-L5: `masked_flow.py` and `codegen_masked.py` are here for the same reason the two
 # above them are — they are the language-0.25 halves of the interpreter's semantics and of
 # the emitter, so an edit to either changes what a flagged program computes and must not
@@ -86,7 +90,7 @@ _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "co
                   _R_DIR / "stdlib.py", _R_DIR / "stdlib_core.py", _R_DIR / "stdlib_math.py",
                   _R_DIR / "stdlib_color.py", _R_DIR / "stdlib_sample.py", _R_DIR / "stdlib_noise.py",
                   _R_DIR / "stdlib_sdf.py", _R_DIR / "stdlib_string.py", _R_DIR / "stdlib_array.py",
-                  _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py",
+                  _R_DIR / "noise.py", _R_DIR / "stdlib_registry.py",
                   _R_DIR / "masked_flow.py", _R_DIR / "codegen_masked.py",
                   # CG-1: the STR-7 split's other two emitters. `codegen_stencil.py` owns the whole
                   # stencil detection-and-lowering route, so an edit there changes emitted code.
@@ -545,7 +549,8 @@ class TEXCache:
                   assigned_bindings or {}, param_declarations or {},
                   used_builtins or frozenset())
         self._memory_put(fp, result)
-        self._save_to_disk(fp, program, binding_types)
+        self._save_to_disk(fp, program, binding_types,
+                           referenced_bindings, assigned_bindings, param_declarations)
 
     def compile_tex(
         self, code: str, binding_types: dict[str, TEXType], *, fp: str | None = None
@@ -694,14 +699,20 @@ class TEXCache:
         # is unaffected.
         sign_pickle(str(path), data)
 
-    def _save_to_disk(self, fp: str, program: Any, binding_types: dict[str, TEXType]):
-        """Persist compilation artifacts to disk."""
+    def _save_to_disk(self, fp: str, program: Any, binding_types: dict[str, TEXType],
+                      referenced: Any = None, assigned: Any = None, params: Any = None):
+        """Persist compilation artifacts to disk. The referenced/assigned/param sets are the
+        FIRST checker's (pre-optimization), so a warm disk hit answers exactly what the cold
+        compile did; the optimized AST cannot reproduce them (dead code is gone)."""
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             data = {
                 "version": _AST_EPOCH,          # CACHE-4: .pkl gated by the AST epoch only
                 "program": program,
                 "binding_types": {k: v.value for k, v in binding_types.items()},
+                "sets": None if referenced is None else (
+                    set(referenced), {k: v.value for k, v in (assigned or {}).items()},
+                    dict(params or {})),
                 "timestamp": time.time(),
             }
             self._atomic_pickle(self._disk_path(fp), data)
@@ -744,6 +755,10 @@ class TEXCache:
                 return None
 
             program = data["program"]
+            sets = data.get("sets")
+            if sets is None:                         # written before the sets were persisted
+                path.unlink(missing_ok=True)
+                return None
 
             # Re-run type checker to regenerate type_map with valid id() keys.
             # The stored program is already optimized, so use lenient redeclare
@@ -757,8 +772,9 @@ class TEXCache:
             os.utime(path, None)
 
             from .tex_runtime.interpreter import _collect_identifiers
-            return (program, type_map, checker.referenced_bindings,
-                    checker.assigned_bindings, checker.param_declarations,
+            referenced, assigned, params = sets
+            return (program, type_map, set(referenced),
+                    {k: TEXType(v) for k, v in assigned.items()}, dict(params),
                     _collect_identifiers(program))
         except Exception as e:
             logger.warning("[TEX] Disk cache load failed for %s…: %s", fp[:12], e)

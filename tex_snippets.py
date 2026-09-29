@@ -101,8 +101,14 @@ def save_user_snippets(snippets) -> bool:
         from .tex_recovery import bounded_mkstemp
         fd, tmp = bounded_mkstemp(dir=d, prefix=".snip_", suffix=".tmp")
         try:
+            text = json.dumps(clean, indent=2, ensure_ascii=False)
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                # A lone surrogate cannot be written as UTF-8; \u-escape this save only.
+                text = json.dumps(clean, indent=2, ensure_ascii=True)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(clean, f, indent=2, ensure_ascii=False)
+                f.write(text)
             os.replace(tmp, p)
             return True
         except Exception:

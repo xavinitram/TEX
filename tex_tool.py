@@ -671,7 +671,10 @@ def _read_capped(path: str) -> str:
         raw = fh.read(MAX_TOOL_BYTES + 1)
     if len(raw) > MAX_TOOL_BYTES:
         raise TEXToolError(f"'{path}' exceeds the {MAX_TOOL_BYTES}-byte limit")
-    return raw.decode("utf-8")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise TEXToolError(f"'{path}' is not valid UTF-8: {e}")
 
 
 # ── type inference for a tool's bindings (shared by preflight + warm keys) ─────────
@@ -1143,7 +1146,8 @@ def load_all_tools(dir: str | None = None) -> list[dict]:
             continue
         try:
             summary = tool_summary(load_tool(path))
-        except TEXToolError as e:
+        except (TEXToolError, OSError, ValueError, RecursionError) as e:
+            # One unreadable, vanished or hostile file must not abort the whole palette.
             summary = {"name": os.path.basename(path), "error": str(e)}
         if key is not None:
             _SUMMARY_CACHE[path] = (key, summary)

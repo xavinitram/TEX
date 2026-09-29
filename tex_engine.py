@@ -994,6 +994,9 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
 
     if ctx.fused_chain or ctx.latent_channel_count or not str(ctx.device).startswith("cuda"):
         return None            # rung 2 is strip tiling; these are the shapes it can't tile
+    if ctx.scale is not None and ctx.scale != 1.0:
+        return None            # the tiled re-cook does not carry the scale: it would return the
+        #                        unscaled picture as if it were this cook's answer
     try:
         from .tex_memory import (is_tile_safe_cached, shared_tile_height, run_tiled,
                                  shared_tile_width, run_tiled_halo)

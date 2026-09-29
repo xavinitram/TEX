@@ -292,10 +292,12 @@ def _load_fused_from_disk(memo_key: tuple):
         return None
 
 
-def _save_fused_to_disk(memo_key: tuple, fused_program, binding_types) -> None:
+def _save_fused_to_disk(memo_key: tuple, fused_program, binding_types,
+                        refs, asg, params) -> None:
     try:
         from .tex_cache import get_cache
-        get_cache()._save_to_disk(_fused_fp(memo_key), fused_program, binding_types)
+        get_cache()._save_to_disk(_fused_fp(memo_key), fused_program, binding_types,
+                                  refs, asg, params)
     except Exception:
         pass  # best-effort; a miss just recompiles next restart
 
@@ -601,6 +603,13 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                              value=A.Identifier(name=wire_map[name]))
                 for name in sorted(wire_map) if name in passthrough
             ]
+            # The same holds for a NON-chain external the terminal also assigns: it stays bare
+            # (passthrough) yet the value lives under the stage-prefixed key, so seed from that.
+            rmw_seeds += [
+                A.Assignment(op="=", target=A.BindingRef(kind="wire", name=name),
+                             value=A.BindingRef(kind="wire", name=_user_prefix(prefix) + name))
+                for name in sorted(ext) if name in passthrough and name not in wire_map
+            ]
             prog.statements[:0] = rmw_seeds
         if seedless_idx is not None:
             # _transform rewrote `@OUT = expr` to `Assignment(Identifier(out_local) = expr)`;
@@ -691,7 +700,7 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     _FUSED_MEMO[memo_key] = result
     while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
         _FUSED_MEMO.popitem(last=False)
-    _save_fused_to_disk(memo_key, fused, binding_types)  # CT-1 persist
+    _save_fused_to_disk(memo_key, fused, binding_types, refs, asg, params)  # CT-1 persist
     return (*result, merged_bindings)
 
 

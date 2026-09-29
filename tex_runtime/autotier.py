@@ -79,6 +79,10 @@ class _KeyState:
 
 
 _STATE: "OrderedDict[tuple, _KeyState]" = OrderedDict()
+# Keys whose current verdict was recorded with persist=False: a fact about this process only.
+# `_persist` rewrites the whole table, so without this set the next durable verdict would
+# carry them to disk anyway.
+_NON_DURABLE: set = set()
 
 
 def _median(xs) -> float:
@@ -123,7 +127,7 @@ def _get(key: tuple) -> _KeyState:
         st = _KeyState()
         _STATE[key] = st
         while len(_STATE) > _STATE_MAX:
-            _STATE.popitem(last=False)
+            _NON_DURABLE.discard(_STATE.popitem(last=False)[0])
     else:
         _STATE.move_to_end(key)
     return st
@@ -190,6 +194,16 @@ def mark_submitted(key: tuple) -> None:
     st.state = COMPILING
 
 
+def reopen(key: tuple) -> None:
+    """A COMMITTED verdict whose compiled artifact is gone (restart, eviction): measure and
+    compile again. `mark_ready` cannot do this — it only moves COMPILING to TRIAL."""
+    st = _get(key)
+    if st.state == COMMITTED:
+        st.state = MEASURING
+        st.submitted = False
+        st.ready_wall = None
+
+
 def mark_ready(key: tuple) -> None:
     """The background compile finished and the fn is cached — trial it next."""
     st = _get(key)
@@ -219,13 +233,17 @@ def record_trial(key: tuple, compiled_ms: float | None, *, persist: bool = True)
         # im == 0 (no interp samples) should not happen; be conservative.
         st.state = COMMITTED if (im > 0 and cm < _COMMIT_RATIO * im) else REJECTED
     if persist:
+        _NON_DURABLE.discard(key)
         _persist()
+    else:
+        _NON_DURABLE.add(key)
     return st.state
 
 
 def reset() -> None:
     """Test hook: drop all in-memory verdicts."""
     _STATE.clear()
+    _NON_DURABLE.clear()
 
 
 # ── Persistence: terminal verdicts survive restarts (with PC-2, a COMMITTED
@@ -308,7 +326,8 @@ def _persist() -> None:
             {"key": list(key), "verdict": st.state,
              "interp_ms": round(_median(st.interp_ms), 4),
              "compiled_ms": round(_median(st.compiled_ms), 4) if st.compiled_ms else None}
-            for key, st in _STATE.items() if st.state in (COMMITTED, REJECTED)
+            for key, st in _STATE.items()
+            if st.state in (COMMITTED, REJECTED) and key not in _NON_DURABLE
         ]
         # ENG-13: the shared atomic write, but NOT fsynced. Two reasons, both specific to
         # this file. (1) `record_trial` runs on the COOK THREAD (compiled.run_auto), so an
@@ -332,6 +351,7 @@ def _reset_for_test() -> None:
     directory it saw first for the whole one-process suite run."""
     global _loaded, _persist_path_cache
     _STATE.clear()
+    _NON_DURABLE.clear()
     _loaded = False
     _persist_path_cache = None
 

@@ -262,7 +262,7 @@ def test_g4_test_module_refs_reads_an_import_inside_a_string_literal(r: SubTestR
         with open(path, "w", encoding="utf-8") as f:
             f.write(src)
         refs = g._test_module_refs(path)
-    want = {"tex_engine", "tex_runtime", "tex_memory"}
+    want = {"tex_engine", "tex_runtime", "tex_runtime.compiled", "tex_memory"}
     if refs != want:
         r.fail("G4 string-literal import match", f"got {sorted(refs)}, want {sorted(want)}")
     else:
@@ -368,7 +368,7 @@ def test_g5_prune_is_wired_into_a_gate_run(r: SubTestResult):
         g._prune_inductor_cache_root = orig_prune
         g._importable_as_tex_wrangle = orig_importable
     if calls:
-        r.fail("G5 wiring", "main() must refuse (rc 2) BEFORE pruning, but pruning ran anyway")
+        r.fail("G5 wiring", "main() must refuse (rc 1) BEFORE pruning, but pruning ran anyway")
     # Now let main() actually reach the pruning call, with a fake (non-spawning) cheap leg
     # standing in for the real one, and the verdict cache redirected to a scratch file so
     # this test writes no entry into the box's real gate cache.

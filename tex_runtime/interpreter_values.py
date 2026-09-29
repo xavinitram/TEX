@@ -56,6 +56,17 @@ def _const_index(index_node, size: int) -> int | None:
     return None
 
 
+def _list_index(v, size: int) -> int:
+    """Floor+clamp a runtime index into a string array (a Python list); NaN reads 0.
+    Codegen's emitted string-array read spells the same rule inline."""
+    v = float(v)
+    if not v >= 0.0:
+        return 0
+    if v >= size:
+        return max(size - 1, 0)
+    return int(math.floor(v))
+
+
 def _host_index(index: torch.Tensor, size: int) -> int | None:
     """Floor+clamp a RUNTIME index using the host reading it carries (TRK-68), or None
     when it has none — the runtime-scalar counterpart to `_const_index`'s compile-time
@@ -67,7 +78,8 @@ def _host_index(index: torch.Tensor, size: int) -> int | None:
     if index.__class__ is not torch.Tensor or index.dim() != 0:
         return None
     v = _host_scalar(index)
-    if v is None:
+    if v is None or not math.isfinite(v):
+        # NaN/Inf: hand back to the caller's device-side floor+clamp, which never raises.
         return None
     return max(0, min(int(math.floor(v)), size - 1))
 
@@ -170,6 +182,17 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
                 b = torch.nn.functional.pad(b, (0, ac - bc))
         return a, b
 
+    # A bare uniform vec `[C]` (e.g. `sincos(0.5)`) carries its channel axis LAST, like a
+    # vec field `[B,H,W,C]` does, so against one it broadcasts as is; against a scalar field
+    # `[B,H,W]` the field takes the channel axis.
+    if (ad == 1 and a.shape[-1] in VEC_CHANNELS) or (bd == 1 and b.shape[-1] in VEC_CHANNELS):
+        if ad == 1 and bd == 3:
+            b = b.unsqueeze(-1)
+        elif bd == 1 and ad == 3:
+            a = a.unsqueeze(-1)
+        if ad >= 4 or bd >= 4 or ad == 3 or bd == 3:
+            return a, b
+
     # A bare [N,N] matrix's axes are TRAILING (right-aligned), unlike a scalar
     # field whose spatial axes are LEADING. Handle every bare-matrix pairing
     # explicitly, building a common [<spatial>, N, N] — appending trailing
@@ -220,20 +243,12 @@ def _tensor_where(cond: torch.Tensor, then_val: torch.Tensor, else_val: torch.Te
     return torch.where(cond, then_val, else_val)
 
 
-# RT-b (v0.43): the single ingest-event fence helper. Was duplicated — this exact body in
-# `compiled.py`, and an inline hand-rolled equivalent (detect-during-the-binding-loop,
-# record-after-builtins) right here in `_execute_inner`. Moved here (compiled.py already
-# imports names from this module, so this introduces no new import cycle) and both call
-# shapes now call this one function. Same record-on-H2D detection, same `.synchronize()`
-# fence, same stream — `compiled.py` calls it immediately after its own bindings are made
-# contiguous (unchanged), and `_execute_inner` calls it once the binding loop has already
-# enqueued every H2D copy (also unchanged) — recording an event any time after those
-# copies are enqueued correctly bounds their completion, since a CUDA stream is FIFO; only
-# recording BEFORE they are all enqueued would be wrong, and neither call site does that.
-# `_execute_inner` keeps its own cheap `async_ingest` flag (the detect half of the old
-# inline code) purely to GATE this call, so a cook with nothing pinned skips this helper's
-# scan instead of re-walking every binding a second time; the helper itself is still the
-# only place that does the detecting+recording, so there is one implementation, not two.
+# The single ingest-event fence helper. `compiled.py` calls it right after making its bindings
+# contiguous and `_execute_inner` calls it once its binding loop has enqueued every H2D copy;
+# recording any time after the copies are enqueued bounds their completion (a CUDA stream is
+# FIFO), and only recording BEFORE they were all enqueued would be wrong. `_execute_inner`
+# keeps a cheap `async_ingest` flag purely to gate the call, so a cook with nothing pinned
+# skips the helper's scan.
 def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
     """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
     an event AT THE COPY POINT on the stream. The caller synchronizes it before

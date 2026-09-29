@@ -85,13 +85,19 @@ class _SpatialContextMixin:
         key = (self._device_str, size)
         hit = self._coord_ramp_lru.get(key)
         if hit is not None:
-            self._coord_ramp_lru.move_to_end(key)
+            try:
+                self._coord_ramp_lru.move_to_end(key)
+            except KeyError:      # a memory sweep on another thread emptied the LRU meanwhile
+                pass
             return hit
         ramp = torch.arange(0, max(size, 0), dtype=torch.float32, device=self.device)
         norm = ramp / max(size - 1, 1)
         self._coord_ramp_lru[key] = (ramp, norm)
         if len(self._coord_ramp_lru) > _COORD_RAMP_LRU_MAX:
-            self._coord_ramp_lru.popitem(last=False)
+            try:
+                self._coord_ramp_lru.popitem(last=False)
+            except KeyError:
+                pass
         return ramp, norm
 
     def _create_builtins(self, program: Program,
@@ -123,7 +129,10 @@ class _SpatialContextMixin:
                      self.latent_channel_count, tile, roi, batch_slice)
         hit = self._builtins_lru.get(cache_key)
         if hit is not None:
-            self._builtins_lru.move_to_end(cache_key)
+            try:
+                self._builtins_lru.move_to_end(cache_key)
+            except KeyError:      # a memory sweep on another thread emptied the LRU meanwhile
+                pass
             self.env.update(hit)
             self._set_time_builtins(used)   # ENG-7: never cached — see _TIME_BUILTIN_NAMES
             return
@@ -222,7 +231,10 @@ class _SpatialContextMixin:
         self._builtins_lru[cache_key] = {k: v for k, v in self.env.items()
                                          if k in _CACHEABLE_BUILTIN_NAMES}
         while len(self._builtins_lru) > _BUILTINS_LRU_MAX:
-            self._builtins_lru.popitem(last=False)
+            try:
+                self._builtins_lru.popitem(last=False)
+            except KeyError:
+                break
         self._set_time_builtins(used)
 
     def _set_time_builtins(self, used: frozenset[str]) -> None:

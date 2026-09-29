@@ -9,6 +9,7 @@ directly, unless registering only this domain is what you want.
 """
 from __future__ import annotations
 import hashlib
+import math
 import re
 import torch
 from .stdlib_registry import stdlib
@@ -18,10 +19,30 @@ from .stdlib_core import (
 )
 
 
+# Names Windows reserves for devices, with or without an extension.
+_RESERVED_FILE_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
+
+
+def _short_float(v: float) -> float:
+    """`v` at 6 significant digits, so a float32 value prints as the number that was typed
+    (0.1, not 0.10000000149011612)."""
+    return float(f"{v:.6g}")
+
+
 class _StdlibString:
     """string builtins: the `fn_*` methods `stdlib.py` mixes into `TEXStdlib`."""
 
     # -- String functions -----------------------------------------------
+
+    @staticmethod
+    def _number_text(v: float) -> str:
+        """A whole finite number prints as an int, any other at 6 significant digits;
+        NaN/Inf print as 'nan'/'inf'."""
+        if not math.isfinite(v):
+            return str(v)
+        return str(int(v)) if v == int(v) else str(_short_float(v))
 
     @stdlib("str", sig='str(x) \\u2192 string', category='Strings', doc='Convert a number to a string.', ex='string s = str(42);')
     @staticmethod
@@ -30,17 +51,14 @@ class _StdlibString:
         if isinstance(x, str):
             return x
         if isinstance(x, torch.Tensor):
-            v = _scalar_from_tensor(x, "str")
-            return str(int(v)) if v == int(v) else str(v)
+            return _StdlibString._number_text(_scalar_from_tensor(x, "str"))
         return str(x)
 
     @stdlib("len", sig='len(x) \\u2192 float', category='Strings', doc='Length of a string, array, or vec-array (element count).', ex='float n = len("hello");')
     @staticmethod
     def fn_len(s) -> torch.Tensor:
         """String length, array length, or vec array element count -> float tensor."""
-        if isinstance(s, str):
-            return torch.scalar_tensor(float(len(s)), dtype=torch.float32)
-        if isinstance(s, list):
+        if isinstance(s, (str, list)):
             return torch.scalar_tensor(float(len(s)), dtype=torch.float32)
         if isinstance(s, torch.Tensor):
             # Vec array [B,H,W,N,C] or [N,C]: element count is dim -2
@@ -122,10 +140,10 @@ class _StdlibString:
         """Extract substring. start is 0-based index."""
         if not isinstance(s, str):
             raise ValueError("substr() expects a string first argument")
-        start_i = _host_int(start)
+        # A negative start or length clamps to 0 (like char_at, nothing wraps from the end).
+        start_i = max(0, _host_int(start))
         if length is not None:
-            len_i = _host_int(length)
-            return s[start_i:start_i + len_i]
+            return s[start_i:start_i + max(0, _host_int(length))]
         return s[start_i:]
 
     @stdlib("to_int", sig='to_int(s) \\u2192 int', category='Strings', doc='Parse a string as an integer.', ex='int n = to_int("42");')
@@ -158,7 +176,12 @@ class _StdlibString:
             raise ValueError("sanitize_filename() expects a string argument")
         cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', s)
         cleaned = cleaned.strip('. ')
-        return cleaned if cleaned else "unnamed"
+        if not cleaned:
+            return "unnamed"
+        # a Windows device name (CON, nul.png, ...) would open the device, not a file
+        if cleaned.split('.')[0].rstrip().upper() in _RESERVED_FILE_STEMS:
+            return "_" + cleaned
+        return cleaned
 
     @stdlib("split", sig='split(s, sep) \\u2192 string[]', category='Strings', doc='Split string into array by separator.', ex='string parts[4] = split(s, ",");')
     @staticmethod
@@ -231,10 +254,10 @@ class _StdlibString:
             if isinstance(a, torch.Tensor):
                 v = _scalar_from_tensor(a, "format")
                 # Round to 6 significant digits to counteract float32 noise
-                if v == int(v):
+                if math.isfinite(v) and v == int(v):
                     converted.append(int(v))
                 else:
-                    converted.append(float(f"{v:.6g}"))
+                    converted.append(_short_float(v))
             else:
                 converted.append(a)
         try:
@@ -319,17 +342,14 @@ class _StdlibString:
             raise ValueError("hash_int() expects a string first argument")
         h = hashlib.sha256(s.encode("utf-8")).digest()
         value = int.from_bytes(h[:8], "big")
-        if max_val is not None:
-            m = _host_int(max_val)
-            if m > 0:
-                value = value % m
-                if m <= 2**24:
-                    # Modulo already bounds the value within float32's exact-int
-                    # range — don't clamp it down and break the [0, max_val) contract.
-                    return torch.scalar_tensor(float(value), dtype=torch.float32)
-        # No max_val (or a range beyond float32's exact-int range): clamp so the
-        # value stays exactly representable as float32.
-        value = min(value, 2**24 - 1)
+        m = _host_int(max_val) if max_val is not None else 0
+        if 0 < m <= 2**24:
+            value = value % m
+        else:
+            # No usable max_val (absent, <= 0, or beyond float32's exact-int range): fold
+            # the hash into [0, 2**24) so it stays exactly representable AND still varies
+            # per string (a min() clamp would return one constant for nearly every input).
+            value = value % 2**24
         return torch.scalar_tensor(float(value), dtype=torch.float32)
 
     @stdlib("char_at", sig='char_at(s, idx) \\u2192 string', category='Strings', doc='Character at index (0-based).', ex='string c = char_at(s, 0);')

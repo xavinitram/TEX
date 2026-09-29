@@ -615,11 +615,11 @@ _iter_child_nodes = _ast_iter_child_nodes
 
 
 def _collect_reassigned_bindings(program: Program) -> set[str]:
-    """Binding names REBOUND via `@name = ...` or `@name.ch = ...` anywhere in
-    the program (loop/if/function bodies included). Rebinding replaces the
-    _bind entry with a new tensor, so a hoisted BCHW permute view of it goes
-    stale. In-place scatter writes (`@name[x, y] = ...`) mutate through shared
-    storage and stay coherent with the view, so they are not collected.
+    """Binding names REBOUND via `@name = ...`, `@name.ch = ...` or a scatter
+    write `@name[x, y] = ...` anywhere in the program (loop/if/function bodies
+    included). Each replaces the _bind entry with a new tensor — a scatter does
+    so on its first write, by the copy-on-write clone (or the fresh buffer for a
+    binding it widens) — so a hoisted BCHW permute view of it goes stale.
     """
     names: set[str] = set()
     stack: list[ASTNode] = list(program.statements)
@@ -631,6 +631,8 @@ def _collect_reassigned_bindings(program: Program) -> set[str]:
                 names.add(t.name)
             elif isinstance(t, ChannelAccess) and isinstance(t.object, BindingRef):
                 names.add(t.object.name)
+            elif isinstance(t, BindingIndexAccess) and isinstance(t.binding, BindingRef):
+                names.add(t.binding.name)
         stack.extend(_iter_child_nodes(node))
     return names
 
@@ -688,6 +690,11 @@ def _body_has_break_continue(stmts: list[ASTNode], kinds=(BreakStmt, ContinueStm
     return False
 
 
+
+
+def _is_zero_literal(node: ASTNode | None) -> bool:
+    """True iff `node` is the literal 0 (a counter provably entering a nest at zero)."""
+    return isinstance(node, NumberLiteral) and node.value == 0
 
 
 def _resolve_through_locals(expr: ASTNode, local_defs: dict[str, ASTNode]) -> ASTNode:
@@ -826,9 +833,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._var_vec_type: dict[str, TEXType] = {}
         # Hoisted BCHW images for inline sample(): binding_name → (bchw_var, grid_var).
         # Cross-loop reuse is only safe for bindings that are never REBOUND:
-        # `@A = ...` / `@A.ch = ...` emit `_bind[name] = ...`, which stales the
-        # hoisted permute view. _hoist_sample_setup skips _reassigned_bindings;
-        # in-place scatter writes share storage with the view and stay coherent.
+        # `@A = ...` / `@A.ch = ...` / `@A[x, y] = ...` all replace `_bind[name]`
+        # (a scatter by its copy-on-write clone), which stales the hoisted permute
+        # view. _hoist_sample_setup skips _reassigned_bindings.
         self._hoisted_bchw: dict[str, tuple[str, str]] = {}
         # Bindings rebound anywhere in the program (set by emit_program).
         self._reassigned_bindings: set[str] = set()
@@ -955,13 +962,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         px_tmp = self._tmp()
         py_tmp = self._tmp()
         if dx_code == "0":
-            self._emit(f"{px_tmp} = {ix_ref}.clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{px_tmp} = {ix_ref}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
         else:
-            self._emit(f"{px_tmp} = ({ix_ref} + {dx_code}).clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{px_tmp} = ({ix_ref} + {dx_code}).clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
         if dy_code == "0":
-            self._emit(f"{py_tmp} = {iy_ref}.clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{py_tmp} = {iy_ref}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
         else:
-            self._emit(f"{py_tmp} = ({iy_ref} + {dy_code}).clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{py_tmp} = ({iy_ref} + {dy_code}).clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
         tmp = self._tmp()
         self._emit(f"{tmp} = {img_var}[:, {py_tmp}, {px_tmp}, :]"
                    f" if {px_tmp}.dim() < 3"
@@ -1415,7 +1422,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # String arrays are Python lists
         self._emit(f"if isinstance({arr}, list):")
         self._indent += 1
-        self._emit(f"{tmp} = {arr}[max(0, min(int(round({idx}.item() if _torch.is_tensor({idx}) else float({idx}))), len({arr}) - 1))]")
+        # floor+clamp, NaN -> 0: the spelling of interpreter_values._list_index
+        iv = self._tmp()
+        self._emit(f"{iv} = float({idx}.item() if _torch.is_tensor({idx}) else {idx})")
+        self._emit(f"{tmp} = {arr}[0 if not {iv} >= 0.0 else (max(len({arr}) - 1, 0) if {iv} >= len({arr}) else int(_math.floor({iv})))]")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1715,18 +1725,36 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._use_native_flow_control = False
         saved_scalar_loop = self._scalar_loop
         self._scalar_loop = False
+        saved_hoists, saved_inits = self._enter_function_scope(stmt, body_vars)
 
         for s in stmt.body:
             self._emit_stmt(s)
 
         # Default return if no explicit return
         self._emit(f"return _torch.scalar_tensor(0.0, dtype=_torch.float32, device=_dev)")
+        self._hoisted_bchw = saved_hoists
+        self._var_initializers = saved_inits
         self._scalar_loop = saved_scalar_loop
         self._use_native_flow_control = saved_native_flow
         self._in_user_function = saved_in_fn
         self._local_vars = saved_locals
         self._spatial_vars = saved_spatial_vars
         self._indent -= 1
+
+    def _enter_function_scope(self, stmt: FunctionDef, body_vars: set[str]):
+        """Scope the two emit-time memos a function body would otherwise leak.
+
+        A sample hoist made in the body binds temps local to the emitted `def`; left in
+        `_hoisted_bchw`, a later top-level loop skips its own hoist and references them
+        (NameError). The body's parameters and locals shadow outer names, so their
+        outer `_var_initializers` entries must not resolve inside it, and the body's own
+        entries must not resolve outside it (a folded direct fetch of the wrong
+        coordinate). Returns the saved pair for the caller to restore."""
+        saved_hoists, saved_inits = self._hoisted_bchw, self._var_initializers
+        shadowed = body_vars | {pname for _, pname in stmt.params}
+        self._hoisted_bchw = {}
+        self._var_initializers = {k: v for k, v in saved_inits.items() if k not in shadowed}
+        return saved_hoists, saved_inits
 
     def _emit_return_stmt(self, stmt: ReturnStmt):
         """Emit a return statement inside a user function."""
@@ -1763,7 +1791,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 # scatter must clone again (mirrors interpreter disown-on-rebind).
                 self._emit(f"_scat_owned.discard({target.name!r})")
         elif isinstance(target, ChannelAccess):
-            self._emit_channel_assign(target, value_expr)
+            self._emit_channel_assign(target, value_expr, stmt.value)
         elif isinstance(target, ArrayIndexAccess):
             self._emit_array_index_assign(target, value_expr)
         elif isinstance(target, BindingIndexAccess):
@@ -1771,7 +1799,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         else:
             raise _Unsupported(f"Unsupported assignment target: {type(target).__name__}")
 
-    def _emit_channel_assign(self, target: ChannelAccess, value_expr: str):
+    def _emit_channel_assign(self, target: ChannelAccess, value_expr: str, rhs_node=None):
         channels = target.channels
         # Spatial-scalar disambiguation is the interpreter's job: `m.r = v` on a channel-less
         # [B,H,W] base means `m = v`, not a `[..., 0]` column write. Bail for a single-channel
@@ -1805,8 +1833,15 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 raise _Unsupported(f"Invalid swizzle: {channels}")
             val_tmp = self._tmp()
             self._emit(f"{val_tmp} = _es({value_expr}, {tmp}.shape[:-1])")
-            multi_flag = self._tmp()
-            self._emit(f"{multi_flag} = {val_tmp}.dim() >= 1 and {val_tmp}.shape[-1] > 1")
+            # Same rule as the interpreter: the RHS's static type decides, never shape[-1]
+            # (a scalar field is `[B,H,W]`, so its last axis is W).
+            rhs_t = self.type_map.get(id(rhs_node)) if rhs_node is not None else None
+            if rhs_t is not None:
+                multi_flag = f"({val_tmp}.dim() >= 1)" if rhs_t.is_vector else "False"
+            else:
+                multi_flag = self._tmp()
+                self._emit(f"{multi_flag} = {val_tmp}.dim() >= 1 and {val_tmp}.shape[-1] > 1 "
+                           f"and {val_tmp}.dim() >= {tmp}.dim()")
             for i, idx in enumerate(indices):
                 self._emit(f"{tmp}[..., {idx}] = {val_tmp}[..., {i}] if {multi_flag} else {val_tmp}")
 
@@ -1844,6 +1879,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # (const/range/vec/kernel/fn/param) already dominate the whole function
         # and need no such scoping.
         hoist_snap = dict(self._hoisted_bchw)
+        # Ownership is emit-time state and every body below is emitted more than once
+        # (then/else, and again on the per-pixel path). A write that claimed a name in one
+        # emission never ran on the path of the next, so each starts from the pre-if set;
+        # otherwise a later emission writes in place through an alias (`vec4 d = c;`) or
+        # into an input binding.
+        owned_snap = set(self._owned)
 
         if self._scalar_loop:
             # Scalar-mode loops (_is_scalar_body) guarantee every value in the
@@ -1854,6 +1895,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"if float({cond_tmp}) > 0.5:")
             self._indent += 1
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             if stmt.then_body:
                 for s in stmt.then_body:
                     self._emit_stmt(s)
@@ -1864,6 +1906,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 self._emit(f"else:")
                 self._indent += 1
                 self._hoisted_bchw = dict(hoist_snap)
+                self._owned = set(owned_snap)
                 for s in stmt.else_body:
                     self._emit_stmt(s)
                 self._indent -= 1
@@ -1885,6 +1928,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit(f"if float({cond_tmp}) > 0.5:")
         self._indent += 1
         self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
         if stmt.then_body:
             for s in stmt.then_body:
                 self._emit_stmt(s)
@@ -1895,6 +1939,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"else:")
             self._indent += 1
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             for s in stmt.else_body:
                 self._emit_stmt(s)
             self._indent -= 1
@@ -1911,7 +1956,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # it must start from the same pre-if hoist snapshot (the scalar path's
         # branch-local hoists are unbound on this path).
         lines_before = len(self._lines)
-        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial, hoist_snap)
+        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial, hoist_snap, owned_snap)
         if len(self._lines) == lines_before:
             self._emit("pass")  # guard against empty else block
 
@@ -1922,7 +1967,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._hoisted_bchw = hoist_snap
 
     def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str, cond_spatial: bool,
-                              hoist_snap: dict[str, tuple[str, str]]):
+                              hoist_snap: dict[str, tuple[str, str]],
+                              owned_snap: set[str]):
         """Emit spatial if/else with selective cloning and torch.where merge.
 
         Uses local variables for env vars when available (program-level locals),
@@ -1935,9 +1981,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         whole if/else. This method (and the scalar path in _emit_if_else) re-emit
         the same branch bodies, so a hoist from a sibling emission is unbound here;
         reset to this snapshot before each branch so every branch re-hoists what it
-        samples (its allocation then dominates its own uses).
+        samples (its allocation then dominates its own uses). ``owned_snap`` is the
+        copy-on-write ownership that holds before the if; each branch starts from it.
         """
         self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
         # Collect modified variables (same analysis as interpreter)
         then_mods = self._collect_modified_vars(stmt.then_body)
         else_mods = self._collect_modified_vars(stmt.else_body) if stmt.else_body else (set(), set())
@@ -1950,10 +1998,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if not all_env_mods and not all_bind_mods:
             # Nothing modified — just execute both branches for side effects
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             for s in stmt.then_body:
                 self._emit_stmt(s)
             if stmt.else_body:
                 self._hoisted_bchw = dict(hoist_snap)
+                self._owned = set(owned_snap)
                 for s in stmt.else_body:
                     self._emit_stmt(s)
             return
@@ -1973,6 +2023,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         # Execute then-branch
         self._hoisted_bchw = dict(hoist_snap)
+        self._owned = set(owned_snap)
         for s in stmt.then_body:
             self._emit_stmt(s)
         # Which modified vars the then-branch left holding a spatial value. Read
@@ -1998,6 +2049,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         if stmt.else_body:
             self._hoisted_bchw = dict(hoist_snap)
+            self._owned = set(owned_snap)
             for s in stmt.else_body:
                 self._emit_stmt(s)
         # Which modified vars are spatial on the else path (with no else body this
@@ -2459,7 +2511,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # better than the old overwrite, which dropped the seed outright.
         self._emit(f"{accum_local} = {accum_local} + {result_tmp}")
         if count_local and n_expr:
-            self._emit(f"{count_local} = _torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)")
+            n_t = f"_torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)"
+            if _is_zero_literal(self._var_initializers.get(stencil.count_var)):
+                self._emit(f"{count_local} = {n_t}")
+            else:
+                # The loop counts up from the counter's entry value, not from 0.
+                self._emit(f"{count_local} = {count_local} + {n_t}")
         return True
 
     def _emit_minmax_stencil(self, stencil: _StencilInfo) -> bool:
@@ -2548,6 +2605,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         """
         if not stencil.array_vars:
             return False
+        # Detection proved each collect writes arr[counter] before the counter's one bump
+        # per pass; tap t lands in slot t only if the counter enters the nest at 0.
+        # Decline before emitting anything so the loop itself runs otherwise.
+        if not _is_zero_literal(self._var_initializers.get(stencil.count_var)):
+            return False
 
         sel_tmp, _ = self._stencil_to_bchw(stencil)
         pad_tmp, kh, kw, n_expr = self._stencil_pad_and_kernel_size(stencil, sel_tmp)
@@ -2571,7 +2633,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 arr_tmp = self._tmp()
                 self._emit(f"{arr_tmp} = {flat_tmp}[:, {ch_idx}, :, :, :]")
                 tgt = self._local_vars.get(arr_name, f"_env[{arr_name!r}]")
-                self._emit(f"{tgt} = {arr_tmp}")
+                self._emit_collect_into(tgt, arr_tmp, "")
         else:
             # Single vec array (e.g. samples[idx] = fetch(...))
             # flat_tmp is [B, C, H, W, N] → [B, H, W, N, C] for vec array
@@ -2579,7 +2641,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             result_tmp = self._tmp()
             self._emit(f"{result_tmp} = {flat_tmp}.permute(0, 2, 3, 4, 1)")
             tgt = self._local_vars.get(arr_name, f"_env[{arr_name!r}]")
-            self._emit(f"{tgt} = {result_tmp}")
+            self._emit_collect_into(tgt, result_tmp, ", :")
 
         # Update counter variable to total number of elements
         if stencil.count_var:
@@ -2587,6 +2649,31 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"{ct} = _torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)")
 
         return True
+
+    def _emit_collect_into(self, tgt: str, taps: str, tail: str):
+        """Leave the array the collect loop would: tap t in slot t, clamped into the
+        DECLARED size, every other slot as it was.
+
+        `taps` holds the N taps along the slot axis (the last axis, or the one before
+        the channels: `tail` is "" or ", :"). When the declared size S equals N the
+        taps ARE the array. Otherwise the loop writes slots 0..min(N,S)-1 and, when
+        N > S, keeps overwriting the clamped last slot, which ends as the last tap."""
+        n, sz, a, m = self._tmp(), self._tmp(), self._tmp(), self._tmp()
+        axis = "-2" if tail else "-1"
+        self._emit(f"{n} = {taps}.shape[{axis}]")
+        self._emit(f"{sz} = {tgt}.shape[{axis}]")
+        self._emit(f"if {sz} == {n}:")
+        self._indent += 1
+        self._emit(f"{tgt} = {taps}")
+        self._indent -= 1
+        self._emit("else:")
+        self._indent += 1
+        self._emit(f"{a} = {tgt}.clone()")
+        self._emit(f"{m} = min({n}, {sz})")
+        self._emit(f"{a}[..., :{m}{tail}] = {taps}[..., :{m}{tail}]")
+        self._emit(f"if {n} > {sz}: {a}[..., {sz} - 1{tail}] = {taps}[..., {n} - 1{tail}]")
+        self._emit(f"{tgt} = {a}")
+        self._indent -= 1
 
     def _try_emit_stencil(self, stmt: ForLoop) -> bool:
         """Try to detect and emit a stencil pattern. Returns True if handled."""
@@ -2631,9 +2718,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
     ):
         """Emit a for loop with a fully static range (zero per-iteration overhead)."""
         loop_var, start, stop, step = static_range
-        n = abs(stop - start) // max(abs(step), 1)
+        # The interpreter iterates range(start, stop, step): a partial last stride still
+        # runs, and a range whose step points away from the bound is empty.
+        n = len(range(start, stop, step))
         if n > 1024:
             self._emit(f"raise RuntimeError('For loop would exceed {1024} iterations')")
+            return
+        if n == 0:
+            self._emit("pass")  # the body never runs; keep an enclosing block non-empty
             return
 
         has_flow_control = _body_has_break_continue(stmt.body)
@@ -2679,6 +2771,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         saved_scalar = self._scalar_loop
         self._scalar_loop = use_scalar
 
+        self._forget_loop_carried_initializers(stmt)
         self._emit(f"for _i_idx in range({n}):")
         self._indent += 1
         if use_scalar:
@@ -2708,7 +2801,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             for vname in sorted(modified_vars):  # deterministic emission order
                 local = self._local_vars.get(vname)
                 if local is not None:
-                    self._emit(f"if not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
+                    # A local declared in a branch the loop never took (or in the
+                    # body of a loop that ran zero passes) is still None.
+                    self._emit(f"if {local} is not None and not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
 
         # Write back modified vars to _env
         for vname in writeback_vars:
@@ -2723,6 +2818,23 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                     del self._local_vars[vname]
             else:
                 self._local_vars[vname] = prev
+
+    def _forget_loop_carried_initializers(self, stmt: ForLoop | WhileLoop):
+        """Drop the VarDecl initializer of every name the loop reassigns.
+
+        Emission is textual, but a loop runs its body again: a read that precedes the
+        reassignment in the body sees the reassigned value from the second pass on. The
+        per-assignment pop in `_emit_assignment` comes too late for such a read, which
+        would otherwise resolve `x` to its pre-loop initializer (`sample(@A, x, v)` with
+        `float x = u;` folded to a direct fetch of the pixel's own texel). A name declared
+        inside the body re-records its initializer when that declaration is emitted,
+        which is right: the declaration re-runs every pass."""
+        names, _ = collect_assigned_vars(stmt.body)
+        upd = getattr(stmt, "update", None)
+        if isinstance(upd, Assignment) and isinstance(upd.target, Identifier):
+            names.add(upd.target.name)
+        for name in names:
+            self._var_initializers.pop(name, None)
 
     def _setup_scalar_loop(
         self, all_vars: set[str], loop_var: str,
@@ -2755,6 +2867,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # Hoist sample/fetch BCHW setup outside loop to avoid per-call overhead
         self._hoist_sample_setup(stmt.body)
         self._emit_stmt(stmt.init)
+        self._forget_loop_carried_initializers(stmt)
 
         static = self._try_static_bound(stmt)
         iter_var = self._tmp()
@@ -2770,7 +2883,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"if not _torch.is_tensor({cv}) or {cv}.dim() == 0:")
             self._indent += 1
             ci = self._tmp()
-            self._emit(f"{ci} = int({cv})")
+            # The real value, never int(): truncation moves a fractional counter across
+            # the bound. Against an integer-valued bound the compare is exact for an fp32
+            # counter, so it agrees with the interpreter's tensor compare.
+            self._emit(f"{ci} = float({cv})")
             if is_le:
                 self._emit(f"if {ci} > {bound}: break")
             else:
@@ -2807,7 +2923,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._emit_iter_limit(iter_var, "For")
 
     def _try_static_bound(self, stmt: ForLoop) -> tuple[str, int, bool] | None:
-        """Try to extract static loop bounds."""
+        """Try to extract static loop bounds.
+
+        Only an integer-valued literal qualifies: a fractional one (`x < 2.5`, `t <= 0.3`)
+        must be compared as the interpreter does, in fp32, so it takes the general
+        condition test instead."""
         cond = stmt.condition
         if not isinstance(cond, BinOp):
             return None
@@ -2816,6 +2936,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if not isinstance(cond.left, Identifier):
             return None
         if not isinstance(cond.right, NumberLiteral):
+            return None
+        if not float(cond.right.value).is_integer():
             return None
         return (cond.left.name, int(cond.right.value), cond.op == "<=")
 
@@ -2830,13 +2952,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         """
         # Hoist sample/fetch BCHW setup outside loop
         self._hoist_sample_setup(stmt.body)
+        self._forget_loop_carried_initializers(stmt)
         iter_var = self._tmp()
         self._emit(f"{iter_var} = 0")
         self._emit(f"while {iter_var} < _MAX_ITER:")
         self._indent += 1
         # Increment first: immune to a native `continue` skipping it. With the
-        # bound at `< _MAX_ITER` this runs exactly _MAX_ITER bodies before the
-        # post-loop limit check fires — matching the interpreter's cap.
+        # bound at `< _MAX_ITER` the loop runs at most _MAX_ITER bodies.
         self._emit(f"{iter_var} += 1")
 
         self._emit_cond_break(stmt.condition)
@@ -2850,7 +2972,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         self._indent -= 1
 
-        self._emit_iter_limit(iter_var, "While")
+        # The interpreter raises only when the budget ran out, never when the loop ended
+        # by its condition or a break — even on the last allowed pass. `while ... else`
+        # runs exactly then; a post-loop `iter >= _MAX_ITER` test would also fire for a
+        # loop that ended on its 1024th condition check or broke in its 1024th body,
+        # because the counter is bumped before either can happen.
+        self._emit("else:")
+        self._indent += 1
+        self._emit("raise RuntimeError('While loop exceeded maximum iteration limit (' + "
+                   "str(_MAX_ITER) + '). Check your loop condition.')")
+        self._indent -= 1
 
     # ── Expression emission ─────────────────────────────────────────────
 

@@ -245,9 +245,10 @@ def _collect_identifiers(program: Program) -> frozenset[str]:
     return frozenset(found)
 
 
-def _collect_expr_names(expr, idents: set, bindings: set) -> None:
+def _collect_expr_names(expr, idents: set, bindings: set, calls: set | None = None) -> None:
     """Single-pass generic AST walk collecting both Identifier names (into
-    *idents*) and BindingRef names (into *bindings*) referenced in an expression.
+    *idents*) and BindingRef names (into *bindings*) referenced in an expression, and,
+    when *calls* is given, the names of the functions it calls.
     Used by UC-3's uniform-range guard, which needs both to reject a bound that
     reads a loop-var/env-var OR a binding the loop body reassigns."""
     cls = expr.__class__
@@ -257,11 +258,13 @@ def _collect_expr_names(expr, idents: set, bindings: set) -> None:
     if cls is BindingRef:
         bindings.add(expr.name)
         return
+    if calls is not None and cls is FunctionCall:
+        calls.add(expr.name)
     for f in _dc_fields(expr):
         v = getattr(expr, f.name)
         if isinstance(v, ASTNode):
-            _collect_expr_names(v, idents, bindings)
+            _collect_expr_names(v, idents, bindings, calls)
         elif isinstance(v, list):
             for x in v:
                 if isinstance(x, ASTNode):
-                    _collect_expr_names(x, idents, bindings)
+                    _collect_expr_names(x, idents, bindings, calls)

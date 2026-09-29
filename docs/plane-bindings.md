@@ -57,7 +57,7 @@ This is the release's compat tripwire and the reason this phase gets its own ses
 
 **The constraint that decides it:** the parser provably never sees binding types.
 `TEXCache.compile_tex` reaches `Parser(tokens, source=source).parse()` through
-`parse_and_split` (`tex_cache.py:242`) and
+`parse_and_split` (`tex_cache.py`) and
 types enter one call later, at `TypeChecker(binding_types=..., source=source)`
 (`tex_cache.py:582`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
 PLANES-typed wire*" cannot live in the grammar. Something upstream of types must tokenize the

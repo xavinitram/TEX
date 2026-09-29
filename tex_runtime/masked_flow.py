@@ -76,6 +76,8 @@ def cond_mask(cond: torch.Tensor) -> torch.Tensor:
 
 def m_and(a, b):
     """Narrow mask `a` by mask `b`."""
+    if a is False or b is False:
+        return False
     if a is True:
         return b
     if b is True:
@@ -85,10 +87,10 @@ def m_and(a, b):
 
 def m_or(a, b):
     """Union of two masks, either of which may be `None` (no pixels)."""
-    if a is None:
-        return b
-    if b is None:
+    if b is None or b is False:
         return a
+    if a is None or a is False:
+        return b
     if a is True or b is True:
         return True
     return a | b
@@ -96,7 +98,7 @@ def m_or(a, b):
 
 def m_sub(a, dead):
     """Mask `a` with the pixels in `dead` removed. `dead is None` means none left."""
-    if dead is None:
+    if dead is None or dead is False:
         return a
     if dead is True:
         return False
@@ -169,6 +171,8 @@ def frames_find(frames, kind: str):
 def apply_transfer(frame, live):
     """A `break`/`continue`/`return` taken under *live*: record the departing pixels on
     *frame* and answer the mask the statements after it run under."""
+    if live is False:
+        return False        # nobody is live to leave
     frame.dead = m_or(frame.dead, live)
     return m_sub(live, frame.dead)
 
@@ -180,6 +184,8 @@ def record_return(frame, value, live):
     The no-return default is built as a zero of the RETURNED VALUE's shape and dtype
     (`zeros_like`), never a 0-dim scalar: masking needs one tensor covering every pixel, and
     for a `vec4`-returning function a scalar zero differs in rank (`L4-F5`)."""
+    if live is False:
+        return False
     if isinstance(value, str) or not isinstance(value, torch.Tensor):
         # M7: no per-pixel representation for a string — first writer wins, which is what
         # `0.23` gives for the same source with a uniform condition.
@@ -187,6 +193,8 @@ def record_return(frame, value, live):
             frame.ret = value
     elif live is True:
         frame.ret = value
+    elif live is False:
+        pass    # a uniform transfer already took every pixel: nothing here to record
     else:
         from .interpreter import _tensor_where
         base = frame.ret
@@ -204,6 +212,8 @@ def merge_write(live, after, before):
     yet) has nothing for a departed pixel to keep, so `0.23`'s write stands."""
     if live is True:
         return after
+    if live is False and isinstance(before, torch.Tensor):
+        return before       # no pixel is live: every pixel keeps what it had
     if not isinstance(before, torch.Tensor) or not isinstance(after, torch.Tensor):
         return after
     from .interpreter import _tensor_where
@@ -741,6 +751,9 @@ class MaskedFlowMixin:
         if not m_any(self._live):
             return torch.scalar_tensor(0.0, dtype=self._dtype, device=self.device)
 
+        # Arguments first: a raising argument must not leave a depth level held.
+        args = [self._eval(arg) for arg in call_node.args]
+
         self._call_depth += 1
         if self._call_depth > MAX_CALL_DEPTH:
             self._call_depth -= 1
@@ -750,8 +763,6 @@ class MaskedFlowMixin:
                 call_node.loc, source=self._source, code="E6060",
                 hint="Check for functions that call themselves without a base case.",
             )
-
-        args = [self._eval(arg) for arg in call_node.args]
 
         saved_env = self.env
         saved_ready = self._inplace_ready

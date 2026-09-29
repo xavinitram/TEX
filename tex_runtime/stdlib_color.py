@@ -18,7 +18,6 @@ from .stdlib_core import (
     LUMA_B,
     _grid_sample_f32,
     _to_tensor,
-    _uniform_dtype,
 )
 # ZERO_GUARD_EPS is bound by attribute lookup, not folded into the `from` import above: a
 # name bound by `from X import name` compiles a later `name.method(...)` call site WITHOUT
@@ -67,7 +66,7 @@ class _StdlibColor:
         q = v * (1.0 - s * f)
         t = v * (1.0 - s * (1.0 - f))
 
-        i_mod = torch.fmod(i, 6.0)
+        i_mod = torch.remainder(i, 6.0)  # sign-safe: hue below 0 wraps to sectors 0..5
 
         # Compute masks once (shared across all 3 channels)
         # instead of 5-deep nested torch.where (which repeats comparisons 3×)
@@ -101,7 +100,9 @@ class _StdlibColor:
 
         cmax = torch.maximum(torch.maximum(r, g), b)
         cmin = torch.minimum(torch.minimum(r, g), b)
-        diff = cmax - cmin + SAFE_EPSILON
+        # dtype-aware guard: 1e-8 underflows to 0 in fp16, and gray would give 0/0 = NaN hue
+        eps = ZERO_GUARD_EPS.get(c.dtype, SAFE_EPSILON)
+        diff = cmax - cmin + eps
 
         # Hue
         h = torch.where(cmax == r, torch.fmod((g - b) / diff, 6.0),
@@ -111,7 +112,7 @@ class _StdlibColor:
         h = torch.fmod(h + 1.0, 1.0)  # ensure positive
 
         # Saturation
-        s = torch.where(cmax > SAFE_EPSILON, diff / cmax, cmax.new_zeros(()))
+        s = torch.where(cmax > eps, diff / cmax, cmax.new_zeros(()))
 
         # Value
         v = cmax
@@ -372,11 +373,25 @@ class _StdlibColor:
         out of [0,1], e.g. a mask subtraction dipping below zero). Here a
         below-threshold denominator is replaced by ±eps carrying denom's own sign."""
         eps = ZERO_GUARD_EPS.get(denom.dtype, SAFE_EPSILON)
-        eps_t = torch.as_tensor(eps, dtype=denom.dtype, device=denom.device)
+        eps_t = denom.new_full((), eps)     # filled on denom's device: no host tensor, no copy
         below = denom.abs() < eps
         guard_trace.note(below)  # C4-ux (no-op unless armed)
         safe = torch.where(below, torch.copysign(eps_t, denom), denom)
         return num / safe
+
+    @staticmethod
+    def _dodge_op(a, b):
+        """Color-dodge kernel. Past b>=1 the denominator changes sign, so that region is
+        answered directly (1 where a>0) instead of dividing by a negative."""
+        q = torch.clamp(TEXStdlib._safe_div(a, 1.0 - b), max=1.0)
+        return torch.where(b >= 1.0, (a > 0.0).to(q.dtype), q)
+
+    @staticmethod
+    def _burn_op(a, b):
+        """Color-burn kernel. Past b<=0 the denominator changes sign, so that region is
+        answered directly (1 where a>=1) instead of dividing by a negative."""
+        q = 1.0 - torch.clamp(TEXStdlib._safe_div(1.0 - a, b), max=1.0)
+        return torch.where(b <= 0.0, (a >= 1.0).to(q.dtype), q)
 
     @stdlib("screen", sig='screen(a, b) \\u2192 vec', category='Color', doc='Screen blend: 1 - (1-a)(1-b). Brightens.', ex='@OUT = vec4(screen(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
@@ -408,16 +423,14 @@ class _StdlibColor:
     @stdlib("color_dodge", sig='color_dodge(a, b) \\u2192 vec', category='Color', doc='Color-dodge: brightens base by blend.', ex='@OUT = vec4(color_dodge(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_color_dodge(base, blend) -> torch.Tensor:
-        """min(1, a / (1-b)); b>=1 -> 1."""
-        return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.clamp(
-            TEXStdlib._safe_div(a, 1.0 - b), max=1.0))
+        """min(1, a / (1-b)); b>=1 -> 1 (0 where a<=0)."""
+        return TEXStdlib._blend_rgb(base, blend, TEXStdlib._dodge_op)
 
     @stdlib("color_burn", sig='color_burn(a, b) \\u2192 vec', category='Color', doc='Color-burn: darkens base by blend.', ex='@OUT = vec4(color_burn(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_color_burn(base, blend) -> torch.Tensor:
-        """1 - min(1, (1-a)/b); b<=0 -> 0."""
-        return TEXStdlib._blend_rgb(base, blend, lambda a, b: 1.0 - torch.clamp(
-            TEXStdlib._safe_div(1.0 - a, b), max=1.0))
+        """1 - min(1, (1-a)/b); b<=0 -> 0 (1 where a>=1)."""
+        return TEXStdlib._blend_rgb(base, blend, TEXStdlib._burn_op)
 
     @stdlib("linear_light", sig='linear_light(a, b) \\u2192 vec', category='Color', doc='Linear-light blend: clamp(a + 2b - 1).', ex='@OUT = vec4(linear_light(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
@@ -431,7 +444,7 @@ class _StdlibColor:
     def fn_vivid_light(base, blend) -> torch.Tensor:
         """b<0.5 -> color_burn(a,2b); else color_dodge(a,2(b-0.5))."""
         def _op(a, b):
-            burn = 1.0 - torch.clamp(TEXStdlib._safe_div(1.0 - a, 2.0 * b), max=1.0)
-            dodge = torch.clamp(TEXStdlib._safe_div(a, 1.0 - 2.0 * (b - 0.5)), max=1.0)
+            burn = TEXStdlib._burn_op(a, 2.0 * b)
+            dodge = TEXStdlib._dodge_op(a, 2.0 * (b - 0.5))
             return torch.where(b < 0.5, burn, dodge)
         return TEXStdlib._blend_rgb(base, blend, _op)

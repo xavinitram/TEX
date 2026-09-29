@@ -8,9 +8,9 @@ pool hands every thread its own Interpreter and keeps a `weakref.WeakSet` of the
 ones so a memory sweep can clear them all — the thread-local holds the only strong ref,
 so a dead thread's interpreter is collectable rather than pinned for the process lifetime.
 
-Two pools exist (the engine's cook interpreter, `tex_engine`; and codegen's persistent
-fallback, `compiled`); this class is the one implementation both instantiate, so the
-lock discipline and the WeakSet-not-list rationale live in exactly one place.
+Pools exist for the engine's cook interpreter (`tex_chain`, re-exported by `tex_engine`) and
+for codegen's persistent fallback (`compiled`); this class is the one implementation they
+instantiate, so the lock discipline and the WeakSet-not-list rationale live in exactly one place.
 """
 import threading
 import weakref
@@ -36,9 +36,10 @@ class ThreadLocalInterpreterPool:
         return inst
 
     def clear_all(self):
-        """Clear `_literal_cache` + `_builtins_lru` on every live instance (a locked
-        snapshot, so a concurrent creation can't perturb the iteration). Best-effort per
-        instance — a cache-shape surprise on one must not block the others."""
+        """Clear `_literal_cache`, `_builtins_lru` and `_coord_ramp_lru` on every live instance
+        (a locked snapshot, so a concurrent creation can't perturb the iteration). Best-effort
+        per instance — a cache-shape surprise on one must not block the others. The owning
+        thread tolerates its LRUs being emptied mid-cook (see `interpreter_spatial`)."""
         with self._lock:
             instances = list(self._all)
         for it in instances:

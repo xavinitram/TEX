@@ -99,7 +99,10 @@ def test_c4st_js_loc_ratchet(r: SubTestResult):
     # (_texCollapseOne's own "every chain node still present" check) instead of a predicted
     # skip-set. Frontend-only pass reordering; the SCHED-1 decomposition (fusion detection already
     # lives in Python) still stands as the file-shrinking remedy — this bump buys that plan time.
-    JS_HARD = 4290
+    # Frontend fixes: +~98 lines of correctness code (single-pass source masking so string/hex
+    # $param defaults survive, scatter/++ output detection, link restore on output changes, v4
+    # params, subgraph id guard, publish default typing); the split remedy stands.
+    JS_HARD = 4385
     js = _PKG / "js" / "tex_extension.js"
     if not js.exists():
         r.fail("C4-st JS ratchet", "js/tex_extension.js missing")
