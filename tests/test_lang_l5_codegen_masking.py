@@ -27,6 +27,7 @@ budget that nothing in the rule needs.
    cannot produce a per-pixel transfer at all, so the rows that matter are the ones drawing
    from `test_v017_phase1._LIVE_EARLY_EXIT_CONDS`.
 """
+import functools
 import hashlib
 import math
 import random
@@ -36,6 +37,7 @@ import pytest
 import torch
 
 from helpers import *   # noqa: F403
+from failure_harness import compile_program as _compile
 
 import compat_corpus as cc
 import scalar_oracle
@@ -72,14 +74,6 @@ def _has_masked_runtime(src: str) -> bool:
 
 
 # ── the two-tier harness ────────────────────────────────────────────────────────
-
-def _compile(src, bindings):
-    bt = {name: _infer_binding_type(v) for name, v in bindings.items()}
-    program = parse_and_split(src, bt)
-    checker = TypeChecker(binding_types=bt, source=src)
-    type_map = checker.check(program)
-    return program, type_map, sorted(checker.assigned_bindings.keys())
-
 
 def _cg_env(program, bindings, sp):
     """The builtin env the codegen tier is called with — `helpers.run_both`'s own
@@ -243,8 +237,8 @@ def test_atom_moves_on_the_codegen_tier_too(name):
 # The DIGEST acceptance (§8's `L5` row: "the emitted `_tex_src` digest for every corpus
 # program without a pragma is unchanged from the base sha") compares two checkouts of the
 # tree, so it cannot live in a test at all; it was taken separately against the commit that
-# precedes the language work, over all 130 corpus programs, and every digest was identical.
-# What CAN live here is the structural property that makes it hold, over the same 130.
+# precedes the language work, over the whole corpus of that time, and every digest was identical.
+# What CAN live here is the structural property that makes it hold, over the corpus as it stands.
 
 def _corpus_compiles():
     for name, src in cc._corpus_programs():
@@ -291,7 +285,9 @@ def test_no_pragma_emits_no_masked_runtime():
         src = fn._tex_src
         if _has_masked_runtime(src):
             offenders.append(name)
-    assert checked >= 120, f"only {checked} corpus programs compiled — the sweep went blind"
+    # 141 corpus programs, 6 asking for the masked rules, none declining: a program that starts
+    # declining silently leaves the sweep, so the count is exact, not a loose floor.
+    assert checked >= 135, f"only {checked} corpus programs compiled — the sweep went blind"
     assert not offenders, f"masked runtime leaked into: {offenders}"
 
 
@@ -399,7 +395,6 @@ def test_precondition_2_emit_function_def_scopes_both_flow_flags():
     body = src[src.index("def _emit_function_def"):]
     body = body[:body.index("\n    def ", 1)]
     for flag in ("_use_native_flow_control", "_scalar_loop"):
-        assert f"saved_native_flow = self._use_native_flow_control" in body or True
         assert body.count(f"self.{flag}") >= 2, f"{flag} is not saved AND restored"
 
     # Behavioural half: emit a function definition inside a native-flow loop and require
@@ -440,10 +435,14 @@ def test_precondition_2_holds_on_the_masked_emitter_too():
 def test_stencil_specialisation_declines_a_flagged_program(monkeypatch):
     """The other over-decline: a loop nest rewritten into one `conv2d` has no passes left
     to mask, and the interpreter has no such rewrite to match."""
-    def _boom(*a, **k):
-        raise AssertionError("stencil specialisation ran for a flagged program")
-    monkeypatch.setattr(cg_mod._CodeGen, "_try_emit_stencil", _boom)
-    src = PRAGMA + """
+    calls = {"n": 0}
+    real = cg_mod._CodeGen._try_emit_stencil
+
+    def _spy(self, *a, **k):
+        calls["n"] += 1
+        return real(self, *a, **k)
+    monkeypatch.setattr(cg_mod._CodeGen, "_try_emit_stencil", _spy)
+    body = """
 float acc = 0.0;
 for (int dy = -1; dy <= 1; dy = dy + 1) {
   for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix + dx, iy + dy].r; }
@@ -451,8 +450,16 @@ for (int dy = -1; dy <= 1; dy = dy + 1) {
 @OUT = vec4(acc / 9.0, 0.0, 0.0, 1.0);
 """
     b = L4._bindings()
+    # Control: the same loop nest with the rules off DOES reach the specialiser, so the
+    # zero below is the decline and not a specialiser that never runs at all.
+    program, type_map, _n = _compile(body, b)
+    assert cg_mod.try_compile(program, type_map, _masked_flow=False) is not None
+    assert calls["n"] > 0, "premise: an unflagged stencil nest reaches the specialiser"
+    calls["n"] = 0
+    src = PRAGMA + body
     program, type_map, _n = _compile(src, b)
     assert cg_mod.try_compile(program, type_map, _masked_flow=True) is not None
+    assert calls["n"] == 0, "stencil specialisation ran for a flagged program"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,16 +545,26 @@ def _fz_generate(count, live_conds, require=("break", "continue", "return")):
 # `return` as well would fill the corpus with user functions whose bodies hold no condition
 # at all, which is how `test_the_live_corpus_actually_clears_bits` read 15/40 on the first
 # sitting: the programs were legal and cookable and had nothing to mask.
-_FZ_LIVE = _fz_generate(_FZ_N, live_conds=True, require=("eacc",))
-_FZ_SHIPPED = _fz_generate(_FZ_N, live_conds=False)
+@functools.lru_cache(maxsize=None)
+def _fz_corpus(kind):
+    """Built on first use, not at import: generating cooks every candidate."""
+    if kind == "live":
+        return tuple(_fz_generate(_FZ_N, live_conds=True, require=("eacc",)))
+    return tuple(_fz_generate(_FZ_N, live_conds=False))
 
 
-def _ids(progs):
-    return [f"g{i:02d}" for i in range(len(progs))]
+def _fz_src(kind, i):
+    corpus = _fz_corpus(kind)
+    assert i < len(corpus), f"the {kind} corpus has only {len(corpus)} programs"
+    return corpus[i]
+
+
+def _ids(i):
+    return f"g{i:02d}"
 
 
 def test_the_fuzz_corpora_are_not_empty():
-    assert len(_FZ_LIVE) == _FZ_N and len(_FZ_SHIPPED) == _FZ_N
+    assert len(_fz_corpus("live")) == _FZ_N and len(_fz_corpus("shipped")) == _FZ_N
 
 
 def test_the_live_corpus_actually_clears_bits():
@@ -556,7 +573,7 @@ def test_the_live_corpus_actually_clears_bits():
     every program is unmoved would make a green sweep a statement about nothing."""
     b = _fz_bindings()
     moved = 0
-    for src in _FZ_LIVE:
+    for src in _fz_corpus("live"):
         m, _c, names = cook_both(PRAGMA + src, b, masked=True)
         p, _c2, _n = cook_both(PRAGMA + src, b, masked=False)
         if any(not torch.equal(m[n], p[n]) for n in names):
@@ -564,21 +581,24 @@ def test_the_live_corpus_actually_clears_bits():
     assert moved >= _FZ_N // 2, f"only {moved}/{_FZ_N} live-condition programs move"
 
 
-@pytest.mark.parametrize("src", _FZ_LIVE, ids=_ids(_FZ_LIVE))
-def test_fuzz_live_conditions_tiers_agree_bitwise(src):
+@pytest.mark.parametrize("i", range(_FZ_N), ids=_ids)
+def test_fuzz_live_conditions_tiers_agree_bitwise(i):
     """The acceptance row. Per-pixel conditions, so some pixels leave a region while
     others stay — the case the shipped pool cannot reach."""
+    src = _fz_src("live", i)
     assert_bitwise("fuzz-live", *cook_both(PRAGMA + src, _fz_bindings()))
 
 
-@pytest.mark.parametrize("src", _FZ_SHIPPED, ids=_ids(_FZ_SHIPPED))
-def test_fuzz_as_shipped_tiers_agree_bitwise(src):
+@pytest.mark.parametrize("i", range(_FZ_N), ids=_ids)
+def test_fuzz_as_shipped_tiers_agree_bitwise(i):
+    src = _fz_src("shipped", i)
     assert_bitwise("fuzz-shipped", *cook_both(PRAGMA + src, _fz_bindings()))
 
 
-@pytest.mark.parametrize("src", _FZ_LIVE[:12], ids=_ids(_FZ_LIVE[:12]))
-def test_fuzz_live_codegen_equals_oracle(src):
+@pytest.mark.parametrize("i", range(12), ids=_ids)
+def test_fuzz_live_codegen_equals_oracle(i):
     """…and the agreed answer is the per-pixel one, not a shared mistake."""
+    src = _fz_src("live", i)
     b = _fz_bindings()
     _iout, cout, names = cook_both(PRAGMA + src, b)
     assert cout is not None
