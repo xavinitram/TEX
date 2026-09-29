@@ -133,7 +133,7 @@ Four workstreams. Effort tags: S/M/L.
 - **FUS-2 (M).** Fused-chain lazy composition: `fused_required_bindings(spec, params)`
   walking stages terminal-first with per-stage folded params, so dead upstream
   branches of a fused chain stop cooking (today `check_lazy_status` short-circuits a fused
-  chain to every pending slot — tex_node.py:362-363). One memoized analysis must feed **both**
+  chain to every pending slot — `check_lazy_status`'s `_pending()` branch). One memoized analysis must feed **both**
   `check_lazy_status` and execute()'s E6003 gate for fused chains — the same
   dual-consumer discipline invariant #11 already mandates for tex_lazy._memo —
   and the never-sever rows extend to fused chains as the gate.

@@ -35,10 +35,9 @@ fp32 tensors. Substituted params are pre-rounded to fp32 to close that gap;
 the residual window (a literal-vs-param straddling one fp32 ulp inside a
 comparison) fails loud per the above, not silently.
 
-Cache #14: a module-level LRU keyed on (code-hash, folded-param fp32 bits,
-egress-profile key — see `_profile_key`).
-Distinct key + lifecycle from the 13 existing caches (ARCHITECTURE.md), and
-shared by check_lazy_status and execute() so the per-cook cost is a dict hit.
+Cache #14 (ARCHITECTURE.md): a module-level LRU keyed on (code-hash, folded-param
+fp32 bits, egress-profile key — see `_profile_key`), shared by check_lazy_status and
+execute() so the per-cook cost is a dict hit.
 """
 from __future__ import annotations
 
@@ -68,15 +67,6 @@ _PARSE_MEMO_MAX = 64
 #: (source, profile key) -> the UNFOLDED `parse_and_split` AST. Handed out only as
 #: `clone_tree` copies.
 _parse_memo: "OrderedDict[tuple, object]" = OrderedDict()
-
-#: COUNTS-44: `_memo` is keyed on `(code hash, param_values, profile)`, and `param_values`
-#: moves on every widget scrub by construction (T3 genuinely depends on the values) — so
-#: `_memo` itself misses every tick a scrub drives, same as it always has. But hashing the
-#: SAME source on every one of those misses is the identical pattern PERF-44 already solved
-#: for `tex_roi._walk` with `tex_cache.code_digest` — the value-INDEPENDENT SHA-256 memo
-#: `TEXCache.fingerprint` keeps for itself (`_FINGERPRINT_MEMO`), shared rather than a second
-#: one hand-rolled here. Imported where used (matches `tex_roi._walk`'s own call site) rather
-#: than at module scope, so this module carries no load-time opinion about `tex_cache`.
 
 
 # ── PERF-8: the egress-profile component of EVERY analysis memo key ───────────
@@ -159,8 +149,13 @@ def _pristine_program(code: str):
 
 def _fp32(v: float) -> float:
     """Round a Python float to fp32 so folded comparisons match the runtime's
-    fp32 tensors (numpy-free per the torch-only invariant)."""
-    return struct.unpack("f", struct.pack("f", float(v)))[0]
+    fp32 tensors (numpy-free per the torch-only invariant). A finite value past the fp32
+    range rounds to +-inf, as it does on the tensor."""
+    f = float(v)
+    try:
+        return struct.unpack("f", struct.pack("f", f))[0]
+    except OverflowError:
+        return math.copysign(math.inf, f)
 
 
 def _substitute_params(node: ASTNode, subs: dict[str, NumberLiteral]) -> None:
@@ -404,7 +399,7 @@ def _param_key(param_values: dict) -> tuple:
             # literal), but the tag keeps the key honest if the analysis ever distinguishes.
             items.append((name, "i", v))
         elif isinstance(v, float):
-            items.append((name, "f", struct.pack("f", float(v))))
+            items.append((name, "f", struct.pack("f", _fp32(v))))
         else:
             items.append((name, "s", str(v)))
     return tuple(items)
@@ -423,7 +418,8 @@ def lazy_required_bindings(code: str,
     param_values = param_values or {}
     # PERF-8: the profile is in the key because the ANSWER moves with it — `p@beauty.diffuse`
     # is one plane name under the engine profile and the wire `beauty` under ComfyUI's.
-    from .tex_cache import code_digest
+    from .tex_cache import code_digest       # the shared source-digest memo; imported where
+    #                                          used, as tex_roi._walk does
     key = (code_digest(code), _param_key(param_values), _profile_key())
     hit = _memo.get(key)
     if hit is not None or key in _memo:
