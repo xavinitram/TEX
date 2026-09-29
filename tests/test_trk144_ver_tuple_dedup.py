@@ -56,7 +56,9 @@ def test_trk144_ver_tuple_examples(r: SubTestResult):
         ("0.25", (0, 25)),
         ("0.40.2", (0, 40, 2)),          # 3-component: the patch digit must survive
         ("1", (1,)),
-        ("1.abc", (1, 0)),               # a bad chunk degrades in place, not to a sentinel
+        ("1.abc.2", (1, 0, 2)),           # a bad chunk degrades in place, not to a sentinel
+        ("0.25.0", (0, 25)),             # trailing zero components do not order after the prefix
+        ("1.0", (1,)),
         ("", (0,)),
     ]
     for v, want in cases:

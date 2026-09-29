@@ -24,28 +24,16 @@ from .tex_compiler.types import (TEXType, set_array_wires, array_wires_enabled,
 if TYPE_CHECKING:
     import torch
 
-# LINT-46: `import torch` (and the `.tex_runtime.stdlib` LUMA_* import, just below) are NOT
-# at module scope. `.tex_runtime.stdlib` is the facade over the whole stdlib registry (every
-# `stdlib_*.py` domain file `import torch` at its own module scope, MEASURE-44 §3), and this
-# module is on `tex_api.check()`'s import path (`tex_api.py` imports `BufferMeta`/
-# `COLORSPACES`/`PREMULT`/`merge_buffer_meta` from here at module scope) — so either import
-# sitting here forced torch onto a pure-lint call that never touches a tensor. `torch.Tensor`
-# annotations stay valid: `from __future__ import annotations` (top of file) already makes
-# every annotation a string, so nothing here needs a real torch for those. Each function that
-# actually calls `torch.*` imports it locally (once per call, cached in `sys.modules` after
-# the first); every real cook path still imports torch before touching a tensor, at the same
-# point in its own call, so behaviour is unchanged.
+# torch and the `.tex_runtime.stdlib` LUMA_* import are NOT imported at module scope: this module is
+# on `tex_api.check()`'s import path, so either would drag torch into a pure-lint call
+# (`test_lint46_check_torch_free.py` guards it). Annotations stay valid because
+# `from __future__ import annotations` makes them strings; the LUMA_* import lives inside
+# `_to_mask_shape`.
 
 logger = logging.getLogger("TEX")
 
-# R3 (v0.46, MEASURE-44 follow-up): the torch module, resolved lazily on first
-# tensor-touching call and cached HERE — a module global, not a module-scope import (that
-# would put torch back on `tex_api.check()`'s import path, LINT-46's whole point, guarded
-# by `test_lint46_check_torch_free.py`) and not a per-call `import torch` either (LINT-46's
-# per-function imports cost one `IMPORT_NAME` + `sys.modules` lookup EVERY call, ~35ns,
-# measured — small, but every one of these functions is on the marshalling hot path, called
-# once per binding per cook). First tensor-touching call pays the one real import; every
-# later call in this process reads the cached module object straight off this global.
+# The torch module, resolved on first tensor-touching call and cached here: cheaper than a
+# per-call `import torch` on the marshalling hot path, and not a module-scope import (see above).
 _torch = None
 
 
@@ -96,9 +84,10 @@ def _pin_worthwhile(t) -> bool:
     no-CUDA)."""
     try:
         torch = _torch_mod()
-        nbytes = t.numel() * t.element_size() if isinstance(t, torch.Tensor) else 0
-        return (isinstance(t, torch.Tensor)
-                and t.device.type == "cpu"
+        if not isinstance(t, torch.Tensor):
+            return False
+        nbytes = t.numel() * t.element_size()
+        return (t.device.type == "cpu"
                 and _PIN_MIN_BYTES <= nbytes <= _PIN_MAX_BYTES
                 and torch.cuda.is_available())
     except Exception:
@@ -182,31 +171,31 @@ def to_fp32_if_int_image(t, device=None):
 # ── Tensor fingerprinting ──
 
 def tensor_fingerprint(t: torch.Tensor) -> str:
-    """Hash a tensor cheaply: 256 strided samples PLUS whole-tensor reductions.
+    """Hash a tensor cheaply for ComfyUI's IS_CHANGED: 256 strided samples PLUS 64 exact
+    segment sums over the flattened data (and one tail sum).
 
-    The strided sample alone collides on localized edits (a single off-stride
-    pixel, a painted mask band, a small moved object) — distinct inputs would
-    then reuse a stale cached result. numel + sum + mean over all elements catch
-    those changes. (sum/mean add one batched GPU sync, ~0.07ms at 512x512.)
+    The strided sample alone collides on an off-stride edit; the segment sums (fp32, hashed
+    as raw bits, not formatted) catch an edit that changes the local sum by more than the
+    fp32 rounding step, and they move when content shifts between segments. What it still
+    cannot see: a sub-rounding edit, or a permutation confined to one segment that misses
+    every sample. A false "unchanged" is therefore possible in principle; a result cache must
+    key on lineage, never on this. (One batched GPU sync, ~0.07ms at 512x512.)
     """
     torch = _torch_mod()
     flat = t.flatten()
     n = flat.numel()
     stride = max(1, n // 256)
-    samples = flat[::stride][:256].float()
-    # sum(dtype=float32) reduces without copying the whole tensor; fold it into
-    # the SAME host transfer as the samples (one GPU->CPU sync), then derive the
-    # mean host-side.
-    s = t.sum(dtype=torch.float32)
-    host = torch.cat([samples, s.reshape(1)]).cpu()
-    sample_vals = host[:-1].tolist()
-    total = host[-1].item()
-    mean = total / max(n, 1)
-    # Hash the packed sample bytes instead of formatting 256 floats into the key
-    # (the old f-string over the full list was ~25x the cost). struct.pack is
-    # C-level and numpy-free — TEX is torch-only and CI runs PyTorch without numpy.
-    digest = hashlib.sha256(struct.pack(f"{len(sample_vals)}f", *sample_vals)).hexdigest()[:16]
-    return f"{t.shape}:{t.dtype}:{n}:{total:.6g}:{mean:.6g}:{digest}"
+    parts = [flat[::stride][:256].float()]
+    if n > 256:
+        m = n // 64
+        parts.append(flat[:m * 64].view(64, m).sum(dim=1, dtype=torch.float32))
+        parts.append(flat[m * 64:].sum(dtype=torch.float32).reshape(1))
+    # One host transfer for samples and sums together.
+    vals = torch.cat(parts).cpu().tolist()
+    # Hash the packed bytes instead of formatting floats into the key. struct.pack is
+    # C-level and numpy-free (TEX is torch-only).
+    digest = hashlib.sha256(struct.pack(f"{len(vals)}f", *vals)).hexdigest()[:16]
+    return f"{t.shape}:{t.dtype}:{n}:{digest}"
 
 
 # ── Latent dict handling ──
@@ -260,17 +249,20 @@ def hex_to_rgb(hex_str: str) -> list[float]:
 #   "v2" — vec2 comma string (e.g. "1.0, 2.0" → [1.0, 2.0])
 #   "v3" — vec3 comma string (e.g. "1, 2, 3" → [1.0, 2.0, 3.0])
 #   "v4" — vec4 comma string (e.g. "1, 2, 3, 4" → [1.0, 2.0, 3.0, 4.0])
+#   "v"  — alias of "v3"
 
 def convert_param_value(value: Any, param_info: dict, param_name: str = "") -> Any:
     """Convert a param widget value to the appropriate Python type for the interpreter.
 
-    Boolean toggles → float 0/1, color hex → [R,G,B] list,
-    vec2/vec3 comma strings → list of floats. Non-string values (already in the
-    target form) pass through. A malformed STRING for a c/v* hint raises a clear,
+    Boolean toggles → float 0/1, color hex or comma-separated RGB floats → [R,G,B] list,
+    vec2/vec3/vec4 comma strings → list of floats (`v` is the alias of `v3`).
+    Non-string values (already in the target form) pass through. A malformed STRING for a c/v* hint raises a clear,
     param-named error instead of silently passing through (which previously
     surfaced as a confusing downstream error with no mention of the parameter).
     """
     hint = param_info.get("type_hint", "f")
+    if hint == "v":
+        hint = "v3"
     if hint in ("f", "i", "s"):
         return value  # common cases need no conversion
     if hint == "b":
@@ -456,7 +448,6 @@ class Promise:
         """
         torch = _torch_mod()
         from .tex_runtime.interpreter import InterpreterError
-        got = None
         if isinstance(value, torch.Tensor):
             got = infer_binding_type(value)
             if self.shape is not None and tuple(value.shape) != self.shape:
@@ -466,7 +457,7 @@ class Promise:
                     hint="The declaration is what the cook's identity was computed from, so "
                          "a mismatch means the program that was compiled is not the program "
                          "these pixels belong to.")
-            if self.device is not None and str(value.device) != self.device:
+            if self.device is not None and not _device_matches(self.device, value.device):
                 raise InterpreterError(
                     f"promised binding '{self.name}' declared device {self.device!r} but "
                     f"landed on {str(value.device)!r}.", None, code="E7006",
@@ -480,6 +471,15 @@ class Promise:
                 f"landed a value of type {got.name}.", None, code="E7006",
                 hint="Declare the type the host will actually deliver — identity was already "
                      "computed from the declaration.")
+
+
+def _device_matches(declared: str, actual) -> bool:
+    """A declared `"cuda"` matches any CUDA index; `"cuda:0"` matches only that index."""
+    try:
+        d = _torch_mod().device(declared)
+    except (RuntimeError, ValueError):
+        return declared == str(actual)          # not a device string: exact match or nothing
+    return d.type == actual.type and (d.index is None or d.index == actual.index)
 
 
 def resolve_promise_bindings(bindings: dict) -> dict:

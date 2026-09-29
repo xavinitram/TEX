@@ -83,7 +83,8 @@ class EngineSession:
 
     def reattach(self, *, result_cache=None) -> dict:
         """ENG-13: re-adopt the engine's persisted warm state IN THIS PROCESS, and report what
-        came back — `{"verdicts", "capturable", "frames", "frame_bytes", "errors"}`.
+        came back — `{"verdicts", "capturable", "frames", "frame_bytes", "media_frames",
+        "media_bytes", "errors"}`.
 
         The recovery half of the crash contract. `reset()` sheds state a host no longer wants;
         this is its opposite — a host whose engine thread died, or which is picking up a cache

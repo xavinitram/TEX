@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 import torch
@@ -215,7 +216,9 @@ class TEXWrangleNode(_BaseClass):
 
     @classmethod
     def fingerprint_inputs(cls, **kwargs):
-        """Cache-busting: re-execute if code, inputs, device, or compile_mode change."""
+        """Cache key for ComfyUI: everything that changes the output — code, every binding,
+        system knobs (device, compile_mode, precision, NaN overlay) and the frontend payloads
+        (`_tex_chain`, `_tex_time`, `_tex_slot_map`)."""
         code = kwargs.get("code", "")
         parts = [code]
         # Include device and compile_mode in the hash
@@ -301,7 +304,12 @@ class TEXWrangleNode(_BaseClass):
         for k in ("frame", "fps", "time"):
             v = raw.get(k)
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                out[k] = float(v)
+                try:
+                    f = float(v)             # a huge JSON integer overflows
+                except OverflowError:
+                    continue
+                if math.isfinite(f):         # json.loads also accepts NaN / Infinity
+                    out[k] = f
         return out or None
 
     @staticmethod

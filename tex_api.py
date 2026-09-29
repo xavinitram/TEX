@@ -186,9 +186,10 @@ def check_proxy_scale(bindings: dict, full_hw: tuple, scale: float, tolerance_px
 def _ver_tuple(v: str) -> tuple:
     """Parse a dotted version string into a tuple of ints, one per `.`-separated component,
     for ordering comparisons (`>`/`<`/`min`/`max`) against another such tuple — never for
-    display. Tolerant per component rather than all-or-nothing: a component with no leading
-    digit degrades to `0` in place (`"1.abc"` -> `(1, 0)`) instead of collapsing the whole
-    result to a sentinel, so a comparison against a well-formed operand (every real call
+    display. Trailing zero components are dropped (`"0.25.0"` -> `(0, 25)`), because Python
+    orders a longer tuple after its prefix. Tolerant per component rather than all-or-nothing:
+    a component with no leading digit degrades to `0` in place (`"1.abc.2"` -> `(1, 0, 2)`)
+    instead of collapsing the whole result to a sentinel, so a comparison against a well-formed operand (every real call
     site's other side: `LANGUAGE_VERSION`, a package version, a source pragma) still reads
     the well-formed components correctly. TRK-144: this was `tex_tool.py`'s copy (the same
     two use sites, `raw["tex_language"]`/LANGUAGE_VERSION and `min_engine`/the package
@@ -199,6 +200,8 @@ def _ver_tuple(v: str) -> tuple:
     for chunk in str(v).split("."):
         m = _re.match(r"\d+", chunk)
         parts.append(int(m.group()) if m else 0)
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()       # "0.25.0" orders as "0.25", not after it
     return tuple(parts)
 
 
@@ -634,10 +637,10 @@ class _ControlFlowLint:
         # now no set on this walk named that class of site for a CUDA-graph capture
         # decision to see.
         self.call_sites = set()
-        self.sync_points = set()          # id(ForLoop/WhileLoop) needing a per-pass live check
-                                          # under masking: its own condition is per-pixel (==
-                                          # varying_loops), or it directly encloses a transfer
-                                          # gated by one (R-BREAK/R-CONT's shape)
+        self.sync_points = set()          # id(ForLoop/WhileLoop) directly enclosing a
+                                          # break/continue gated by a per-pixel `if`
+                                          # (R-BREAK/R-CONT's shape); `flow_plan` unions
+                                          # `varying_loops` in to form FlowPlan.sync_points
         self.emit = False
         self.diags = {}
         self.budget = 200_000 + 200 * sum(1 for _ in self._walk(program))
@@ -878,11 +881,7 @@ class _ControlFlowLint:
             for name, fd in self.fns.items():
                 if not self.gathers[name] and any(self._has_gather(s) for s in fd.body):
                     self.gathers[name] = changed = True
-        while True:                               # facts only grow, so this terminates
-            before = self._facts()
-            self._pass()
-            if self._facts() == before:
-                break
+        self._fixed_point()
         self.emit = True
         self._pass()
         return sorted(self.diags.values(), key=lambda d: (d.loc.line, d.loc.col, d.code))
@@ -894,12 +893,16 @@ class _ControlFlowLint:
         the gather fixed point (which only W7006 reads) is skipped. Raises `_CFBudget` past
         the work budget, which the predicate turns into 'region-dependent' — it is a GATE,
         so it fails closed."""
+        self._fixed_point()
+        return self.varying_loops, self.string_ifs, self.scalar_casts
+
+    def _fixed_point(self):
+        """Repeat `_pass` until the facts stop growing (they only grow, so this terminates)."""
         while True:
             before = self._facts()
             self._pass()
             if self._facts() == before:
                 break
-        return self.varying_loops, self.string_ifs, self.scalar_casts
 
     def _facts(self):
         return (tuple(sorted((k, tuple(sorted(v))) for k, v in self.params_vary.items())),
@@ -1251,17 +1254,14 @@ class _ControlFlowLint:
 #
 # UNCONDITIONAL by design — NOT gated on `Program.language` or `LANGUAGE_VERSION`. The
 # sites named are a structural fact about the program; a caller combines this plan with
-# the language gate (`Program.language`, and — once `LANGUAGE_VERSION` reaches `0.25` —
-# `tex_roi._language_tuple`) to decide whether to actually mask. Gating the WALK itself on
-# the pragma would make `flow_plan` permanently empty for every program until `LANGUAGE_
-# VERSION` bumps at L7 — including the very repro programs L4/L5 need it to name sites for
-# while they are still being built, before that bump exists.
+# the language gate (`Program.language` against `tex_roi.MASKED_FLOW_SINCE`, via
+# `tex_roi._language_tuple`) to decide whether to actually mask.
 @dataclass(frozen=True)
 class FlowPlan:
     """Every site a masking implementation (L4/L5) or a masking-aware consumer (L6) needs
     to know about, computed ONCE per program by `_ControlFlowLint`'s existing per-pixel
-    walk. Nothing here masks anything — the plan only NAMES sites; L4/L5 decide what to do
-    with them.
+    walk. Nothing here masks anything — the plan only NAMES sites; the consumer decides what
+    to do with them.
 
     Every field except `complete` is a frozenset of `id()` of an AST node — the same
     identity-keyed spelling `region_dependent`'s `varying_loops`/`string_ifs`/`scalar_casts`
@@ -1347,11 +1347,7 @@ def flow_plan(program, binding_types: dict | None = None) -> FlowPlan:
     try:
         lint = _ControlFlowLint(
             program, "", binding_types if isinstance(binding_types, dict) else {})
-        while True:
-            before = lint._facts()
-            lint._pass()
-            if lint._facts() == before:
-                break
+        lint._fixed_point()
     except Exception:
         return _INCOMPLETE_FLOW_PLAN
     return FlowPlan(

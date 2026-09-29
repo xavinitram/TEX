@@ -12,22 +12,11 @@ import sys
 
 # ── PORT-6: the ComfyUI adapter loads LAZILY ─────────────────────────────────
 # `tex_node` is the ComfyUI adapter (S-1: one of the three files permitted to touch a
-# ComfyUI surface). Importing it HERE meant that `import TEX_Wrangle.tex_api` — the entry
-# a SECOND host uses — pulled the adapter in behind it: executing this module executes
-# line 12, whatever the importer actually wanted. The S-1 lint proved `tex_core` never
-# *imports comfy*; it could not stop the package root from loading the adapter anyway.
-#
-# `NODE_CLASS_MAPPINGS` is the only name that needs the adapter, so it is now built on
-# first access (PEP 562 module `__getattr__`). The ComfyUI path is unchanged in substance:
-# ComfyUI's loader reads `NODE_CLASS_MAPPINGS` off the module immediately after executing
-# it, so the adapter still loads during node registration — microseconds later, in the same
-# call — and an import error inside it still surfaces at load time, not at first cook. A
-# host that imports only `tex_api`/`tex_engine`/`tex_session` never touches the attribute,
-# so it never loads the adapter and never attempts a `comfy` import.
-#
-# Pinned by `tests/test_v035_hygiene.py::test_v035_port6_engine_import_is_adapter_free`,
-# which drives BOTH halves in a ComfyUI-free subprocess (engine import stays adapter-free;
-# reading `NODE_CLASS_MAPPINGS` still yields the registered node).
+# ComfyUI surface). A host that imports only `tex_api`/`tex_engine`/`tex_session` must not
+# load it, so `NODE_CLASS_MAPPINGS` (the one name that needs it) is built on first access
+# (PEP 562 module `__getattr__`). ComfyUI's loader reads it right after executing this
+# module, so registration is unchanged and an adapter import error still surfaces at load
+# time. Pinned by `tests/test_v035_hygiene.py::test_v035_port6_engine_import_is_adapter_free`.
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TEX_Wrangle": "TEX Wrangle",
@@ -221,6 +210,7 @@ def _load_example_snippets():
         _snippets_cache = snippets
         return snippets
 
+    incomplete = False
     for fname in sorted(os.listdir(_EXAMPLES_DIR)):
         if not fname.endswith(".tex"):
             continue
@@ -235,9 +225,11 @@ def _load_example_snippets():
             with open(os.path.join(_EXAMPLES_DIR, fname), "r", encoding="utf-8") as f:
                 snippets[path_key] = f.read()
         except OSError:
+            incomplete = True       # a transient lock must not hide this example until restart
             continue
 
-    _snippets_cache = snippets
+    if not incomplete:
+        _snippets_cache = snippets
     return snippets
 
 
@@ -260,28 +252,51 @@ try:
         """Return built-in example snippets as JSON."""
         return web.json_response(_load_example_snippets())
 
-    @routes.post("/tex_wrangle/free_caches")
-    async def free_caches(request):
-        """M-2: drop every TEX tensor cache (mip pyramids, grid buffers, compiled
-        codegen, CUDA graphs) and soft-empty CUDA, on user request."""
-        freed = False
+    def _cook_running():
+        """True when ComfyUI reports a prompt executing. Unknown counts as idle."""
+        try:
+            running, _pending = PromptServer.instance.prompt_queue.get_current_queue_volatile()
+            return bool(running)
+        except Exception:
+            return False
+
+    def _sweep_caches():
+        """The three teardown steps, each isolated; returns {step: succeeded}."""
+        steps = {"tensor_caches": False, "disk_caches": False, "device_cache": False}
         try:
             from .tex_memory import free_tensor_caches
             free_tensor_caches()
-            freed = True
+            steps["tensor_caches"] = True
         except Exception:
             pass
         try:
             from .tex_cache import get_cache
             get_cache().clear_all()
+            steps["disk_caches"] = True
         except Exception:
             pass
         try:
             from .tex_runtime.host import get_host_services  # PORT-1 seam
             get_host_services().soft_empty_cache()
+            steps["device_cache"] = True
         except Exception:
             pass
-        return web.json_response({"ok": freed})
+        return steps
+
+    @routes.post("/tex_wrangle/free_caches")
+    async def free_caches(request):
+        """M-2: drop every TEX tensor cache (mip pyramids, grid buffers, compiled
+        codegen, CUDA graphs) and soft-empty CUDA, on user request. The sweep must not
+        run concurrently with a live cook, so it is refused (409) while ComfyUI reports
+        one running, and otherwise runs off the event loop. `ok` is true only when all
+        three steps succeeded; `steps` says which did."""
+        import asyncio
+        if _cook_running():
+            return web.json_response(
+                {"ok": False, "error": "a cook is running; free the caches when it finishes"},
+                status=409)
+        steps = await asyncio.get_running_loop().run_in_executor(None, _sweep_caches)
+        return web.json_response({"ok": all(steps.values()), "steps": steps})
 
     @routes.get("/tex_wrangle/doctor")
     async def doctor(request):
@@ -305,12 +320,16 @@ try:
             return web.json_response({"ok": False, "error": "bad request body",
                                       "stage_of_error": None, "stats": None})
         try:
+            import asyncio
             from .tex_fusion import preflight_from_spec
             from .tex_marshalling import infer_binding_type as _infer_binding_type
             spec = {"stages": body.get("stages", []),
                     "terminal_image_input": body.get("terminal_image_input")}
-            result = preflight_from_spec(spec, body.get("terminal_code", ""),
-                                         _infer_binding_type)
+            # The preflight compiles every stage (CPU-bound, disk cache): off the event
+            # loop, like detect_regions and check.
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, preflight_from_spec, spec, body.get("terminal_code", ""),
+                _infer_binding_type)
         except Exception as e:
             result = {"ok": False, "error": f"preflight error: {e}",
                       "stage_of_error": None, "stats": None}
@@ -423,8 +442,11 @@ try:
     async def list_installed_tools(request):
         """TOOL-2: enumerate installed tools (palette). Summaries only — no source."""
         try:
+            import asyncio
             from .tex_tool import load_all_tools
-            return web.json_response({"tools": load_all_tools()})
+            # Loading validates every tool file (cold reads): off the event loop.
+            tools = await asyncio.get_running_loop().run_in_executor(None, load_all_tools)
+            return web.json_response({"tools": tools})
         except Exception as e:
             return web.json_response({"tools": [], "error": f"{type(e).__name__}: {e}"}, status=503)
 
@@ -432,25 +454,24 @@ try:
 
     @routes.get("/tex_wrangle/docs/{page}")
     async def get_offline_docs(request):
-        """LANG-7: serve the shipped offline reference (Function-Reference.md, and
-        Error-Codes.md when a wiki/ checkout is present) as text/markdown, so an air-gapped
+        """LANG-7: serve the shipped offline reference pages (Function-Reference,
+        Error-Codes, LANGUAGE) from beside this file as text/markdown, so an air-gapped
         box gets docs without the remote GitHub wiki (paired with TEX_DOCS_LOCAL, which
         points diagnostics' docs_url here). Only whitelisted page names, read from disk."""
-        import os as _os
         page = request.match_info.get("page", "")
-        here = _os.path.dirname(_os.path.abspath(__file__))
+        here = os.path.dirname(os.path.abspath(__file__))
         candidates = {
-            "Function-Reference": _os.path.join(here, "Function-Reference.md"),
-            "Error-Codes": _os.path.join(here, "Error-Codes.md"),
-            "LANGUAGE": _os.path.join(here, "LANGUAGE.md"),
+            "Function-Reference": os.path.join(here, "Function-Reference.md"),
+            "Error-Codes": os.path.join(here, "Error-Codes.md"),
+            "LANGUAGE": os.path.join(here, "LANGUAGE.md"),
         }
         path = candidates.get(page.replace(".md", ""))
-        if not path or not _os.path.exists(path):
+        if not path or not os.path.exists(path):
             return web.json_response({"error": f"no offline doc '{page}'"}, status=404)
         try:
             # Cache by mtime: these are static shipped files, so re-reading from disk on every
             # docs-panel open / "open docs" click is wasted I/O.
-            mtime = _os.path.getmtime(path)
+            mtime = os.path.getmtime(path)
             cached = _DOCS_CACHE.get(path)
             if cached is None or cached[0] != mtime:
                 with open(path, "r", encoding="utf-8") as fh:

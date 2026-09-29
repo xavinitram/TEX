@@ -275,7 +275,7 @@ armed and no checkpoint lookups on the path. This is the report's own sequencing
 also invariant #7: whatever CACHE-7 does, a host that never arms it must not be able to tell.
 
 **Phase 2 runs on idle** — the host submits it at `SPECULATIVE` with reason
-`IDLE_CHECKPOINT` (the constant `CookQueue._run_one` (`tex_cookqueue.py:734`) has been
+`IDLE_CHECKPOINT` (the reason constant `tex_cookqueue.IDLE_CHECKPOINT` has been
 reserving since v0.31 with no producer). It re-cooks the chain with `tap: True` on the
 planned stages and `put`s each
 harvested boundary. Because it is speculative it is preemptible and sheddable: an interactive

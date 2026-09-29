@@ -73,7 +73,8 @@ class FrameProvider(Protocol):
     that returns the same pixels from both is a legal nearest-neighbour provider — but it
     does cache them separately, because a provider is *allowed* to make them differ.
 
-    Both return `[1,H,W,C]` or `[H,W,C]` at the SOURCE's own resolution, not the cook's.
+    Both return `[1,H,W,4]` or `[H,W,4]` (RGBA; `_normalize` refuses any other channel
+    count) at the SOURCE's own resolution, not the cook's.
     """
     #: Stable for the life of the session; keys the pool. Defaults to the class name.
     provider_id: str
@@ -84,6 +85,10 @@ class FrameProvider(Protocol):
     #: Temporal identity: which two times are the same frame. Only the provider knows its
     #: own rate, so only the provider can answer. Optional — see `quantize_time` below.
     def quantize_time(self, source_key: str, t: float) -> float: ...
+
+    #: Optional. Frames per second, when the provider has a fixed one: `declare_window` steps
+    #: a prefetch window by `1/rate`. Without it the caller passes `step=`.
+    rate: float
 
     #: Optional. A provider that watches its own sources reports here; one that does not
     #: gets the engine-side counter `bump_source_version()` drives.
@@ -155,8 +160,7 @@ class SyntheticFrameProvider:
 
     def _frame(self, source_key: str, t: float, bias: float) -> torch.Tensor:
         if self.latency_s > 0.0:
-            import time as _time
-            _time.sleep(self.latency_s)
+            time.sleep(self.latency_s)
         self.fetches += 1
         h = w = self.res
         base = math.fmod(abs(float(t)) * 0.01 + bias + (len(source_key) * 0.003), 1.0)
@@ -267,8 +271,9 @@ def bump_source_version(source_key: str) -> int:
     whole previous version's bytes into the governor's accounting until pressure happened
     to evict them.
     """
-    v = int(_versions.get(source_key, 0)) + 1
-    _versions[source_key] = v
+    with _provider_lock:                 # the read-modify-write must not lose a concurrent bump
+        v = int(_versions.get(source_key, 0)) + 1
+        _versions[source_key] = v
     get_media_cache().invalidate_source(source_key)
     return v
 
@@ -360,7 +365,8 @@ class MediaCache:
     # ── writes ──
     def put(self, key: tuple, tensor: torch.Tensor, *, t: float = 0.0,
             speculative: bool = False) -> bool:
-        """Insert a frame. Returns False if the insert was REFUSED.
+        """Insert a frame. Returns False if the insert was REFUSED (a frame larger than the
+        whole budget, or a speculative one into a full pool).
 
         A speculative insert (a prefetch) into a pool that is already at budget is refused
         rather than admitted-then-evicting: a prefetch is a guess, and evicting a frame
@@ -374,13 +380,18 @@ class MediaCache:
             if key in self._entries:
                 self._entries.move_to_end(key)
                 return True
-            if speculative and self._budget and self._total() + nbytes > self._budget:
+            # A frame bigger than the whole budget can never stay: admitting it would flush
+            # the pool and then evict the frame itself. Budget 0 therefore caches nothing.
+            if nbytes > self._budget:
+                if speculative:
+                    self.refused += 1
+                return False
+            if speculative and self._total() + nbytes > self._budget:
                 self.refused += 1
                 return False
             self._entries[key] = _MediaEntry(tensor, nbytes, dev_type, float(t))
             self._bytes_by_dev[dev_type] = self._bytes_by_dev.get(dev_type, 0) + nbytes
-            if self._budget:
-                self._enforce_locked()
+            self._enforce_locked()
             return True
 
     def _total(self) -> int:
@@ -481,12 +492,7 @@ def set_media_budget_mb(mb: float) -> None:
 
 
 def stats() -> dict:
-    """The media pool's counters, for a host HUD or a test.
-
-    (The original docstring claimed `tex doctor` reads this. It does not — `tex_doctor` reports
-    the governor profile and the cache budgets, and has never had a media line. The claim
-    survived three edits to this file; corrected rather than made true, because a doctor line
-    is a UX decision and this is a patch release.)"""
+    """The media pool's counters, for a host HUD or a test."""
     return {"provider": provider_id(), **get_media_cache().stats()}
 
 
@@ -505,7 +511,7 @@ def _normalize(frame, source_key: str, t: float) -> torch.Tensor:
     # `stdlib_signatures`, and unlike `sample(@A,…)` there is no wire to take a channel
     # count from — so either the type checker states a truth or it states a hope. The host
     # owns decoding, which makes expanding a mono/RGB source to RGBA its job, and this
-    # refusal names that. Per-source declared channel counts arrive with DATA-6 (v0.37).
+    # refusal names that.
     if frame.dim() != 4 or frame.shape[0] != 1 or frame.shape[-1] != 4:
         _raise(E_BAD_FRAME,
                f"the frame provider returned shape {tuple(frame.shape)} for `{source_key}` "
@@ -566,9 +572,7 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
     source_key = "" if source_key is None else str(source_key)
     try:
         qt = float(prov.quantize_time(source_key, t))    # type: ignore[attr-defined]
-    except AttributeError:
-        qt = float(t)          # a provider without a rate quantizes not at all
-    except Exception:
+    except Exception:      # no quantize_time (AttributeError) means no quantization at all
         qt = float(t)
 
     cache = get_media_cache()
@@ -584,8 +588,8 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
         # key, a stale entry is simply unreachable and a stale insert lands somewhere
         # nobody will look — the guard below becomes belt-and-braces rather than the only
         # thing standing between two providers.
-        key = (provider_id(prov), gen, source_key, mode, repr(qt),
-               source_version(source_key, prov))
+        version = source_version(source_key, prov)
+        key = (provider_id(prov), gen, source_key, mode, repr(qt), version)
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -595,8 +599,11 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
         frame = fn(source_key, qt)
     except Exception as e:
         # An InterpreterError from the Null provider (E7001) is already the right
-        # diagnostic; anything else is the host's exception and gets named as such.
-        if type(e).__name__ == "InterpreterError":
+        # diagnostic; anything else is the host's exception and gets named as such. Imported
+        # here, on the error path only, for the reason `_raise` does (a module-level import
+        # would be a cycle through the stdlib).
+        from .tex_runtime.interpreter import InterpreterError
+        if isinstance(e, InterpreterError):
             raise
         _raise(E_FETCH_FAILED,
                f"the frame provider failed reading `{source_key}` at t={qt:g}: "
@@ -629,6 +636,10 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
         # provider that no longer exists, which `clear()` has already walked past.
         if _provider_gen != gen:
             return None if speculative else frame
+        # Same for a source bumped while this fetch was in flight: the frame is the old
+        # version's, its key is unreachable, and inserting it would only hold pool bytes.
+        if source_version(source_key, prov) != version:
+            return None if speculative else frame
         # The defensive copy is taken HERE — below both guards — because it exists to protect
         # the POOL, and above them it was paid by two paths that never reach the pool: an
         # unkeyed source (`source_key == ""`, which CACHE-6's precedent says is never cached)
@@ -660,8 +671,15 @@ def _uniform_time(t, source_key: str) -> float:
     if t.numel() == 1:
         return float(t.reshape(()).item())
     flat = t.reshape(-1)
-    if bool(torch.all(flat == flat[0])):
-        return float(flat[0].item())
+    if flat.numel() == 0:
+        _raise(E_NONUNIFORM_TIME,
+               f"fetch_time/sample_time need ONE time per cook, but `{source_key}` was asked "
+               f"for an empty time tensor.",
+               hint="Pass a scalar time (a $param, the `time` builtin, or a literal).")
+    first = flat[0]
+    # NaN compares unequal to itself, so a grid of one NaN would read as N distinct times.
+    if bool(torch.all((flat == first) | (torch.isnan(flat) & torch.isnan(first)))):
+        return float(first.item())
     n = int(torch.unique(flat).numel())
     _raise(E_NONUNIFORM_TIME,
            f"fetch_time/sample_time need ONE time per cook, but `{source_key}` was asked "
@@ -675,13 +693,17 @@ def _uniform_time(t, source_key: str) -> float:
 
 def declare_window(queue, source_key: str, t0: float, t1: float, *,
                    confidence: float = 0.5, mode: str = "sample",
-                   max_frames: int = 64) -> list:
+                   max_frames: int = 64, step: float | None = None) -> list:
     """Mint one SPECULATIVE prefetch job per quantized frame in `[t0, t1]`.
 
     A prefetch window is a bet like any other: priced, ordered and shed by the
     `SpeculativePolicy` already installed on the queue, so the window that arrives during a
     render loses to the render by rules the tree already has. Returns the submitted jobs
     (some may already be CANCELLED — the policy refuses at submit).
+
+    `step` is the spacing between frames, in seconds. Without it the provider's optional
+    `rate` attribute gives `1/rate`; a provider with neither has no knowable frame spacing,
+    and a window over it (`t0 != t1`) raises ValueError rather than guess one.
 
     `feeds_profile=False` is the PROF-1 pollution guard and it is deliberately explicit
     rather than "we happened not to pass a profile key": an I/O wait recorded as compute
@@ -694,14 +716,30 @@ def declare_window(queue, source_key: str, t0: float, t1: float, *,
     from .tex_cookqueue import SPECULATIVE, PREFETCH
 
     prov = get_provider()
-    try:
-        qt0 = float(prov.quantize_time(source_key, t0))   # type: ignore[attr-defined]
-        qt1 = float(prov.quantize_time(source_key, t1))   # type: ignore[attr-defined]
-        step = abs(qt1 - qt0) / max(1, max_frames - 1) if qt1 != qt0 else 1.0
-        rate = float(getattr(prov, "rate", 0.0) or 0.0)
-        step = (1.0 / rate) if rate > 0 else step
-    except Exception:
-        qt0, qt1, step = float(t0), float(t1), 1.0
+
+    def _quantized(t):
+        try:
+            return float(prov.quantize_time(source_key, t))   # type: ignore[attr-defined]
+        except Exception:        # no quantize_time: identity, as `materialize` treats it
+            return float(t)
+
+    qt0, qt1 = _quantized(t0), _quantized(t1)
+    if step is None:
+        try:
+            rate = float(getattr(prov, "rate", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        if rate > 0:
+            step = 1.0 / rate
+        elif qt0 == qt1:
+            step = 1.0                   # a single frame; the spacing is never used
+        else:
+            raise ValueError(
+                f"declare_window: the provider has no `rate`, so the spacing of frames in "
+                f"[{t0:g}, {t1:g}] is unknown; pass step= (seconds between frames).")
+    step = abs(float(step))
+    if not step > 0.0:
+        raise ValueError(f"declare_window: step must be a positive number of seconds, got {step!r}")
 
     times, t = [], qt0
     direction = 1.0 if qt1 >= qt0 else -1.0

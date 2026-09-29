@@ -309,8 +309,13 @@ class CookQueue:
         eligible — until every one has landed, so the single worker never blocks on I/O."""
         if klass not in self._q:
             raise ValueError(f"unknown cook class {klass!r} (expected one of {CLASSES})")
+        confidence = float(confidence)
+        if confidence != confidence:         # NaN would clamp to 1.0 and skip every admission brake
+            confidence = 0.0
+        if cost_ms is not None and cost_ms != cost_ms:
+            cost_ms = 0.0
         job = Job(id=next(self._ids), klass=klass, fn=fn, reason=reason,
-                  confidence=float(confidence), profile_key=profile_key, px=px,
+                  confidence=confidence, profile_key=profile_key, px=px,
                   cost_ms=cost_ms, feeds_profile=bool(feeds_profile),
                   inputs=tuple(inputs or ()))
         with self._wake:
@@ -322,11 +327,15 @@ class CookQueue:
                     f"speculative cook refused by admission policy: {reason or 'no reason given'}"))
                 return job
             self.stats.submitted += 1
-            waiting = bool(job.inputs) and not self._inputs_ready(job)
+            # An input that already FAILED counts as waiting too: `landed` is true for a failed
+            # promise, and the fail-the-job path lives in `_wake_if_ready_locked`.
+            waiting = bool(job.inputs) and (not self._inputs_ready(job) or self._input_failed(job))
             if waiting:
                 job.state = WAITING
                 self.stats.waiting += 1
             self._enqueue_locked(job)
+            if waiting and self._input_failed(job):
+                self._wake_if_ready_locked(job)
             # A WAITING job must NOT preempt. Tripping a running render for a job that cannot
             # start is the worst trade available: the render loses all its progress (§4a —
             # there is no resume) and the preemptor is still waiting on a disk read.
@@ -351,12 +360,22 @@ class CookQueue:
                 logger.exception("[TEX] promise refused a landing callback; waking the job")
                 self._wake_if_ready(job)
         if self._worker is None:      # benign unlocked double-check; _ensure_worker re-tests
-            self._ensure_worker()
+            try:
+                self._ensure_worker()
+            except BaseException:
+                # The caller gets no handle from a raising submit, so the enqueued job must not
+                # survive to run on a later worker start.
+                self.cancel(job)
+                raise
         return job
 
     @staticmethod
     def _inputs_ready(job: Job) -> bool:
         return all(getattr(p, "landed", True) for p in job.inputs)
+
+    @staticmethod
+    def _input_failed(job: Job) -> bool:
+        return any(getattr(p, "error", None) is not None for p in job.inputs)
 
     def _on_input_landed(self, _promise) -> None:
         """A promise landed: wake every WAITING job whose inputs are now all in.
@@ -516,8 +535,26 @@ class CookQueue:
                 self.stats.cancelled += 1
                 self._finish_locked(job, CANCELLED,
                                     error=CookCancelled(f"job {job.id} cancelled before it ran"))
+                self._retract_preempt_locked()
             self._wake.notify_all()
             return True
+
+    def _retract_preempt_locked(self) -> None:
+        """Withdraw the running job's preempt request once nothing outranking it is queued.
+
+        The request is granted for a specific arrival; if that job is cancelled before the
+        runner reaches a yield point, honouring the flag would discard the runner's progress
+        and spend its preemption budget for nobody."""
+        run = self._running
+        if run is None or not run.preempt_requested:
+            return
+        for k in CLASSES:
+            if k >= run.klass:
+                break
+            if any(j.state == PENDING and not j.shed_requested for j in self._q[k]):
+                return
+        run.preempt_requested = False
+        self.stats.preempted -= 1
 
     def _remove_locked(self, job: Job) -> bool:
         try:
@@ -572,7 +609,10 @@ class CookQueue:
         for klass in SHEDDABLE:
             dq = self._q[klass]
             while len(dq) > max(0, keep):
-                job = min(dq, key=lambda j: j.score)
+                # Ties go to the NEWEST job and never to a resumed one: a prefetch window
+                # submits equal-scored frames in playback order, and the oldest is the one
+                # needed soonest; a resumed job has already paid partial work.
+                job = min(dq, key=lambda j: (j.score, j.resumed, -j.id))
                 dq.remove(job)
                 job.shed_requested = True
                 self.stats.shed += 1
@@ -786,7 +826,13 @@ class CookQueue:
             self.stats.waiting -= 1
         job.state = state
         job.value = value
+        if error is not None:
+            error.__traceback__ = None       # its frames would pin the cook's locals
         job.error = error
+        # The handle outlives the run; the closure (an input frame) and the landed promises
+        # must not.
+        job.fn = None
+        job.inputs = ()
         job._done.set()
 
     # ── lifecycle / introspection ────────────────────────────────────────────

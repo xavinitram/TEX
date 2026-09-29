@@ -123,11 +123,14 @@ The rest follows:
 ## 4. Prefetch, and the PROF-1 pollution guard
 
 ```python
-tex_provider.declare_window(queue, source_key, t0, t1, *, confidence=0.5, mode="sample")
+tex_provider.declare_window(queue, source_key, t0, t1, *, confidence=0.5, mode="sample",
+                            max_frames=64, step=None)
 ```
 
 mints one SPECULATIVE job per quantized frame in `[t0, t1]`, reason `PREFETCH`, each of
-which fetches into the media pool. They are priced, ordered and shed by the existing
+which fetches into the media pool. Frames are `step` seconds apart, or `1/rate` for a
+provider that declares a `rate`; a provider with neither has no knowable spacing and the
+call raises rather than guess. They are priced, ordered and shed by the existing
 `SpeculativePolicy` — a prefetch window is a bet like any other, and the one that arrives
 during a render loses to the render by the rules already in the tree.
 
