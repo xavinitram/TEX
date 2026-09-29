@@ -106,8 +106,8 @@ def test_v034_io1_prepare_resolves_and_refuses(r):
             unlanded = Promise("A", type=TEXType.VEC4)
             try:
                 tex_engine.cook("@OUT = vec4(@A.rgb, 1.0);", {"A": unlanded}, device_mode=dev)
-                r.fail("IO-1 unlanded refusal", "an unlanded promise cooked")
-                return
+                r.fail(f"IO-1 unlanded refusal ({dev})", "an unlanded promise cooked")
+                continue
             except Exception as e:
                 assert getattr(e, "_code", "") == "E7007", f"{getattr(e, '_code', '')}: {e}"
             r.ok(f"IO-1: a landed promise cooks bit-identically; an unlanded one is E7007 ({dev})")
@@ -332,10 +332,12 @@ def test_v034_io1_backpressure_refuses_rather_than_evicting(r):
 
 
 def test_v034_io1_cancellation_drops_on_landing(r):
-    """A cancelled prefetch's result is never installed.
+    """A prefetch cancelled while still QUEUED never runs, so it installs nothing.
 
-    The provider's read cannot be stopped from outside once it has begun; what TEX
-    guarantees is that nothing the host did not still want ends up in the pool."""
+    Only the queued half is pinned here: the tail of the window is cancelled behind the single
+    worker, so the pool must hold exactly the frames of the jobs that were not cancelled. A
+    cancel that lands while the provider's read is already in flight is not covered (that
+    frame is pooled by `materialize` before the job's cancel check runs)."""
     q = Q.CookQueue(name="io1-cancel")
     tex_provider.reset_provider()
     tex_provider.set_provider(tex_provider.SyntheticFrameProvider(res=16, rate=1.0,
@@ -349,9 +351,9 @@ def test_v034_io1_cancellation_drops_on_landing(r):
             q.cancel(j)
         q.drain(20)
         cancelled = sum(1 for j in jobs if j.state == Q.CANCELLED)
-        assert cancelled >= 1, [j.state for j in jobs]
+        assert len(jobs) == 6 and cancelled == 4, [j.state for j in jobs]
         frames = tex_provider.get_media_cache().stats()["frames"]
-        assert frames <= len(jobs) - cancelled + 1, \
+        assert frames == len(jobs) - cancelled, \
             f"{frames} frames pooled after {cancelled} cancellations of {len(jobs)}"
         r.ok(f"IO-1: {cancelled} cancelled prefetches installed nothing (pool={frames})")
     except Exception as e:
