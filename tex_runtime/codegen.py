@@ -794,12 +794,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._lines: list[str] = []
         self._preamble: list[str] = []  # hoisted constant assignments
         self._indent = 1  # Start at 1 (inside function body)
-        self._const_cache: dict[float, str] = {}  # value → variable name
+        self._const_cache: dict[str, tuple] = {}  # literal source → (value, variable name)
         # PERF-2: set when the program calls a builtin that resolves an argument to a
         # host number, which is the only case where tagging the hoisted constants buys
         # anything. Every other program's emitted source stays byte-identical.
         self._tag_consts = False
-        self._vec_const_cache: dict[tuple, str] = {}  # (v1, v2, ...) → variable name
+        self._vec_const_cache: dict[str, str] = {}  # component source → variable name
         self._range_cache: dict[tuple, str] = {}  # (start, stop, step) → variable name
         self._tagged_ranges: set[tuple] = set()  # ranges whose values carry a host tag
         self._kernel_const_cache: dict[tuple, str] = {}  # (kvals, kH, kW) → base kernel var
@@ -1061,14 +1061,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         src = _num_src(value)
         if self._scalar_loop:
             return src
-        # Keyed by value, so 0.0 and -0.0 share a tensor: the interpreter's literal
-        # cache does the same, and the oracle decides which zero a program sees.
-        cached = self._const_cache.get(value)
+        # Keyed by the spelling: -0.0 == 0.0 as a dict key, and a signed zero keeps its sign.
+        cached = self._const_cache.get(src)
         if cached is not None:
-            return cached
+            return cached[1]
         var = self._tmp()
         self._preamble.append(f"    {var} = _torch.scalar_tensor({src}, dtype=_torch.float32, device=_dev)")
-        self._const_cache[value] = var
+        self._const_cache[src] = (value, var)
         return var
 
     def emit_program(self, program: Program):
@@ -1197,7 +1196,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             # without a 4-byte D2H and the stream sync it implies. `_host_scalar` reads
             # the tag; an untagged operand still reads back, so a constant whose
             # rounding cannot be established simply keeps the old cost.
-            for value, var in self._const_cache.items():
+            for value, var in self._const_cache.values():
                 rounded = _dtype_rounded(value, torch.float32)
                 if rounded is not None:
                     preamble_lines.append(f"    {var}.{_HOST_SCALAR_ATTR} = {_num_src(rounded)}")
@@ -3686,18 +3685,17 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # Optimization: hoist all-literal vec constructors to preamble.
         # vec3(0.2126, 0.7152, 0.0722) → single pre-computed tensor reused on every call.
         if len(node.args) > 1 and all(isinstance(a, NumberLiteral) for a in node.args) and len(node.args) == n:
-            values = tuple(a.value for a in node.args)
-            cached = self._vec_const_cache.get(values)
+            vals_repr = ", ".join(_num_src(a.value) for a in node.args)
+            cached = self._vec_const_cache.get(vals_repr)  # by spelling: keeps -0.0 apart
             if cached is not None:
                 return cached
             var = self._tmp()
-            vals_repr = ", ".join(_num_src(v) for v in values)
             self._preamble.append(
                 f"    {var} = _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
                 f".reshape(" + ", ".join(["1"] * 3) + f", {n}).expand(*_sp, {n})"
                 f" if _sp else _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
             )
-            self._vec_const_cache[values] = var
+            self._vec_const_cache[vals_repr] = var
             return var
 
         args = [self._emit_expr(a) for a in node.args]

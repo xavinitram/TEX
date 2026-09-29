@@ -65,3 +65,13 @@ def test_string_array_write_floors_its_index():
             'a[1.7] = "zzzzz";\n@OUT = vec3(float(len(a[1])), float(len(a[2])), 0.0);')
     ref = _parity(code, "fp32")
     assert ref[..., 0].unique().tolist() == [5.0] and ref[..., 1].unique().tolist() == [3.0]
+
+
+@pytest.mark.parametrize("first,expr", [
+    ("0.0 * @A.g", "-0.0 * @A.r"),
+    ("vec3(0.0, 1.0, 2.0).x * @A.g", "vec3(-0.0, 1.0, 2.0).x * @A.r"),
+], ids=["scalar", "vec"])
+def test_signed_zero_literal_keeps_its_sign(first, expr):
+    # The +0.0 literal appears first, so a constant cache keyed by value would hand the
+    # -0.0 literal its tensor.
+    _parity(f"@OUT = vec3(atan2(0.0, {first}), atan2(0.0, {expr}), 0.0);", "fp32")
