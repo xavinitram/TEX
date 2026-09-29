@@ -2440,6 +2440,18 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             return sq_tmp
         return tmp
 
+    def _emit_runtime_radius(self, stencil: _StencilInfo, radius: ASTNode, rad: str):
+        """`rad = int(radius)`. A float counter over a fractional radius visits fractional
+        offsets no integer kernel has, so that cook raises and runs on the interpreter."""
+        r_expr = self._emit_expr(radius)
+        if not stencil.float_counter:
+            self._emit(f"{rad} = int({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
+            return
+        self._emit(f"{rad} = float({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
+        self._emit(f"if not {rad}.is_integer(): raise RuntimeError("
+                   "'stencil lowering: a float counter over a fractional radius')")
+        self._emit(f"{rad} = int({rad})")
+
     def _stencil_pad_and_kernel_size(self, stencil: _StencilInfo, sel_tmp: str
                                      ) -> tuple[str, str, str, str | None]:
         """Emit padding + compute kernel size for a stencil.
@@ -2455,8 +2467,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             if isinstance(stencil.y_radius, int):
                 self._emit(f"{rad_y} = {stencil.y_radius}")
             else:
-                r_expr = self._emit_expr(stencil.y_radius)
-                self._emit(f"{rad_y} = int({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
+                self._emit_runtime_radius(stencil, stencil.y_radius, rad_y)
 
             same_radius = (stencil.y_radius == stencil.x_radius if isinstance(stencil.y_radius, int)
                            else _ast_equal(stencil.y_radius, stencil.x_radius))
@@ -2469,8 +2480,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 if isinstance(stencil.x_radius, int):
                     self._emit(f"{rad_x} = {stencil.x_radius}")
                 else:
-                    r_expr = self._emit_expr(stencil.x_radius)
-                    self._emit(f"{rad_x} = int({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
+                    self._emit_runtime_radius(stencil, stencil.x_radius, rad_x)
 
             self._emit(f"{kh_tmp} = 2 * {rad_y} + 1")
             if not same_radius:
@@ -2732,6 +2742,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # fall through to the bit-exact per-sample codegen.
         if not stencil.is_fetch:
             return False
+        stencil.float_counter = any(
+            isinstance(loop.init, VarDecl) and loop.init.type_name == "float"
+            for loop in (stmt, *(s for s in stmt.body if isinstance(s, ForLoop))))
 
         if stencil.kind == "box":
             return self._emit_box_stencil(stencil)

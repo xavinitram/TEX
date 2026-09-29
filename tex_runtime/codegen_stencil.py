@@ -30,6 +30,7 @@ class _StencilInfo:
     y_radius: int | ASTNode | None = None
     x_radius: int | ASTNode | None = None
     is_symmetric: bool = False
+    float_counter: bool = False  # a runtime radius must then be integer-valued (codegen)
     # For asymmetric static ranges only:
     dy_start: int | None = None
     dy_stop: int | None = None   # exclusive

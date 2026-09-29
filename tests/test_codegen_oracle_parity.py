@@ -596,3 +596,28 @@ def test_spatial_if_string_merge_takes_the_majority_branch(on, else_arm):
     code = ('string s = "a";\nif (@A.r > 0.5) { s = "bb"; }' + else_arm +
             "\n@OUT = vec3(float(len(s))) + @A.rgb * 0.0;")
     assert_parity(code, {"A": _mostly(on)}, atol=0.0)
+
+
+# ── a float counter over a runtime radius: an integer radius lowers, a fractional one ──
+#    runs the loop (fractional offsets no integer kernel has)
+
+_FLOAT_COUNTER_BOX = (
+    "vec3 s = vec3(0.0); float n = 0.0;\n"
+    "for (float dy = -$r; dy <= $r; dy += 1.0) {\n  for (float dx = -$r; dx <= $r; dx += 1.0) {\n"
+    "    s = s + fetch(@A, ix + dx, iy + dy).rgb; n = n + 1.0; } }\n@OUT = s / n;")
+
+
+def test_float_counter_integer_runtime_radius_keeps_the_lowering():
+    assert_parity(_FLOAT_COUNTER_BOX, {"A": _img(H=10, W=10), "r": 2.0})
+
+
+@pytest.mark.parametrize("r", [2.5, 1.5])
+def test_float_counter_fractional_runtime_radius_matches_interpreter(r):
+    code, bindings = _FLOAT_COUNTER_BOX, {"A": _img(H=10, W=10), "r": r}
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, _refs, _assigned, _params, used = get_cache().compile_ast(program, bt, source=code)
+    ref = Interpreter().execute(program, _clone(bindings), tm, device="cpu", output_names=["OUT"])
+    got = _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
+                                used_builtins=used, fingerprint=None, time_context=None)
+    assert (ref["OUT"] - got["OUT"]).abs().max().item() <= 1e-5
