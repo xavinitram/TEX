@@ -14,6 +14,9 @@ Every row here is RED against base `7477a93` (v0.48.0): that `pacing.py` has no
 `_COST_TABLE`, no `pace_budget_ms`, and `paced_check` takes no `call_site_id` keyword at all
 (TypeError) -- so every assertion below has nothing matching to read.
 """
+import functools
+import inspect
+
 import pytest
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
@@ -119,6 +122,10 @@ def test_call_site_id_omitted_is_byte_identical_to_pre_pace49(r):
     with DeviceSpy() as spy, _clock_ctx() as clock:
         tok = _Token(pace=True, pace_depth=8, pace_stride_ms=10.0, pace_budget_ms=0.001)
         _pace.reset(tok, "cuda")
+        # Pre-warm the key an omitted id would use with an estimate far over the budget: were
+        # the gate consulted for `None`, the second poll would fall through and record.
+        for _ in range(_pace._COST_WARMUP_SAMPLES + 1):  # noqa: SLF001
+            _pace._cost_feed((None, _pace._state.device_idx, _pace._state.px_bucket), 1e6)  # noqa: SLF001
         _pace.paced_check(tok, "cuda")            # records (no call_site_id)
         clock.advance(0.001)
         _pace.paced_check(tok, "cuda")             # inside window, tail done -> should skip
@@ -401,3 +408,23 @@ def test_cost_table_is_bounded(r):
         r.ok(f"table holds exactly {size} entries after {_pace._COST_TABLE_MAX + 50} feeds")  # noqa: SLF001
     else:
         r.fail("PACE-49 bounded table", f"expected {_pace._COST_TABLE_MAX}, got {size}")  # noqa: SLF001
+
+
+def _isolated(fn):
+    """Give an `(r)` row the same pacing-state isolation the autouse fixture gives it
+    under pytest, so `run_all.py` (which calls rows directly) sees it too."""
+    @functools.wraps(fn)
+    def run(*a, **k):
+        _pace._state.__dict__.clear()
+        _pace._COST_TABLE.clear()
+        try:
+            return fn(*a, **k)
+        finally:
+            _pace._state.__dict__.clear()
+            _pace._COST_TABLE.clear()
+    return run
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("test_") and list(inspect.signature(_fn).parameters) == ["r"]:
+        globals()[_name] = _isolated(_fn)

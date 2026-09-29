@@ -108,14 +108,22 @@ def test_morph50_a_clamp_is_gone(r: SubTestResult):
 
 def test_morph50_b_bitexact_small_and_mid_radius(r: SubTestResult):
     print("\n--- MORPH-50 (b): torch.equal vs an independent brute-force oracle, r in [0,300] ---")
-    _MORPH50_R_SWEEP = (0, 1, 2, 8, 9, 10, 11, 12, 20, 64, 100, 255, 256, 257, 300)
+    _MORPH50_R_SWEEP = (0, 1, 2, 8, 9, 10, 11, 12, 20, 30, 64, 100, 255, 256, 257, 300)
     for dev in devices():
+        # The small cases above take the whole-line shortcut for every r >= 11 (r >= N-1);
+        # the two "block" cases are larger than the radii 11..30 so the cummax/cummin
+        # block code runs (partial last block, NaN/inf/-inf through the cummax).
+        block_nan = _mk(2, 41, 45, 2, seed=10, device=dev, nan_inf=True)
+        block_nan[1, 20, 17, 0] = float("nan")
+        block_nan[0, 33, 5, 1] = float("inf")
         cases = {
             "1px": _mk(1, 1, 1, 3, seed=2, device=dev),
             "nonsquare": _mk(2, 5, 9, 3, seed=3, device=dev),
             "batch": _mk(4, 10, 10, 1, seed=4, device=dev),
             "mask_no_channel": _mk(2, 7, 11, 0, seed=5, device=dev),
             "nan_inf": _mk(1, 8, 8, 3, seed=6, device=dev, nan_inf=True),
+            "block": _mk(1, 40, 37, 3, seed=11, device=dev),
+            "block_nan_inf": block_nan,
         }
         for case_name, img in cases.items():
             for radius in _MORPH50_R_SWEEP:
@@ -123,7 +131,7 @@ def test_morph50_b_bitexact_small_and_mid_radius(r: SubTestResult):
                     try:
                         got = TEXStdlib._morph(img, radius, grow)
                         want = _bruteforce_running_extreme(img, radius, grow)
-                        if case_name == "nan_inf":
+                        if case_name.endswith("nan_inf"):
                             ok = _bitexact(got, want)
                         else:
                             ok = torch.equal(got, want)
@@ -157,7 +165,7 @@ def test_morph50_c_large_radius_small_image(r: SubTestResult):
                     assert torch.equal(got, want), (
                         f"{name}(r={radius})@{dev} diverges from brute-force"
                     )
-                    r.ok(f"{name}(r={radius})@{dev} matches brute-force on a 6x7 image")
+                    r.ok(f"{name}(r={radius})@{dev} matches brute-force on a 1x3x700x2 image")
                 except AssertionError as e:
                     r.fail(f"{name} large-r r={radius}@{dev}", str(e))
 
@@ -185,29 +193,35 @@ def test_morph50_d_no_limit_kept(r: SubTestResult):
 def test_morph50_e_crossover_uses_original_loop(r: SubTestResult):
     print("\n--- MORPH-50 (e): at/below the crossover, _morph delegates to the ORIGINAL "
           "iterative loop (same code, same cost -- invariant 7) ---")
+    # Both algorithms are bit-exact to the oracle, so equal outputs cannot say which one
+    # ran: spy on the two entry points and assert the dispatch itself.
     img = _mk(1, 16, 16, 3, seed=9)
     crossover = TEXStdlib._MORPH_VANHERK_CROSSOVER
-    for name, grow in (("erode", False), ("dilate", True)):
-        try:
-            x = (img.unsqueeze(-1) if img.dim() == 3 else img).permute(0, 3, 1, 2)
-            direct = TEXStdlib._morph_iterative(x.clone(), crossover, grow)
-            via_dispatch = TEXStdlib._morph(img, crossover, grow)
-            direct_out = direct.permute(0, 2, 3, 1)
-            assert torch.equal(direct_out, via_dispatch), (
-                f"{name}(r={crossover}) via _morph does not match calling "
-                f"_morph_iterative directly -- dispatch picked the wrong path"
-            )
-            r.ok(f"{name}(r={crossover}) == crossover dispatches to _morph_iterative")
-        except AssertionError as e:
-            r.fail(f"{name} crossover dispatch r={crossover}", str(e))
+    real_iter, real_vh = TEXStdlib._morph_iterative, TEXStdlib._morph_vanherk
+    calls = []
 
-    # And just above the crossover, the van Herk path is the one running (still
-    # bit-exact, per test (b) above -- this only pins WHICH function ran).
+    def spy_iter(x, rr, grow):
+        calls.append(("iterative", rr))
+        return real_iter(x, rr, grow)
+
+    def spy_vh(x, rr, grow):
+        calls.append(("vanherk", rr))
+        return real_vh(x, rr, grow)
+
+    TEXStdlib._morph_iterative = staticmethod(spy_iter)
+    TEXStdlib._morph_vanherk = staticmethod(spy_vh)
     try:
-        x = (img.unsqueeze(-1) if img.dim() == 3 else img).permute(0, 3, 1, 2)
-        via_vanherk = TEXStdlib._morph_vanherk(x.clone(), crossover + 1, False)
-        via_dispatch = TEXStdlib._morph(img, crossover + 1, False)
-        assert torch.equal(via_vanherk.permute(0, 2, 3, 1), via_dispatch)
-        r.ok(f"erode(r={crossover + 1}) dispatches to _morph_vanherk")
-    except AssertionError as e:
-        r.fail("crossover+1 dispatch", str(e))
+        for name, grow in (("erode", False), ("dilate", True)):
+            for radius, want in ((crossover, "iterative"), (crossover + 1, "vanherk")):
+                try:
+                    calls.clear()
+                    TEXStdlib._morph(img, radius, grow)
+                    assert calls == [(want, radius)], (
+                        f"{name}(r={radius}) ran {calls}, expected exactly one {want} call"
+                    )
+                    r.ok(f"{name}(r={radius}) dispatches to _morph_{want}")
+                except AssertionError as e:
+                    r.fail(f"{name} dispatch r={radius}", str(e))
+    finally:
+        TEXStdlib._morph_iterative = staticmethod(real_iter)
+        TEXStdlib._morph_vanherk = staticmethod(real_vh)

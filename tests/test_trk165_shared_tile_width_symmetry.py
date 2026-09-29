@@ -132,45 +132,54 @@ def run_tier_ref(code, bindings, tier):
 
 
 def test_trk165_planners_take_non_spatial(r: SubTestResult):
-    """`tex_tiling._tile_plan`/`_halo_tile_plan` now derive and pass the same `non_spatial`
-    exclusion into their `shared_tile_height`/`shared_tile_width` calls. Both planners are
-    CUDA-gated (they answer None off any other device), so this only exercises the real
-    decision when CUDA is present; off CUDA it confirms the documented no-op instead."""
+    """`tex_tiling._tile_plan`/`_halo_tile_plan` derive and pass the `non_spatial` exclusion into
+    their `shared_tile_height`/`shared_tile_width` calls. Without it a LUT whose own dims
+    differ from the image's reads as a second candidate size and the planner refuses before it
+    ever sizes the cook. The planners are gated on a `cuda` device NAME, so this passes
+    "cuda:0" with CPU tensors and a stub for `estimate_peak_bytes` (the TRK-166 technique):
+    reaching the stub proves the shared size resolved to the one real image size."""
     print("\n--- TRK-165: _tile_plan/_halo_tile_plan thread non_spatial through ---")
     from TEX_Wrangle import tex_tiling
-    img = make_img(1, 8, 8, 3, seed=3)
-    lut = torch.rand(8, 8, 8, 3)     # coincidental N == H == W == 8, by construction
+    calls = []
+    real = tex_memory.estimate_peak_bytes
+
+    def _spy(program, spatial, dtype_bytes, fingerprint=None):
+        calls.append(spatial)
+        return 1024
+
+    def _plan(fn, *args):
+        calls.clear()
+        tex_memory.estimate_peak_bytes = _spy
+        try:
+            fn(*args)
+        finally:
+            tex_memory.estimate_peak_bytes = real
+        return list(calls)
+
     code = "@OUT = vec4(apply_lut3d(@A.rgb, @LUT), 1.0);"       # tile-safe (pointwise + LUT)
-    bindings = {"A": img, "LUT": lut}
+    bindings = {"LUT": torch.rand(5, 5, 5, 3), "A": make_img(2, 8, 12, 3, seed=3)}
     try:
         prog, tm, outs = compile_program(code, bindings)
-        if not _CUDA:
-            n = tex_tiling._tile_plan(prog, bindings, "cpu")
-            assert n is None, f"expected None off CUDA, got {n}"
-            r.ok("_tile_plan answers None off CUDA regardless of the LUT collision "
-                 "(documented no-op — nothing to skew when nothing plans)")
-        else:
-            # On CUDA: with the LUT correctly excluded, the plan must not be thrown by the
-            # coincidence (no crash, a well-formed answer or None on a cook too small to
-            # need tiling — either is fine; a StopIteration/exception is not).
-            n = tex_tiling._tile_plan(prog, bindings, "cuda")
-            r.ok(f"_tile_plan on CUDA with a colliding LUT returns {n!r} without raising")
+        assert _non_spatial_names_cached(prog) == {"LUT"}
+        # Control: without the exclusion the two leading dims (5 vs 8) disagree.
+        assert tex_memory.shared_tile_height(bindings) is None
+        got = _plan(tex_tiling._tile_plan, prog, bindings, "cuda:0", 0, 4, "trk165_tile",
+                    None, code, None)
+        assert got == [(2, 8, 12)], f"_tile_plan sized {got}, expected the real image's (2, 8, 12)"
+        r.ok("_tile_plan excludes the mismatched LUT and sizes the cook off the real image")
     except Exception as e:
         r.fail("TRK-165 _tile_plan", f"{type(e).__name__}: {e}")
 
-    halo_code = _HALO_CODE
-    lut2 = torch.rand(16, 16, 16, 3)
-    bindings2 = {"A": make_img(1, 16, 16, 3, seed=4), "LUT": lut2}
+    bindings2 = {"LUT": torch.rand(5, 5, 5, 3), "A": make_img(2, 16, 24, 3, seed=4)}
     try:
-        prog2, tm2, outs2 = compile_program(halo_code, bindings2)
-        if not _CUDA:
-            n2 = tex_tiling._halo_tile_plan(prog2, halo_code, bindings2, "cpu", 0, 4,
-                                            "trk165_test", None, "fp32")
-            assert n2 is None, f"expected None off CUDA, got {n2}"
-            r.ok("_halo_tile_plan answers None off CUDA regardless of the LUT collision")
-        else:
-            n2 = tex_tiling._halo_tile_plan(prog2, halo_code, bindings2, "cuda", 0, 4,
-                                            "trk165_test", None, "fp32")
-            r.ok(f"_halo_tile_plan on CUDA with a colliding LUT returns {n2!r} without raising")
+        prog2, tm2, outs2 = compile_program(_HALO_CODE, bindings2)
+        assert _non_spatial_names_cached(prog2) == {"LUT"}
+        assert tex_memory.shared_tile_height(bindings2) is None
+        assert tex_memory.shared_tile_width(bindings2) is None
+        got2 = _plan(tex_tiling._halo_tile_plan, prog2, _HALO_CODE, bindings2, "cuda:0", 0, 4,
+                     "trk165_halo", None, "fp32")
+        assert got2 == [(2, 16, 24)], (
+            f"_halo_tile_plan sized {got2}, expected the real image's (2, 16, 24)")
+        r.ok("_halo_tile_plan excludes the mismatched LUT from both shared sizes")
     except Exception as e:
         r.fail("TRK-165 _halo_tile_plan", f"{type(e).__name__}: {e}")

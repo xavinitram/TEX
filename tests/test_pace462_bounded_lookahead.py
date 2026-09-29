@@ -20,6 +20,9 @@ previous event exists (an unconditional one-poll-interval wait, not a depth-gate
 so `_pace._resolve_depth` does not exist at all (AttributeError) and the ring/ construction-
 count assertions below have nothing matching to read.
 """
+import functools
+import inspect
+
 import pytest
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
@@ -1101,3 +1104,21 @@ def test_p1_ring_is_not_reused_across_a_same_thread_device_switch(r):
             return
     r.ok("cuda:1 cook after a cuda:0 cook on the same thread never touched a "
          "device-0-bound event")
+
+
+def _isolated(fn):
+    """Give an `(r)` row the same pacing-state isolation the autouse fixture gives it
+    under pytest, so `run_all.py` (which calls rows directly) sees it too."""
+    @functools.wraps(fn)
+    def run(*a, **k):
+        _pace._state.__dict__.clear()
+        try:
+            return fn(*a, **k)
+        finally:
+            _pace._state.__dict__.clear()
+    return run
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("test_") and list(inspect.signature(_fn).parameters) == ["r"]:
+        globals()[_name] = _isolated(_fn)
