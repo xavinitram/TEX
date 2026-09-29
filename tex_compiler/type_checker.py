@@ -847,17 +847,9 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_scalar_condition(self, cond_type: TEXType, keyword: str, loc):
-        """Require a condition expression to be a scalar (float/int) value.
-
-        TRK-162: an ARRAY-typed condition — reachable with a plain LOCAL array
-        declaration on the default ComfyUI profile (`float arr[3] = {...};`), no engine
-        profile needed; a WIRED array binding additionally needs
-        `tex_compiler.types.set_array_wires(True)` — used to type-check clean here
-        (`TEXType.ARRAY.is_vector` is `False`) and crash three layers into execution instead, inside
-        `_merge_branch_vars`'s `_tensor_where` — a per-pixel branch merge broadcasting the
-        condition's own length against the branch values' vector width. Refused here
-        instead, the same class of fix `TRK-9`/`TRK-28` each made for their own crash
-        shapes: a named diagnostic at type-check time, never a bare `RuntimeError`."""
+        """Require a condition expression to be a scalar (float/int) value: a vector, array,
+        matrix or string condition would crash (or broadcast into the wrong shape) in the
+        per-pixel merge instead of drawing a named diagnostic."""
         if cond_type.is_vector:
             self._error(f"This '{keyword}' condition needs a scalar expression (int or float), but found a vector.",
                         loc, code="E3500",
@@ -866,6 +858,10 @@ class TypeChecker:
             self._error(f"This '{keyword}' condition needs a scalar expression (int or float), but found an array.",
                         loc, code="E3501",
                         hint="Try indexing into the array (e.g. arr[0]) to get a single value.")
+        elif cond_type.is_string or cond_type.is_matrix or cond_type.is_planes:
+            self._error(f"This '{keyword}' condition needs a scalar expression (int or float), "
+                        f"but found {cond_type.value}.", loc, code="E3500",
+                        hint="Compare it to get a 0/1 value, e.g. len(s) > 0.")
 
     def _check_if_else(self, node: IfElse):
         """Type-check an if/else: a scalar condition plus both branch bodies."""
@@ -1345,7 +1341,7 @@ class TypeChecker:
 
     def _check_ternary(self, node: TernaryOp) -> TEXType:
         """Type-check a ternary: a scalar condition plus the promoted common type of both arms."""
-        self._check_expr(node.condition)
+        self._check_scalar_condition(self._check_expr(node.condition), "?:", node.loc)
         tt = self._check_expr(node.true_expr)
         ft = self._check_expr(node.false_expr)
         # Both branches must agree for string
@@ -1353,6 +1349,10 @@ class TypeChecker:
             self._error("Both branches of a ternary (? :) need to be the same kind: both strings or both numeric.",
                         node.loc, code="E3400",
                         hint="Make sure the true and false branches return the same general type.")
+        elif any(t.is_matrix or t.is_array or t.is_planes for t in (tt, ft)):
+            self._error("A ternary (? :) picks between numbers, vectors or strings, not "
+                        "matrices or arrays.", node.loc, code="E3400",
+                        hint="Use an if/else that assigns the matrix or array instead.")
         result = self._promote(tt, ft)
         self._set_type(node, result)
         return result
@@ -1518,6 +1518,9 @@ class TypeChecker:
                 node.loc, code="E3700",
                 hint="Try: to_int() or to_float() to parse a string as a number.",
             )
+        # float()/int() are element-wise: a vector or matrix keeps its shape.
+        if t.is_scalar and (expr_type.is_vector or expr_type.is_matrix):
+            t = expr_type
         self._set_type(node, t)
         return t
 

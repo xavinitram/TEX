@@ -361,3 +361,22 @@ def test_function_defined_in_a_loop_survives_unrolling():
              "s += f(1.0); } @OUT = vec4(s);", {"A": _a()}, torch.full((1, 4, 4, 4), 2.0))
     run_both("float s = @A.r * 0.0; if (@A.r > -1.0) { float f(float x) { return x * 3.0; } s = f(1.0); } "
              "@OUT = vec4(s);", {"A": _a()}, torch.full((1, 4, 4, 4), 3.0))
+
+
+@pytest.mark.parametrize("code,want", [
+    ('float x = ("a") ? 1.0 : 0.0; @OUT = vec4(x);', "E3500"),
+    ("float x = (@A.rgb) ? 1.0 : 0.0; @OUT = vec4(x);", "E3500"),
+    ("mat3 m = mat3(1.0); mat3 n = mat3(2.0); mat3 k = (@A.r < 1.0) ? m : n; @OUT = vec4(1.0);", "E3400"),
+    ('if ("a") { @OUT = vec4(1.0); }', "E3500"),
+    ("mat3 m = mat3(1.0); if (m) { @OUT = vec4(1.0); }", "E3500"),
+    ("float x = float(vec3(1.0, 2.0, 3.0) + @A.rgb); @OUT = vec4(x);", "E3200"),
+    ("int i = int(mat3(2.0)); @OUT = vec4(float(i));", "E3200"),
+], ids=["tern-str", "tern-vec", "tern-mat", "if-str", "if-mat", "float-vec", "int-mat"])
+def test_conditions_and_casts_are_typed_as_they_run(code, want):
+    assert want in check_errors(code, _V4)
+
+
+def test_int_cast_of_a_vector_is_an_elementwise_vector():
+    A = _a()
+    ref = run_both("vec3 q = int(@A.rgb * 8.0) / 8.0; @OUT = vec4(q, 1.0);", {"A": A})
+    assert torch.allclose(ref["OUT"][..., :3], torch.floor(A[..., :3] * 8.0) / 8.0)
