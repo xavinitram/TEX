@@ -38,6 +38,8 @@ import copy
 import re as _re
 
 from .lexer import Token, TokenType
+
+_FP32_MAX = 3.4028234663852886e38
 from .ast_nodes import (
     SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
@@ -238,6 +240,24 @@ class Parser:
                     code: str = "E2000", hint: str = "") -> ParseError:
         """Create a ParseError with source context."""
         return ParseError(message, loc, source=self._source, code=code, hint=hint)
+
+    def _literal_value(self, tok: Token) -> int | float:
+        """A numeric token's value: hex-aware for INT_LIT, and a positioned E2000 instead of
+        a raw ValueError or a silent inf for a literal the fp32 runtime cannot hold."""
+        if tok.type == TokenType.INT_LIT:
+            try:
+                return int(tok.value, 16) if tok.value[:2] in ("0x", "0X") else int(tok.value)
+            except ValueError:   # past Python's int-digit limit
+                raise self._make_error(f"Integer literal `{tok.value[:20]}...` is too long.",
+                                       tok.loc, code="E2000",
+                                       hint="Use a value at or below 2**53.") from None
+        val = float(tok.value)
+        if not (abs(val) <= _FP32_MAX):
+            raise self._make_error(
+                f"Float literal `{tok.value}` is outside the float range (about 3.4e38).",
+                tok.loc, code="E2000",
+                hint="Values are 32-bit floats; use a literal at or below 3.4e38.")
+        return val
 
     def _synchronize(self):
         """Panic-mode recovery: skip tokens until a synchronization point."""
@@ -567,13 +587,9 @@ class Parser:
         else — an identifier, a `(`, a `$binding` — is rejected here (literals only)."""
         neg = self.match(TokenType.MINUS)
         tok = self.current()
-        if tok.type == TokenType.INT_LIT:
+        if tok.type in (TokenType.INT_LIT, TokenType.FLOAT_LIT):
             self.advance()
-            val = int(tok.value, 16) if tok.value[:2] in ("0x", "0X") else int(tok.value)
-            return -val if neg else val
-        if tok.type == TokenType.FLOAT_LIT:
-            self.advance()
-            val = float(tok.value)
+            val = self._literal_value(tok)
             return -val if neg else val
         if tok.type == TokenType.STRING_LIT and not neg:
             self.advance()
@@ -598,7 +614,7 @@ class Parser:
         size = None
         if self.peek() == TokenType.INT_LIT:
             size_tok = self.advance()
-            size = int(size_tok.value, 16) if size_tok.value[:2] in ("0x", "0X") else int(size_tok.value)
+            size = self._literal_value(size_tok)
             if size <= 0:
                 raise self._make_error(f"Array size must be positive, got {size}.",
                                       size_tok.loc, code="E2004")
@@ -963,13 +979,9 @@ class Parser:
         # Numeric literals
         if tok.type == TokenType.INT_LIT:
             self.advance()
-            if tok.value.startswith("0x") or tok.value.startswith("0X"):
-                val = int(tok.value, 16)
-            else:
-                val = int(tok.value)
-            # NumberLiteral stores value as a Python float; ints above 2**53
-            # cannot be represented exactly as IEEE-754 doubles and would be
-            # silently rounded despite is_int=True. Fail loudly instead.
+            val = self._literal_value(tok)
+            # NumberLiteral stores the value as a Python float, exact only to 2**53, so a
+            # larger literal fails here. At run time an int is fp32 (exact to 2**24).
             if abs(val) > (1 << 53):
                 raise self._make_error(
                     f"Integer literal `{tok.value}` is too large to represent "
@@ -980,7 +992,7 @@ class Parser:
 
         if tok.type == TokenType.FLOAT_LIT:
             self.advance()
-            return NumberLiteral(loc=tok.loc, value=float(tok.value), is_int=False)
+            return NumberLiteral(loc=tok.loc, value=self._literal_value(tok), is_int=False)
 
         # String literals
         if tok.type == TokenType.STRING_LIT:

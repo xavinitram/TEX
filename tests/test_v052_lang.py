@@ -209,3 +209,30 @@ def test_vec_array_literal_elements_widen():
              torch.cat([A[..., :3], torch.ones_like(A[..., :1])], -1))
     run_both("vec3 a[2] = {@A.r * 0.0 + 0.5, vec3(1.0, 2.0, 3.0)}; @OUT = vec4(a[0], 1.0);", {"A": A},
              torch.tensor([0.5, 0.5, 0.5, 1.0]).expand(1, 4, 4, 4))
+
+
+# ── Parser: literals the fp32 runtime cannot hold ───────────
+
+def _parse_error_code(code):
+    from TEX_Wrangle.tex_compiler.parser import ParseError
+    try:
+        parse_and_split(code, {"OUT": TEXType.VEC4})
+    except ParseError as e:
+        return e.code if hasattr(e, "code") else "?"
+    except TEXMultiError as e:
+        return e.diagnostics[0].code
+    return None
+
+
+@pytest.mark.parametrize("code", [
+    "@OUT = vec4(1e39);", "float x = 1e999;", "@OUT = vec4(-3.5e38);",
+    "f$k = 0.5 [max: 1e999];", "int x = " + "9" * 5000 + ";", "float a[" + "9" * 5000 + "];",
+], ids=["1e39", "1e999", "neg3.5e38", "meta1e999", "int5000digits", "size5000digits"])
+def test_out_of_range_literal_is_a_parse_error(code):
+    assert _parse_error_code(code) == "E2000"
+
+
+def test_in_range_literals_parse():
+    for code in ("@OUT = vec4(3.4028234e38);", "float a[0x4]; @OUT = vec4(a[1]);",
+                 "f$k = 0.5 [max: 1e30]; @OUT = vec4($k);"):
+        assert _parse_error_code(code) is None, code
