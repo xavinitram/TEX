@@ -16,9 +16,11 @@ The analysis composes the existing pieces (roadmap ROI-2):
     fold/propagate), so `gauss_blur(@A, $sigma)` resolves its radius when the widget
     value is known; a radius that stays symbolic conservatively → `image`.
   * ROI-1's registry footprint + the **reach model** (`_call_reach`) — turns a call's
-    `('halo', r)` / `('halo_arg', i[, mult])` descriptor into a pixel halo. The
-    `halo_arg` multiplier is the fix for the trap the roadmap flagged: `gauss_blur`'s
+    `('halo', r)` / `('halo_arg', i[, mult[, approx_above]])` descriptor into a pixel halo.
+    The `halo_arg` multiplier is the fix for the trap the roadmap flagged: `gauss_blur`'s
     kernel radius is `ceil(3·sigma)`, not `sigma` — the descriptor carries `mult=3.0`.
+    `approx_above` names the raw argument past which the builtin switches to a resample
+    approximation anchored to the crop's edges; such a call is `unbounded` (never narrowed).
   * affine offset extraction — reused from `codegen_stencil` — refines a constant-offset
     `fetch(@A, ix+3, iy)` / `@A[ix-1, iy]` from `image` to a bounded (but **non-narrowable**,
     absolute-coordinate) halo, for ROI-5/GRAPH-1 substrate.
@@ -334,19 +336,11 @@ def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
             state["blocked"] = True
             _mark_whole(reads, img, node, state)        # still record the footprint (substrate)
         elif r == "unbounded":                          # direct-tensor op, symbolic radius
-            if ctx_halo == "image":
-                _accumulate(img, "image", reads, state)  # inside a gather → input is whole anyway
-            else:
+            if ctx_halo != "image":                     # (inside a gather the input is whole anyway)
                 state["blocked"] = True                  # cannot narrow to an unknown halo
-                _accumulate(img, "image", reads, state)
+            _accumulate(img, "image", reads, state)
         else:                                           # narrowable halo op — add r to image arg
-            new_ctx = "image" if ctx_halo == "image" else ctx_halo + r
-            if new_ctx != "image" and new_ctx > state["halo"]:
-                # The cook halo is the max reach of ANY halo op — including one wrapping a
-                # GENERATED expression (`erode(vec4(u,v,..),3)`), which reads neighbours of
-                # values computed only over the cook region, so the region must still grow.
-                state["halo"] = new_ctx
-            _accumulate(img, new_ctx, reads, state)
+            _accumulate_narrow(img, ctx_halo, r, reads, state)
         # REACH-48 (TIERS-48-design.md SS B.2 point 2): a `rest` argument reads at the
         # outer ctx (a radius/coord/flag scalar) UNLESS this function DECLARES it its own,
         # independent reach (`convolve`'s `kernel` is the first case) — a plain
@@ -358,10 +352,7 @@ def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
             if ar is None:
                 _accumulate(a, ctx_halo, reads, state)
             elif isinstance(ar, int):                   # a narrowable halo on THIS argument
-                new_ctx = "image" if ctx_halo == "image" else ctx_halo + ar
-                if new_ctx != "image" and new_ctx > state["halo"]:
-                    state["halo"] = new_ctx
-                _accumulate(a, new_ctx, reads, state)
+                _accumulate_narrow(a, ctx_halo, ar, reads, state)
             else:                                        # 'image' / 'unbounded' — read whole
                 state["blocked"] = True
                 _mark_whole(reads, a, node, state)
@@ -376,6 +367,17 @@ def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
 
     for ch in iter_child_nodes(node):
         _accumulate(ch, ctx_halo, reads, state)
+
+
+def _accumulate_narrow(node, ctx_halo, r: int, reads: dict, state: dict) -> None:
+    """Accumulate `node` under a narrowable halo op's reach `r` added to `ctx_halo`. The cook
+    halo is the max reach of ANY halo op, including one wrapping a GENERATED expression
+    (`erode(vec4(u,v,..),3)`), which reads neighbours of values computed only over the cook
+    region, so the region must still grow."""
+    new_ctx = "image" if ctx_halo == "image" else ctx_halo + r
+    if new_ctx != "image" and new_ctx > state["halo"]:
+        state["halo"] = new_ctx
+    _accumulate(node, new_ctx, reads, state)
 
 
 def _record(reads: dict, name: str, ctx_halo) -> None:
@@ -547,9 +549,9 @@ def _unfolded_region_independent(code: str, binding_types, code_hash: str | None
     `_language_tuple` sunset test does not depend on the fold either (same pragma, same
     engine version before and after). Working through both of `region_dependent`'s
     branches: unfolded `strings=() and casts=()` forces folded `strings=() and casts=()`
-    too (subset), and unfolded `bool(loops) and SUNSET_OLD == False` forces the same
-    for folded (either `loops` was already empty and stays empty, or `SUNSET_OLD` is
-    False and cancels `loops` either way) — so "unfolded says False" implies "folded says
+    too (subset), and unfolded `bool(loops)` with `_language_tuple(program, code) <
+    MASKED_FLOW_SINCE` false forces the same for folded (either `loops` was already empty
+    and stays empty, or the language gate is off and cancels `loops` either way) — so "unfolded says False" implies "folded says
     False", for every valuation, unconditionally. When the unfolded source says True,
     this predicate is simply not useful — `_walk` still walks the actual fold per
     valuation exactly as it does today, because folding CAN flip that True to False for
@@ -602,7 +604,10 @@ def region_dependent_cached(program, fingerprint, binding_types=None, code=None)
         while len(_region_dep_memo) > _REGION_DEP_MEMO_MAX:
             _region_dep_memo.popitem(last=False)
     else:
-        _region_dep_memo.move_to_end(key)
+        try:
+            _region_dep_memo.move_to_end(key)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; v stands
     return v
 
 
@@ -711,16 +716,9 @@ def _has_ungrounded_halo(program) -> bool:
             if init_has:
                 halo_named.add(node.name)
             return has
-        if cls is IfElse:
-            # ROI-48A/O2: a resolved (literal-condition) IfElse cannot reach this walk at all —
-            # `_fold_program` prunes it away structurally (`tex_lazy._prune_static_flow`,
-            # spliced into the surviving statement list) before `_has_ungrounded_halo` ever
-            # runs, so every IfElse seen here is genuinely symbolic and both bodies are walked,
-            # same as any other construct with no case-(1) boundary of its own.
-            for ch in iter_child_nodes(node):
-                if _visit(ch, ungrounded, scanned):
-                    has = True
-            return has
+        # An IfElse takes the generic path below: `_fold_program` already pruned every
+        # resolved (literal-condition) one, so any IfElse seen here is genuinely symbolic and
+        # both bodies are walked, with no case-(1) boundary of its own.
         inner = True if cls in (FunctionDef, ForLoop, WhileLoop) else ungrounded
         if cls is Assignment:
             value_has = False
@@ -780,8 +778,9 @@ def _pristine_program(code: str):
     parse is a function of the source alone, so it is cached here and each caller gets its
     own `clone_tree` copy to mutate; the fold still runs per value, on a reused parse.
 
-    The entry is the PRISTINE parse and is never handed out directly — a caller that mutated
-    it would poison every later fold of that source with the previous call's literals. Same
+    The entry is the PRISTINE parse. A caller that only READS it may use it directly; one
+    that mutates must `clone_tree` first, or it would poison every later fold of that source
+    with the previous call's literals (`_fold_program` clones). Same
     bounded-LRU discipline as `_walk_memo`, with a smaller cap because an entry is a whole
     AST rather than a five-tuple, and `clear_roi_memo` drops it with the rest.
 
@@ -926,21 +925,18 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
         return None
     hit = _walk_memo.get(key)
     if hit is not None or key in _walk_memo:
-        _walk_memo.move_to_end(key)
+        try:
+            _walk_memo.move_to_end(key)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; hit stands
         return hit
     try:
         program = _fold_program(code, param_values)
         reads: dict = {}
         state = {"blocked": False, "halo": 0}
-        # O2 (R4-altitude finding 2) / TRK-219: `_accumulate`/`_has_ungrounded_halo` used to
-        # each re-derive "does this IfElse's condition resolve, and if so which body runs" via
-        # their own copy of the now-deleted `_resolved_branch` — one pruning step, shared,
-        # replaces both. TRK-219 moved that pruning step INTO `_fold_program` itself (it used
-        # to run here, on a private clone, scoped to keep `region_dependent` below reading the
-        # un-pruned tree — deliberately widened once every one of `_fold_program`'s other three
-        # consumers turned out to need the exact same pruned tree), so `program` here IS the
-        # pruned tree already — no second clone-and-prune needed, and `region_dependent` below
-        # now sees the same pruned tree every other `_fold_program` consumer does.
+        # `_fold_program` has already pruned every resolved (literal-condition) IfElse, so
+        # `program` is the tree `_accumulate`, `_has_ungrounded_halo` and `region_dependent`
+        # all read.
         for stmt in program.statements:
             _accumulate(stmt, 0, reads, state)
         blocked = state["blocked"] or _has_ungrounded_halo(program)
@@ -1016,7 +1012,7 @@ _NOT_EXECUTABLE = RoiPlan(False)
 def _scale_halo(halo: int, scale: float) -> int:
     """SCALE-47b: apply a cook's resolution scale to an already-composed pixel margin,
     ceiling up -- never down (the same discipline `_call_reach`'s `mult` already
-    established at `tex_roi.py:151`). Applied HERE, after `_walk`'s memoized per-program
+    established in `_reach_of`). Applied HERE, after `_walk`'s memoized per-program
     walk has already produced the scale-INDEPENDENT composed halo (the max narrowable
     reach anywhere in the program), rather than threaded into the walk/memo itself: the
     walk's answer does not depend on scale, so re-deriving it per scale value would only
@@ -1294,7 +1290,10 @@ def scale_verdict(code: str, param_values: dict | None = None) -> ScaleVerdict:
         while len(_scale_verdict_memo) > _SCALE_VERDICT_MEMO_MAX:
             _scale_verdict_memo.popitem(last=False)
     else:
-        _scale_verdict_memo.move_to_end(key)
+        try:
+            _scale_verdict_memo.move_to_end(key)
+        except KeyError:
+            pass          # a concurrent insert evicted it between the get and here; v stands
     return v
 
 
@@ -1402,8 +1401,9 @@ def roi_exec_enabled(opt_in: bool | None = None) -> bool:
         # Coerced, not returned raw. `False` is documented above as an explicit KILL SWITCH, and
         # the truthiness of a string defeats that: `roi_exec="0"`, `"false"`, `"off"` — the
         # spellings a host reads out of a config file or an env var — are all truthy, so every
-        # one of them ARMED the path they were written to disable. Strings get the same
-        # vocabulary `TEX_ROI_EXEC` accepts; everything else is a plain truth test.
+        # one of them ARMED the path they were written to disable. A string is read as a
+        # boolean word; everything else is a plain truth test. (The `TEX_ROI_EXEC` env var
+        # below is stricter: it is on only for "1", like the other TEX_* switches.)
         if isinstance(opt_in, str):
             return opt_in.strip().lower() in ("1", "true", "yes", "on")
         return bool(opt_in)
@@ -1473,9 +1473,6 @@ def validate_roi(roi) -> str | None:
         return f"roi origin must be non-negative (got {x0},{y0})"
     if x0 + w > W or y0 + h > H:
         return f"roi window ({x0},{y0},{w},{h}) overhangs the {W}x{H} image"
-    # The window's (W, H) must describe the image the bindings actually carry, or the narrow
-    # slices the wrong extent (measured: a mismatch raises inside run_roi and re-cooks
-    # whole-frame with a log line on EVERY frame of a pan).
     return None
 
 
@@ -1676,7 +1673,7 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
     if scale <= 0:
         raise ValueError(f"chain_windows: scale must be > 0, got {scale!r}")
     # `_dag_grow` now lives in `tex_roi_dag` (moved by JOINWIRE-50's REG-2 split, see the
-    # module note above this function) — a function-local import, because `tex_roi_dag`
+    # module note below this function) — a function-local import, because `tex_roi_dag`
     # imports FROM this module at its own top level and this module must not import it back
     # at load time.
     from .tex_roi_dag import _dag_grow
@@ -1688,7 +1685,7 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
     # inherits that. Refuse rather than plan over it.
     if declined and valid is not None:
         for i in sorted(set(declined)):
-            if 0 <= i < n and i > 0 and valid[i - 1] is not None:
+            if 0 < i < n and i - 1 < len(valid) and valid[i - 1] is not None:
                 return None
     out = [None] * n
     if n == 0:
@@ -1710,7 +1707,7 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
         # inside whatever region that canvas is actually correct over. `+ halos[start]` because
         # stage `start` reaches that far into its input.
         need = out[start]
-        pad = int(halos[start]) if start < n else 0
+        pad = int(halos[start])
         if need is not None:
             grown = _dag_grow(need, pad)
             upstream_valid = valid[start - 1] if start - 1 < len(valid) else None
