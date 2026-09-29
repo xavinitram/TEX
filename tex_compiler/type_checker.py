@@ -41,7 +41,7 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, MatConstructor,
     CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral, ParamDecl,
-    BindingIndexAccess, BindingSampleAccess, ErrorNode,
+    BindingIndexAccess, BindingSampleAccess, ErrorNode, rename_shadowing_locals,
 )
 from .diagnostics import (
     TEXMultiError, get_builtin_var_hint, get_function_hint, get_keyword_hint,
@@ -294,6 +294,7 @@ class TypeChecker:
             if len(self.errors) == 1:
                 raise self.errors[0]
             raise TEXMultiError([e.diagnostic for e in self.errors if e.diagnostic])
+        rename_shadowing_locals(program, _BUILTIN_VAR_NAMES)   # the runtimes' flat table
         return types
 
     def _set_type(self, node: ASTNode, t: TEXType):

@@ -1674,6 +1674,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         for vname in sorted(body_vars):  # sorted → deterministic local naming order
             if vname not in self._local_vars:  # don't overwrite params
                 self._local_vars[vname] = f"_ufl_{vname}"  # never `_uf_<x>`: that names a function
+        self._capture_outer_reads(stmt, saved_locals, body_vars)
 
         saved_in_fn = self._in_user_function
         self._in_user_function = True
@@ -1711,6 +1712,18 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._local_vars = saved_locals
         self._spatial_vars = saved_spatial_vars
         self._indent -= 1
+
+    def _capture_outer_reads(self, stmt: FunctionDef, outer: dict, body_vars: set[str]):
+        """Bind each enclosing local the body reads to a local of the emitted def, read at
+        call time. A function sees the variables visible where it is defined (shadows were
+        renamed apart by the checker), and a def-local copy is never a Python closure
+        write, which a scalar loop in the body would otherwise make."""
+        own = body_vars | {pname for _, pname in stmt.params}
+        for name in sorted(self._collect_read_vars(stmt.body) - own):
+            local = outer.get(name)
+            if local is not None and local.isidentifier():
+                self._local_vars[name] = f"_fo_{name}"
+                self._emit(f"_fo_{name} = {local}")
 
     def _enter_function_scope(self, stmt: FunctionDef, body_vars: set[str]):
         """Scope the two emit-time memos a function body would otherwise leak.
@@ -3402,9 +3415,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         # User-defined function call
         if name in self._user_functions:
-            args_str = ", ".join(args)
-            depth_arg = ", _depth=_depth+1" if self._in_user_function else ""
-            self._emit(f"{tmp} = _uf_{name}({args_str}{depth_arg})")
+            if self._in_user_function:
+                args = args + ["_depth=_depth+1"]
+            self._emit(f"{tmp} = _uf_{name}({', '.join(args)})")
             return tmp
 
         # SCALE-CG-48: a `pixel_args=`-tagged builtin's pixel-unit argument(s) are

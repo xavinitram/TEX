@@ -130,3 +130,53 @@ def test_scatter_mul_under_a_mask_counts_live_sources_only():
     ref = run_tiers(code, {"A": A, "OUT": torch.ones(1, 4, 5, 4)})
     n = int((A[..., 0] > 0.5).sum())
     assert ref["OUT"][0, 0, 0, 0].item() == pytest.approx(2.0 ** n)
+
+
+# ── Names resolve lexically: a shadow ends with its block, and a function reads the ─────
+# variables visible where it is defined, never a caller's same-named local.
+
+def _u():
+    return torch.arange(5, dtype=torch.float32).div(4).view(1, 1, 5).expand(1, 4, 5)
+
+
+@pytest.mark.parametrize("code,want", [
+    ("float g = 1.0; float f() { return g; } float r = 0.0;"
+     " if (1.0) { float g = 5.0; r = f(); } @OUT = vec4(r);", 1.0),
+    ("float g = 1.0; float f() { return g; } float h(float g) { return f(); }"
+     " @OUT = vec4(h(9.0));", 1.0),
+    ("float g = 1.0; float f() { return g; } float h() { float g = 4.0; return f() + g; }"
+     " @OUT = vec4(h());", 5.0),
+    ("float g = 1.0; float f() { return g; } g = 3.0; @OUT = vec4(f());", 3.0),
+    ("float g = 1.0; if (1.0) { float g = 5.0; } @OUT = vec4(g);", 1.0),
+    ("float s = 1.0; for (int i = 0; i < 3; i++) { float s = 2.0 + i; } @OUT = vec4(s);", 1.0),
+    ("float s = 1.0; int n = 3; while (n > 0) { float s = 9.0; n = n - 1; } @OUT = vec4(s);", 1.0),
+    ("float g = 2.0; if (1.0) { float g = g * 3.0; @OUT = vec4(g); }", 6.0),
+    ("float i = 7.0; for (int i = 0; i < 2; i++) { } @OUT = vec4(i);", 7.0),
+    ("float g = 1.0; if (@A.r > 0.5) { vec3 g = vec3(2.0); } @OUT = vec4(g);", 1.0),
+    ("float g = 1.0; float f() { return g; } float h() { return f() + 1.0; } @OUT = vec4(h());", 2.0),
+    ("//!tex 0.25\nfloat g = 1.0; float f() { return g; } float h() { return f() + 1.0; }"
+     " @OUT = vec4(h());", 2.0),
+    ("float k = 2.0; float f() { float s = 0.0; for (int i = 0; i < 3; i++) { s = s + k; }"
+     " return s; } @OUT = vec4(f());", 6.0),
+    ("float t = 0.0; for (int i = 1; i < 3; i++) { float w = i * 1.0;"
+     " float f() { return w; } t = t + f(); } @OUT = vec4(t);", 3.0),
+], ids=["caller-block-shadow", "caller-param-shadow", "caller-local-shadow", "by-reference",
+        "block-shadow-ends", "loop-shadow-ends", "while-shadow-ends", "shadow-init-reads-outer",
+        "loop-counter-shadow", "per-pixel-typed-shadow", "nested-no-arg-call",
+        "masked-nested-no-arg-call", "scalar-loop-reads-outer", "fn-in-loop-reads-loop-local"])
+def test_names_resolve_lexically(code, want):
+    ref = run_tiers(code, {"A": _img()})
+    assert torch.allclose(ref["OUT"], torch.full_like(ref["OUT"], want))
+
+
+def test_a_block_local_does_not_replace_a_builtin():
+    ref = run_tiers("if (1.0) { float u = 7.0; } @OUT = vec4(u);", {"A": _img()})
+    assert torch.allclose(ref["OUT"][..., 0], _u())
+
+
+def test_masked_call_reads_the_definition_scope():
+    code = ("//!tex 0.25\nfloat g = 1.0; float f() { return g; } float r = 0.0;\n"
+            "if (@A.r > 0.5) { float g = 5.0; r = f(); }\n@OUT = vec4(r);")
+    A = _img()
+    ref = run_tiers(code, {"A": A})
+    assert torch.equal(ref["OUT"][..., 0], (A[..., 0] > 0.5).float())
