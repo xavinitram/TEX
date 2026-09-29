@@ -21,6 +21,8 @@ ROWS for the preempt/shed/cancel outcome matrix, and one real `tex_engine.cook` 
 row so none of the above can pass vacuously against a synthetic callable.
 """
 import ast
+import inspect
+import textwrap
 import threading
 
 from helpers import *
@@ -453,8 +455,12 @@ def test_v031_sched4_fifo_and_head_requeue(r: SubTestResult):
         r.ok(f"FIFO within a class: {order}") if order == [0, 1, 2, 3] else \
             r.fail("SCHED-4 fifo", f"{order}")
 
-    # Head-requeue: preempt A once, then queue three peers behind it. A must run BEFORE them.
+    # Head-requeue: three peers are already queued BEHIND the running victim when an INTERACTIVE
+    # job preempts it; the interactive job holds the worker on a gate until the victim is back on
+    # the queue. Requeued at the head the victim runs before its peers; requeued at the tail it
+    # runs after them.
     started, release, seen = threading.Event(), threading.Event(), []
+    inter_running, gate = threading.Event(), threading.Event()
 
     def victim(cancel):
         started.set()
@@ -463,17 +469,32 @@ def test_v031_sched4_fifo_and_head_requeue(r: SubTestResult):
         seen.append("victim")
         return "v"
 
-    with Q.CookQueue() as q:
+    def urgent(cancel):
+        inter_running.set()
+        gate.wait(_WAIT)
+        return "urgent"
+
+    with Q.CookQueue(min_quantum_ms=0.0) as q:
         v = q.submit(victim, klass=Q.SPECULATIVE)
-        started.wait(_WAIT)
-        q.submit(lambda cancel: "urgent", klass=Q.INTERACTIVE).result(timeout=_WAIT)
+        if not started.wait(_WAIT):
+            r.fail("SCHED-4 head-requeue", "the victim never started")
+            return
         peers = [q.submit((lambda n: lambda cancel: seen.append(f"peer{n}"))(i),
                           klass=Q.SPECULATIVE) for i in range(3)]
+        q.submit(urgent, klass=Q.INTERACTIVE)
+        if not inter_running.wait(_WAIT):
+            r.fail("SCHED-4 head-requeue", "the interactive job never took the worker")
+            gate.set()
+            release.set()
+            return
+        # The victim has yielded and is back on the queue with its three peers.
+        gate.set()
         release.set()
         q.drain(timeout=_WAIT)
-        r.ok(f"a preempted job resumes ahead of later peers: {seen}") \
-            if seen and seen[0] == "victim" else \
-            r.fail("SCHED-4 head-requeue", f"{seen}")
+        want = ["victim", "peer0", "peer1", "peer2"]
+        r.ok(f"a preempted job resumes ahead of its peers: {seen}") \
+            if seen == want else \
+            r.fail("SCHED-4 head-requeue", f"{seen} != {want}")
 
 
 def test_v031_sched4_real_cook_preemption(r: SubTestResult):
@@ -485,8 +506,10 @@ def test_v031_sched4_real_cook_preemption(r: SubTestResult):
 
     A = make_img(1, 256, 256, 4, seed=31)
     # Many top-level statements => many interpreter yield points, so the preempt lands mid-cook.
-    slow = "\n".join([f"float v{i} = luma(@A) * {1.0 + i * 0.01};" for i in range(200)]) + \
-           "\n@OUT = vec4(vec3(v199), 1.0);"
+    # Each statement reads the previous one, so none is dead code the optimiser could drop.
+    slow = "float v0 = luma(@A);\n" + "\n".join(
+        f"float v{i} = v{i - 1} * 0.999 + sin(v{i - 1} + {i}.0) * 0.001;"
+        for i in range(1, 200)) + "\n@OUT = vec4(vec3(v199), 1.0);"
     quick = "@OUT = vec4(@A.rgb * 1.25 + vec3(0.01), 1.0);"
     reference = tex_engine.cook(quick, {"A": A.clone()}, device_mode="cpu").outputs["OUT"]
 
@@ -495,9 +518,12 @@ def test_v031_sched4_real_cook_preemption(r: SubTestResult):
     def spec_cook(cancel):
         return tex_engine.cook(slow, {"A": A.clone()}, device_mode="cpu",
                                cancel=cancel,
-                               on_progress=lambda phase, frac: cooking.set())
+                               on_progress=lambda phase, frac: (
+                                   cooking.set() if phase == "stmt" else None))
 
-    with Q.CookQueue() as q:
+    # min_quantum_ms=0: the preempt request is honoured at the very next statement, so the cook
+    # cannot finish before it lands (the default 15 ms brake would make that a race).
+    with Q.CookQueue(min_quantum_ms=0.0) as q:
         spec = q.submit(spec_cook, klass=Q.SPECULATIVE, reason="panel-open")
         if not cooking.wait(_WAIT):
             r.fail("SCHED-4 real cook", "the speculative cook never began executing statements")
@@ -513,23 +539,24 @@ def test_v031_sched4_real_cook_preemption(r: SubTestResult):
         md = (got.float() - reference.float()).abs().max().item()
         r.ok(f"the preempting interactive cook is bit-identical to a solo cook ({md:.1e})") \
             if md == 0.0 else r.fail("SCHED-4 real cook", f"maxdiff {md:.2e}")
+        # `preempted` only counts the request; `requeued` is the cook actually yielding and
+        # going back on the queue. The first statement event fires with 199 statements still to
+        # run and the quantum is 0, so the yield is not a race.
+        stats = q.snapshot()["stats"]
         r.ok("the real cook was preempted at a SCHED-3 yield point") \
-            if q.snapshot()["stats"]["preempted"] >= 1 else \
-            r.fail("SCHED-4 real cook", "no preemption was recorded")
+            if stats["preempted"] >= 1 and stats["requeued"] >= 1 else \
+            r.fail("SCHED-4 real cook", f"no preemption landed: {stats}")
 
-        # And the abandoned work is not lost — it either re-cooks (attempts ≥ 2) or the cook
-        # returned before the preempt landed and is delivered anyway (§4b). Both are correct, and
-        # which one happens depends on the starvation quantum against this program's speed, so
-        # asserting `attempts >= 2` here would be asserting a race. That the requeue path works
-        # is pinned by `test_v031_sched4_priority_and_preemption`, which controls the timing.
+        # And the abandoned work is not lost: it re-cooks and is delivered.
         try:
             res = spec.result(timeout=30.0)
         except (TimeoutError, CookCancelled) as e:
             r.fail("SCHED-4 real cook", f"the preempted cook was abandoned: {e!r}")
             return
         r.ok(f"the preempted cook is delivered, not lost (attempts={spec.attempts})") \
-            if res.outputs["OUT"].shape == (1, 256, 256, 4) else \
-            r.fail("SCHED-4 real cook", f"shape={tuple(res.outputs['OUT'].shape)}")
+            if res.outputs["OUT"].shape == (1, 256, 256, 4) and spec.attempts >= 2 else \
+            r.fail("SCHED-4 real cook",
+                   f"shape={tuple(res.outputs['OUT'].shape)} attempts={spec.attempts}")
 
 
 def test_v031_sched4_off_the_default_path(r: SubTestResult):
@@ -567,13 +594,15 @@ def test_v031_sched4_off_the_default_path(r: SubTestResult):
     # -- so it matched no real import line, ever, and the sweep above reported green
     # having swept nothing. Proven directly here, on a small corpus, so a future edit
     # that reintroduces the same corruption reds on THIS line rather than relying on
-    # the whole-package sweep going quiet again by coincidence. (A second copy of the
-    # pattern text, on purpose: `lint_sources()`'s own first argument above must stay
-    # an inline string literal, since `tests/test_v0422_redos.py`'s ReDoS regression
-    # test reads it live with `ast` and needs a literal to parse.)
-    _sched4_rx = _re.compile(
-        r"^[ \t]*(?:from[ \t]+[\w.]*\btex_cookqueue\b|import[ \t]+[\w.]*\btex_cookqueue\b)",
-        _re.MULTILINE)
+    # the whole-package sweep going quiet again by coincidence. The corpus runs against the
+    # very literal the sweep used, read back with `ast` (that argument must stay an inline
+    # string literal, since `tests/test_v0422_redos.py` reads it the same way), so a
+    # corruption of the sweep's own pattern is what reds here.
+    _sweep_call = next(
+        c for c in ast.walk(ast.parse(textwrap.dedent(
+            inspect.getsource(test_v031_sched4_off_the_default_path))))
+        if isinstance(c, ast.Call) and getattr(c.func, "id", None) == "lint_sources")
+    _sched4_rx = _re.compile(ast.literal_eval(_sweep_call.args[0]), _re.MULTILINE)
     _sched4_corpus = {
         "from tex_cookqueue import CookQueue": True,
         "from .tex_cookqueue import CookQueue": True,
