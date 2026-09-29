@@ -194,20 +194,12 @@ _DEFAULT_DEPTH = 2
 #: Minimum HOST time (seconds) that must pass since the pool last recorded before a poll
 #: point is allowed to touch it again -- see `paced_check`'s own docstring for what this
 #: buys and what PACE-47's `heavy=`/peek mechanism guarantees regardless of its value.
-#: **Superseded by `_DEFAULT_STRIDE_S` below**, kept only as the value every stride/depth
-#: combination was FIRST measured against; the override below is the one actually in
-#: effect. Chosen by measurement (`benchmarks/preempt_drain_bench.py --sweep`).
-_DEFAULT_STRIDE_S = 0.0005
-
-
-#: **Re-chosen, PACE-47d.** Once every paced poll route honours `heavy` (PACE-47c/47d close
+#: **Chosen, PACE-47d.** Once every paced poll route honours `heavy` (PACE-47c/47d close
 #: the completed-tail blind spot on every route this tree has), `stride` is a pure cost
 #: knob, never a correctness bound (see `paced_check`'s own docstring) -- this choice is a
 #: latency-margin/cost trade-off, not a safety one. Chosen by measurement
 #: (`benchmarks/preempt_drain_bench.py --sweep`, swept across stride x depth x program
-#: shape): the largest tested-safe value was also the cheapest, so it is the new default.
-#: Overrides the module's original default above rather than editing it in place, so a
-#: build that re-measures can tell which reading it is replacing.
+#: shape): the largest tested-safe value was also the cheapest, so it is the default.
 _DEFAULT_STRIDE_S = 0.004
 
 #: PACE-47e: a cook whose own (B*H*W) pixel count is at or above this is treated as heavy
@@ -381,20 +373,17 @@ def is_paced() -> bool:
     to do ONLY when a poll will actually read it (a heavy-builtin classification walk,
     thrown away unread by `paced_check` below whenever this reads False) can check here
     FIRST and skip that work entirely, rather than computing it and having `paced_check`
-    discard it. Cheaper than `paced_check`'s own `getattr(_state, "paced", False)` need
-    not be duplicated by a caller — reading `_state.paced` directly would raise on a
-    thread that never called `reset()`, so this keeps the same tolerant `getattr` default.
-    A CPU cook, an unwired cancel, or the real ComfyUI default (a token with no `pace`
+    discard it. Callers use this instead of reading `_state.paced` themselves, which would
+    raise on a thread that never called `reset()`; it keeps the same tolerant `getattr`
+    default. A CPU cook, an unwired cancel, or the real ComfyUI default (a token with no `pace`
     attribute) all read False here, identically to how they read inside `paced_check`."""
     return getattr(_state, "paced", False)
 
 
-#: P4 (Phase C): the ceiling on `pace_depth`. Unbounded, an adversarial or misconfigured
-#: token grows the per-thread ring by that many `None` slots in one Python list expression
-#: BEFORE a single `torch.cuda.Event` is allocated — confirmed accepted and unbounded at
-#: `pace_depth=1_000_000_000` (several GB of pure list overhead). 64 is generous next to the
-#: K-sweep's own tried range (1-8) and the depth*stride pre-emption bound this ask exists to
-#: keep small — a real host has no reason to want look-ahead in the dozens, let alone more.
+#: P4 (Phase C): the ceiling on `pace_depth`. A token asking for a huge look-ahead would let
+#: the host queue that many intervals of device work ahead of a cancel. 64 is generous next
+#: to the K-sweep's own tried range (1-8); a real host has no reason to want look-ahead in
+#: the dozens, let alone more.
 _MAX_DEPTH = 64
 
 
@@ -474,8 +463,8 @@ def _record_on(ev, device, is_current) -> None:
     says the cook's device is already the thread's ambient CUDA device: recording with no
     context switch at all is byte-identical to switching to the device you are already on.
     O4 (v0.46, FIX-OBSROUTE) still applies in full when it is not: the same
-    `torch.cuda.device(...)` discipline `graphed.py:571` uses to replay on the cook's own
-    device, so a cook on a non-default CUDA device never paces (or fences) against an event
+    `torch.cuda.device(...)` discipline `graphed.GraphedProgram.replay` uses to replay on the
+    cook's own device, so a cook on a non-default CUDA device never paces (or fences) against an event
     recorded on the WRONG device."""
     if is_current:
         ev.record()
@@ -490,10 +479,9 @@ def record_on(event, device) -> None:
     manager (OVERHEAD-462) when *device* is already the thread's ambient-current CUDA
     device. For a caller elsewhere in `tex_runtime` that already knows its event belongs on
     a CUDA device and wants this module's device-context-skip discipline without
-    duplicating it (`profile.py`'s own event-recording helpers are exactly this shape today
-    — R1#2/R3#4 in the Phase C simplification/efficiency reviews) — a future caller, not
-    this module's own `paced_check`/`cook_done_event`, which read `reset()`'s cached
-    `is_current` directly rather than paying this function's own fresh resolve.
+    duplicating it (`profile.py`'s event-recording helpers call it) — not this module's own
+    `paced_check`/`cook_done_event`, which read `reset()`'s cached `is_current` directly
+    rather than paying this function's own fresh resolve.
 
     Resolves *device*'s is-current answer FRESH, via `_resolve_cuda_target`, rather than
     trusting any cache of this module's own: a caller reaching this function may not have
@@ -864,7 +852,16 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None,
     # `elapsed_time()` read is always available at whichever peek/wait next confirms it
     # complete, at no cost beyond the flag itself (only a PACED cook's own events; the
     # unpaced default path never constructs one).
-    ev = free.pop() if free else torch.cuda.Event(blocking=True, enable_timing=True)
+    # The timing anchor (the event just attributed from, above) must not be the one re-recorded
+    # here: re-arming it moves the anchor to the newest stream position and no later interval
+    # would ever be measurable from it.
+    anchor = pool.get("timed_prev")
+    for i in range(len(free) - 1, -1, -1):
+        if free[i] is not anchor:
+            ev = free.pop(i)
+            break
+    else:
+        ev = torch.cuda.Event(blocking=True, enable_timing=True)
     _record_on(ev, device, _state.is_current)
     outstanding.append(ev)
     # PACE-49: seed the timing anchor from THIS record, but ONLY when there is none yet
@@ -969,7 +966,7 @@ def cook_done_event(device) -> "torch.cuda.Event | None":
     another stream-ordered enqueue (like any kernel launch), so this costs nothing unless a
     caller later reads or synchronizes it. Always a FRESH `torch.cuda.Event()` — callers may
     hold onto and synchronize `CookResult.done` well after this cook returns, so it is never
-    drawn from `paced_check`'s reusable ring.
+    drawn from `paced_check`'s pool of reusable events.
 
     P2 (Phase C): keeps its OWN tiny per-thread memo, keyed on the RAW *device* value this
     function is actually called with — `tex_engine`'s `ctx.device`, always a plain `str`
@@ -1008,14 +1005,14 @@ def save_state() -> dict:
     docstring says cooks nest (a codegen invocation inside an interpreted fallback, a tiled
     strip loop) and which already saves/restores its OWN four `_cook_ctx` fields for exactly
     that reason. Before this, `set_cook_grid` called `reset()` with no save at all: an inner
-    cook's `reset()` unconditionally overwrote `_state`'s `paced`/`depth`/`stride_s`/`ring`/
-    `head`/`count`, and `restore_cook_ctx` never knew pacing had state to give back — so a
+    cook's `reset()` unconditionally overwrote `_state`'s `paced`/`depth`/`stride_s`/`pool`/
+    `is_current`, and `restore_cook_ctx` never knew pacing had state to give back — so a
     real (opt-in, CUDA) outer cook that reached a second, nested `set_cook_grid` before its
     own `finally: restore_cook_ctx` would permanently lose its own pacing bookkeeping to the
     inner cook's.
 
     A shallow copy of `_state.__dict__` is enough to restore every SCALAR field (`paced`,
-    `depth`, `stride_s`, `is_current`, `last_record_t`, which `_pace.pool` an outer cook is
+    `depth`, `stride_s`, `is_current`, `last_record_t`, which `_state.pool` an outer cook is
     using) exactly as it was — `reset()` never REPLACES `_state.pools` or any one device's
     pool dict, only mutates one in place, so the reference itself survives an inner cook's
     own `reset()` call unchanged. What this does NOT isolate: an inner cook that nests on

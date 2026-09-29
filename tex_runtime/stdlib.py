@@ -126,17 +126,3 @@ for _leaf in (stdlib_color, stdlib_sample, stdlib_noise, stdlib_sdf):
     _leaf.TEXStdlib = TEXStdlib
 del _leaf
 
-
-# -- Noise functions (extracted to noise.py) --------------------------------
-from .noise import (
-    _perlin2d_fast, _perlin3d_fast, _simplex2d,
-    _fbm2d, _fbm3d,
-    _worley2d, _worley3d,
-    _worley2d_id, _worley3d_id,
-    _curl2d, _curl3d,
-    _ridged2d, _ridged3d,
-    _billow2d, _billow3d,
-    _turbulence2d, _turbulence3d,
-    _flow2d, _flow3d,
-    _alligator2d, _alligator3d,
-)

@@ -20,20 +20,19 @@ plain re-export keeps every in-place mutation (`_trial_futures[cache_key] = ...`
 `_promotion_stats["failed"] += 1`) visible from both this module and `compiled.py`'s own
 call sites (the same rule SPLIT-47 already used for `_deferred_ev`/`_warnings_shown`).
 
-This module reaches back into `compiled.py` for the three names that stay there
-(`_canon_device`, `_compiled_cache`, `_WARM_POOL`) lazily, inside each function body that
-needs them — the same posture `compiled_capability.py` already uses for
+This module reaches back into `compiled.py` for the names that stay there
+(`_canon_device`, `_compiled_cache`, `_pool_for`, `_mark_pool_busy`, `_mark_pool_free`)
+lazily, inside each function body that needs them — the same posture `compiled_capability.py` already uses for
 `compiled._backend_status`/`compiled._setup_msvc_env` — so this module never imports
 `compiled.py` at its own module scope and there is no load-time cycle."""
 from __future__ import annotations
 
 import concurrent.futures
 import time as _time
-from typing import Any
 
 import torch
 
-from .compiled_exec_support import _contiguous_bindings, _timed
+from .compiled_exec_support import _contiguous_bindings, _is_transient_failure, _timed
 from .host import _cancel_check  # SCHED-3 seam
 
 # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation of a freshly-promoted
@@ -56,10 +55,7 @@ _transient_failed: set = set()
 
 def _note_failure(cache_key, exc) -> None:
     """Remember that the failure just seen under `cache_key` is not a property of the program."""
-    if (isinstance(exc, (MemoryError, concurrent.futures.CancelledError,
-                         concurrent.futures.BrokenExecutor))
-            or type(exc).__name__ == "OutOfMemoryError"
-            or "out of memory" in str(exc).lower()):
+    if _is_transient_failure(exc):
         _transient_failed.add(cache_key)
 
 
@@ -76,8 +72,7 @@ def promotion_stats() -> dict:
     """AUTOSAFE-50: a copy of the cumulative promotion counters -- how many cooks
     deferred an in-flight TRIAL invocation past the bounded wait ("bounded"), and how
     many times a background compile or a TRIAL invocation ended in failure ("failed").
-    Read-only for hosts/tests; `_reset_capability_cache_for_test`-style callers reset via
-    `_reset_promotion_stats_for_test`."""
+    Read-only for hosts/tests; tests reset with `_reset_promotion_stats_for_test`."""
     return dict(_promotion_stats)
 
 
@@ -130,10 +125,11 @@ def _submit_trial(cache_key, program, bindings, type_map, device,
         # the real invocation, the same way `_submit_bg_compile`'s job does -- a TRIAL
         # invocation that never returns must not silently poison every OTHER
         # fingerprint's future submissions to `_WARM_POOL` forever.
-        _mark_pool_busy("warm")
+        busy_token = _mark_pool_busy("warm")
         try:
             with torch.inference_mode():
-                entry = _compiled_cache.get(cache_key)
+                from .lru_util import lru_get
+                entry = lru_get(_compiled_cache, cache_key)
                 if entry is None:
                     return None, None
                 compiled_fn, _b = entry
@@ -141,7 +137,7 @@ def _submit_trial(cache_key, program, bindings, type_map, device,
                                            latent_channel_count, output_names, scale=scale)
                 return _timed(call, device_type)
         finally:
-            _mark_pool_free("warm")
+            _mark_pool_free("warm", busy_token)
 
     try:
         _trial_futures[cache_key] = _pool_for("warm").submit(_worker)

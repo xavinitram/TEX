@@ -10,8 +10,8 @@ process exit and force a relaunch to re-discover everything from scratch —
   * COMPILETRY-50 (D1): the fn-calls-compile verdict (`fncalls_compile._memo`: fp -> bool) —
     whether a program whose codegen'd fn calls a non-inlined stdlib builtin was worth handing
     to `torch.compile` for real, replacing `compiled._try_compile`'s old blanket
-    `_has_fn_calls` gate. Paid once per fingerprint per this file's whole design; both True
-    and False persist for the same reason the capturability verdict does.
+    `_has_fn_calls` gate. Both True and False persist, for the same reason the capturability
+    verdict does.
 
 CUDA graphs themselves cannot serialize — we persist the DECISION, re-capture off the hot path
 (LAT-1b's lesson). Deliberately NOT persisted: backend probes (`compiled._backend_status` — a
@@ -158,7 +158,7 @@ def _persisted_stores():
             pass
 
     def _snap_cap():
-        return {fp: [bool(v[0]), int(v[1])] for fp, v in graphed._capturable_memo.items()}
+        return {fp: [bool(v[0]), int(v[1])] for fp, v in list(graphed._capturable_memo.items())}
 
     def _snap_fnc():
         return {fp: bool(ok) for fp, ok in _fnc.snapshot_items().items()}

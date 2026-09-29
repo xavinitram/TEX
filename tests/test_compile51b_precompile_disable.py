@@ -59,6 +59,7 @@ import pytest
 
 from helpers import *  # noqa: F401,F403
 from TEX_Wrangle.tex_runtime import compiled as C
+from TEX_Wrangle.tex_runtime import compiled_precompile as CP
 # C2 (R1): reuse the byte-identical `_fake_cg_fn` this file used to carry its own copy of,
 # rather than a second definition of the same stand-in.
 from test_compiletry50_fncalls_gate import _fake_cg_fn  # noqa: F401 (re-used below)
@@ -136,13 +137,14 @@ def test_precompile_ctx_default_still_scopes_flag_on():
     assert dynamo_config.caching_precompile is False
 
 
-def test_precompile_flag_lock_serializes_two_off_scoped_callers():
+def test_precompile_flag_lock_serializes_two_off_scoped_callers(monkeypatch):
     """`_precompile_flag_lock` must be held across the WHOLE off-scoped window, not just
     the flag flip -- two threads both requesting `disable=True` must never observe each
     other's window overlapping (the process-global flag would otherwise be flipped back ON
     by whichever thread exits first, corrupting the OTHER thread's still-running compile).
     Forces the overlap with a barrier-like sleep inside the `with` block and records
-    enter/exit order."""
+    enter/exit order. Forces the shared-global build shape: a per-thread patch needs no lock."""
+    monkeypatch.setattr(CP, "_patch_thread_local", False)
     dynamo_config.caching_precompile = True
     events = []
     lock = threading.Lock()
@@ -175,7 +177,7 @@ def test_precompile_flag_lock_serializes_two_off_scoped_callers():
 
 
 @pytest.mark.timing
-def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock():
+def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock(monkeypatch):
     """FIX-COMPILE51 C1 (B3#1): RED at `365fdb4` -- `_precompile_flag_lock` was taken only
     by the `disable=True` (OFF-scoped) branch (`_precompile_off_ctx`); the `disable=False`
     (default, ON-scoped) branch called `_dc.patch(caching_precompile=True)` directly, never
@@ -200,7 +202,9 @@ def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock():
     (simulating a live off-scoped compile in progress on the OTHER pool) and asserts that
     entering the default (`disable=False`) scope BLOCKS until it is released -- AFTER the
     fix, both branches share one lock-wrapped helper, so entering either one while the
-    other's window is open must wait for it."""
+    other's window is open must wait for it (on a build whose patch is a shared global; a
+    per-thread patch is covered by the test below)."""
+    monkeypatch.setattr(CP, "_patch_thread_local", False)
     dynamo_config.caching_precompile = False
 
     def _holder():
@@ -225,3 +229,31 @@ def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock():
         f"entering the default (disable=False) scope returned in {elapsed * 1000:.1f}ms "
         f"while _precompile_flag_lock was held by another caller -- the disable=False "
         f"branch does not actually acquire the shared lock")
+
+
+@pytest.mark.timing
+def test_a_per_thread_patch_does_not_wait_for_another_pools_compile(monkeypatch):
+    """On a build whose config patch is per-thread (torch 2.12), one pool's long compile
+    must not hold up the other pool's scope entry."""
+    monkeypatch.setattr(CP, "_patch_thread_local", None)
+    if not CP._patch_is_thread_local(dynamo_config):
+        return   # a shared-global build keeps the lock; the two tests above cover that shape
+    holder_in = threading.Event()
+    release = threading.Event()
+
+    def _long_compile():
+        with C._precompile_ctx(disable=False):
+            holder_in.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=_long_compile)
+    holder.start()
+    try:
+        assert holder_in.wait(5)
+        start = time.monotonic()
+        with C._precompile_ctx(disable=True):
+            elapsed = time.monotonic() - start
+    finally:
+        release.set()
+        holder.join(5)
+    assert elapsed < 0.5, f"second scope waited {elapsed * 1000:.0f}ms behind the first"

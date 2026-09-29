@@ -1,20 +1,16 @@
 """PACE-47d — registry-derived per-statement heavy/cheap classification.
 
-A small, self-contained helper (deliberately its own file rather than an addition to
-`interpreter_analysis.py` or `codegen.py`, per this ask's own brief: "keep your edits
-confined to the poll sites and a small helper", while SCALE-47b edits interpreter/codegen
-emission in parallel — this stays out of that surface's way entirely).
+A small helper kept apart from `interpreter_analysis.py` and `codegen.py`, which both use it.
 
-**What "heavy" means here, and why.** PACE-47c closed the completed-tail blind spot
-(`tex_runtime/pacing.py:paced_check`'s `heavy=` parameter: bypass the stride economization
-entirely, always record) for exactly two builtins (`gauss_blur`, the mip pyramid) by hand,
-because those happened to already have an internal multi-pass poll point to hang it on.
-PACE-47d generalizes the CLASSIFICATION half — "is the statement about to run heavy" —
-so every paced poll point can ask the same question, DERIVED FROM THE REGISTRY rather than
-a hand-maintained name list: a builtin is heavy here iff its OWN `@stdlib(...)` footprint
-(ROI-1) is `('halo', r)` or `('halo_arg', i[, mult])` — a fixed or argument-derived pixel
-reach, the coordinator's own criterion. This covers `gauss_blur`/`erode`/`dilate`/
-`bilateral_filter` by construction, with zero per-name special-casing.
+**What "heavy" means here, and why.** `pacing.paced_check`'s `heavy=` parameter bypasses the
+stride economization entirely (always record), closing the completed-tail blind spot for a
+statement whose device time is long. This module answers "is the statement about to run
+heavy" for every paced poll point, DERIVED FROM THE REGISTRY rather than a hand-maintained
+name list: a builtin is heavy iff its own `@stdlib(...)` footprint (ROI-1) is `('halo', r)` or
+`('halo_arg', i[, mult])` (a fixed or argument-derived pixel reach), OR its registry entry
+carries the `heavy` tag (device-expensive for a reason a footprint cannot express). This
+covers `gauss_blur`/`erode`/`dilate`/`bilateral_filter` by construction, with zero per-name
+special-casing.
 
 **What this does NOT cover, on purpose.** `sample_mip`/`sample_mip_gauss` are multi-pass
 but their own footprint is `'image'` (COLOR-1: a `('halo_arg', kernel)` shape cannot express
@@ -86,8 +82,7 @@ def _stmt_calls_heavy_builtin(stmt) -> bool:
 #: statements` is a plain attribute read of the SAME list object every time (a dataclass
 #: field, not a property that copies), so every call site already holds the right memo
 #: key in hand without threading `program` itself through call sites that today only ever
-#: receive `stmts` (`_exec_stmts_profiled` is one — PACE-45 never needed `program` there
-#: and this ask's own brief asks for the smallest surface, not a new parameter everywhere).
+#: receive `stmts` (`_exec_stmts_profiled` is one).
 #: Classifying is a pure function of the AST, so it belongs once per program, not once per
 #: cook.
 _HEAVY_STMT_MEMO: "OrderedDict[int, tuple[object, frozenset[int]]]" = OrderedDict()
@@ -100,10 +95,10 @@ def heavy_stmt_ids(stmts) -> frozenset:
     program's own top-level statement list (`Program.statements`). Memoized per list
     object; a cache miss pays one full-program walk, the same cost class
     `_collect_binding_reads` already pays on a cold program."""
+    from .lru_util import lru_get
     key = id(stmts)
-    cached = _HEAVY_STMT_MEMO.get(key)
+    cached = lru_get(_HEAVY_STMT_MEMO, key)   # another cook thread may evict it at any time
     if cached is not None and cached[0] is stmts:
-        _HEAVY_STMT_MEMO.move_to_end(key)
         return cached[1]
     heavy_ids = frozenset(id(stmt) for stmt in stmts if _stmt_calls_heavy_builtin(stmt))
     _HEAVY_STMT_MEMO[key] = (stmts, heavy_ids)

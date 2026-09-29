@@ -10,9 +10,9 @@ PROF-1, "effort-based" has no measured effort and PRED-1's admission has nothing
 
 **What it stores.** An EWMA of cook cost, keyed by (program fingerprint, device type,
 precision) and bucketed by resolution, plus a per-STAGE breakdown for fused programs. Two
-consumers: PRED-1's admission (v0.31, this release) and CACHE-7's checkpoint placement
-(v0.32 — where to cut a chain is a question about cumulative *stage* cost, which is why the
-per-stage half is here and not deferred).
+consumers: PRED-1's admission (`predict`) and CACHE-7's checkpoint placement
+(`stage_snapshot`: where to cut a chain is a question about cumulative *stage* cost, which is
+why the per-stage half is kept).
 
 **Why an EWMA rather than autotier's median deque.** autotier is deciding a one-way verdict
 (is the compiled tier faster?) and wants outlier resistance. PROF-1 is answering "how long
@@ -99,7 +99,7 @@ def _blend(prev: float, ms: float, n: int) -> float:
     tracks recent cooks, which is what an interactive host's drifting resolution needs."""
     if n <= 1:
         return ms
-    return max(_ALPHA, 1.0 / n) * ms + (1.0 - max(_ALPHA, 1.0 / n)) * prev
+    return (a := max(_ALPHA, 1.0 / n)) * ms + (1.0 - a) * prev
 
 
 #: {(program_fp, device_type, precision): {px_bucket: _Bucket}}
@@ -587,8 +587,8 @@ def snapshot() -> dict:
 
 
 class measure:
-    """Time a cook and feed it to `key`, syncing CUDA around the region — optionally with the
-    per-STAGE breakdown too.
+    """Time a cook and feed it to `key` — on CUDA by recording timing events (never a
+    synchronize; see PROF-462 below) — optionally with the per-STAGE breakdown too.
 
     The explicit surface for a host cooking OUTSIDE the queue (`tex_engine.cook` directly), and
     the same object the engine's own hook uses. A no-op body when `should_sample` says no, so a

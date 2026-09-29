@@ -18,7 +18,6 @@ import glob
 import logging
 import math
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -32,6 +31,7 @@ from ..tex_compiler.ast_nodes import BindingRef
 from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS, _record_ingest_event)
+from .interpreter import MAX_LOOP_ITERATIONS as _MAX_LOOP_ITERATIONS  # kept for benchmarks
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
 from .host import CookCancelled, _cancel_check  # SCHED-3 seam (no cycle: host imports torch only)
@@ -55,7 +55,7 @@ from .compiled_exec_support import (_show_once, _maybe_triton_hint, _ensure_indu
                                     _timed, _timed_deferred, _deferred_ev,
                                     _contiguous_bindings, _WARM_CLONE_CAP_BYTES,
                                     _bindings_nbytes, _cuda_headroom_ok, _capture_in_flight,
-                                    _warnings_shown)
+                                    _warnings_shown, _is_user_limit, _settle_fncalls)
 # K0 (v0.50.0 Phase C split, R2#3): compiled.py's first domain cut after SPLIT-47 --
 # `compiled.py` had reached 1987/2000 lines with no floor and no split plan. The
 # AUTOSAFE-50 promotion-TRIAL state and its two functions are a self-contained domain
@@ -72,9 +72,6 @@ from .compiled_precompile import (_precompile_flag_lock, _precompile_off_ctx,
                                   _clear_dynamo_precompile_store)
 
 logger = logging.getLogger("TEX")
-
-# Hard limit on for-loop iterations (must match interpreter.MAX_LOOP_ITERATIONS)
-_MAX_LOOP_ITERATIONS = 1024
 
 
 # ── MSVC environment setup (Windows) ─────────────────────────────────
@@ -132,21 +129,18 @@ def _do_setup_msvc_env() -> None:
     if os.environ.get("INCLUDE"):
         return
 
-    # Search common locations for vcvarsall.bat
-    search_patterns = [
-        r"C:\Program Files (x86)\Microsoft Visual Studio\**\BuildTools\VC\Auxiliary\Build\vcvarsall.bat",
-        r"C:\Program Files\Microsoft Visual Studio\**\BuildTools\VC\Auxiliary\Build\vcvarsall.bat",
-        r"C:\Program Files (x86)\Microsoft Visual Studio\**\Community\VC\Auxiliary\Build\vcvarsall.bat",
-        r"C:\Program Files\Microsoft Visual Studio\**\Community\VC\Auxiliary\Build\vcvarsall.bat",
-        r"C:\Program Files (x86)\Microsoft Visual Studio\**\Professional\VC\Auxiliary\Build\vcvarsall.bat",
-        r"C:\Program Files (x86)\Microsoft Visual Studio\**\Enterprise\VC\Auxiliary\Build\vcvarsall.bat",
-    ]
-
+    # Search common locations for vcvarsall.bat: each edition under both Program Files roots,
+    # newest install (lexically last path) first within one pattern.
     vcvarsall = None
-    for pattern in search_patterns:
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            vcvarsall = matches[0]
+    for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+        for root in (r"C:\Program Files (x86)", r"C:\Program Files"):
+            matches = glob.glob(
+                "\\".join((root, "Microsoft Visual Studio", "**", edition, "VC", "Auxiliary",
+                           "Build", "vcvarsall.bat")), recursive=True)
+            if matches:
+                vcvarsall = sorted(matches)[-1]
+                break
+        if vcvarsall:
             break
 
     if vcvarsall is None:
@@ -206,9 +200,8 @@ def _blacklist_add(fp: str) -> None:
     compile blacklist is deliberately NOT persisted (a transient runtime/OOM crash must not harden
     into a permanent cross-launch demotion — see warm_state.py).
 
-    K6: the shared bounded-LRU idiom (`lru_util.lru_put`) -- see that module's own
-    docstring for why this used to be one of three independent hand-copies."""
-    from .lru_util import lru_put
+    K6: the shared bounded-LRU idiom (`lru_util.lru_put`)."""
+    from .lru_util import lru_put   # lazy: keeps the engine's cold-import closure unchanged
     lru_put(_compile_blacklist, fp, None, _BLACKLIST_MAX)
 
 # Track which (backend, device_type) pairs have been tested and whether they
@@ -243,10 +236,10 @@ def _bindings_px(bindings) -> int:
 
 
 def _canon_device(device) -> "torch.device":
-    """torch.device with an index-less "cuda" resolved to the current device —
-    single source with the interpreter's canonicalization, so codegen cache keys
-    ("cuda" vs "cuda:0") can't split and cached env tensors can't be served for
-    the wrong GPU after a current-device switch."""
+    """torch.device with an index-less "cuda" resolved to the current device, so codegen
+    cache keys ("cuda" vs "cuda:0") can't split and cached env tensors can't be served for
+    the wrong GPU after a current-device switch. `Interpreter.__init__` applies the same rule
+    inline; the two must agree."""
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     if dev.type == "cuda" and dev.index is None:
         try:
@@ -453,19 +446,21 @@ def _pool_for(name: str) -> "concurrent.futures.ThreadPoolExecutor":
     return _COMPILE_POOL if name == "compile" else _WARM_POOL
 
 
-def _mark_pool_busy(name: str) -> None:
+def _mark_pool_busy(name: str) -> float:
     """Called from INSIDE a submitted job, as its first line -- records when the pool's
-    CURRENTLY EXECUTING job started. `setdefault`, not assignment: with `max_workers=1`,
-    jobs run strictly sequentially, so a second job's own start can only ever observe an
-    empty slot (the first already cleared it via `_mark_pool_free`) -- `setdefault` is
-    just the cheap, race-tolerant way to write that once."""
-    _pool_busy_since.setdefault(name, _time.monotonic())
+    CURRENTLY EXECUTING job started and returns that start time as the job's token.
+    `setdefault`, not assignment: with `max_workers=1`, jobs run strictly sequentially, so
+    a second job's own start can only ever observe an empty slot."""
+    return _pool_busy_since.setdefault(name, _time.monotonic())
 
 
-def _mark_pool_free(name: str) -> None:
+def _mark_pool_free(name: str, token: float | None = None) -> None:
     """Called from a submitted job's own `finally` -- clears the busy marker so the NEXT
-    submission's `_pool_for` check reads 'no job running' rather than a stale timestamp."""
-    _pool_busy_since.pop(name, None)
+    submission's `_pool_for` check reads 'no job running' rather than a stale timestamp.
+    Given the token `_mark_pool_busy` returned, it clears only that job's own marker: an
+    abandoned pool's job that finishes late must not blind the replacement pool's check."""
+    if token is None or _pool_busy_since.get(name) == token:
+        _pool_busy_since.pop(name, None)
 
 # Minimum tensor-op count for torch.compile to be worthwhile.
 # Below this threshold the fusion benefit cannot overcome tracing overhead.
@@ -521,6 +516,8 @@ def execute_compiled(
         output_names:         List of named outputs for multi-output programs.
         used_builtins:        Set of coordinate builtins the program uses (env pruning).
         precision:            "fp32" (default) or "fp16" — see the M-3 fp16 contract.
+        time_context:         Playhead values (`frame`, `fps`, `time`) for the program's time
+                              builtins; forwarded to whichever tier runs the cook.
         scale:                SCALECX-49 resolution-scale multiplier (`None` = inactive,
                               byte-identical to before this ask — invariant 7).
 
@@ -622,8 +619,11 @@ def execute_compiled(
             # it OFF instead.
             with _precompile_ctx(disable=_wants_precompile_off(
                     program, type_map, fingerprint)), torch.inference_mode():
-                # Get or create the compiled callable (on THIS thread)
-                if cache_key not in _compiled_cache:
+                # Get or create the compiled callable (on THIS thread). A background job may
+                # evict the entry at any moment, so the lookup and the LRU touch are one step.
+                from .lru_util import lru_get
+                cached = lru_get(_compiled_cache, cache_key)
+                if cached is None:
                     entry = _try_compile(device_type, program, type_map,
                                          used_builtins=used_builtins, precision=precision,
                                          fingerprint=fingerprint)
@@ -657,7 +657,7 @@ def execute_compiled(
                         # very thread that invokes compiled_fn just below (and the
                         # calling thread). The bounded cache already caps growth.
                         _compiled_cache.popitem(last=False)
-                    compiled_fn, entry_backend = _compiled_cache[cache_key]
+                    compiled_fn, entry_backend = entry
                     # K2 (v0.50.0 Phase C, B3#2): resolve the fncalls_compile verdict
                     # only AFTER this compiled callable's FIRST REAL INVOCATION
                     # completes (or raises) -- never right after torch.compile()
@@ -675,15 +675,14 @@ def execute_compiled(
                         result = compiled_fn(program, contiguous_bindings, type_map,
                                              device, latent_channel_count, output_names,
                                              scale=scale)
-                    except Exception:
-                        fncalls_compile.resolve_attempt(fingerprint, device_type, precision, None)
+                    except Exception as exc:
+                        _settle_fncalls(fingerprint, device_type, precision, None, exc)
                         raise
                     fncalls_compile.resolve_attempt(fingerprint, device_type, precision,
                                                     entry_backend)
                     return result
 
-                compiled_fn, _entry_backend = _compiled_cache[cache_key]
-                _compiled_cache.move_to_end(cache_key)
+                compiled_fn, _entry_backend = cached
                 verify = _verify_state.get(cache_key)
                 if verify is not None and len(verify["samples"]) < _VERIFY_COOKS:
                     # G: verification window — time this warm compiled cook.
@@ -722,8 +721,7 @@ def execute_compiled(
         # stay blacklisted even after the user fixes the loop). The interpreter
         # fallback below raises the clean E6010/E6060 diagnostic.
         _emsg = str(compile_error)
-        is_user_limit = ("iteration" in _emsg or "iterations" in _emsg
-                         or "call depth" in _emsg)
+        is_user_limit = _is_user_limit(compile_error)
         _show_once(
             f"compile_exec_fail_{fingerprint[:12]}",
             f"[TEX] torch.compile execution failed, falling back to interpreter: {compile_error}",
@@ -977,8 +975,9 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
         # crash below (a real failure, not just a wrap failure) settles the verdict too.
         # K5: mark/clear this pool's busy-since window around the whole job, so a stuck
         # attempt is what a LATER submission's `_pool_for` check actually measures.
-        _mark_pool_busy(pool_name)
+        busy_token = _mark_pool_busy(pool_name)
         fnc_backend = None
+        job_exc = None
         try:
             # COMPILE-51b: `_has_fn_calls` scopes caching_precompile OFF instead.
             with _precompile_ctx(disable=_wants_precompile_off(
@@ -1000,12 +999,13 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
             return "ok"
         except Exception as _exc:
             _note_failure(cache_key, _exc)
+            job_exc = _exc
             _compiled_cache.pop(cache_key, None)   # never hand a proven-broken artifact on
             fnc_backend = None   # a warm_call crash after a successful wrap is still a fail
             return "failed"
         finally:
-            fncalls_compile.resolve_attempt(fingerprint, device_type, precision, fnc_backend)
-            _mark_pool_free(pool_name)
+            _settle_fncalls(fingerprint, device_type, precision, fnc_backend, job_exc)
+            _mark_pool_free(pool_name, busy_token)
 
     # C1 (B1#1): route to the DEDICATED `_WARM_POOL` whenever a `warm_call` is given —
     # the only case with a potentially SLOW (10-30s) step — so it never shares a worker
@@ -1070,14 +1070,17 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
     (result, None) otherwise — the COMMITTED tier skips timing so it never forces
     a per-cook CUDA sync. Returns (None, None) if the run crashed.
 
-    `scale` (SCALECX-49): forwarded to the cached `compiled_fn` — `cache_key` already
-    partitions by scale (see `run_auto`), so this is always the SAME value the artifact at
-    `cache_key` was built/warmed for."""
+    `scale` (SCALECX-49): forwarded to the cached `compiled_fn` as a runtime argument;
+    `cache_key` carries no scale, so one artifact serves every value."""
     contiguous = _contiguous_bindings(bindings, _canon_device(device))
 
     def _worker():
         with torch.inference_mode():
-            compiled_fn, _b = _compiled_cache[cache_key]
+            from .lru_util import lru_get
+            entry = lru_get(_compiled_cache, cache_key)   # a cook every frame keeps it hot
+            if entry is None:
+                return None, None   # evicted meanwhile: the caller falls back
+            compiled_fn = entry[0]
             call = lambda: compiled_fn(program, contiguous, type_map, device,
                                        latent_channel_count, output_names, scale=scale)
             return _timed(call, device_type) if timed else (call(), None)
@@ -1141,7 +1144,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     # a cache that persists to disk.
     sp = _consensus_extent(bindings, program)
     key = autotier.make_key(fingerprint, device_type, precision, sp, scale=scale)
-    autotier.seed_from_disk(key)
+    autotier.load()   # adopt persisted verdicts once (a latched no-op afterwards)
     state = autotier.verdict(key)
 
     def _codegen(bind):
@@ -1171,6 +1174,12 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     if state == autotier.COMMITTED:
         autotier.reopen(key)
         state = autotier.verdict(key)
+
+    if state == autotier.COMPILING and _bg_status(cache_key) == "ready":
+        # A compile that finished is promoted before the convergence bound below is judged:
+        # a pause between cooks must not turn a ready artifact into a REJECTED key.
+        autotier.mark_ready(key)
+        state = autotier.TRIAL
 
     if state == autotier.TRIAL and cache_key in _compiled_cache:
         # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation used to run
@@ -1279,7 +1288,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
             # fingerprint's bindings shape, contradicting the comment).
             warm_bytes = _bindings_nbytes(bindings)
             warm_call = None
-            if (warm_bytes <= _WARM_CLONE_CAP_BYTES
+            if (cache_key not in _compiled_cache and cache_key not in _bg_futures
+                    and warm_bytes <= _WARM_CLONE_CAP_BYTES
                     and _cuda_headroom_ok(device, extra_bytes=warm_bytes)):
                 # CC-5: clone the REPRESENTATIVE bindings now, on the cook thread, so the
                 # background warm-up below (which runs later, off-thread) never races
@@ -1405,14 +1415,13 @@ _ENV_TENSOR_CACHE_MAX = 256
 
 
 def _env_cached(key: tuple, make) -> torch.Tensor:
-    t = _ENV_TENSOR_CACHE.get(key)
+    from .lru_util import lru_get
+    t = lru_get(_ENV_TENSOR_CACHE, key)
     if t is None:
         t = make()
         _ENV_TENSOR_CACHE[key] = t
         while len(_ENV_TENSOR_CACHE) > _ENV_TENSOR_CACHE_MAX:
             _ENV_TENSOR_CACHE.popitem(last=False)
-    else:
-        _ENV_TENSOR_CACHE.move_to_end(key)
     return t
 
 
@@ -1427,7 +1436,8 @@ def _build_codegen_env(
     """Build the environment dict and spatial shape for codegen execution.
 
     Returns (env, spatial_shape, used_identifiers).
-    Shared by _codegen_exec and _codegen_only_execute.
+    Called by `_codegen_only_execute`, `_codegen_with_params_on_device` and the two
+    adapters `_try_compile` builds (`_codegen_exec`, `_codegen_exec_eager`).
 
     used_builtins (when provided) is the precomputed identifier set; passing it
     avoids a full per-frame AST walk via _collect_identifiers.

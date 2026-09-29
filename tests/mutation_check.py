@@ -167,8 +167,8 @@ MUTATIONS = [
      ("test_v033_xpu2",)),
     ("XPU-2: a RETAINED destination gets pinned anyway (retained= ignored)",
      "tex_runtime/streams.py",
-     "    if (not isinstance(src, torch.Tensor) or src.device.type != \"cuda\" or retained",
-     "    if (not isinstance(src, torch.Tensor) or src.device.type != \"cuda\"",
+     "    if (src.device.type != \"cuda\" or retained",
+     "    if (src.device.type != \"cuda\"",
      ("test_v033_xpu2",)),
     # ── v0.33.1 (the release-audit findings) ───────────────────────────────────────────
     # RETIRED, with the reason — not silently deleted. This row SURVIVED, and the survival is

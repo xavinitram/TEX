@@ -96,8 +96,8 @@ def _allocator_slack(idx: int) -> int:
     sm_120/torch 2.12). This sits in the preflight of every CUDA cook, so that
     difference is the whole cost of ENG-2.
 
-    Returns 0 on any shape surprise: slack is a refinement to the driver's number, and
-    a wrong refinement is worse than none."""
+    Returns 0 on any shape surprise (a wrong refinement is worse than none). Over-reports by
+    at most the CUDA-graph byte budget while graphs live: their private-pool blocks are not reusable."""
     import torch
     try:
         st = torch.cuda.memory_stats_as_nested_dict(device=idx)

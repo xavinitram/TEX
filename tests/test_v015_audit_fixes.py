@@ -615,6 +615,7 @@ def test_p2_pc1_sibling_sweep(r: SubTestResult):
     try:
         parent.mkdir(parents=True, exist_ok=True)
         fake.mkdir(exist_ok=True); (fake / "x.bin").write_text("x")
+        os.utime(fake / "x.bin", (0, 0))   # an abandoned store; a recently written one is spared
         os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
         C._ensure_inductor_cache_dir()
         assert not fake.exists(), "stale sibling version dir not swept"

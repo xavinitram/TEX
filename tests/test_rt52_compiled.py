@@ -1,0 +1,473 @@
+"""Compiled-tier runtime: pool busy markers, MSVC discovery, limit classification, fn-calls verdicts, LRU touches."""
+import sys
+import threading
+import uuid
+from collections import OrderedDict
+
+import pytest
+import torch
+
+from helpers import *  # noqa: F401,F403
+from TEX_Wrangle.tex_runtime import compiled as C
+from TEX_Wrangle.tex_runtime import compiled_exec_support as ES
+from TEX_Wrangle.tex_runtime import fncalls_compile as FC
+from TEX_Wrangle.tex_runtime import lru_util
+
+
+def test_late_job_of_an_abandoned_pool_keeps_the_replacement_marker():
+    saved_pool, saved_busy, saved_bound = C._COMPILE_POOL, dict(C._pool_busy_since), C._POOL_STUCK_BOUND_S
+    try:
+        C._pool_busy_since.clear()
+        C._POOL_STUCK_BOUND_S = 0.05
+        old_token = C._mark_pool_busy("compile")
+        C._pool_busy_since["compile"] = old_token = C._time.monotonic() - 1.0
+        fresh = C._pool_for("compile")           # the stuck pool is abandoned
+        assert "compile" not in C._pool_busy_since
+        new_token = C._mark_pool_busy("compile")  # the replacement pool's job
+        C._mark_pool_free("compile", old_token)   # the orphan finally finishes
+        assert C._pool_busy_since.get("compile") == new_token
+        C._mark_pool_free("compile", new_token)
+        assert "compile" not in C._pool_busy_since
+        assert fresh is not saved_pool
+    finally:
+        C._COMPILE_POOL = saved_pool
+        C._pool_busy_since.clear()
+        C._pool_busy_since.update(saved_busy)
+        C._POOL_STUCK_BOUND_S = saved_bound
+
+
+def test_msvc_search_covers_64bit_professional_and_takes_the_newest(monkeypatch):
+    import glob as _glob
+    seen = []
+    prof = r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
+    older = r"C:\Program Files\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvarsall.bat"
+
+    def fake_glob(pattern, recursive=False):
+        seen.append(pattern)
+        if r"Program Files\Microsoft" in pattern and "Professional" in pattern:
+            return [older, prof]
+        return []
+
+    ran = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("INCLUDE", raising=False)
+    monkeypatch.setattr(_glob, "glob", fake_glob)
+    monkeypatch.setattr(C.subprocess, "run",
+                        lambda cmd, **kw: ran.append(cmd) or (_ for _ in ()).throw(RuntimeError("stop")))
+    C._do_setup_msvc_env()
+    assert ran and ran[0][3] == prof, ran
+
+
+def test_user_limit_is_recognised_by_code_or_limit_phrase_not_the_word_iteration():
+    assert ES._is_user_limit(RuntimeError("While loop exceeded maximum iteration limit (1024). Check"))
+    assert ES._is_user_limit(RuntimeError("For loop would exceed 1024 iterations"))
+    assert ES._is_user_limit(RuntimeError("Maximum function call depth exceeded in f()"))
+    coded = RuntimeError("anything")
+    coded.code = "E6010"
+    assert ES._is_user_limit(coded)
+    assert not ES._is_user_limit(RuntimeError("dictionary changed size during iteration"))
+    assert not ES._is_user_limit(RuntimeError("Inductor lowering failed at iteration 3"))
+
+
+def test_a_transient_or_environmental_failure_leaves_the_fncalls_verdict_unset():
+    FC.reset_for_test()
+    fp = "rt52_fnc_" + uuid.uuid4().hex     # a verdict recorded by an earlier run must not be adopted
+    try:
+        for exc in (MemoryError("x"), RuntimeError("CUDA out of memory"),
+                    RuntimeError("Triton is not installed"), RuntimeError("Maximum function call depth exceeded")):
+            assert FC.begin_attempt(fp, "cpu", "fp32")
+            ES._settle_fncalls(fp, "cpu", "fp32", None, exc)
+            assert FC.verdict(fp, "cpu", "fp32") is None
+        assert FC.begin_attempt(fp, "cpu", "fp32")          # granted again after each
+        ES._settle_fncalls(fp, "cpu", "fp32", None, RuntimeError("real dynamo failure"))
+        assert FC.verdict(fp, "cpu", "fp32") is False
+    finally:
+        FC.reset_for_test()
+
+
+def test_lru_get_touches_and_tolerates_a_vanished_key():
+    d = OrderedDict([("a", 1), ("b", 2)])
+    assert lru_util.lru_get(d, "a") == 1
+    assert list(d) == ["b", "a"]
+    assert lru_util.lru_get(d, "zzz", 7) == 7
+
+    class Evicting(OrderedDict):
+        def move_to_end(self, key, last=True):
+            self.pop(key, None)                     # another thread evicted it just now
+            raise KeyError(key)
+    e = Evicting(a=1)
+    assert lru_util.lru_get(e, "a", "gone") == "gone"
+
+
+def test_a_cached_artifact_that_is_cooked_every_frame_moves_to_the_recent_end():
+    hot, other = ("hot", "cpu", "fp32"), ("other", "cpu", "fp32")
+    saved = OrderedDict(C._compiled_cache)
+    try:
+        C._compiled_cache.clear()
+        fn = lambda program, b, tm, dev, lcc, on, scale=None: torch.zeros(1)
+        C._compiled_cache[hot] = (fn, "inductor")
+        C._compiled_cache[other] = (fn, "inductor")
+        res, _ = C._run_cached_compiled(hot, None, {}, {}, "cpu", 0, None, "cpu", timed=False)
+        assert res is not None
+        assert list(C._compiled_cache)[-1] == hot
+        C._compiled_cache.pop(hot)
+        assert C._run_cached_compiled(hot, None, {}, {}, "cpu", 0, None, "cpu", timed=False) == (None, None)
+    finally:
+        C._compiled_cache.clear()
+        C._compiled_cache.update(saved)
+
+
+def _auto_setup():
+    from TEX_Wrangle.tex_cache import parse_and_split
+    from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
+    from TEX_Wrangle.tex_runtime.interpreter import _collect_identifiers
+    code = "vec3 c=@A.rgb*1.3 - 0.1; c=clamp(c,0.0,1.0); @OUT=vec4(c,1.0);"
+    bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+    prog = parse_and_split(code, bt)
+    tm = TypeChecker(binding_types=bt, source=code).check(prog)
+    return prog, tm, _collect_identifiers(prog)
+
+
+def test_a_finished_compile_is_trialled_even_after_an_idle_pause(tmp_path, monkeypatch):
+    """The convergence bound counts wall-clock time, so a pause after the compile was submitted
+    used to reject a healthy key (and persist the rejection). A finished compile is promoted
+    first, and a bound-fired rejection is never written to disk."""
+    from TEX_Wrangle.tex_runtime import autotier as AT
+    prog, tm, used = _auto_setup()
+    img = torch.rand(1, 8, 8, 3)
+    fp = "rt52_idle_fp"
+    cache_key = (fp, "cpu", "fp32")
+
+    def fake_compiled(program, bindings, type_map, device, lcc, names, scale=None):
+        return {n: torch.zeros(1, 8, 8, 4) for n in (names or ["OUT"])}
+
+    monkeypatch.setattr(C, "_try_compile", lambda *a, **k: (fake_compiled, "inductor"))
+    monkeypatch.setattr(C, "compile_capability_async",
+                        lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}})
+    AT.reset()
+    try:
+        for _ in range(3):
+            C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
+        C._drain_bg_for_test()
+        C._bg_futures.pop(cache_key, None)
+        key = AT.make_key(fp, "cpu", "fp32", C._consensus_extent({"A": img}, prog))
+        assert AT.verdict(key) == AT.COMPILING and cache_key in C._compiled_cache
+        AT._get(key).ready_wall -= AT._CONVERGENCE_BOUND_S + 5.0      # the user paused
+        C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
+        assert AT.verdict(key) != AT.REJECTED, "an idle pause rejected a compile that had finished"
+    finally:
+        C._drain_bg_for_test()
+        C._compiled_cache.pop(cache_key, None)
+        AT.reset()
+
+
+def test_the_convergence_bound_is_not_persisted():
+    from TEX_Wrangle.tex_runtime import autotier as AT
+    AT.reset()
+    key = ("rt52", "bound", "cpu", "fp32", 10, None)
+    try:
+        AT.record_interp(key, 5.0)
+        for _ in range(3):
+            AT.record_interp(key, 5.0)
+        assert AT.should_submit_compile(key)
+        AT.mark_submitted(key)
+        AT._get(key).ready_wall -= AT._CONVERGENCE_BOUND_S + 1.0
+        assert AT.enforce_convergence_bound(key)
+        assert AT.verdict(key) == AT.REJECTED
+        assert key in AT._NON_DURABLE
+    finally:
+        AT.reset()
+
+
+def test_persisted_tier_verdicts_are_tagged_with_the_gpu(monkeypatch):
+    from TEX_Wrangle.tex_runtime import autotier as AT
+    from TEX_Wrangle.tex_runtime import xfer
+    monkeypatch.setattr(xfer, "_version_tag", lambda: "GPU-A_2.12")
+    tag_a = AT._version_tag()
+    monkeypatch.setattr(xfer, "_version_tag", lambda: "GPU-B_2.12")
+    assert AT._version_tag() != tag_a
+
+
+def test_autotier_has_no_per_key_seed_alias():
+    from TEX_Wrangle.tex_runtime import autotier as AT
+    assert not hasattr(AT, "seed_from_disk")
+
+
+def test_loop_depth_counts_loops_inside_user_functions():
+    from TEX_Wrangle.tex_cache import parse_and_split
+    from TEX_Wrangle.tex_runtime import compiled_capability as CC
+    code = ("float f(float a) { float s = 0.0; for (int i=0;i<2;i++) { for (int j=0;j<2;j++) "
+            "{ for (int k=0;k<2;k++) { s += a; } } } return s; }\n@OUT = vec4(f(@A.r));")
+    prog = parse_and_split(code, {"A": TEXType.VEC3, "OUT": TEXType.VEC4})
+    assert CC._max_loop_depth(prog) == 3
+
+
+def test_cpu_probe_wants_a_cplusplus_compiler_not_a_c_one(monkeypatch):
+    import shutil
+    import torch._inductor.cpp_builder as cb
+    from TEX_Wrangle.tex_runtime import compiled_capability as CC
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def no_torch_choice():
+        raise RuntimeError("no compiler")
+    monkeypatch.setattr(cb, "get_cpp_compiler", no_torch_choice)
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n if n in ("gcc", "cc", "clang") else None)
+    assert CC._probe_cpu_inductor()[0] is False       # a C compiler cannot build inductor's C++
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n if n == "g++" else None)
+    assert CC._probe_cpu_inductor()[0] is True
+
+
+def test_capability_future_cleared_by_another_thread_does_not_raise(monkeypatch):
+    import concurrent.futures
+    from TEX_Wrangle.tex_runtime import compiled_capability as CC
+
+    class ClearsOnRelease:
+        """Another caller resets the shared slot the moment this one lets go of the lock."""
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            CC._capability_future = None
+
+    class FakePool:
+        def submit(self, fn):
+            f = concurrent.futures.Future()
+            f.set_result(None)
+            return f
+
+    monkeypatch.setattr(CC, "_capability_future", None)
+    monkeypatch.setattr(CC, "_capability_cache", None)
+    monkeypatch.setattr(CC, "_capability_pool_lock", ClearsOnRelease())
+    monkeypatch.setattr(CC, "_get_capability_pool", lambda: FakePool())
+    assert CC.compile_capability_async() is None
+
+
+def test_the_cache_sweep_spares_a_sibling_store_that_is_still_being_written(tmp_path, monkeypatch):
+    import os
+    import time
+    import types
+    from TEX_Wrangle import tex_cache
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.setattr(tex_cache, "get_cache",
+                        lambda: types.SimpleNamespace(torch_compile_cache_dir=tmp_path))
+    stale, live = tmp_path / "old_epoch", tmp_path / "other_install"
+    for d in (stale, live):
+        (d / "fxgraph").mkdir(parents=True)
+        (d / "fxgraph" / "k.bin").write_bytes(b"x")
+    week_ago = time.time() - 7 * 86400
+    os.utime(stale / "fxgraph" / "k.bin", (week_ago, week_ago))
+    ES._ensure_inductor_cache_dir()
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_a_callback_that_raises_a_base_exception_does_not_silence_later_cooks():
+    from TEX_Wrangle.tex_runtime import cook_observer as CO
+    seen = []
+
+    def interrupting(entry, thread):
+        raise KeyboardInterrupt
+
+    handle = CO.register(interrupting)
+    try:
+        try:
+            with CO.scope("run"):
+                pass
+        except KeyboardInterrupt:
+            pass
+    finally:
+        CO.unregister(handle)
+    assert getattr(CO._local, "depth", 0) == 0
+    handle = CO.register(lambda entry, thread: seen.append(entry))
+    try:
+        with CO.scope("run"):
+            pass
+    finally:
+        CO.unregister(handle)
+    assert seen == ["run"]
+
+
+def _graphed_capture_attempt(monkeypatch, exc):
+    """Drive graphed.run_graphed to its capture step on a CPU box with a capture that raises `exc`."""
+    from TEX_Wrangle.tex_runtime import graphed as G
+    key_holder = {}
+
+    class BoomProgram:
+        def __init__(self, key):
+            key_holder["key"] = key
+            self.bytes = 0
+
+        def capture(self, *a, **k):
+            raise exc
+
+    monkeypatch.setattr(G, "_capturable_memo", {"rt52_fp": (True, 50)})
+    monkeypatch.setattr(G, "_graph_capture_worthwhile", lambda ops, px: True)
+    monkeypatch.setattr(G, "_under_memory_pressure", lambda dev: False)
+    monkeypatch.setattr(G, "_recover_from_capture_failure", lambda idx: True)
+    monkeypatch.setattr(G, "GraphedProgram", BoomProgram)
+    monkeypatch.setattr(G, "_graph_cache", OrderedDict())
+    monkeypatch.setattr(G, "_blacklist", OrderedDict())
+    monkeypatch.setattr(G, "_graph_mode_disabled", False)
+    out = G.run_graphed(None, {"A": torch.zeros(1, 4, 4, 3)}, {}, "cuda:0", "rt52_fp",
+                        output_names=["OUT"], used_builtins=frozenset())
+    return out, key_holder["key"] in G._blacklist
+
+
+def test_an_out_of_memory_capture_is_retried_later_but_other_failures_are_not(monkeypatch):
+    oom = torch.cuda.OutOfMemoryError("CUDA out of memory")
+    out, blacklisted = _graphed_capture_attempt(monkeypatch, oom)
+    assert out is None and not blacklisted
+    out, blacklisted = _graphed_capture_attempt(monkeypatch, RuntimeError("capture invalidated"))
+    assert out is None and blacklisted
+
+
+def test_guard_trace_reset_disarm_and_shape_change():
+    from TEX_Wrangle.tex_runtime import guard_trace as GT
+    GT.arm()
+    try:
+        GT.note(torch.ones(1, 4, 4, 1, dtype=torch.bool))
+        assert GT.count() == 16 and GT.mask() is not None
+        GT.reset()                                    # the attempt was discarded
+        assert GT.count() == 0 and GT.mask() is None and GT.armed()
+        GT.note(torch.ones(1, 4, 4, 1, dtype=torch.bool))
+        GT.note(torch.ones(1, 2, 2, 1, dtype=torch.bool))   # a retry at another size
+        assert GT.count() == 20
+        assert tuple(GT.mask().shape) == (1, 2, 2)
+    finally:
+        GT.disarm()
+    assert GT.mask() is None and not GT.armed()
+
+
+def _run_child_source(src, stdin_text="{}", timeout=120):
+    import subprocess
+    return subprocess.run([sys.executable, "-c", src], input=stdin_text, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def test_prewarm_child_loads_the_package_under_a_path_style_name():
+    """ComfyUI registers a custom-node folder under its absolute path, which no sys.path entry
+    can import; the child loads the package by location under that same name."""
+    import json
+    import os
+    import TEX_Wrangle
+    from TEX_Wrangle.tex_runtime import prewarm_worker as PW
+    pkg_dir = os.path.dirname(os.path.abspath(TEX_Wrangle.__file__))
+    weird = "C:" + chr(92) + "ComfyUI" + chr(92) + "custom_nodes" + chr(92) + "TEX"
+    payload = {"jobs": [], "device": "cpu", "precision": "fp32", "compile_mode": "none"}
+    proc = _run_child_source(PW._child_source(weird, pkg_dir), json.dumps(payload))
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert json.loads(proc.stdout.strip().splitlines()[-1]).get("errors", 0) == 0
+
+
+def test_prewarm_boundary_reports_child_detail_timeout_and_undecodable_stderr(monkeypatch):
+    from TEX_Wrangle.tex_runtime import prewarm_worker as PW
+    jobs = [("@OUT = vec4(0.0);", {}, "fp")]
+    kw = dict(device="cpu", precision="fp32", compile_mode="none")
+
+    def use(script):
+        monkeypatch.setattr(PW, "_child_source", lambda name, path: script)
+
+    use("import sys, json; print(json.dumps({'error': 'ImportError: boom-detail'})); sys.exit(1)")
+    assert "boom-detail" in PW.warm_in_subprocess(jobs, **kw)["error"]
+
+    monkeypatch.setattr(PW, "_WORKER_TIMEOUT_S", 0.5)
+    use("import time; time.sleep(30)")
+    assert "timed out" in PW.warm_in_subprocess(jobs, **kw)["error"]
+    monkeypatch.setattr(PW, "_WORKER_TIMEOUT_S", 120.0)
+
+    use("import sys, json; sys.stderr.buffer.write(bytes([0x8f, 0x81])); "
+        "print(json.dumps({'programs': 1, 'bg_compile': 1, 'error': None}))")
+    out = PW.warm_in_subprocess(jobs, **kw)
+    assert out["error"] is None and out["bg_compile"] == 1, out
+
+
+def test_pacing_wait_path_measures_an_interval_from_an_event_it_does_not_recycle(monkeypatch):
+    """At the default depth the wait branch used to re-record the very event it had just made the
+    timing anchor, so no valid interval was ever measured from a cook that never economizes."""
+    import itertools
+    from TEX_Wrangle.tex_runtime import pacing as P
+    clock = itertools.count(1)
+
+    class FakeEvent:
+        def __init__(self, *a, **k):
+            self.t = None
+
+        def record(self, *a, **k):
+            self.t = next(clock)
+
+        def synchronize(self):
+            pass
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            if self.t is None or other.t is None or other.t < self.t:
+                raise RuntimeError("events not in order")
+            return float(other.t - self.t)
+
+    fed = []
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(P, "_record_on", lambda ev, device, is_current: ev.record())
+    monkeypatch.setattr(P, "_cost_feed", lambda key, ms, anchor=None: fed.append(ms))
+    monkeypatch.setattr(P, "wants_pacing", lambda token: True)
+    monkeypatch.setattr(P, "_resolve_cuda_target", lambda device: (True, 0, True))
+    monkeypatch.setattr(P, "_resolve_depth", lambda token: 2)
+    monkeypatch.setattr(P, "_resolve_stride", lambda token: 0.0)
+    monkeypatch.setattr(P, "_resolve_budget_ms", lambda token: 50.0)
+
+    class Token:
+        def check(self):
+            pass
+
+    monkeypatch.setattr(P._state, "pools", {}, raising=False)
+    tok = Token()
+    P.reset(tok, "cuda:0", (1, 8, 8))
+    for _ in range(8):
+        P.paced_check(tok, "cuda:0", heavy=True, call_site_id=7, call_site_anchor=object())
+    assert fed and all(ms > 0 for ms in fed), fed
+
+
+def test_heavy_statement_memo_survives_a_concurrent_eviction(monkeypatch):
+    from TEX_Wrangle.tex_runtime import pacing_heavy as PH
+
+    class Evicting(OrderedDict):
+        def move_to_end(self, key, last=True):
+            self.pop(key, None)        # another cook thread evicted the entry just now
+            raise KeyError(key)
+
+    stmts = []
+    memo = Evicting()
+    memo[id(stmts)] = (stmts, frozenset({1}))
+    monkeypatch.setattr(PH, "_HEAVY_STMT_MEMO", memo)
+    assert PH.heavy_stmt_ids(stmts) in (frozenset(), frozenset({1}))
+
+
+def test_a_frame_handle_whose_event_query_raises_is_not_reported_ready():
+    from TEX_Wrangle.tex_runtime.streams import FrameHandle
+
+    class StickyEvent:
+        def query(self):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        def synchronize(self):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    handle = FrameHandle(torch.zeros(2), torch.zeros(2), StickyEvent())
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        handle.is_ready()
+    assert handle._event is not None      # still fenced: the bytes are not handed out as ready
+
+
+def test_a_frame_handle_whose_event_query_raises_but_completes_is_ready():
+    from TEX_Wrangle.tex_runtime.streams import FrameHandle
+
+    class OddEvent:
+        def query(self):
+            raise RuntimeError("backend without query")
+
+        def synchronize(self):
+            pass
+
+    handle = FrameHandle(torch.zeros(2), torch.zeros(2), OddEvent())
+    assert handle.is_ready() and handle._event is None

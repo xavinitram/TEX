@@ -23,8 +23,8 @@ properties of *that host*, not of the idea:
     would have to survive an arbitrary third-party consumer that has never heard of one, and
     the first `.cpu()` or `.shape` on the wrong side is a silent wrong frame.
   * Under ENGINE custody every consumer is in this repository. There are exactly two today —
-    `ResultCache`'s demote drain and its spill path — and both are in `tex_results.py`, three
-    lines apart, fencing explicitly.
+    `ResultCache`'s demote drain (`tex_results_residency.py`) and its spill path
+    (`tex_results.py`), each fencing explicitly.
 
 So this module is **engine-only, by construction and not by convention**: nothing in
 `tex_node.py` can reach it, and `ResultCache` is already dormant under ComfyUI (the host caches
@@ -97,13 +97,16 @@ class FrameHandle:
         """True if the copy has landed. Never blocks. A `False` here is what tells a scheduler
         to go and do something else; it is NOT permission to read the buffer when it turns
         True on a later poll without also having fenced, because polling is not ordering."""
-        if self._event is None:
+        ev = self._event
+        if ev is None:
             return True
         try:
-            if not self._event.query():
+            if not ev.query():
                 return False
         except Exception:
-            pass                        # a wedged/absent event reads as ready
+            # query() raises on a sticky CUDA error: do not report the frame ready. Blocking on
+            # the fence itself makes that error surface here instead of as an unfenced buffer.
+            ev.synchronize()
         # Observing completion RELEASES, exactly as `wait` does. Without this a poll-based
         # consumer that never fences keeps both the source's VRAM block and the page-locked
         # host buffer alive indefinitely — measured: 64 MB still allocated at 2048² after the
@@ -115,9 +118,10 @@ class FrameHandle:
     # ── the fence ──
     def wait(self) -> "FrameHandle":
         """Block until the copy has landed. Idempotent and cheap once satisfied."""
-        if self._event is not None:
+        ev = self._event
+        if ev is not None:
             try:
-                self._event.synchronize()
+                ev.synchronize()
             except Exception:
                 torch.cuda.synchronize()        # last resort: fence the whole device
             self._event = None                  # fenced; also releases the Event
@@ -143,8 +147,8 @@ class FrameHandle:
 
 def _blocking(src: torch.Tensor, want) -> FrameHandle:
     """The plain synchronous copy, wrapped in an already-complete handle. Spelled once: it is
-    the answer to four different questions in `egress` below, and three copies of it is three
-    places to forget a `memory_format` the day one is needed."""
+    the answer every decline path in `egress` below gives, and each extra copy of it is a
+    place to forget a `memory_format` the day one is needed."""
     host = torch.empty(src.shape, dtype=want, device="cpu")
     host.copy_(src)
     return FrameHandle(host)
@@ -171,7 +175,7 @@ def egress(src: torch.Tensor, *, dtype=None, retained: bool = False) -> FrameHan
     should need.)
     """
     want = dtype or src.dtype
-    if (not isinstance(src, torch.Tensor) or src.device.type != "cuda" or retained
+    if (src.device.type != "cuda" or retained
             or want != src.dtype or not torch.cuda.is_available()):
         return _blocking(src, want)
     # The shipped pinned-staging band, read from its owner rather than restated here — the cap
