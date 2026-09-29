@@ -479,3 +479,81 @@ def test_lexer_skips_a_leading_bom_and_reads_leading_dot_exponents():
 
 def test_select_condition_must_be_a_scalar():
     assert "E5003" in check_errors("float a[2] = {0.0, 1.0}; @OUT = vec4(select(a, 1.0, 0.0));", _V4)
+
+
+# ── Parse diagnostics: what is quoted, where they point, how many there are ───────────────
+
+def _parse_diags(code):
+    """[(message, line, col, end_col)] for a program that fails to parse, else []."""
+    from TEX_Wrangle.tex_compiler.lexer import Lexer
+    from TEX_Wrangle.tex_compiler.parser import Parser
+    try:
+        Parser(Lexer(code).tokenize(), code).parse()
+    except TEXMultiError as e:
+        ds = e.diagnostics
+    except Exception as e:
+        ds = [e.diagnostic if e.diagnostic else (e._build_diagnostic() or e.diagnostic)]
+    else:
+        return []
+    return [(d.message, d.loc.line, d.loc.col, d.end_col) for d in ds]
+
+
+@pytest.mark.parametrize("code, shown", [
+    ("x = 1 @B;", "@B"), ('x = 1 "s";', '"s"'), ("x = 1 f$k;", "f$k"),
+    ("x = 1 f@k;", "f@k"), ("x = 1 $k;", "$k"),
+])
+def test_parse_error_quotes_the_token_as_written(code, shown):
+    (msg, line, col, end_col), = _parse_diags(code)
+    assert f"`{shown}`" in msg
+    assert (line, col, end_col) == (1, 7, 7 + len(shown))
+
+
+@pytest.mark.parametrize("code, where", [
+    ("float x = 1\nfloat y = 2;", (1, 12)),
+    ("float x = 1 // c\n\n\nfloat y = 2;", (1, 12)),
+    ("@OUT = vec4(1.0)\n", (1, 17)),
+    ("if (a) {\n  x = 1;\n", (2, 9)),
+])
+def test_missing_closer_points_just_after_the_last_token(code, where):
+    ds = _parse_diags(code)
+    assert (ds[0][1], ds[0][2]) == where
+
+
+def test_missing_closer_on_the_same_line_keeps_the_offending_token():
+    (msg, line, col, _e), = _parse_diags("float x = 1 float y = 2;")
+    assert (line, col) == (1, 13) and "`float`" in msg
+
+
+@pytest.mark.parametrize("code", [
+    "float out = 1.0; out = 2.0; @OUT = vec4(out);",
+    "float var = 1.0; var += 1.0; @OUT = vec4(var);",
+    "int case = 1; case++; @OUT = vec4(float(case));",
+    "vec3 in = vec3(0.0); in.x = 1.0; @OUT = vec4(in, 1.0);",
+    "float a[2] = {0.0, 0.0}; float class = 1.0; class *= 2.0; @OUT = vec4(class);",
+])
+def test_variable_named_like_a_foreign_keyword_can_be_assigned(code):
+    assert _parse_diags(code) == []
+
+
+@pytest.mark.parametrize("code", ["var x = 1.0;", "switch (x) { }", "let y = 2;", "import math;"])
+def test_foreign_keyword_statement_is_still_rejected(code):
+    (msg, *_), = _parse_diags(code)
+    assert "Unexpected keyword" in msg
+
+
+@pytest.mark.parametrize("code, n", [
+    ("if (a) { b = ; } c = 1;", 1),
+    ("if (a) { x = ; } else { y = 1; }", 1),
+    ("while (x < 3 { x++; }", 1),
+    ("x = {1};", 1),
+    ("if (a) { b = ; c = ; } d = 1;", 2),
+    ("float f(float x) { return ; } float y = ;", 2),
+])
+def test_one_bad_statement_reports_one_error(code, n):
+    assert len(_parse_diags(code)) == n
+
+
+def test_block_recovery_keeps_parsing_after_the_bad_statement():
+    ds = _parse_diags("if (a) { b = ; } else { c = ; }\nfloat z = ;")
+    assert [d[1] for d in ds] == [1, 1, 2]
+
