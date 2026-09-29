@@ -211,7 +211,14 @@ def test_vec_array_literal_elements_widen():
              torch.tensor([0.5, 0.5, 0.5, 1.0]).expand(1, 4, 4, 4))
 
 
-# ── Parser: literals the fp32 runtime cannot hold ───────────
+# ── Parser: scatter increments accumulate; literals the fp32 runtime cannot hold ───────────
+
+@pytest.mark.parametrize("stmt,want", [("@OUT[0,0]++;", 16.0), ("@OUT[0,0]--;", -16.0),
+                                       ("@OUT[0,0] += 1.0;", 16.0)])
+def test_scatter_increment_accumulates_like_compound_add(stmt, want):
+    ref = run_both("@OUT = @A.r * 0.0; " + stmt, {"A": _a()})
+    assert ref["OUT"][0, 0, 0].item() == want
+
 
 def _parse_error_code(code):
     from TEX_Wrangle.tex_compiler.parser import ParseError

@@ -807,9 +807,12 @@ class Parser:
         """Desugar i++ -> i = i + 1, i-- -> i = i - 1
 
         The read side gets a clone of the lvalue: passes that mutate the AST
-        in place assume no shared subtrees.
+        in place assume no shared subtrees. A scatter target (`@OUT[x,y]++`) keeps
+        `op`, so colliding writes accumulate exactly as `@OUT[x,y] += 1` does.
         """
         one = NumberLiteral(loc=loc, value=1.0, is_int=True)
+        if isinstance(target, BindingIndexAccess):
+            return Assignment(loc=loc, target=target, value=one, op=op)
         return Assignment(
             loc=loc,
             target=target,
