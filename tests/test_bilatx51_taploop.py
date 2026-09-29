@@ -180,10 +180,10 @@ def _old_weighted_avg_deterministic(patches, center, w_spatial, sr):
 def _old_tiled_exact_reference(bchw, ss, sr, radius):
     """A byte-for-byte copy of the pre-BILATX-51 `_bilateral_exact_bchw` row-tiling loop,
     kept here ONLY as this test's own before/after reference -- never called by product
-    code. Identical to the still-shipped `_bilateral_exact_bchw`, since BILATX-51 did not
-    change its math, only which radii still call it; kept as a separate copy so this test
-    does not silently start comparing a function against itself if a future change ever
-    touches `_bilateral_exact_bchw`."""
+    code. Same math as the shipped `_bilateral_exact_bchw`; it differs only in reduction order
+    for radius > 3, where this copy keeps the removed fixed-order accumulator. Kept as a
+    separate copy so this test does not compare a function against itself if a future
+    change touches `_bilateral_exact_bchw`."""
     B, C, H, W = bchw.shape
     w_spatial, ksize = TEXStdlib._bilateral_spatial_weights(ss, radius, bchw.device)
     padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
@@ -305,12 +305,34 @@ def test_bilatx51_taploop_peak_memory_is_image_sized_not_ksize_squared(r: SubTes
         peak["numel"] = max(peak["numel"], out.numel())
         return out
 
+    # The padded frame bounds only what pad returns: a reintroduced unfold (a [B,C,H,W,k,k]
+    # window tensor, the ksize^2 allocation this row is named for) would leave it unchanged,
+    # so any unfold call inside the tap-loop is a failure of its own.
+    unfolds = []
+    orig_unfold, orig_f_unfold = torch.Tensor.unfold, torch.nn.functional.unfold
+
+    def _spy_unfold(self, *a, **kw):
+        unfolds.append(tuple(self.shape))
+        return orig_unfold(self, *a, **kw)
+
+    def _spy_f_unfold(t, *a, **kw):
+        unfolds.append(tuple(t.shape))
+        return orig_f_unfold(t, *a, **kw)
+
     torch.nn.functional.pad = _spy_pad
+    torch.Tensor.unfold = _spy_unfold
+    torch.nn.functional.unfold = _spy_f_unfold
     try:
         for radius in (10, 24, 40):
             ss = radius / 3.0
             peak["numel"] = 0
+            del unfolds[:]
             TEXStdlib._bilateral_exact_taploop_bchw(bchw.clone(), ss, 0.2, radius)
+            if unfolds:
+                r.fail(f"tap-loop unfold radius={radius}",
+                       f"the tap-loop called unfold on {unfolds[:3]}; it must accumulate tap "
+                       f"by tap without materializing the ksize^2 window tensor")
+                return
             # The padded frame is the largest tensor this path ever allocates; it must
             # stay within a small, RADIUS-INDEPENDENT multiple of the image's own size
             # (the padding grows the frame by 2*radius per side, a modest constant
@@ -324,6 +346,8 @@ def test_bilatx51_taploop_peak_memory_is_image_sized_not_ksize_squared(r: SubTes
              "radius-independent multiple of the image's own size across radius=10/24/40")
     finally:
         torch.nn.functional.pad = orig_pad
+        torch.Tensor.unfold = orig_unfold
+        torch.nn.functional.unfold = orig_f_unfold
 
 
 def test_bilatx51_taploop_peak_cuda_memory_bounded(r: SubTestResult):

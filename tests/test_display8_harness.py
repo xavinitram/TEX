@@ -81,11 +81,34 @@ def test_display8_code_diff_stats_contract(r: SubTestResult):
     if diff["max"] != 5 or diff["centre_max"] != 5:
         r.fail("display8 diff stats magnitude", f"expected max/centre_max == 5, got {diff}")
         return
-    if diff["changed"] <= 0.0 or diff["ge4"] <= 0.0:
-        r.fail("display8 diff stats fractions", f"expected changed/ge4 > 0, got {diff}")
+    n = H * W
+    if (diff["changed"], diff["ge2"], diff["ge4"]) != (1 / n, 1 / n, 1 / n):
+        r.fail("display8 diff stats fractions",
+               f"one changed pixel of {n} should give changed = ge2 = ge4 = {1 / n}, got {diff}")
+        return
+    if diff["centre_ge2"] != 1 / ((H // 2) * (W // 2)):
+        r.fail("display8 diff stats centre",
+               f"the centre half is {H // 2}x{W // 2} pixels, so centre_ge2 should be "
+               f"{1 / ((H // 2) * (W // 2))}, got {diff['centre_ge2']}")
+        return
+    if abs(diff["mean_signed"] + 5.0 / (n * 3)) > 1e-12:
+        r.fail("display8 diff stats mean", f"mean_signed should be -5/{n * 3}, got {diff['mean_signed']}")
         return
     if diff["mean_signed"] >= 0.0:
         r.fail("display8 diff stats sign", f"code_diff_stats(a, b) reports (a - b); b > a at one "
                f"pixel should give a negative mean_signed, got {diff['mean_signed']}")
         return
     r.ok(f"code_diff_stats(a, b) reports a single 5-code centre diff correctly: {diff}")
+
+
+def test_display8_code_diff_stats_tiny_frame_falls_back_to_full_frame(r: SubTestResult):
+    print("\n--- display8: on a frame with H < 4 the centre half is empty, so centre_* read the whole frame ---")
+    a = torch.zeros(1, 4, 3, dtype=torch.int16)
+    b = a.clone()
+    b[0, 3, 0] = 5
+    stats = code_diff_stats(a, b)
+    if stats["centre_max"] != 5 or stats["centre_ge2"] != 0.25:
+        r.fail("display8 diff stats tiny frame",
+               f"expected centre_max 5 and centre_ge2 1/4 from the full-frame fallback, got {stats}")
+        return
+    r.ok(f"a 1x4 frame's centre stats fall back to the full frame: {stats}")

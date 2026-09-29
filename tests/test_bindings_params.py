@@ -116,7 +116,8 @@ def test_binding_access(r: SubTestResult):
     # @A(u, v) — sample at current UV (identity, approximately)
     try:
         result = compile_and_run("@OUT = @A(u, v);", {"A": img})
-        # Bilinear at exact pixel centers should be close to identity
+        # Bilinear at exact pixel centers is the identity
+        assert torch.allclose(result, img, atol=1e-5), f"Max diff: {(result - img).abs().max()}"
         r.ok("@A(u, v) identity sample")
     except Exception as e:
         r.fail("@A(u, v) identity sample", str(e))
@@ -143,6 +144,8 @@ def test_binding_access(r: SubTestResult):
     # Chaining with channel access: @A(u, v).r
     try:
         result = compile_and_run("float val = @A(u, v).r; @OUT = @A * val;", {"A": img})
+        expected = img * img[..., 0:1]
+        assert torch.allclose(result, expected, atol=1e-5), f"Max diff: {(result - expected).abs().max()}"
         r.ok("@A(u, v).r chain")
     except Exception as e:
         r.fail("@A(u, v).r chain", str(e))
@@ -171,6 +174,8 @@ def test_binding_access(r: SubTestResult):
         result = compile_and_run("@OUT = @A[ix, iy, 0];", {"A": batch_img})
         # Frame 0 sampled everywhere
         expected_frame = batch_img[0:1].expand_as(batch_img)
+        assert torch.allclose(result, expected_frame, atol=1e-5), (
+            f"Max diff: {(result - expected_frame).abs().max()}")
         r.ok("@A[ix, iy, 0] with frame")
     except Exception as e:
         r.fail("@A[ix, iy, 0] with frame", str(e))
@@ -179,6 +184,9 @@ def test_binding_access(r: SubTestResult):
     try:
         batch_img = torch.rand(2, 4, 4, 4)
         result = compile_and_run("@OUT = @A(u, v, 0);", {"A": batch_img})
+        expected_frame = batch_img[0:1].expand_as(batch_img)
+        assert torch.allclose(result, expected_frame, atol=1e-5), (
+            f"Max diff: {(result - expected_frame).abs().max()}")
         r.ok("@A(u, v, 0) with frame")
     except Exception as e:
         r.fail("@A(u, v, 0) with frame", str(e))
@@ -200,6 +208,7 @@ def test_binding_access(r: SubTestResult):
             }
             @OUT = blur_sample(0.0, 0.0);
         """, {"A": img})
+        assert torch.allclose(result, img, atol=1e-5), f"Max diff: {(result - img).abs().max()}"
         r.ok("binding sample in user function")
     except Exception as e:
         r.fail("binding sample in user function", str(e))
@@ -251,6 +260,10 @@ def test_binding_access_advanced(r: SubTestResult):
             }
             @OUT = sum / 3.0;
         """, {"A": img})
+        cols = torch.arange(4)
+        expected = sum(img[:, :, (cols + d).clamp(0, 3), :] for d in (-1, 0, 1)) / 3.0
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: access in loop (neighbor)")
     except Exception as e:
         r.fail("binding: access in loop (neighbor)", str(e))
@@ -262,6 +275,10 @@ def test_binding_access_advanced(r: SubTestResult):
             float cy = clamp(float(iy) * 2.0, 0.0, float(ih - 1));
             @OUT = @A[int(cx), int(cy)];
         """, {"A": img})
+        idx = (torch.arange(4) * 2).clamp(0, 3)
+        expected = img[:, idx][:, :, idx]
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: arithmetic coords")
     except Exception as e:
         r.fail("binding: arithmetic coords", str(e))
@@ -271,6 +288,10 @@ def test_binding_access_advanced(r: SubTestResult):
         result = compile_and_run("""
             @OUT = @A[int(floor(u * float(iw - 1))), int(floor(v * float(ih - 1)))];
         """, {"A": img})
+        # u = ix / (iw - 1), so floor(u * (iw - 1)) is the pixel's own column
+        expected = img
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: function call coords")
     except Exception as e:
         r.fail("binding: function call coords", str(e))
@@ -283,6 +304,12 @@ def test_binding_access_advanced(r: SubTestResult):
             float offset = brightness * 3.0;
             @OUT = @A[int(clamp(float(ix) + offset, 0.0, float(iw - 1))), iy];
         """, {"A": img})
+        cols = torch.arange(4, dtype=torch.float32).view(1, 1, 4)
+        offset = img[..., 0] * 3.0
+        src = (cols + offset).clamp(0.0, 3.0).long()
+        expected = torch.stack([torch.stack([img[0, y, src[0, y, x]] for x in range(4)]) for y in range(4)]).unsqueeze(0)
+        assert torch.allclose(result, expected, atol=1e-4), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: nested access (data-dependent coords)")
     except Exception as e:
         r.fail("binding: nested access (data-dependent coords)", str(e))
@@ -303,6 +330,11 @@ def test_binding_access_advanced(r: SubTestResult):
         result = compile_and_run("""
             @OUT = @A(u * 0.5 + 0.25, v * 0.5 + 0.25);
         """, {"A": img})
+        px = 0.5 * torch.arange(4, dtype=torch.float32) + 0.75
+        # img is linear in x and y, so bilinear sampling inside the frame is exact
+        expected = (0.1 * px.view(1, 1, 4, 1) + 0.01 * px.view(1, 4, 1, 1)).expand(1, 4, 4, 4)
+        assert torch.allclose(result, expected, atol=1e-4), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: sample with computed UV")
     except Exception as e:
         r.fail("binding: sample with computed UV", str(e))
@@ -313,6 +345,10 @@ def test_binding_access_advanced(r: SubTestResult):
             float l = luma(@A(u, v));
             @OUT = vec4(l, l, l, 1.0);
         """, {"A": img})
+        lum = img[..., 0:1]
+        expected = torch.cat([lum, lum, lum, torch.ones_like(lum)], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-4), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: sample result in function (luma)")
     except Exception as e:
         r.fail("binding: sample result in function (luma)", str(e))
@@ -338,6 +374,9 @@ def test_binding_access_advanced(r: SubTestResult):
             int f = 0;
             @OUT = @A[ix, iy, f];
         """, {"A": batch_img})
+        expected = batch_img[0:1].expand_as(batch_img)
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: frame access with variable")
     except Exception as e:
         r.fail("binding: frame access with variable", str(e))
@@ -347,6 +386,10 @@ def test_binding_access_advanced(r: SubTestResult):
         result = compile_and_run("""
             @OUT = u > 0.5 ? @A[ix, iy] : @B[ix, iy];
         """, {"A": img, "B": img_b})
+        right = (torch.arange(4) >= 2).view(1, 1, 4, 1)
+        expected = torch.where(right, img, img_b)
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: access in ternary")
     except Exception as e:
         r.fail("binding: access in ternary", str(e))
@@ -369,6 +412,9 @@ def test_binding_access_advanced(r: SubTestResult):
             float alpha = @A(u, v).a;
             @OUT = vec4(alpha);
         """, {"A": img})
+        expected = img[..., 3:4].expand(1, 4, 4, 4)
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: swizzle .a on sample")
     except Exception as e:
         r.fail("binding: swizzle .a on sample", str(e))
@@ -389,6 +435,9 @@ def test_binding_access_advanced(r: SubTestResult):
             vec4 sampled = @A(u, v);
             @OUT = (fetched + sampled) * 0.5;
         """, {"A": img})
+        expected = img
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("binding: mixed fetch and sample in same program")
     except Exception as e:
         r.fail("binding: mixed fetch and sample in same program", str(e))
@@ -434,7 +483,11 @@ def test_scatter_writes(r: SubTestResult):
     # Out-of-bounds clamp: scatter to negative coords should clamp to 0
     try:
         result = compile_and_run("@OUT[ix - 100, iy] = @A;", {"A": img})
-        # All pixels land at x=0 (clamped), last-write-wins
+        # All pixels land at x=0 (clamped), last-write-wins: column 0 of each row holds the
+        # row's LAST pixel, and no other column was written
+        assert torch.allclose(result[0, :, 0, :], img[0, :, W - 1, :], atol=1e-5), (
+            "column 0 is not each row's last-written pixel")
+        assert result[0, :, 1:, :].abs().max().item() == 0.0, "a clamped write leaked past column 0"
         r.ok("scatter: out-of-bounds clamp")
     except Exception as e:
         r.fail("scatter: out-of-bounds clamp", f"{e}\n{traceback.format_exc()}")
@@ -463,7 +516,7 @@ def test_scatter_writes(r: SubTestResult):
     except Exception as e:
         r.fail("scatter: compound +=", f"{e}\n{traceback.format_exc()}")
 
-    # Compound -= scatter (per-pixel: every pixel subtracts at (0,0))
+    # Compound -= scatter (per-pixel: each pixel subtracts at its own position)
     try:
         result = compile_and_run(
             "@OUT = vec3(1.0); @OUT[ix, iy] -= vec3(0.1, 0.1, 0.1);",
@@ -549,11 +602,11 @@ def test_wireable_params(r: SubTestResult):
 
     # Param uses code default when not provided (via tex_node's param_info injection)
     try:
-        from TEX_Wrangle.tex_cache import TEXCache
-        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
-        code = "f$strength = 0.5;\n@OUT = @A * $strength;"
-        bt = {"A": TEXType.VEC3}
-        program, type_map, refs, assigned, param_info, *_ = cache.compile_tex(code, bt)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as cache_dir:
+            cache = TEXCache(cache_dir=Path(cache_dir))
+            code = "f$strength = 0.5;\n@OUT = @A * $strength;"
+            bt = {"A": TEXType.VEC3}
+            program, type_map, refs, assigned, param_info, *_ = cache.compile_tex(code, bt)
         # Simulate tex_node.py's default injection: inject param default into bindings
         bindings = {"A": test_img}
         for ref_name in refs:
@@ -659,7 +712,6 @@ def test_new_param_types(r: SubTestResult):
 
     # Color param — hex short form
     try:
-        from TEX_Wrangle.tex_marshalling import hex_to_rgb as _hex_to_rgb
         rgb = _hex_to_rgb("#FFF")
         assert abs(rgb[0] - 1.0) < 1e-3 and abs(rgb[1] - 1.0) < 1e-3 and abs(rgb[2] - 1.0) < 1e-3
         r.ok("param: _hex_to_rgb short form #FFF")
@@ -691,11 +743,11 @@ def test_new_param_types(r: SubTestResult):
 
     # Param default extraction for vec constructor
     try:
-        from TEX_Wrangle.tex_cache import TEXCache
-        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
-        code = "v3$color = vec3(0.2, 0.4, 0.6);\n@OUT = @A * $color;"
-        bt = {"A": TEXType.VEC3}
-        _, _, refs, _, param_info, *_ = cache.compile_tex(code, bt)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as cache_dir:
+            cache = TEXCache(cache_dir=Path(cache_dir))
+            code = "v3$color = vec3(0.2, 0.4, 0.6);\n@OUT = @A * $color;"
+            bt = {"A": TEXType.VEC3}
+            _, _, refs, _, param_info, *_ = cache.compile_tex(code, bt)
         assert "color" in param_info
         dv = param_info["color"]["default_value"]
         assert isinstance(dv, list) and len(dv) == 3
@@ -830,6 +882,11 @@ def test_user_functions(r: SubTestResult):
             }
             @OUT = @A * circle(0.5, 0.5, 0.3);
         """, {"A": img})
+        uu = torch.linspace(0.0, 1.0, img.shape[2]).view(1, 1, -1, 1)
+        vv = torch.linspace(0.0, 1.0, img.shape[1]).view(1, -1, 1, 1)
+        inside = (((uu - 0.5) ** 2 + (vv - 0.5) ** 2).sqrt() < 0.3).float()
+        assert torch.allclose(result, img * inside, atol=1e-5), (
+            f"Max diff: {(result - img * inside).abs().max()}")
         r.ok("function using builtins (u, v)")
     except Exception as e:
         r.fail("function using builtins (u, v)", str(e))
@@ -1079,8 +1136,10 @@ def test_user_functions(r: SubTestResult):
         """, {"A": img})
         r.fail("error: recursion depth limit", "Should have raised an error")
     except InterpreterError as e:
-        assert "depth" in str(e).lower() or "recursion" in str(e).lower(), f"Expected recursion error, got: {e}"
-        r.ok("error: recursion depth limit")
+        if "depth" in str(e).lower() or "recursion" in str(e).lower():
+            r.ok("error: recursion depth limit")
+        else:
+            r.fail("error: recursion depth limit", f"Expected recursion error, got: {e}")
     except (TypeCheckError, TEXMultiError):
         r.fail("error: recursion depth limit", "Unexpected type check error")
     except Exception as e:
@@ -1358,8 +1417,9 @@ def test_user_functions_advanced(r: SubTestResult):
         """, {"A": img})
         r.fail("error: undefined func (typo blned)", "Should have raised an error")
     except (TypeCheckError, TEXMultiError) as e:
-        msg = str(e).lower()
-        # Should suggest 'blend' in the error
+        diag = getattr(e, "diagnostic", None)
+        assert diag is not None and diag.code == "E5001", f"not the undefined-function error: {e}"
+        assert "blend" in diag.suggestions, f"should suggest 'blend', got {diag.suggestions}"
         r.ok("error: undefined func (typo blned)")
     except Exception as e:
         r.fail("error: undefined func (typo blned)", str(e))
@@ -1390,6 +1450,10 @@ def test_user_functions_advanced(r: SubTestResult):
             @OUT = tint_red(@A);
         """, {"A": img})
         assert result.shape == img.shape
+        lum = img[..., 0:1] * 0.2126 + img[..., 1:2] * 0.7152 + img[..., 2:3] * 0.0722
+        expected = torch.cat([lum * 1.5, lum * 0.5, lum * 0.5, img[..., 3:4]], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-4), (
+            f"Max diff: {(result - expected).abs().max()}")
         r.ok("func: vec4 with multiple statements")
     except Exception as e:
         r.fail("func: vec4 with multiple statements", str(e))

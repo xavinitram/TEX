@@ -141,26 +141,34 @@ def test_precompile_flag_lock_serializes_two_off_scoped_callers():
     the flag flip -- two threads both requesting `disable=True` must never observe each
     other's window overlapping (the process-global flag would otherwise be flipped back ON
     by whichever thread exits first, corrupting the OTHER thread's still-running compile).
-    Forces the overlap with a barrier-like sleep inside the `with` block and records
-    enter/exit order."""
+    Forces the overlap with events, not timing: A signals from inside its scope, only then
+    does B start, and A stays inside until B has begun (and had a moment) to enter, so B's
+    window overlaps A's unless the lock serializes them. Records enter/exit order."""
     dynamo_config.caching_precompile = True
     events = []
     lock = threading.Lock()
+    a_inside = threading.Event()
+    b_started = threading.Event()
 
     def _worker(tag):
+        if tag == "B":
+            b_started.set()
         with C._precompile_ctx(disable=True):
             with lock:
                 events.append((tag, "enter"))
-            # Give the OTHER thread a window to (wrongly) start its own off-scope
-            # while this one is still inside, if the lock did not actually serialize.
-            import time as _t
-            _t.sleep(0.05)
+            if tag == "A":
+                a_inside.set()
+                # Stay inside until B is running, then give it a window to (wrongly) enter.
+                b_started.wait(5)
+                import time as _t
+                _t.sleep(0.05)
             with lock:
                 events.append((tag, "exit"))
 
     t1 = threading.Thread(target=_worker, args=("A",))
     t2 = threading.Thread(target=_worker, args=("B",))
     t1.start()
+    assert a_inside.wait(5), "worker A never entered its off-scope"
     t2.start()
     t1.join(5)
     t2.join(5)
@@ -203,14 +211,17 @@ def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock():
     other's window is open must wait for it."""
     dynamo_config.caching_precompile = False
 
+    acquired = threading.Event()
+
     def _holder():
         with C._precompile_flag_lock:
+            acquired.set()
             time.sleep(0.1)  # hold for a fixed window, released on its own
 
     holder = threading.Thread(target=_holder)
     holder.start()
     try:
-        time.sleep(0.02)  # let the holder actually acquire the lock first
+        assert acquired.wait(5), "the holder never acquired the lock"
         start = time.monotonic()
         ctx = C._precompile_ctx(disable=False)
         ctx.__enter__()

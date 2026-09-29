@@ -31,7 +31,7 @@ SKIP = frozenset({
     "debug_print",   # LX-5: string label + interpreter-only side-effect probe
 })
 
-_IMG_UV3 = {"sample", "fetch", "sample_cubic", "sample_lanczos"}      # (img, u, v) -> vec3
+_IMG_UV3 = {"sample", "sample_cubic", "sample_lanczos"}                # (img, u, v) -> vec3
 _IMG_UV4 = {"sample_mip", "sample_mip_gauss"}                         # (img, u, v, lod)
 _NOISE2 = {"perlin", "simplex", "worley_f1", "worley_f2", "voronoi", "worley_id", "alligator"}
 _NOISE_OCT = {"fbm", "ridged", "billow", "turbulence"}
@@ -72,6 +72,9 @@ def _wrap(call, kind):
 def _call_and_kind(name, lo):
     """Return (call_expr, output_kind) for `name`, or None if unhandled."""
     if name in _IMG_UV3:      return f"{name}(@A, u, v)", "vec3"
+    # fetch takes integer PIXEL coordinates (clamped to the frame): normalized u, v would read
+    # only texels 0 and 1, so probe it at the pixel's own neighbour to reach every texel.
+    if name == "fetch":       return "fetch(@A, ix + 1, iy)", "vec3"
     if name in _IMG_UV4:      return f"{name}(@A, u, v, 1.0)", "vec3"
     if name == "gauss_blur":  return "gauss_blur(@A, 2.0)", "vec3"
     if name == "bilateral_filter": return "bilateral_filter(@A, 1.5, 0.2)", "vec3"

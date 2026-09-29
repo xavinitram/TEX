@@ -873,3 +873,19 @@ def test_shipped_generator_conditions_are_false_on_every_pixel():
             live_somewhere.append(cond)
     assert live_somewhere == [], \
         f"the shipped pool is no longer all-false: {live_somewhere}"
+
+
+def test_oracle_array_assignment_copies():
+    """`b = a` copies an array in the language, so the oracle must not alias the list: a
+    later `b[0] = x` leaves `a[0]` alone, exactly as the interpreter's cook does."""
+    src = """float a[3] = {1.0, 2.0, 3.0};
+float b[3] = {0.0, 0.0, 0.0};
+b = a;
+b[0] = 9.0;
+@OUT = vec4(a[0], b[0], 0.0, 1.0);"""
+    b = _bindings()
+    out, _ = _cook(src, b, False)
+    program, _tm, names = _compile(src, b)
+    ref, _probes = sweep(program, dict(b), _B, _H, _W, names)
+    assert ref["OUT"][0, 0, 0].tolist() == [1.0, 9.0, 0.0, 1.0]
+    assert out["OUT"][0, 0, 0].tolist() == [1.0, 9.0, 0.0, 1.0]

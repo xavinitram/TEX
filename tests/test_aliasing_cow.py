@@ -375,14 +375,33 @@ def test_noise_backend_gate(r: SubTestResult):
     from TEX_Wrangle.tex_runtime import noise as _noise
 
     # CUDA availability of inductor must be gated on Triton, not MSVC
+    import importlib.util as _ilu
+    import shutil as _shutil
+    saved_cache = dict(_noise._inductor_available)
+    saved_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    real_find_spec, real_which = _ilu.find_spec, _shutil.which
     try:
-        import importlib.util as _ilu
-        has_triton = _ilu.find_spec("triton") is not None
-        got = _noise._can_inductor_compile(torch.device("cuda"))
-        assert got == has_triton, f"cuda gate said {got}, triton present={has_triton}"
-        r.ok("inductor gate: cuda keyed on triton")
+        # Both probes are faked so each combination is pinned on any box: the cuda answer must
+        # follow Triton alone, whatever the host C++ compiler probe says.
+        for triton, cl in ((True, False), (False, True)):
+            _ilu.find_spec = lambda name, *a, **k: (
+                object() if triton else None) if name == "triton" else real_find_spec(name, *a, **k)
+            _shutil.which = lambda name, *a, **k: (
+                "C:/fake/cl.exe" if cl else None) if name == "cl" else real_which(name, *a, **k)
+            _noise._inductor_available.clear()
+            got = _noise._can_inductor_compile(torch.device("cuda"))
+            assert got is triton, f"triton={triton}, cl={cl}: cuda gate said {got}"
+        r.ok("inductor gate: cuda keyed on triton, not on the C++ compiler")
     except Exception as e:
         r.fail("inductor gate: cuda keyed on triton", str(e))
+    finally:
+        _ilu.find_spec, _shutil.which = real_find_spec, real_which
+        _noise._inductor_available.clear()
+        _noise._inductor_available.update(saved_cache)
+        if saved_dir is None:
+            os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+        else:
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = saved_dir
 
     # fbm must execute on CUDA even when the compile tier is unavailable
     try:

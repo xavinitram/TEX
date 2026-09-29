@@ -258,10 +258,12 @@ class ScalarOracle:
 
     @staticmethod
     def _coerce_decl(type_name, v):
+        # Arrays are Python lists: always hand back a copy, so a parameter binding never
+        # aliases the caller's array (the language has value semantics).
         tn = (type_name or "").lower()
         if tn in ("vec2", "vec3") and isinstance(v, list):
             return v[: int(tn[-1])]
-        return v
+        return list(v) if isinstance(v, list) else v
 
     def _for(self, n):
         if n.init is not None:
@@ -312,6 +314,8 @@ class ScalarOracle:
                 value = [value] * len(cur)
             elif isinstance(cur, list) and isinstance(value, list):
                 value = value[: len(cur)] if len(value) > len(cur) else value
+            if isinstance(value, list):
+                value = list(value)          # `b = a` copies; a later `b[i] = x` must not move `a`
             self.env[target.name] = value
             return None
         if cls is A.BindingRef:

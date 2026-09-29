@@ -38,7 +38,7 @@ poll (near-zero cost once done); a failed one is recorded via `tier_trace.record
 silent reject and never a hang.
 
 Marked `@pytest.mark.timing` per the standing rule (CI does not deselect `timing`) for the
-one row whose ASSERTION is a millisecond bound, even though the mechanism producing the two
+rows whose ASSERTION is a millisecond or wall-clock bound, even though the mechanism producing the two
 outcomes (RED at base, GREEN at head) is fully deterministic.
 """
 import threading
@@ -65,6 +65,15 @@ def _tiny_program():
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     used = _collect_identifiers(prog)
     return prog, tm, used
+
+
+def _bounded(fn, timeout_s=15.0):
+    """Run `fn` on a daemon thread; True if it returned within `timeout_s`. A `run_auto` that
+    really blocks (the regression hunted here) fails the row instead of hanging the suite."""
+    t = threading.Thread(target=fn, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return not t.is_alive()
 
 
 def _drive_to_trial(prog, tm, used, bindings, fp, *, cap_ok=True):
@@ -223,7 +232,7 @@ def test_t3_failed_compile_never_hangs_the_next_cook(r: SubTestResult):
     """TRK-231: "one 'auto' hang after a failed background compile" — the host's
     own report is explicitly PROVISIONAL (1 occurrence in 2 on the candidate, 0 in 2 on the
     control; not reproduced by a later confirmation leg). Two forced, deterministic attempts
-    here, both bounded by an explicit timeout so THIS test can never itself hang the suite:
+    here, each run on a daemon thread joined with a 15 s timeout, so a blocking `run_auto` fails THIS test rather than hanging the suite:
 
     1. A background compile that RAISES at each stage a real one can fail at (the wrap
        itself, and the warm call) -- the ordinary, expected-and-handled failure shape.
@@ -256,16 +265,15 @@ def test_t3_failed_compile_never_hangs_the_next_cook(r: SubTestResult):
         real_cap = C.compile_capability_async
         C.compile_capability_async = lambda: {"cpu_inductor": True, "cuda_inductor": True}
         fp1 = "autosafe50_t3_fail_wrap_fp"
-        hung = False
-        try:
-            t0 = time.perf_counter()
+        def _attempt1():
             for _ in range(AT._MEASURE_COOKS + 3):
                 C.run_auto(prog, dict(bindings), tm, "cpu", fp1, output_names=["OUT"],
                           used_builtins=used)
-                if time.perf_counter() - t0 > 15.0:
-                    hung = True
-                    break
-            C._drain_bg_for_test(timeout=10.0)
+
+        try:
+            hung = not _bounded(_attempt1)
+            if not hung:
+                C._drain_bg_for_test(timeout=10.0)
         finally:
             C._try_compile = real_try_compile
             C.compile_capability_async = real_cap
@@ -273,8 +281,13 @@ def test_t3_failed_compile_never_hangs_the_next_cook(r: SubTestResult):
             r.fail("T3 attempt 1 (compile-wrap raises)",
                   "run_auto did not return within 15s after a forced compile-wrap failure")
         else:
-            r.ok("T3 attempt 1 (compile-wrap raises): NOT CONFIRMED as a hang -- "
-                 "run_auto returned promptly every cook; failed job routed to REJECTED")
+            key1 = AT.make_key(fp1, "cpu", "fp32", C._consensus_extent(bindings, prog))
+            if AT.verdict(key1) == AT.REJECTED:
+                r.ok("T3 attempt 1 (compile-wrap raises): NOT CONFIRMED as a hang -- "
+                     "run_auto returned promptly every cook; failed job routed to REJECTED")
+            else:
+                r.fail("T3 attempt 1 (compile-wrap raises)",
+                       f"a failed compile must end REJECTED, verdict is {AT.verdict(key1)}")
 
         # Attempt 2: the compile-wrap itself never returns (an Event that is never set --
         # deterministic, no real sleep-forever thread leaked past the test: joined with a
@@ -290,15 +303,14 @@ def test_t3_failed_compile_never_hangs_the_next_cook(r: SubTestResult):
         C.compile_capability_async = lambda: {"cpu_inductor": True, "cuda_inductor": True}
         C._try_compile = _hanging_try_compile
         fp2 = "autosafe50_t3_hang_fp"
-        hung2 = False
-        try:
-            t0 = time.perf_counter()
+        def _attempt2():
             for _ in range(AT._MEASURE_COOKS + 1):
                 C.run_auto(prog, dict(bindings), tm, "cpu", fp2, output_names=["OUT"],
                           used_builtins=used)
-                if time.perf_counter() - t0 > 15.0:
-                    hung2 = True
-                    break
+
+        hung2 = True
+        try:
+            hung2 = not _bounded(_attempt2)
         finally:
             C._try_compile = real_try_compile
             C.compile_capability_async = real_cap
