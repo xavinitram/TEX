@@ -14,6 +14,7 @@ from .stdlib_registry import stdlib
 from .stdlib_core import (
     SAFE_EPSILON,
     _POW_NAN_STATE,
+    _align_field_rank,
     _has_channel_axis,
     _is_scalar,
     _lerp_f32,
@@ -30,6 +31,12 @@ from .stdlib_core import (
 from . import stdlib_core as _stdlib_core
 ZERO_GUARD_EPS = _stdlib_core.ZERO_GUARD_EPS
 _texlog = _stdlib_core._texlog
+
+
+def _eps(t: torch.Tensor) -> float:
+    """The epsilon guard for `t`'s dtype: SAFE_EPSILON, or the fp16-representable one where
+    1e-8 would round to 0 and a `x + eps` / `clamp(min=eps)` guard would vanish."""
+    return ZERO_GUARD_EPS.get(t.dtype, SAFE_EPSILON)
 
 
 class _StdlibMath:
@@ -70,7 +77,7 @@ class _StdlibMath:
     @stdlib("atan2", sig='atan2(y, x) \\u2192 float', category='Math', doc='Two-argument arctangent. Returns radians.', ex='float angle = atan2(v - 0.5, u - 0.5);')
     @staticmethod
     def fn_atan2(y, x) -> torch.Tensor:
-        return torch.atan2(_to_tensor(y), _to_tensor(x))
+        return torch.atan2(*_align_field_rank(_to_tensor(y), _to_tensor(x)))
 
     @stdlib("sincos", sig='sincos(x) \\u2192 vec2', category='Math', doc='Returns vec2(sin(x), cos(x)). More efficient than separate sin/cos calls.', ex='vec2 sc = sincos(angle);\nfloat s = sc.x;\nfloat c = sc.y;')
     @staticmethod
@@ -87,8 +94,7 @@ class _StdlibMath:
     @stdlib("pow", sig='pow(x, y) \\u2192 float', category='Math', doc='Raise x to the power y.', ex='float p = pow(u, 2.2);')
     @staticmethod
     def fn_pow(base, exp) -> torch.Tensor:
-        b = _to_tensor(base)
-        e = _to_tensor(exp)
+        b, e = _align_field_rank(_to_tensor(base), _to_tensor(exp))
         # An exp-log fast path (exp(log(b)*e)) is faster for spatial tensors but
         # silently destroys the sign of negative bases: pow(x, 2) on a signed /
         # centered coordinate (vignettes, radial gradients, SDFs) would return
@@ -121,7 +127,8 @@ class _StdlibMath:
     @stdlib("log", sig='log(x) \\u2192 float', category='Math', doc='Natural logarithm (base e).', ex='float l = log(u + 1.0);')
     @staticmethod
     def fn_log(x) -> torch.Tensor:
-        return torch.log(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
+        t = _to_tensor(x)
+        return torch.log(torch.clamp(t, min=_eps(t)))
 
     @stdlib("abs", sig='abs(x) \\u2192 float', category='Math', doc='Absolute value.', ex='float a = abs(u - 0.5);')
     @staticmethod
@@ -162,21 +169,23 @@ class _StdlibMath:
     @stdlib("mod", sig='mod(x, y) \\u2192 float', category='Math', doc='Modulo (remainder).', ex='float m = mod(u * 10.0, 1.0);')
     @staticmethod
     def fn_mod(a, b) -> torch.Tensor:
-        a_t, b_t = _to_tensor(a), _to_tensor(b)
+        a_t, b_t = _align_field_rank(_to_tensor(a), _to_tensor(b))
         zero = b_t == 0
         guard_trace.note(zero)  # C4-ux (no-op unless armed)
-        safe_b = torch.where(zero, ZERO_GUARD_EPS.get(b_t.dtype, SAFE_EPSILON), b_t)
+        safe_b = torch.where(zero, _eps(b_t), b_t)
         return torch.fmod(a_t, safe_b)
 
     @stdlib("log2", sig='log2(x) \\u2192 float', category='Math', doc='Logarithm base 2.', ex='float l = log2(256.0);')
     @staticmethod
     def fn_log2(x) -> torch.Tensor:
-        return torch.log2(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
+        t = _to_tensor(x)
+        return torch.log2(torch.clamp(t, min=_eps(t)))
 
     @stdlib("log10", sig='log10(x) \\u2192 float', category='Math', doc='Logarithm base 10.', ex='float l = log10(1000.0);')
     @staticmethod
     def fn_log10(x) -> torch.Tensor:
-        return torch.log10(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
+        t = _to_tensor(x)
+        return torch.log10(torch.clamp(t, min=_eps(t)))
 
     @stdlib("pow2", sig='pow2(x) \\u2192 float', category='Math', doc='2 raised to the power x.', ex='float p = pow2(8.0);')
     @staticmethod
@@ -206,7 +215,7 @@ class _StdlibMath:
     @stdlib("hypot", sig='hypot(x, y) \\u2192 float', category='Math', doc='Hypotenuse: sqrt(x*x + y*y).', ex='float d = hypot(u - 0.5, v - 0.5);')
     @staticmethod
     def fn_hypot(x, y) -> torch.Tensor:
-        return torch.hypot(_to_tensor(x), _to_tensor(y))
+        return torch.hypot(*_align_field_rank(_to_tensor(x), _to_tensor(y)))
 
     @stdlib("isnan", sig='isnan(x) \\u2192 float', category='Math', doc='Returns 1.0 if x is NaN, 0.0 otherwise.', ex='float check = isnan(x);')
     @staticmethod
@@ -232,19 +241,19 @@ class _StdlibMath:
     @staticmethod
     def fn_spow(x, y) -> torch.Tensor:
         """Safe power — sign(x) * pow(abs(x), y). Avoids NaN on negative bases."""
-        t = _to_tensor(x)
-        yt = _to_tensor(y)
+        t, yt = _align_field_rank(_to_tensor(x), _to_tensor(y))
+        eps = _eps(t)
         abs_t = torch.abs(t)
-        mask = abs_t < SAFE_EPSILON
-        safe_abs = torch.clamp(abs_t, min=SAFE_EPSILON)
+        mask = abs_t < eps
+        safe_abs = torch.clamp(abs_t, min=eps)
         return torch.where(mask, torch.zeros_like(t), torch.sign(t) * torch.pow(safe_abs, yt))
 
     @stdlib("sdiv", sig='sdiv(a, b) \\u2192 float', category='Math', doc='Safe divide. Returns 0 when b is zero.', ex='float d = sdiv(1.0, u);')
     @staticmethod
     def fn_sdiv(a, b) -> torch.Tensor:
-        """Safe division — returns 0.0 where abs(b) < SAFE_EPSILON."""
-        a_t, b_t = _to_tensor(a), _to_tensor(b)
-        mask = torch.abs(b_t) < SAFE_EPSILON
+        """Safe division — returns 0.0 where abs(b) < the dtype's epsilon guard."""
+        a_t, b_t = _align_field_rank(_to_tensor(a), _to_tensor(b))
+        mask = torch.abs(b_t) < _eps(b_t)
         guard_trace.note(mask)  # C4-ux (no-op unless armed)
         safe_b = torch.where(mask, torch.ones_like(b_t), b_t)
         return torch.where(mask, torch.zeros_like(a_t), a_t / safe_b)
@@ -282,12 +291,12 @@ class _StdlibMath:
     @stdlib("min", sig='min(a, b) \\u2192 float', category='Interpolation', doc='Returns the smaller value.', ex='float m = min(u, 0.5);')
     @staticmethod
     def fn_min(a, b) -> torch.Tensor:
-        return torch.minimum(_to_tensor(a), _to_tensor(b))
+        return torch.minimum(*_align_field_rank(_to_tensor(a), _to_tensor(b)))
 
     @stdlib("max", sig='max(a, b) \\u2192 float', category='Interpolation', doc='Returns the larger value.', ex='float m = max(u, 0.0);')
     @staticmethod
     def fn_max(a, b) -> torch.Tensor:
-        return torch.maximum(_to_tensor(a), _to_tensor(b))
+        return torch.maximum(*_align_field_rank(_to_tensor(a), _to_tensor(b)))
 
     @stdlib("clamp", sig='clamp(x, lo, hi) \\u2192 float', category='Interpolation', doc='Clamp x to [lo, hi] range.', ex='float c = clamp(u * 2.0, 0.0, 1.0);')
     @staticmethod
@@ -306,15 +315,14 @@ class _StdlibMath:
                 return torch.clamp(xt, min=_to_tensor(lo), max=_to_tensor(hi))
             return torch.clamp(xt, min=_to_float(lo), max=_to_float(hi))
         # Spatially-varying bounds
-        return torch.minimum(torch.maximum(_to_tensor(x), _to_tensor(lo)), _to_tensor(hi))
+        xt, lot, hit = _align_field_rank(_to_tensor(x), _to_tensor(lo), _to_tensor(hi))
+        return torch.minimum(torch.maximum(xt, lot), hit)
 
     @stdlib("lerp", sig='lerp(a, b, t) \\u2192 float', category='Interpolation', aliases=("mix",), doc='Linear interpolation from a to b by t.', ex='@OUT = lerp(@A, @B, 0.5);')
     @staticmethod
     def fn_lerp(a, b, t) -> torch.Tensor:
-        a_t, b_t, t_t = _to_tensor(a), _to_tensor(b), _to_tensor(t)
-        # Auto-unsqueeze weight for channel broadcast: [B,H,W] weight with [B,H,W,C] values
-        if t_t.dim() + 1 == a_t.dim():
-            t_t = t_t.unsqueeze(-1)
+        # A [B,H,W] weight against [B,H,W,C] values gains the channel axis.
+        a_t, b_t, t_t = _align_field_rank(_to_tensor(a), _to_tensor(b), _to_tensor(t))
         return _lerp_f32(a_t, b_t, t_t)
 
     @stdlib("select", sig='select(cond, a, b) \\u2192 vec', category='Interpolation',
@@ -340,23 +348,24 @@ class _StdlibMath:
     @staticmethod
     def fn_fit(val, old_min, old_max, new_min, new_max) -> torch.Tensor:
         """Remap val from [old_min, old_max] to [new_min, new_max]."""
-        v = _to_tensor(val)
-        o_min, o_max = _to_tensor(old_min), _to_tensor(old_max)
-        n_min, n_max = _to_tensor(new_min), _to_tensor(new_max)
-        t = (v - o_min) / (o_max - o_min + SAFE_EPSILON)
+        v, o_min, o_max, n_min, n_max = _align_field_rank(
+            _to_tensor(val), _to_tensor(old_min), _to_tensor(old_max),
+            _to_tensor(new_min), _to_tensor(new_max))
+        t = (v - o_min) / (o_max - o_min + _eps(v))
         return _lerp_f32(n_min, n_max, t)
 
     @stdlib("smoothstep", sig='smoothstep(lo, hi, x) \\u2192 float', category='Interpolation', doc='Smooth Hermite interpolation between lo and hi.', ex='float s = smoothstep(0.3, 0.7, u);')
     @staticmethod
     def fn_smoothstep(edge0, edge1, x) -> torch.Tensor:
-        e0, e1, xv = _to_tensor(edge0), _to_tensor(edge1), _to_tensor(x)
-        t = torch.clamp((xv - e0) / (e1 - e0 + SAFE_EPSILON), 0.0, 1.0)
+        e0, e1, xv = _align_field_rank(_to_tensor(edge0), _to_tensor(edge1), _to_tensor(x))
+        t = torch.clamp((xv - e0) / (e1 - e0 + _eps(xv)), 0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
 
     @stdlib("step", sig='step(edge, x) \\u2192 float', category='Interpolation', doc='Returns 0 if x < edge, 1 otherwise.', ex='float s = step(0.5, u);')
     @staticmethod
     def fn_step(edge, x) -> torch.Tensor:
-        return ((_to_tensor(x)) >= _to_tensor(edge)).float()
+        xt, et = _align_field_rank(_to_tensor(x), _to_tensor(edge))
+        return (xt >= et).float()
 
     # -- Vector operations ----------------------------------------------
 
@@ -407,7 +416,7 @@ class _StdlibMath:
         t = _to_tensor(v)
         if _has_channel_axis(t):
             norm = torch.linalg.vector_norm(t, dim=-1, keepdim=True)
-            return t / (norm + SAFE_EPSILON)
+            return t / (norm + _eps(t))
         return torch.sign(t)
 
     @stdlib("cross", sig='cross(a, b) \\u2192 vec3', category='Vector', doc='Cross product of two vec3 vectors.', ex='vec3 n = cross(tangent, bitangent);')

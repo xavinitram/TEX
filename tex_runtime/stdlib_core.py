@@ -44,11 +44,24 @@ VEC_CHANNELS = frozenset((2, 3, 4))
 
 
 def _has_channel_axis(t) -> bool:
-    """True when length/distance/normalize should reduce over the last (channel)
-    dim: a standard vec (last dim in {2,3,4}), or any 4D [B,H,W,C] tensor with
-    C>1 (channels are always last for 4D) — but never a lower-rank scalar field /
-    mask whose last dim is a spatial axis."""
-    return (t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS) or (t.dim() >= 4 and t.shape[-1] > 1)
+    """True when length/distance/normalize should reduce over the last (channel) dim: a bare
+    vec `[C]` or vec array `[N,C]` (last dim in {2,3,4}), or a spatial `[B,H,W,C]` with C>1.
+    A rank-3 tensor is always a `[B,H,W]` scalar field, whose last axis is the image width,
+    so it never reduces, whatever W is."""
+    d = t.dim()
+    if d == 3:
+        return False
+    return (d >= 1 and t.shape[-1] in VEC_CHANNELS) or (d >= 4 and t.shape[-1] > 1)
+
+
+def _align_field_rank(*ts):
+    """Give every `[B,H,W]` scalar field among `ts` a trailing channel axis when another
+    operand is a `[B,H,W,C]` vector, so a mixed vec/field builtin broadcasts like the
+    operators do. Operands of equal rank, and 0-dim scalars, pass through untouched."""
+    hi = max(t.dim() for t in ts)
+    if hi < 2 or all(t.dim() == hi for t in ts):
+        return ts
+    return tuple(t.unsqueeze(-1) if t.dim() == hi - 1 and t.dim() >= 1 else t for t in ts)
 
 
 # ── Host-resolved scalars (PERF-2) ────────────────────────────────────

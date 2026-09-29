@@ -182,6 +182,17 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
                 b = torch.nn.functional.pad(b, (0, ac - bc))
         return a, b
 
+    # A bare uniform vec `[C]` (e.g. `sincos(0.5)`) carries its channel axis LAST, like a
+    # vec field `[B,H,W,C]` does, so against one it broadcasts as is; against a scalar field
+    # `[B,H,W]` the field takes the channel axis.
+    if (ad == 1 and a.shape[-1] in VEC_CHANNELS) or (bd == 1 and b.shape[-1] in VEC_CHANNELS):
+        if ad == 1 and bd == 3:
+            b = b.unsqueeze(-1)
+        elif bd == 1 and ad == 3:
+            a = a.unsqueeze(-1)
+        if ad >= 4 or bd >= 4 or ad == 3 or bd == 3:
+            return a, b
+
     # A bare [N,N] matrix's axes are TRAILING (right-aligned), unlike a scalar
     # field whose spatial axes are LEADING. Handle every bare-matrix pairing
     # explicitly, building a common [<spatial>, N, N] — appending trailing
