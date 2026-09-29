@@ -367,8 +367,11 @@ Operators, in decreasing precedence: postfix (`.`, `[]`, calls) · unary (`- !`)
 **Truthiness.** A condition is true when its value is **greater than 0.5**: `if`, `while`,
 the `for` test, `?:`, `&&`, `||` and `!` all use that one rule, and comparisons produce
 `1.0` or `0.0`. So `if (0.4)` is false, so is `if (-3)`, and `!0.5` is `1`. This is not the
-C rule that any non-zero value is true. Every loop is capped at 1024 iterations; a loop
-that needs more fails the cook with E6010, so a cook always terminates.
+C rule that any non-zero value is true.
+
+Every loop is capped
+at 1024 iterations; a loop that needs more fails the cook with E6010, so a cook always
+terminates.
 
 ### 7.1 Uniform and per-pixel conditions
 
