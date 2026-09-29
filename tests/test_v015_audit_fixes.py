@@ -62,7 +62,6 @@ def test_uc3_fractional_and_bindingmut(r: SubTestResult):
                       {"n": TEXType.INT, "OUT": TEXType.VEC3}, {"n": 4}))
         assert v2 == 4.0
         # Confirm the fast path actually still engages for integer bounds.
-        from TEX_Wrangle.tex_compiler.parser import Parser as P
         code = "float s=0.0; for(int i=0;i<5;i=i+1){s=s+1.0;} @OUT=vec3(s,0,0);"
         prog = parse_and_split(code, {"OUT": TEXType.VEC3})
         tm = TypeChecker(binding_types={"OUT": TEXType.VEC3}, source=code).check(prog)
@@ -137,9 +136,8 @@ def test_q6_preview_kwarg_popped(r: SubTestResult):
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
         img = torch.rand(1, 8, 8, 3)
-        out = TEXWrangleNode().execute(code="@OUT = @A * 0.5;", device="cpu",
-                                       compile_mode="none", A=img, _tex_preview={"scale": 0.25})
-        res = out[0] if isinstance(out, tuple) else out
+        TEXWrangleNode().execute(code="@OUT = @A * 0.5;", device="cpu",
+                                 compile_mode="none", A=img, _tex_preview={"scale": 0.25})
         r.ok("_tex_preview kwarg accepted without becoming a binding")
     except Exception as e:
         r.fail("Q-6 preview kwarg", f"{type(e).__name__}: {e}")
@@ -327,6 +325,7 @@ def test_cc1_triton_hint(r: SubTestResult):
         root = logging.getLogger()
         h = _H()
         root.addHandler(h)
+        prev_level = root.level
         root.setLevel(logging.DEBUG)
         try:
             C._warnings_shown.clear()
@@ -339,6 +338,7 @@ def test_cc1_triton_hint(r: SubTestResult):
             fired_wrong = any("triton-windows" in m for m in msgs)
         finally:
             root.removeHandler(h)
+            root.setLevel(prev_level)
         assert fired_triton, "hint not emitted for a CUDA triton error"
         assert not fired_wrong, "hint wrongly emitted on CPU / non-triton"
         r.ok("Triton hint fires on CUDA+triton only (was dead code at wrap)")
@@ -363,8 +363,10 @@ def test_cc1_triton_hint(r: SubTestResult):
         root = logging.getLogger()
         h2 = _H2()
         root.addHandler(h2)
+        prev_level = root.level
         root.setLevel(logging.DEBUG)
         C._warnings_shown.clear()
+        saved_status, saved_blacklist = dict(C._backend_status), C._compile_blacklist.copy()
         C._backend_status.clear()
         C._compile_blacklist.clear()
 
@@ -387,6 +389,11 @@ def test_cc1_triton_hint(r: SubTestResult):
         finally:
             C._try_compile = orig
             root.removeHandler(h2)
+            root.setLevel(prev_level)
+            C._backend_status.clear()
+            C._backend_status.update(saved_status)
+            C._compile_blacklist.clear()
+            C._compile_blacklist.update(saved_blacklist)
         assert any("triton-windows" in m for m in msgs), \
             "first-call TritonMissing did not reach the hint through execute_compiled"
         assert fell_back, "cook did not fall back to a finite result"
@@ -416,14 +423,16 @@ def test_p2_cache_hygiene(r: SubTestResult):
         r.fail("P2 codegen memory LRU", str(e))
     try:
         saved = os.environ.get("TEX_CODEGEN_NO_OUT_REUSE")
-        os.environ.pop("TEX_CODEGEN_NO_OUT_REUSE", None)
-        h_on = tc._compute_compiler_hash()
-        os.environ["TEX_CODEGEN_NO_OUT_REUSE"] = "1"
-        h_off = tc._compute_compiler_hash()
-        if saved is None:
+        try:
             os.environ.pop("TEX_CODEGEN_NO_OUT_REUSE", None)
-        else:
-            os.environ["TEX_CODEGEN_NO_OUT_REUSE"] = saved
+            h_on = tc._compute_compiler_hash()
+            os.environ["TEX_CODEGEN_NO_OUT_REUSE"] = "1"
+            h_off = tc._compute_compiler_hash()
+        finally:
+            if saved is None:
+                os.environ.pop("TEX_CODEGEN_NO_OUT_REUSE", None)
+            else:
+                os.environ["TEX_CODEGEN_NO_OUT_REUSE"] = saved
         assert h_on != h_off, "kill switch does not invalidate the codegen cache"
         r.ok("TEX_CODEGEN_NO_OUT_REUSE toggle invalidates the codegen cache")
     except Exception as e:
@@ -441,16 +450,13 @@ def test_p2_tap_cap(r: SubTestResult):
         for i in range(12):
             stages.append({"code": "@OUT = @A * 0.9;", "chain_input": (None if i == 0 else "A"),
                            "bindings": ({"A": img} if i == 0 else {}), "tap": True})
-        # compile_fused signature varies; just ensure the assembled program never
-        # declares more than 8 tap/output bindings (drops the excess).
+        # 11 tapped upstream stages: OUT plus 7 tap slots fill MAX_OUTPUTS (8); the
+        # other 4 taps are dropped. Exact, so dropping every tap fails too.
         prog, tm, ref, assigned, par, used, merged = FUS.compile_fused(
             stages, _infer_binding_type)
-        assert len(assigned) <= 8, f"fused chain assigned {len(assigned)} outputs > 8"
-        r.ok(f"tap exports capped: {len(assigned)} outputs <= 8")
-    except TypeError:
-        # compile_fused doesn't accept a per-stage 'tap' flag in this build —
-        # the cap logic still guards the real tap path; treat as covered.
-        r.ok("tap flag not wired in compile_fused signature (cap guards real path)")
+        want = {"OUT"} | {f"_tap_s{i}" for i in range(7)}
+        assert set(assigned) == want, f"fused chain assigned {sorted(assigned)}, want {sorted(want)}"
+        r.ok(f"tap exports capped at MAX_OUTPUTS: {len(assigned)} outputs")
     except Exception as e:
         r.fail("P2 tap cap", str(e))
 

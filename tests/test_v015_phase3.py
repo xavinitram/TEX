@@ -86,7 +86,6 @@ def test_m2_cache_budget(r: SubTestResult):
             else:
                 os.environ["TEX_CACHE_BUDGET_MB"] = saved
         n_after = len(_sl._mip_cache)
-        assert n_after <= max(1, n_before), "budget did not evict"
         assert n_after < n_before or n_before <= 1, f"no eviction under 1MB budget ({n_before}->{n_after})"
         r.ok(f"tiny budget evicts mip entries ({n_before}->{n_after})")
     except Exception as e:
@@ -94,14 +93,18 @@ def test_m2_cache_budget(r: SubTestResult):
 
     # A generous budget keeps entries; env override is honored.
     try:
-        assert cache_budget_bytes.__call__ is not None
-        os.environ["TEX_CACHE_BUDGET_MB"] = "4096"
+        prev_budget = os.environ.pop("TEX_CACHE_BUDGET_MB", None)
         try:
+            os.environ["TEX_CACHE_BUDGET_MB"] = "4096"
             assert cache_budget_bytes("cpu") == 4096 * 1024 * 1024
-        finally:
+            # default CPU budget is 512 MB
             os.environ.pop("TEX_CACHE_BUDGET_MB", None)
-        # default CPU budget is 512 MB
-        assert cache_budget_bytes("cpu") == 512 * 1024 * 1024
+            assert cache_budget_bytes("cpu") == 512 * 1024 * 1024
+        finally:
+            if prev_budget is None:
+                os.environ.pop("TEX_CACHE_BUDGET_MB", None)
+            else:
+                os.environ["TEX_CACHE_BUDGET_MB"] = prev_budget
         r.ok("cache budget env override + CPU default")
     except Exception as e:
         r.fail("cache budget env override + CPU default", str(e))
@@ -113,7 +116,7 @@ def test_m3_fp16_mode(r: SubTestResult):
     print("\n--- M-3: fp16 image-data mode (fp32 coordinates) ---")
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
 
-    def _run(code, bindings, precision, H, W):
+    def _run(code, bindings, precision):
         prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         used = _collect_identifiers(prog)
@@ -125,7 +128,7 @@ def test_m3_fp16_mode(r: SubTestResult):
     # in fp16 mode (fp16 u would collapse to ~4097 values).
     try:
         img = torch.rand(1, 2048, 2048, 3)
-        r16 = _run("@OUT = vec4(vec3(u), 1.0);", {"A": img}, "fp16", 2048, 2048)
+        r16 = _run("@OUT = vec4(vec3(u), 1.0);", {"A": img}, "fp16")
         distinct = len(torch.unique(r16[0, 0, :, 0]))
         assert distinct == 2048, f"fp16 coordinates collapsed ({distinct} distinct, want 2048)"
         r.ok(f"coordinates stay fp32 in fp16 mode ({distinct} distinct @2048)")
@@ -136,8 +139,8 @@ def test_m3_fp16_mode(r: SubTestResult):
     try:
         img = torch.rand(1, 256, 256, 3)
         code = "vec3 c=@A.rgb; float l=luma(c); @OUT=vec4(mix(c, vec3(l), 0.4)*1.1 + 0.05, 1.0);"
-        a16 = _run(code, {"A": img}, "fp16", 256, 256)
-        a32 = _run(code, {"A": img}, "fp32", 256, 256)
+        a16 = _run(code, {"A": img}, "fp16")
+        a32 = _run(code, {"A": img}, "fp32")
         md = (a16[..., :3].float() - a32[..., :3].float()).abs().max().item()
         assert md < 4e-3, f"fp16 accuracy {md} exceeds 8-bit quantum"
         r.ok(f"pointwise fp16 accuracy {md:.1e} < 4e-3")
@@ -147,7 +150,7 @@ def test_m3_fp16_mode(r: SubTestResult):
     # Sampling works under fp16 (grid_sample dtype reconciled; grid stays fp32).
     try:
         img = torch.rand(1, 128, 128, 3)
-        s16 = _run("@OUT = vec4(sample(@A, u, v).rgb, 1.0);", {"A": img}, "fp16", 128, 128)
+        s16 = _run("@OUT = vec4(sample(@A, u, v).rgb, 1.0);", {"A": img}, "fp16")
         assert torch.isfinite(s16).all()
         r.ok("sample() works in fp16 (dtype reconciled)")
     except Exception as e:
@@ -156,7 +159,7 @@ def test_m3_fp16_mode(r: SubTestResult):
     # Output is upcast to fp32 (the IMAGE contract is unchanged).
     try:
         img = torch.rand(1, 16, 16, 3)
-        out = _run("@OUT = vec4(@A * 0.5, 1.0);", {"A": img}, "fp16", 16, 16)
+        out = _run("@OUT = vec4(@A * 0.5, 1.0);", {"A": img}, "fp16")
         assert out.dtype == torch.float32, f"fp16 output not upcast (got {out.dtype})"
         r.ok("fp16 output upcast to fp32 (IMAGE contract preserved)")
     except Exception as e:

@@ -130,6 +130,7 @@ def test_m2cpu_and_m1_freeretry(r: SubTestResult):
 
     # P1-M2-CPU: enforce_cache_budget now evicts on a CPU device too.
     saved = dict(SL._grid_buf)
+    prev_budget = os.environ.get("TEX_CACHE_BUDGET_MB")
     try:
         SL._grid_buf_budget.clear(SL._grid_buf)
         for i in range(6):
@@ -145,7 +146,10 @@ def test_m2cpu_and_m1_freeretry(r: SubTestResult):
     except Exception as e:
         r.fail("M-2-CPU eviction", f"{type(e).__name__}: {e}")
     finally:
-        os.environ.pop("TEX_CACHE_BUDGET_MB", None)
+        if prev_budget is None:
+            os.environ.pop("TEX_CACHE_BUDGET_MB", None)
+        else:
+            os.environ["TEX_CACHE_BUDGET_MB"] = prev_budget
         SL._grid_buf_budget.clear(SL._grid_buf)
         for _k, _v in saved.items():
             SL._grid_buf_budget.put(SL._grid_buf, _k, _v)

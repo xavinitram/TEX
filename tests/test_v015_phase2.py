@@ -112,8 +112,6 @@ def test_uc4_const_prop(r: SubTestResult):
     # A reassigned local is NOT propagated.
     try:
         code = "float k = 1.0; k = k + luma(@A); @OUT = vec4(@A * k, 1.0);"
-        prog = parse_and_split(code, bt)
-        tm = TypeChecker(binding_types=bt, source=code).check(prog)
         img = make_img(1, 4, 4, 3)
         # bit-exact vs interpreter after optimize (correctness under reassignment)
         _i, _c = run_both(code, {"A": img})

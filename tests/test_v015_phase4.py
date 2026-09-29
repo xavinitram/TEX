@@ -1,7 +1,7 @@
 """
 v0.15.0 Phase 4 regression tests — defaults & QOL.
 Q-4: fused-chain error attribution (stage-tagged SourceLoc).
-CC-1: Triton-on-Windows hint (guidance only — smoke).
+CT-2: offset-based lazy source locations.
 """
 from helpers import *
 import TEX_Wrangle.tex_fusion as _FUS

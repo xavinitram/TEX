@@ -140,6 +140,7 @@ def test_pc2_precompile_safety(r: SubTestResult):
         r.fail("precompile attach-failure allowlist classifies correctly", str(e))
 
     # The inductor cache dir is versioned by cache-version + torch build.
+    prev_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
     try:
         os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
         _C._ensure_inductor_cache_dir()
@@ -150,6 +151,11 @@ def test_pc2_precompile_safety(r: SubTestResult):
         r.ok("inductor cache dir is version-scoped")
     except Exception as e:
         r.fail("inductor cache dir is version-scoped", str(e))
+    finally:
+        if prev_dir is None:
+            os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+        else:
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = prev_dir
 
 
 def test_pc2_precompile_recovery_wipes_the_whole_store(r: SubTestResult):

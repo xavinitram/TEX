@@ -28,7 +28,7 @@ _LUT_CODE = "@OUT = vec4(apply_lut3d(@A.rgb, @LUT), 1.0);"                      
 _HALO_CODE = "@OUT = vec4(apply_lut3d(gauss_blur(@A.rgb, 2.0), @LUT), 1.0);"     # halo-tileable
 
 
-def _capture_spatial(monkey_target):
+def _capture_spatial():
     """Replace `tex_memory.estimate_peak_bytes` with a recorder; returns (calls, restore)."""
     calls = []
     real = tex_memory.estimate_peak_bytes
@@ -56,7 +56,7 @@ def test_trk166_tile_plan_anchor_by_name(r: SubTestResult):
         prog, tm, outs = compile_program(_LUT_CODE, bindings)
         non_spatial = _non_spatial_names_cached(prog)
         assert non_spatial == {"LUT"}, f"expected {{'LUT'}}, got {non_spatial}"
-        calls, restore = _capture_spatial(tex_tiling)
+        calls, restore = _capture_spatial()
         try:
             tex_tiling._tile_plan(prog, bindings, "cuda:0", 0, 4, "trk166_test",
                                   free_hint=None, code=_LUT_CODE, binding_types=None)
@@ -83,7 +83,7 @@ def test_trk166_halo_tile_plan_anchor_by_name(r: SubTestResult):
         prog, tm, outs = compile_program(_HALO_CODE, bindings)
         non_spatial = _non_spatial_names_cached(prog)
         assert non_spatial == {"LUT"}, f"expected {{'LUT'}}, got {non_spatial}"
-        calls, restore = _capture_spatial(tex_tiling)
+        calls, restore = _capture_spatial()
         try:
             tex_tiling._halo_tile_plan(prog, _HALO_CODE, bindings, "cuda:0", 0, 4,
                                        "trk166_halo_test", None, "fp32", None)
@@ -108,7 +108,7 @@ def test_trk166_control_no_non_spatial_binding_unchanged(r: SubTestResult):
     code = "@OUT = vec4(@A.rgb, 1.0);"
     try:
         prog, tm, outs = compile_program(code, bindings)
-        calls, restore = _capture_spatial(tex_tiling)
+        calls, restore = _capture_spatial()
         try:
             tex_tiling._tile_plan(prog, bindings, "cuda:0", 0, 4, "trk166_ctrl",
                                   free_hint=None, code=code, binding_types=None)
