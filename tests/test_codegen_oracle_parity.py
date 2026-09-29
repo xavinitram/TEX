@@ -76,9 +76,11 @@ _TRIP_ROWS = [
     ("empty range, start above stop (scalar body)",
      "float acc = 0.0;\nfor (int i = 5; i < 3; i++) { acc = acc + 1.0; if (acc > 500.0) { break; } }\n"
      "@OUT = vec3(acc) + @A.rgb * 0.0;", 0.0),
-    ("empty range, step against the bound (scalar body)",
+    # A step that counts away from a `<` bound never reaches it: the loop runs until its
+    # own `break` (C semantics), not zero times as a Python range would say.
+    ("step against the bound runs to its break (scalar body)",
      "float acc = 0.0;\nfor (int i = 0; i < 10; i -= 1) { acc = acc + 1.0; if (acc > 500.0) { break; } }\n"
-     "@OUT = vec3(acc) + @A.rgb * 0.0;", 0.0),
+     "@OUT = vec3(acc) + @A.rgb * 0.0;", 501.0),
     ("step 3 over 10 (tensor body)",
      "vec3 s = vec3(0.0);\nfor (int i = 0; i < 10; i += 3) { s = s + @A.rgb * 0.0 + vec3(1.0); if (i > 500) { break; } }\n"
      "@OUT = s;", 4.0),
