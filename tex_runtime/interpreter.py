@@ -919,8 +919,10 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         return torch.gather(array, dim=-1, index=idx_expanded).squeeze(-1)
 
     def _eval_binop(self, node: BinOp) -> torch.Tensor | str:
-        left = self._eval(node.left)
-        right = self._eval(node.right)
+        return self._apply_binop(node, self._eval(node.left), self._eval(node.right))
+
+    def _apply_binop(self, node: BinOp, left, right) -> torch.Tensor | str:
+        """`node`'s operator over operands the caller has already evaluated."""
         op = node.op
 
         # Fast path: both are tensors (vast majority of cases)

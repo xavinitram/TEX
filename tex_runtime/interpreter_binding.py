@@ -122,7 +122,12 @@ class _BindingExecMixin:
         else:
             # Zero-initialized array
             size = node.size
-            if is_vec:
+            elem_t = TYPE_NAME_MAP.get(node.element_type_name)
+            if elem_t is not None and elem_t.is_matrix:
+                # Matrix elements are stored [n, n, N], as the initializer-list form does.
+                n = 3 if elem_t == TEXType.MAT3 else 4
+                value = torch.zeros(n, n, size, dtype=self._dtype, device=self.device)
+            elif is_vec:
                 channels = TYPE_NAME_MAP[node.element_type_name].channels
                 if self.spatial_shape:
                     B, H, W = self.spatial_shape
@@ -192,7 +197,8 @@ class _BindingExecMixin:
                     if current is not None and current.__class__ is torch.Tensor:
                         other_val = self._eval(rhs.right)
                         if other_val.__class__ is torch.Tensor and (
-                            other_val.dim() == 0 or other_val.shape == current.shape
+                            other_val.dim() == 0
+                            or (other_val.shape == current.shape and other_val.dtype == current.dtype)
                         ):
                             current = self._ensure_inplace_ready(name)
                             if is_div:
@@ -202,20 +208,30 @@ class _BindingExecMixin:
                             else:
                                 method(current, other_val)
                             return
+                        # Shape mismatch: finish out of place with the value already computed.
+                        self._assign_value(node, self._apply_binop(rhs, current, other_val))
+                        return
                 # Pattern 2: x = expr OP x (only for commutative ops)
                 elif commutative and isinstance(rhs.right, Identifier) and rhs.right.name == name:
                     current = self.env.get(name)
                     if current is not None and current.__class__ is torch.Tensor:
                         other_val = self._eval(rhs.left)
                         if other_val.__class__ is torch.Tensor and (
-                            other_val.dim() == 0 or other_val.shape == current.shape
+                            other_val.dim() == 0
+                            or (other_val.shape == current.shape and other_val.dtype == current.dtype)
                         ):
                             current = self._ensure_inplace_ready(name)
                             method(current, other_val)
                             return
+                        self._assign_value(node, self._apply_binop(rhs, other_val, current))
+                        return
 
-        value = self._eval(node.value)
+        self._assign_value(node, self._eval(node.value))
 
+    def _assign_value(self, node: Assignment, value):
+        """Store an evaluated right-hand side into the assignment's target."""
+        from .interpreter import InterpreterError
+        target = node.target
         if isinstance(target, Identifier):
             # Enforce the declared vec2/vec3 width on reassignment so the variable
             # doesn't silently widen (e.g. `vec3 sum; sum += sample()`), matching
@@ -366,13 +382,13 @@ class _BindingExecMixin:
     def _exec_array_index_assign(self, target: ArrayIndexAccess, value, rhs_node=None):
         """Handle: arr[i] = expr;"""
         from .interpreter import (_ensure_spatial, _safe_array_index, _const_index,
-                                  _host_index, InterpreterError)
+                                  _host_index, _list_index, InterpreterError)
         array = self._eval(target.array)
         index = self._eval(target.index)
 
         # String array (Python list)
         if isinstance(array, list):
-            idx_int = max(0, min(int(round(index.item() if isinstance(index, torch.Tensor) else float(index))), len(array) - 1))
+            idx_int = _list_index(index.item() if isinstance(index, torch.Tensor) else index, len(array))
             result = list(array)
             result[idx_int] = value if isinstance(value, str) else str(value)
             if isinstance(target.array, Identifier):
@@ -385,8 +401,25 @@ class _BindingExecMixin:
         name = tgt.name if tgt.__class__ is Identifier else None
         inplace = self._can_write_inplace(name, array, value, rhs_node)
 
+        # Matrix array: always [n, n, N] (uniform elements only).
+        if array.dim() == 3:
+            arr_size = array.shape[-1]
+            ci = _const_index(target.index, arr_size)
+            if ci is None and isinstance(index, torch.Tensor) and index.dim() == 0:
+                ci = _host_index(index, arr_size)
+                if ci is None:
+                    ci = int(_safe_array_index(index, arr_size).item())
+            if (ci is None or not isinstance(value, torch.Tensor)
+                    or tuple(value.shape) != tuple(array.shape[:2])):
+                raise InterpreterError(
+                    "An array of matrices holds one matrix per slot, so it needs a single "
+                    "index and a plain matrix value (not one that varies per pixel).",
+                    target.loc, source=self._source, code="E6005",
+                    hint="Index with one number, e.g. 'm[1] = mat3(2.0);'.")
+            result = array if inplace else array.clone()
+            result[..., ci] = value
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]
-        if array.dim() in (2, 5):
+        elif array.dim() in (2, 5):
             arr_size = array.shape[-2]
             idx = _safe_array_index(index, arr_size)
             result = array if inplace else array.clone()
@@ -412,7 +445,7 @@ class _BindingExecMixin:
                 if idx_exp.shape[:3] != result.shape[:3]:
                     idx_exp = idx_exp.expand(result.shape[:3] + (1, C))
                 val_spatial = _ensure_spatial(value, result.shape[:-2])
-                val_exp = val_spatial.unsqueeze(-2)
+                val_exp = val_spatial.to(result.dtype).unsqueeze(-2)
                 result.scatter_(-2, idx_exp, val_exp)
 
         else:
@@ -436,7 +469,7 @@ class _BindingExecMixin:
                 if idx_expanded.shape[:3] != result.shape[:3]:
                     idx_expanded = idx_expanded.expand(result.shape[:3] + (1,))
                 val_spatial = _ensure_spatial(value, result.shape[:-1])
-                val_expanded = val_spatial.unsqueeze(-1)
+                val_expanded = val_spatial.to(result.dtype).unsqueeze(-1)
                 result.scatter_(-1, idx_expanded, val_expanded)
 
         # Write back to the correct location
@@ -469,8 +502,10 @@ class _BindingExecMixin:
         px, py = args[0], args[1]
         frame = args[2] if len(args) == 3 else None
 
-        # Determine channel count from value
-        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[-1] in VEC_CHANNELS:
+        # Determine channel count from value. A spatial-rank tensor is a scalar field whose
+        # last axis is the width, never a channel axis, whatever the width is.
+        if (isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[-1] in VEC_CHANNELS
+                and value.dim() != len(self.spatial_shape or ())):
             C = value.shape[-1]
         else:
             C = 1
