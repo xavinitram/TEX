@@ -4,6 +4,7 @@ import threading
 import uuid
 from collections import OrderedDict
 
+import pytest
 import torch
 
 from helpers import *  # noqa: F401,F403
@@ -378,3 +379,95 @@ def test_prewarm_boundary_reports_child_detail_timeout_and_undecodable_stderr(mo
         "print(json.dumps({'programs': 1, 'bg_compile': 1, 'error': None}))")
     out = PW.warm_in_subprocess(jobs, **kw)
     assert out["error"] is None and out["bg_compile"] == 1, out
+
+
+def test_pacing_wait_path_measures_an_interval_from_an_event_it_does_not_recycle(monkeypatch):
+    """At the default depth the wait branch used to re-record the very event it had just made the
+    timing anchor, so no valid interval was ever measured from a cook that never economizes."""
+    import itertools
+    from TEX_Wrangle.tex_runtime import pacing as P
+    clock = itertools.count(1)
+
+    class FakeEvent:
+        def __init__(self, *a, **k):
+            self.t = None
+
+        def record(self, *a, **k):
+            self.t = next(clock)
+
+        def synchronize(self):
+            pass
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            if self.t is None or other.t is None or other.t < self.t:
+                raise RuntimeError("events not in order")
+            return float(other.t - self.t)
+
+    fed = []
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(P, "_record_on", lambda ev, device, is_current: ev.record())
+    monkeypatch.setattr(P, "_cost_feed", lambda key, ms, anchor=None: fed.append(ms))
+    monkeypatch.setattr(P, "wants_pacing", lambda token: True)
+    monkeypatch.setattr(P, "_resolve_cuda_target", lambda device: (True, 0, True))
+    monkeypatch.setattr(P, "_resolve_depth", lambda token: 2)
+    monkeypatch.setattr(P, "_resolve_stride", lambda token: 0.0)
+    monkeypatch.setattr(P, "_resolve_budget_ms", lambda token: 50.0)
+
+    class Token:
+        def check(self):
+            pass
+
+    monkeypatch.setattr(P._state, "pools", {}, raising=False)
+    tok = Token()
+    P.reset(tok, "cuda:0", (1, 8, 8))
+    for _ in range(8):
+        P.paced_check(tok, "cuda:0", heavy=True, call_site_id=7, call_site_anchor=object())
+    assert fed and all(ms > 0 for ms in fed), fed
+
+
+def test_heavy_statement_memo_survives_a_concurrent_eviction(monkeypatch):
+    from TEX_Wrangle.tex_runtime import pacing_heavy as PH
+
+    class Evicting(OrderedDict):
+        def move_to_end(self, key, last=True):
+            self.pop(key, None)        # another cook thread evicted the entry just now
+            raise KeyError(key)
+
+    stmts = []
+    memo = Evicting()
+    memo[id(stmts)] = (stmts, frozenset({1}))
+    monkeypatch.setattr(PH, "_HEAVY_STMT_MEMO", memo)
+    assert PH.heavy_stmt_ids(stmts) in (frozenset(), frozenset({1}))
+
+
+def test_a_frame_handle_whose_event_query_raises_is_not_reported_ready():
+    from TEX_Wrangle.tex_runtime.streams import FrameHandle
+
+    class StickyEvent:
+        def query(self):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        def synchronize(self):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    handle = FrameHandle(torch.zeros(2), torch.zeros(2), StickyEvent())
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        handle.is_ready()
+    assert handle._event is not None      # still fenced: the bytes are not handed out as ready
+
+
+def test_a_frame_handle_whose_event_query_raises_but_completes_is_ready():
+    from TEX_Wrangle.tex_runtime.streams import FrameHandle
+
+    class OddEvent:
+        def query(self):
+            raise RuntimeError("backend without query")
+
+        def synchronize(self):
+            pass
+
+    handle = FrameHandle(torch.zeros(2), torch.zeros(2), OddEvent())
+    assert handle.is_ready() and handle._event is None

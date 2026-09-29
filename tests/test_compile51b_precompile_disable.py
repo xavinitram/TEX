@@ -231,6 +231,7 @@ def test_precompile_ctx_default_branch_also_blocks_on_the_shared_lock(monkeypatc
         f"branch does not actually acquire the shared lock")
 
 
+@pytest.mark.timing
 def test_a_per_thread_patch_does_not_wait_for_another_pools_compile(monkeypatch):
     """On a build whose config patch is per-thread (torch 2.12), one pool's long compile
     must not hold up the other pool's scope entry."""
