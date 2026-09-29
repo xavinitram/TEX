@@ -730,8 +730,8 @@ TEX_Wrangle.tex_runtime.host.get_host_services = _boom
 res = drive("POST", "/tex_wrangle/free_caches")
 OUT["free_dead"] = [res.status, res.body]
 
-# ...and the partial one: `ok` reports the TENSOR-cache drop only, so a live tensor cache with
-# two dead neighbours still answers true. That is the payload's actual meaning.
+# ...and the partial one: `ok` is true only when all three steps succeeded, so a live tensor
+# cache with two dead neighbours answers false and `steps` says which one worked.
 TEX_Wrangle.tex_memory.free_tensor_caches = _real_free
 res = drive("POST", "/tex_wrangle/free_caches")
 OUT["free_partial"] = [res.status, res.body]
@@ -762,7 +762,7 @@ def test_neg3_uncalled_routes_are_driven_both_ways(r):
         for path in ("POST /tex_wrangle/free_caches", "GET /tex_wrangle/list_tools"):
             assert path in out["paths"], (path, out["paths"])
         status, body = out["free_ok"]
-        assert status == 200 and body == {"ok": True}, out["free_ok"]
+        assert status == 200 and body["ok"] is True and all(body["steps"].values()), out["free_ok"]
         r.ok("free_caches: 200 {'ok': true} when the caches drop")
     except Exception as e:
         r.fail("free_caches success path", f"{type(e).__name__}: {e}")
@@ -770,10 +770,12 @@ def test_neg3_uncalled_routes_are_driven_both_ways(r):
     try:
         status, body = out["free_dead"]
         assert status == 200, f"a dead subsystem must not 500 the route: {status}"
-        assert body == {"ok": False}, body
+        assert body["ok"] is False and not any(body["steps"].values()), body
         status, body = out["free_partial"]
-        assert status == 200 and body == {"ok": True}, out["free_partial"]
-        r.ok("free_caches: 200 {'ok': false} on total failure, true on a partial one")
+        assert status == 200 and body["ok"] is False, out["free_partial"]
+        assert body["steps"] == {"tensor_caches": True, "disk_caches": False,
+                                 "device_cache": False}, out["free_partial"]
+        r.ok("free_caches: 200 {'ok': false} on total failure and on a partial one, steps named")
     except Exception as e:
         r.fail("free_caches failure path", f"{type(e).__name__}: {e}")
 
