@@ -694,6 +694,18 @@ def _body_has_break_continue(stmts: list[ASTNode], kinds=(BreakStmt, ContinueStm
 
 
 
+def _indexes_arrays_by(stmts: list[ASTNode], name: str) -> bool:
+    """Does an array element access in `stmts` use the bare variable `name` as its index?"""
+    stack = list(stmts)
+    while stack:
+        n = stack.pop()
+        if (isinstance(n, ArrayIndexAccess) and isinstance(n.index, Identifier)
+                and n.index.name == name):
+            return True
+        stack.extend(_ast_iter_child_nodes(n))
+    return False
+
+
 def _is_zero_literal(node: ASTNode | None) -> bool:
     """True iff `node` is the literal 0 (a counter provably entering a nest at zero)."""
     return isinstance(node, NumberLiteral) and node.value == 0
@@ -789,6 +801,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._tag_consts = False
         self._vec_const_cache: dict[tuple, str] = {}  # (v1, v2, ...) → variable name
         self._range_cache: dict[tuple, str] = {}  # (start, stop, step) → variable name
+        self._tagged_ranges: set[tuple] = set()  # ranges whose values carry a host tag
         self._kernel_const_cache: dict[tuple, str] = {}  # (kvals, kH, kW) → base kernel var
         # TEX local vars whose current tensor is exclusively owned (no live alias)
         # at this straight-line emission point — lets index/channel writes skip the
@@ -1415,6 +1428,22 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # zeros()/stack()/clone() all produce a brand-new, unaliased tensor.
         self._owned.add(stmt.name)
 
+    def _emit_host_index(self, index_node: ASTNode, idx: str):
+        """Emit `_ah`: the index's host reading, or None. A literal gives its value; a
+        hoisted constant or a static-loop counter gives the tag it carries. The access
+        then floor+clamps on the host (`interpreter_values._host_index`), no readback."""
+        if isinstance(index_node, NumberLiteral) and math.isfinite(index_node.value):
+            self._emit(f"_ah = {float(index_node.value)!r}")
+            return
+        self._emit(f"_ah = getattr({idx}, {_HOST_SCALAR_ATTR!r}, None)")
+        self._emit("if _ah is not None and not _math.isfinite(_ah): _ah = None")
+
+    @staticmethod
+    def _clamped_index(idx: str, size: str) -> str:
+        """The floor+clamped element index: a host int from `_ah`, else a device tensor."""
+        return (f"max(0, min(int(_math.floor(_ah)), {size} - 1)) if _ah is not None "
+                f"else _torch.clamp(_torch.floor({idx}).long(), 0, {size} - 1)")
+
     def _emit_array_index_read(self, node: ArrayIndexAccess) -> str:
         """Emit array[index] read with clamped bounds."""
         arr = self._emit_expr(node.array)
@@ -1431,13 +1460,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
+        self._emit_host_index(node.index, idx)
         # Tensor arrays — check dim for vec (dim 2 or 5) vs scalar (dim 1 or 4)
         self._emit(f"if {arr}.dim() in (2, 5):")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {arr}.shape[-2] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{arr}.shape[-2]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{tmp} = {arr}[..., _ai.item(), :]")
+        self._emit(f"{tmp} = {arr}[..., int(_ai), :]")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1452,10 +1482,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {arr}.shape[-1] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{arr}.shape[-1]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{tmp} = {arr}[..., _ai.item()]")
+        self._emit(f"{tmp} = {arr}[..., int(_ai)]")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1500,12 +1530,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         else:
             c = "_arr_c"
             self._emit(f"{c} = {arr}.clone()")
+        self._emit_host_index(target.index, idx)
         self._emit(f"if {c}.dim() in (2, 5):")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {c}.shape[-2] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{c}.shape[-2]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{c}[..., _ai.item(), :] = _es({value_expr}, {c}.shape[:-2]) if {c}.dim() > 2 else {value_expr}")
+        self._emit(f"{c}[..., int(_ai), :] = _es({value_expr}, {c}.shape[:-2]) if {c}.dim() > 2 else {value_expr}")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -1521,10 +1552,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {c}.shape[-1] - 1)")
-        self._emit(f"if _ai.dim() == 0:")
+        self._emit(f"_ai = {self._clamped_index(idx, f'{c}.shape[-1]')}")
+        self._emit(f"if not _torch.is_tensor(_ai) or _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"{c}[..., _ai.item()] = _es({value_expr}, {c}.shape[:-1]) if {c}.dim() > 1 else {value_expr}")
+        self._emit(f"{c}[..., int(_ai)] = _es({value_expr}, {c}.shape[:-1]) if {c}.dim() > 1 else {value_expr}")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
@@ -2768,7 +2799,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if use_scalar:
             self._setup_scalar_loop(all_vars, loop_var)
         else:
-            self._setup_tensor_loop(start, stop, step)
+            self._setup_tensor_loop(start, stop, step, stmt.body, loop_var)
 
         saved_scalar = self._scalar_loop
         self._scalar_loop = use_scalar
@@ -2850,10 +2881,13 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 local = self._local_vars[vname]
                 self._emit(f"if _torch.is_tensor({local}): {local} = {local}.item()")
 
-    def _setup_tensor_loop(self, start: int, stop: int, step: int):
+    def _setup_tensor_loop(self, start: int, stop: int, step: int,
+                           body: list[ASTNode] = (), loop_var: str | None = None):
         """Prepare variables for a tensor-mode for loop.
 
-        Hoists arange/unbind to preamble for zero-overhead iteration.
+        Hoists arange/unbind to preamble for zero-overhead iteration. When `body` indexes
+        an array by `loop_var`, each counter value carries its host reading, so that
+        element access reads nothing back from the device.
         """
         range_key = (start, stop, step)
         vals_tmp = self._range_cache.get(range_key)
@@ -2863,6 +2897,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 f"    {vals_tmp} = _torch.arange({start}, {stop}, {step}, dtype=_torch.float32, device=_dev).unbind(0)"
             )
             self._range_cache[range_key] = vals_tmp
+        if (range_key not in self._tagged_ranges and loop_var is not None
+                and _indexes_arrays_by(body, loop_var)):
+            self._tagged_ranges.add(range_key)
+            self._preamble.append(
+                f"    for _v, _h in zip({vals_tmp}, range({start}, {stop}, {step})): "
+                f"setattr(_v, {_HOST_SCALAR_ATTR!r}, float(_h))")
 
     def _emit_general_for_loop(self, stmt: ForLoop):
         """Emit a general for loop as init + while (dynamic bounds)."""

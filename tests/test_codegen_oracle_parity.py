@@ -481,3 +481,51 @@ def test_nested_min_max_emits_its_operand_once():
     src = try_compile(program, tm)._tex_src
     assert "clamp" not in src and src.count("_torch.maximum(") == 2, src
     assert src.count("_bind['A'][..., 0]") == 1 and src.count("_bind['A'][..., 1]") == 1, src
+
+
+# ── array element access by a literal or a static-loop counter reads no device value ─────
+
+_ARRAY_INDEX_ROWS = [
+    ("fill and read a float array by the counter, literal and fractional literal reads",
+     "float w[16];\nfor (int i = 0; i < 16; i++) { w[i] = float(i) * 0.5 + @A.r; }\n"
+     "float s = 0.0;\nfor (int j = 0; j < 16; j++) { s = s + w[j] * @A.g; }\n@OUT = vec3(s, w[3], w[2.7]);"),
+    ("vec array, negative and out-of-range literal reads",
+     "vec3 c[12];\nfor (int i = 0; i < 12; i++) { c[i] = @A.rgb * float(i); }\n"
+     "vec3 s = vec3(0.0);\nfor (int j = 0; j < 12; j++) { s = s + c[j]; }\n@OUT = s + c[-3.0] + c[40];"),
+    ("step 3 counter",
+     "float w[40];\nfor (int i = 0; i < 40; i += 3) { w[i] = @A.r + float(i); }\n@OUT = vec3(w[39], w[36], w[1]);"),
+    ("masked 0.25 loop",
+     "//!tex 0.25\nfloat w[16];\nfor (int i = 0; i < 16; i++) { if (@A.r > 2.0) { break; } w[i] = float(i) + @A.g; }\n"
+     "@OUT = vec3(w[5], w[15], 0.0);"),
+]
+
+
+@pytest.mark.parametrize("label,code", _ARRAY_INDEX_ROWS, ids=[r[0] for r in _ARRAY_INDEX_ROWS])
+def test_array_index_by_counter_or_literal_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img(H=6, W=6)}, atol=0.0)
+
+
+def test_array_index_by_counter_or_literal_reads_no_device_value(monkeypatch):
+    code = _ARRAY_INDEX_ROWS[0][1]
+    bindings = {"A": _img(H=6, W=6)}
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, _refs, _assigned, _params, used = get_cache().compile_ast(
+        program, bt, source=code)
+
+    def cook():
+        return _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
+                                     used_builtins=used, fingerprint=None, time_context=None)
+    cook()  # compile outside the spy
+    calls = []
+    orig = torch.Tensor.item
+
+    def spy(self):
+        calls.append(1)
+        return orig(self)
+    monkeypatch.setattr(torch.Tensor, "item", spy)
+    tier_trace.reset()
+    cook()
+    monkeypatch.undo()
+    assert tier_trace.last().tier == "codegen"
+    assert calls == [], f"{len(calls)} device reads for 32 counter and 2 literal accesses"

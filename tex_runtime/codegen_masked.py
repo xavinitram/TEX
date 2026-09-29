@@ -435,7 +435,7 @@ class MaskedEmitMixin:
             if vname != loop_var and saved_locals[vname] is None:
                 self._emit(f"{self._local_vars[vname]} = _env.get({vname!r})")
 
-        self._setup_tensor_loop(start, stop, step)
+        self._setup_tensor_loop(start, stop, step, stmt.body, loop_var)
         vals_tmp = self._range_cache[(start, stop, step)]
 
         # M3.5: the loop-header counter is declared BY the loop, so it stays uniform —
