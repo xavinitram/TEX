@@ -14,12 +14,14 @@ Every row here is RED against base `7477a93` (v0.48.0): that `pacing.py` has no
 `_COST_TABLE`, no `pace_budget_ms`, and `paced_check` takes no `call_site_id` keyword at all
 (TypeError) -- so every assertion below has nothing matching to read.
 """
+import contextlib
 import types
 import functools
 import inspect
 
 import pytest
 
+from helpers import FakeClock
 from TEX_Wrangle.tex_runtime import pacing as _pace
 from TEX_Wrangle.tex_testkit import DeviceSpy, FakeCudaEvent
 
@@ -55,24 +57,15 @@ class _Token:
         self.checks += 1
 
 
-class _FakeClock:
-    def __init__(self, t=0.0):
-        self.t = t
-
-    def __call__(self):
-        return self.t
-
-    def advance(self, dt):
-        self.t += dt
-
-
-@pytest.fixture
-def clock():
-    c = _FakeClock(0.0)
+@contextlib.contextmanager
+def _clock_ctx():
+    c = FakeClock(0.0)
     real = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=c)
-    yield c
-    _pace._time = real
+    try:
+        yield c
+    finally:
+        _pace._time = real
 
 
 # ── §4: the default (unpaced) path touches nothing this ask adds ─────────────────
@@ -137,20 +130,6 @@ def test_call_site_id_omitted_is_byte_identical_to_pre_pace49(r):
     else:
         r.fail("PACE-49 opt-out", f"constructed={constructed} outstanding={outstanding} "
                f"(expected 1/1 -- an omitted call_site_id must never force a record)")
-
-
-import contextlib  # noqa: E402
-
-
-@contextlib.contextmanager
-def _clock_ctx():
-    c = _FakeClock(0.0)
-    real = _pace._time
-    _pace._time = types.SimpleNamespace(perf_counter=c)
-    try:
-        yield c
-    finally:
-        _pace._time = real
 
 
 # ── §6.1: the table updates only at a fresh peek-confirm or a wait, never a cache hit ──
@@ -258,8 +237,6 @@ def test_warm_call_site_over_budget_forces_a_fallthrough(r):
             _pace._cost_feed(key, 50.0)                     # far above the 5ms budget, warm
         _pace.paced_check(tok, "cuda", call_site_id="loop")    # records E1 (1/8)
         clock.advance(0.001)
-        waits_before = sum(ev.sync_calls for ev in
-                            list(_pace._state.pool["outstanding"]) + _pace._state.pool["free"])  # noqa: SLF001
         _pace.paced_check(tok, "cuda", call_site_id="loop", heavy=False)   # tail done, but
                                                                             # WARM + over
                                                                             # budget -> record

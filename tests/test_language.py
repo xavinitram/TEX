@@ -707,8 +707,8 @@ def test_scope_and_shadowing(r: SubTestResult):
     except Exception as e:
         r.fail("scope: loop var not visible after loop", str(e))
 
-    # Variable re-declaration in if block — TEX if-blocks share the enclosing
-    # scope, so re-declaring x inside an if-block overwrites the outer x.
+    # Assignment inside an if block writes the outer variable (a declaration made inside
+    # the block, by contrast, is not visible after it: see the rows above).
     try:
         result = compile_and_run("""
             float x = 1.0;
@@ -1088,7 +1088,7 @@ def test_casting_exhaustive(r: SubTestResult):
     except Exception as e:
         r.fail("cast: float(int)", str(e))
 
-    # int(float) — truncation
+    # int(float) — floors (see the negative row below)
     try:
         result = compile_and_run("""
             float f = 1.7;
@@ -1096,10 +1096,10 @@ def test_casting_exhaustive(r: SubTestResult):
             @OUT = vec4(float(n));
         """, {"A": img})
         v = result[0, 0, 0, 0].item()
-        assert abs(v - 1.0) < 1e-5, f"Expected 1.0 (truncated), got {v}"
-        r.ok("cast: int(1.7) truncates")
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0 (floored), got {v}"
+        r.ok("cast: int(1.7) floors to 1")
     except Exception as e:
-        r.fail("cast: int(1.7) truncates", str(e))
+        r.fail("cast: int(1.7) floors to 1", str(e))
 
     # vec3(float) — broadcast
     try:
@@ -1176,7 +1176,7 @@ def test_casting_exhaustive(r: SubTestResult):
     except Exception as e:
         r.fail("cast: to_float(string)", str(e))
 
-    # int(3.9) — should truncate to 3
+    # int(3.9) — floors to 3
     try:
         result = compile_and_run("""
             int n = int(3.9);
@@ -1184,11 +1184,11 @@ def test_casting_exhaustive(r: SubTestResult):
         """, {"A": img})
         v = result[0, 0, 0, 0].item()
         assert abs(v - 3.0) < 1e-5, f"Expected 3.0, got {v}"
-        r.ok("cast: int(3.9) truncates to 3")
+        r.ok("cast: int(3.9) floors to 3")
     except Exception as e:
-        r.fail("cast: int(3.9) truncates to 3", str(e))
+        r.fail("cast: int(3.9) floors to 3", str(e))
 
-    # int(-1.5) — negative truncation
+    # int(-1.5) — floors to -2, not -1
     try:
         result = compile_and_run("""
             int n = int(-1.5);
@@ -1197,9 +1197,9 @@ def test_casting_exhaustive(r: SubTestResult):
         v = result[0, 0, 0, 0].item()
         # TEX uses floor-based int cast: int(-1.5) -> -2
         assert abs(v - (-2.0)) < 1e-5, f"Expected -2.0, got {v}"
-        r.ok("cast: int(-1.5) negative truncation")
+        r.ok("cast: int(-1.5) floors to -2")
     except Exception as e:
-        r.fail("cast: int(-1.5) negative truncation", str(e))
+        r.fail("cast: int(-1.5) floors to -2", str(e))
 
     # Cast in expression
     try:

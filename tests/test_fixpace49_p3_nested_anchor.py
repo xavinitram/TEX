@@ -142,20 +142,13 @@ def test_restore_without_nesting_still_attributes_correctly(r):
         _pace.restore_state(snapshot)  # no nested cook ran in between -- anchor cleared
 
         clock.advance(20.0)
-        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)  # E2: seeds
-                                                                                   # a fresh
-                                                                                   # anchor,
-                                                                                   # nothing
-                                                                                   # to
-                                                                                   # attribute
-                                                                                   # yet
+        # E2 seeds a fresh anchor, so there is nothing to attribute yet.
+        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)
         clock.advance(20.0)
         _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)  # E3, real
         clock.advance(0.001)
-        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)  # confirms
-                                                                                   # E3 ->
-                                                                                   # attributes
-                                                                                   # (E2, E3)
+        # This call confirms E3, which attributes the interval (E2, E3).
+        _pace.paced_check(tok, "cuda", call_site_id="A", call_site_anchor=stmt)
 
         est = _pace._cost_lookup(("A", idx, bkt), stmt)
 

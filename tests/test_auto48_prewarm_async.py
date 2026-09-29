@@ -5,9 +5,11 @@ AUTO-48 (v0.48) -- `tex_api.prewarm_async()`, a compile-ahead HOOK.
 it runs on the CALLING thread -- an embedding host that calls it from its own cook worker
 pays its full cost inline (measured on an embedding host's own edit-tick shape at ~11s on
 a cold cache). This ask adds the non-blocking counterpart:
-`prewarm_async()` submits the SAME `prewarm()` body to the SAME single-worker daemon pool
-`compile_capability_async()` already uses (`tex_runtime.compiled_capability._get_capability_pool()`,
-AUTO-47) -- no new pool -- and hands back a `PrewarmHandle` to poll, wait on, or cancel.
+`prewarm_async()` submits the SAME `prewarm()` body to a single-worker daemon pool of its own
+(`tex_runtime.compiled_capability._get_prewarm_pool()`), separate from the one
+`compile_capability_async()` uses (`_get_capability_pool()`, AUTO-47) so a large warm-ahead
+batch cannot starve a capability probe -- and hands back a `PrewarmHandle` to poll, wait on,
+or cancel.
 Mechanism only: nothing here decides WHEN a host should call it, and nothing here can change
 what a real cook produces -- warming only populates the same caches an un-warmed cook would
 populate on its own first cook (invariant 7).

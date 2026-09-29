@@ -23,6 +23,8 @@ identity and import direction, not bytecode; the two are complementary evidence,
 claim.
 """
 from helpers import *
+from helpers import (assigned_at_module_level, line_count as _loc,
+                     runtime_module_level_imports as _runtime_module_level_imports)
 import ast
 
 _PKG = Path(__file__).resolve().parent.parent
@@ -33,30 +35,6 @@ _MOVED_FUNCS = ("_code_epoch", "env_epoch", "_canon_params", "_canon_time", "lin
 # Moved too, but data rather than a function, so `__module__` cannot answer for it — a plain
 # module-level dict, checked by identity instead.
 _MOVED_OBJECTS = ("_ENV_EPOCH_CACHE",)
-
-
-def _runtime_module_level_imports(tree: ast.Module):
-    """The dotted name of every import statement that RUNS at module level.
-
-    Deliberately excludes function-local imports (the lazy edges ARCHITECTURE.md refuses to
-    let anyone hoist) and anything inside an `if TYPE_CHECKING:` block, which never executes.
-    """
-    out = []
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            out.extend(a.name for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            prefix = "." * node.level
-            if node.module:
-                out.append(prefix + node.module)
-            else:                       # `from . import x`
-                out.extend(prefix + a.name for a in node.names)
-    return out
-
-
-def _loc(path: Path) -> int:
-    with open(path, encoding="utf-8") as f:
-        return sum(1 for _ in f)
 
 
 def test_neg6_tex_results_keys_exists_and_carries_the_move(r: SubTestResult):
@@ -101,9 +79,9 @@ def test_neg6_the_moved_names_are_the_same_objects(r: SubTestResult):
         if mod != "TEX_Wrangle.tex_results_keys":
             fails.append(f"{name}: __module__ is {mod!r}, expected TEX_Wrangle.tex_results_keys")
     # The half-done move: a name left assigned in tex_results.py would shadow the import.
-    res_src = (_PKG / "tex_results.py").read_text(encoding="utf-8")
+    res_tree = ast.parse((_PKG / "tex_results.py").read_text(encoding="utf-8"))
     for name in _MOVED_OBJECTS:
-        if f"\n{name} = " in res_src or f"\n{name}:" in res_src:
+        if assigned_at_module_level(res_tree, name):
             fails.append(f"{name}: still assigned in tex_results.py — the move is half-done")
     if fails:
         r.fail("NEG-6 homes", "; ".join(fails))

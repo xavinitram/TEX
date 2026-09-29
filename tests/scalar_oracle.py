@@ -658,10 +658,11 @@ def sweep(program, bindings, B, H, W, output_names, latent_channels=0,
     """Run the oracle over every pixel of a `(B, H, W)` grid, in ROW-MAJOR order (M5's
     stated compaction order), and reassemble the per-pixel answers into whole tensors.
 
-    Returns `(outputs, skipped)`: `outputs` maps each name in `output_names` to a
-    `[B, H, W]` or `[B, H, W, C]` tensor, `skipped` is None or the `OracleUnsupported`
-    reason the sweep could not be completed. A scatter output is returned from
-    `scatter_init`'s buffer, written by the pixels in source order."""
+    Returns `(outputs, probes)`: `outputs` maps each name in `output_names` to a
+    `[B, H, W]` or `[B, H, W, C]` tensor, `probes` is the list of `debug_print` probes the
+    pixels recorded. `OracleUnsupported` and `OracleLoopCap` propagate to the caller, which
+    reports them as a skip. A scatter output is returned from `scatter_init`'s buffer,
+    written by the pixels in source order."""
     scatter = {k: v.clone() for k, v in (scatter_init or {}).items()}
     per_pixel = {name: [] for name in output_names}
     probes: list = []

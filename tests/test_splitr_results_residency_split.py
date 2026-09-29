@@ -25,6 +25,7 @@ every `with self._lock:` in the moved bodies is byte-for-byte what it was before
 This file's job is narrower: prove the move itself is total and cycle-free.
 """
 from helpers import *
+from helpers import line_count as _loc, runtime_module_level_imports as _runtime_module_level_imports
 import ast
 
 _PKG = Path(__file__).resolve().parent.parent
@@ -37,28 +38,6 @@ _MOVED_METHODS = ("set_vram_budget", "_enforce_residency", "_queue_demotions",
 # Moved too, but a plain module-level function rather than a method — re-exported onto
 # tex_results the same way NEG-6 re-exported env_epoch/lineage_key.
 _MOVED_FUNCS = ("_dev_bucket",)
-
-
-def _runtime_module_level_imports(tree: ast.Module):
-    """The dotted name of every import statement that RUNS at module level. Deliberately
-    excludes function-local imports (the lazy edges ARCHITECTURE.md refuses to let anyone
-    hoist) and anything inside an `if TYPE_CHECKING:` block, which never executes."""
-    out = []
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            out.extend(a.name for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            prefix = "." * node.level
-            if node.module:
-                out.append(prefix + node.module)
-            else:                       # `from . import x`
-                out.extend(prefix + a.name for a in node.names)
-    return out
-
-
-def _loc(path: Path) -> int:
-    with open(path, encoding="utf-8") as f:
-        return sum(1 for _ in f)
 
 
 def test_splitr_tex_results_residency_exists_and_carries_the_move(r: SubTestResult):

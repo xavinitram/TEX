@@ -4,7 +4,7 @@ diverges from a whole-frame cook.
 
 Both builtins' downscale approximations (`gauss_blur`'s pyramid past
 `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`; `bilateral_filter`'s detail-transfer past
-`_BILATERAL_APPROX_THRESHOLD_SS`) resample starting at the CROP's own (0,0), not the
+`_BILATERAL_APPROX_THRESHOLD_SS`, 40/3, past which the exact tier gives way) resample starting at the CROP's own (0,0), not the
 frame's absolute coordinates. A window whose halo has not saturated to the whole frame
 therefore used to sample on a different phase than a whole-frame cook of the same
 program (B1/B2's bug hunt: gauss_blur maxdiff ~8e-5, bilateral_filter maxdiff up to
@@ -91,7 +91,7 @@ def test_fixapprox_a1_bilateral_past_threshold_declines_and_matches_whole_frame(
           "narrowed (non-saturating) window declines and matches a whole-frame cook ---")
     H = W = 4320
     image = _make_frame(H, W, seed=103)
-    ss = _Sample._BILATERAL_APPROX_THRESHOLD_SS + 0.5  # 8.5: just past the threshold
+    ss = _Sample._BILATERAL_APPROX_THRESHOLD_SS + 0.5  # 40/3 + 0.5: just past the threshold
     code = f"@OUT = bilateral_filter(@A, {ss}, 0.2);"
     roi = (1900, 1900, 1200, 1200, W, H)
     cooked_roi, win, full = _windowed_vs_whole(code, image, roi)
@@ -114,7 +114,7 @@ def test_fixapprox_a1_bilateral_below_threshold_still_narrows(r: SubTestResult):
           "still narrows, still bit-exact vs a whole-frame crop (invariant 7) ---")
     H = W = 200
     image = _make_frame(H, W, seed=104)
-    code = "@OUT = bilateral_filter(@A, 3.0, 0.2);"  # well below 8.0 (exact-tiled tier)
+    code = "@OUT = bilateral_filter(@A, 3.0, 0.2);"  # well below 40/3 (the exact tier)
     roi = (60, 60, 40, 40, W, H)
     cooked_roi, win, full = _windowed_vs_whole(code, image, roi)
     if cooked_roi != roi:

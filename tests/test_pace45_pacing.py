@@ -38,6 +38,7 @@ import threading
 import pytest
 
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, time, make_img)
+from helpers import StatementTripToken, measure_full_cuda_runtime
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle.tex_runtime.host import CookCancelled
 from TEX_Wrangle.tex_runtime import pacing as _pace
@@ -151,51 +152,6 @@ class _ThreadTripToken:
             raise CookCancelled("PACE-45 repro: deadline token tripped")
 
 
-class _StatementTripToken:
-    """PACE-462: trips deterministically after `trip_after` top-level statements have been
-    DISPATCHED, via the SAME `on_progress("stmt", ...)` callback the interpreter/codegen
-    tiers already report on every statement (see `interpreter.py`'s statement loop) --
-    immune to wall-clock/GPU-clock variance entirely, unlike a background `threading.Timer`
-    racing a moving completion target. Pass as BOTH `cancel=` (this token) and
-    `on_progress=self.on_progress` to `tex_engine.cook`. This still exercises the real
-    regression this ask answers: the trip is observed by `paced_check`'s `token.check()` at
-    the NEXT poll point after it fires, exactly the yield-point mechanism under test -- it
-    is only the ARMING that is now deterministic, not the poll/raise path. Because the unpaced
-    statement loop polls too, a row using this token cannot distinguish paced from unpaced."""
-    def __init__(self, trip_after: int, pace: bool = True):
-        self.pace = pace
-        self._trip_after = trip_after
-        self._count = 0
-        self._tripped = False
-
-    def on_progress(self, phase, frac) -> None:
-        if phase == "stmt":
-            self._count += 1
-            if self._count >= self._trip_after:
-                self._tripped = True
-
-    def check(self) -> None:
-        if self._tripped:
-            raise CookCancelled("PACE-45 repro: statement-count trip fired")
-
-
-def _measure_full_runtime_cuda() -> float:
-    """The TRUE uncancelled GPU completion time (drain included), independent of pacing --
-    an explicit `torch.cuda.synchronize()` after `cook()` returns, mirroring how the finding
-    itself measured "the GPU drained for about 5.5-8.5s". Discards a cold-cache first leg
-    (docs/brief-conventions.md's measurement rule) and takes the FLOOR of two warm legs, the
-    same 'lower-bound scale, not a precise duration' floor `test_v044_cancel44.py` uses. A
-    `synchronize()` between legs keeps one leg's tail from backing up into the next's queue."""
-    def once(seed):
-        t0 = time.perf_counter()
-        tex_engine.cook(_PROGRAM, _pace45_bindings(seed), device_mode="cuda")
-        torch.cuda.synchronize()
-        return time.perf_counter() - t0
-
-    once(900)  # discard cold leg
-    return min(once(901), once(902))
-
-
 def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
     """The core PACE-45(b) repro (non-timing half), plus the bit-exactness check it shares a
     CUDA guard with. Both need a real CUDA device; there is no CPU witness for either."""
@@ -203,7 +159,7 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
         r.skip("PACE-45 CUDA repro", "no CUDA on this box")
         return
 
-    full = _measure_full_runtime_cuda()
+    full = measure_full_cuda_runtime(_PROGRAM, _pace45_bindings, 900)
 
     # -- No pixel change: a paced, uncancelled cook is bit-exact with the plain route --
     plain = tex_engine.cook(_PROGRAM, _pace45_bindings(910), device_mode="cuda")
@@ -218,13 +174,13 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
         r.fail("PACE-45 CUDA bit-exactness", f"maxdiff {md}")
 
     # -- A paced cook is cancellable: a token armed for pacing, tripped after a quarter of
-    #    the statements have DISPATCHED (`_StatementTripToken` -- deterministic, immune to
+    #    the statements have DISPATCHED (`StatementTripToken` -- deterministic, immune to
     #    the wall-clock/GPU-clock variance a `threading.Timer` had), must raise before the
     #    whole program finishes. This is a smoke row, not the regression detector: the
     #    same-thread trip is also observed by the unpaced statement loop, so only
     #    `test_pace45_cuda_repro_latency` (a trip landing while the host is parked in a
     #    wait) can tell paced from unpaced.
-    tok = _StatementTripToken(trip_after=_N_STATEMENTS // 4, pace=True)
+    tok = StatementTripToken(_N_STATEMENTS // 4, pace=True, label="PACE-45 repro: statement-count trip")
     t0 = time.perf_counter()
     try:
         tex_engine.cook(_PROGRAM, _pace45_bindings(920), device_mode="cuda", cancel=tok,
@@ -263,7 +219,7 @@ def test_pace45_cuda_repro_latency(r: SubTestResult):
         r.skip("PACE-45 CUDA repro latency", "no CUDA on this box")
         return
 
-    full = _measure_full_runtime_cuda()
+    full = measure_full_cuda_runtime(_PROGRAM, _pace45_bindings, 900)
     per_statement = full / _N_STATEMENTS
     delay = per_statement * 1.5
     trials = 5

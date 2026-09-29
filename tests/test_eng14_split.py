@@ -22,6 +22,7 @@ The re-export surface itself is pinned elsewhere, deliberately: by
 before this release and now names all 28 promised attributes.
 """
 from helpers import *
+from helpers import line_count as _loc, runtime_module_level_imports as _module_level_imports
 import ast
 
 _PKG = Path(__file__).resolve().parent.parent
@@ -43,29 +44,6 @@ _MOVED_CONSTANTS = {"_TDR_BUDGET_MS": "tex_tiling"}
 # What a LEAF is allowed to import at module level. `tex_runtime.host` is the PORT-1
 # host seam, which sits below both modules in the layer table.
 _LEAF_IMPORTS_ALLOWED = {"__future__", "math", "typing", "torch", ".tex_runtime.host"}
-
-
-def _loc(path: Path) -> int:
-    with open(path, encoding="utf-8") as f:
-        return sum(1 for _ in f)
-
-
-def _module_level_imports(tree: ast.Module):
-    """(module_name, is_module_level) for every import STATEMENT at module level only.
-    Function-local imports are deliberately not reported: the `tex_memory` / `tex_roi` /
-    `autotier` imports inside the moved planner bodies are exactly the deliberate lazy
-    edges ARCHITECTURE.md refuses to let anyone hoist."""
-    out = []
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            out.extend(a.name for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            prefix = "." * node.level
-            if node.module:
-                out.append(prefix + node.module)
-            else:                       # `from . import x`
-                out.extend(prefix + a.name for a in node.names)
-    return out
 
 
 def test_eng14_the_two_leaves_exist(r: SubTestResult):
@@ -139,8 +117,6 @@ def test_eng14_the_new_modules_stay_leaves(r: SubTestResult):
             if name not in _LEAF_IMPORTS_ALLOWED:
                 fails.append(f"{mod}: module-level import {name!r} is not a leaf import "
                              f"(allowed: {sorted(_LEAF_IMPORTS_ALLOWED)})")
-            if "tex_engine" in name:
-                fails.append(f"{mod}: imports tex_engine at module level — this is a cycle")
     if fails:
         r.fail("ENG-14 leafness", "; ".join(fails))
     else:

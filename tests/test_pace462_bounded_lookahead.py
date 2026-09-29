@@ -26,6 +26,7 @@ import inspect
 
 import pytest
 
+from helpers import FakeClock
 from TEX_Wrangle.tex_runtime import pacing as _pace
 from TEX_Wrangle.tex_runtime.host import CookCancelled as _CookCancelled
 from TEX_Wrangle.tex_testkit import DeviceSpy, FakeCudaEvent
@@ -73,7 +74,7 @@ class _Token:
 
 # ── Depth semantics: waits only once the pool is full, on the OLDEST event ───────
 
-def _pool_events(r=None):  # noqa: SLF001 (white-box by design)
+def _pool_events():  # noqa: SLF001 (white-box by design)
     """Every `_FakeEvent` this thread's CURRENT device pool has ever built (outstanding +
     free), for summing e.g. `sync_calls` across the whole pool regardless of which list an
     event currently sits in."""
@@ -341,8 +342,8 @@ def test_none_token_is_a_no_op(r):
 # shape and its measurement discipline (discard a cold leg, floor of two warm legs).
 
 from helpers import torch, time, make_img  # noqa: E402  (after the mechanism-only tests)
+from helpers import StatementTripToken, measure_full_cuda_runtime  # noqa: E402
 from TEX_Wrangle import tex_engine
-from TEX_Wrangle.tex_runtime.host import CookCancelled
 
 _N_STATEMENTS = 20
 _SIZE = 2048
@@ -351,46 +352,6 @@ _PROGRAM = "vec4 x = @A;\n" + "x = gauss_blur(x, 8.0);\n" * _N_STATEMENTS + "@OU
 
 def _bindings(seed):
     return {"A": make_img(1, _SIZE, _SIZE, 4, seed=seed).cuda()}
-
-
-def _measure_full_runtime():
-    def once(seed):
-        t0 = time.perf_counter()
-        tex_engine.cook(_PROGRAM, _bindings(seed), device_mode="cuda")
-        torch.cuda.synchronize()
-        return time.perf_counter() - t0
-
-    once(940)  # discard cold leg
-    return min(once(941), once(942))
-
-
-class _StatementTripToken:
-    """PACE-462: trips deterministically once `trip_after` top-level statements have been
-    DISPATCHED, via the SAME `on_progress("stmt", ...)` callback the interpreter/codegen
-    tiers already report per statement -- immune to wall-clock/GPU-clock variance, unlike a
-    background `threading.Timer` calibrated against a separately-measured runtime (an
-    earlier version of this test used exactly that and was flaky on this box's laptop GPU,
-    which clock-ramps under load: a since-boosted paced cook's own host-return time could
-    legitimately land under a delay calibrated a few cooks earlier at a slower clock,
-    racing the trip to the finish before it ever fired). Pass as BOTH `cancel=` and
-    `on_progress=self.on_progress`."""
-    def __init__(self, trip_after, pace_depth=None):
-        self.pace = True
-        if pace_depth is not None:
-            self.pace_depth = pace_depth
-        self._trip_after = trip_after
-        self._count = 0
-        self._tripped = False
-
-    def on_progress(self, phase, frac):
-        if phase == "stmt":
-            self._count += 1
-            if self._count >= self._trip_after:
-                self._tripped = True
-
-    def check(self):
-        if self._tripped:
-            raise CookCancelled("PACE-462 drained-bound repro: statement-count trip fired")
 
 
 @pytest.mark.timing
@@ -404,20 +365,20 @@ def test_pace462_cuda_drained_bound(r):
         r.skip("PACE-462 drained bound", "no CUDA on this box")
         return
 
-    full = _measure_full_runtime()
+    full = measure_full_cuda_runtime(_PROGRAM, _bindings, 940)
     per_statement = full / _N_STATEMENTS
     depth = 2
     trip_after = _N_STATEMENTS // 4
-    tok = _StatementTripToken(trip_after, pace_depth=depth)
+    tok = StatementTripToken(trip_after, pace_depth=depth,
+                             label="PACE-462 drained-bound repro: statement-count trip")
 
-    t_trip_seen = None
     try:
         tex_engine.cook(_PROGRAM, _bindings(950), device_mode="cuda", cancel=tok,
                         on_progress=tok.on_progress)
         r.fail("PACE-462 drained bound", f"cook completed without raising (tripped after "
                f"statement {trip_after}/{_N_STATEMENTS})")
         return
-    except CookCancelled:
+    except _CookCancelled:
         t_trip_seen = time.perf_counter()
     torch.cuda.synchronize()
     t_drained = time.perf_counter()
@@ -442,23 +403,12 @@ def test_pace462_cuda_drained_bound(r):
 # "has `stride` seconds of HOST time passed since the ring last recorded" is provable
 # without ever actually sleeping.
 
-class _FakeClock:
-    def __init__(self, t=0.0):
-        self.t = t
-
-    def __call__(self):
-        return self.t
-
-    def advance(self, dt):
-        self.t += dt
-
-
 def test_stride_gates_the_ring_not_the_token_check(r):
     """With a stride of 10ms and a large depth (so the ring-full wait never fires in this
     test), a poll 1ms after the ring last recorded must touch NEITHER the ring nor
     `torch.cuda` beyond `token.check()`; a poll 20ms after must record."""
     print("\n--- PACE-462 stride: polls inside the window record nothing ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
@@ -536,7 +486,7 @@ def test_pace47_stride_skip_falls_through_when_device_is_behind(r):
     so polls 2 and 3 would never touch the pool at all and no wait would ever fire."""
     print("\n--- PACE-47: a poll inside the stride window still records/waits when the "
           "device is behind ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
@@ -584,7 +534,7 @@ def test_pace47_stride_skip_still_fires_once_device_catches_up(r):
     device touch beyond the `query()` peek. Proves the fix does not simply disable striding;
     it conditions the skip on the device's own state."""
     print("\n--- PACE-47: the stride skip still fires once the device has caught up ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
@@ -629,7 +579,7 @@ def test_pace47b_repeated_skip_reuses_one_query_call(r):
     total (the first poll's own peek) -- PACE-47b's cache. Pre-PACE-47b, this was RED:
     every one of the 10 polls called `query()` again on the identical, unchanged event."""
     print("\n--- PACE-47b: repeated economizing polls reuse one query() call ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     query_calls = {"n": 0}
@@ -666,7 +616,7 @@ def test_pace47b_query_cache_invalidates_on_a_real_record(r):
     or the device found behind), the next economizing poll's tail is a DIFFERENT (or
     freshly re-armed) event and must be peeked again, not answered from the stale cache."""
     print("\n--- PACE-47b: the query() cache is invalidated by a real record ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     query_calls = {"n": 0}
@@ -719,7 +669,7 @@ def test_pace47c_completed_tail_blind_spot_is_real_without_heavy(r):
     live-event count completely untouched: none of the 20 is ever tracked or waited on,
     proving the backlog these 20 represent is invisible to the depth bound."""
     print("\n--- PACE-47c: the completed-tail blind spot is real without `heavy` ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
@@ -764,7 +714,7 @@ def test_pace47c_heavy_true_forces_the_bound_regardless_of_the_tail(r):
     completion state. Pre-`heavy`-parameter, this is RED: `paced_check()` takes no `heavy`
     keyword at all (TypeError)."""
     print("\n--- PACE-47c: heavy=True forces the depth bound regardless of the tail ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
@@ -846,7 +796,7 @@ def test_pace47e_large_resolution_forces_record_despite_caller_heavy_false(r):
     would for a footprint='point' statement -- must NOT be able to skip indefinitely: the
     depth bound must still be enforced from the cook's own resolution alone."""
     print("\n--- PACE-47e: a large cook's resolution forces the bound even at heavy=False ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:
@@ -885,7 +835,7 @@ def test_pace47e_small_resolution_still_economizes(r):
     """Regression: a SMALL cook must still economize exactly as PACE-47b's own tests
     proved -- the resolution check must not make every cook heavy by accident."""
     print("\n--- PACE-47e: a small-resolution cook still economizes at heavy=False ---")
-    clock = _FakeClock(0.0)
+    clock = FakeClock(0.0)
     real_perf_counter = _pace._time
     _pace._time = types.SimpleNamespace(perf_counter=clock)
     try:

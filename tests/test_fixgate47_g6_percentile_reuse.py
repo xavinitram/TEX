@@ -19,9 +19,10 @@ _HERE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _load_artist_loops_bench():
-    """Fresh load, isolated from the module cache key `artist_loops_bench.py` itself uses
-    (`_artist_loops_<name>`), so patching `compile_modes_bench._pctl` for this test cannot
-    leak into -- or be shadowed by -- another test's own cached load."""
+    """Fresh load of `artist_loops_bench` under a private module name. The sibling
+    `compile_modes_bench` it loads is NOT isolated: it is cached under one shared
+    `sys.modules` key, so every load sees the same module object, and the spy below is
+    safe only because its `finally` restores `_pctl`."""
     path = os.path.join(_HERE, "artist_loops_bench.py")
     spec = importlib.util.spec_from_file_location("_g6_artist_loops_bench_under_test", path)
     mod = importlib.util.module_from_spec(spec)

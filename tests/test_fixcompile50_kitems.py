@@ -8,6 +8,12 @@ PORTABILITY: CPU-only (no CUDA/MSVC/Triton assumed); K1 uses a real `torch.compi
 backend="aot_eager")` (no Inductor/toolchain needed for aot_eager) — the same backend
 COMPILETRY-50's own D2 test uses for the identical reason.
 """
+import ast
+import functools
+import inspect
+import linecache
+import sys
+import textwrap
 import threading
 import time
 import types
@@ -16,6 +22,7 @@ import torch
 import torch._dynamo.config as _dynamo_config
 
 from helpers import *  # noqa: F401,F403
+from helpers import isolated_warm_state
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import codegen_persist as CP
 from TEX_Wrangle.tex_runtime import fncalls_compile as FC
@@ -62,12 +69,37 @@ def _k1_build(namespace: dict):
     return namespace["_tex_fn"]
 
 
+def _isolated(fn):
+    """Run a row with `warm_state` on a scratch snapshot: these rows record verdicts, and
+    `note_fncalls_update` would otherwise write them into the process's cache dir, where
+    the next run's first `verdict()` miss adopts them."""
+    @functools.wraps(fn)
+    def _wrapped(*a, **k):
+        with isolated_warm_state():
+            return fn(*a, **k)
+    return _wrapped
+
+
+def _calls_lru_put(fn) -> bool:
+    """True when `fn`'s body contains an actual CALL to `lru_put` (a bare name or an
+    attribute), so a comment or docstring that only mentions the helper does not count."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return any(isinstance(n, ast.Call)
+               and (getattr(n.func, "id", None) == "lru_put"
+                    or getattr(n.func, "attr", None) == "lru_put")
+               for n in ast.walk(tree))
+
+
 def test_k1_bare_dict_globals_raise_keyerror_on_resume(r: SubTestResult):
     """RED-FIRST EVIDENCE: the exact pre-fix shape (a bare dict with no dunders, the
     literal `{"_MF": ..., "_CK": ..., "_SCM": ...}` `codegen.py`/`codegen_persist.py`
     used to hand `exec()`) really does raise `KeyError: '__name__'` inside Dynamo's
     graph-break resume, under `caching_precompile=True` -- the exact flag
-    `compiled._precompile_ctx()` sets around every real compile attempt."""
+    `compiled._precompile_ctx()` sets around every real compile attempt.
+
+    This pins a defect in the installed torch's Dynamo, not in TEX: if a newer torch stops
+    raising (or drops the `caching_precompile` knob) this row goes red as the signal that
+    the K1 workaround can be retired, not because TEX regressed."""
     print("\n--- K1 (red-first): a bare exec-globals dict raises on a graph-break resume ---")
     fn = _k1_build({})
     try:
@@ -98,9 +130,9 @@ def test_k1_codegen_exec_namespace_survives_a_graph_break_resume(r: SubTestResul
     try:
         namespace = CP._codegen_exec_namespace(filename, {})
         mod_name = CP._codegen_module_name(filename)
-        assert mod_name in __import__("sys").modules, (
+        assert mod_name in sys.modules, (
             "the fix must register a REAL module in sys.modules, found none")
-        assert __import__("sys").modules[mod_name].__dict__ is namespace, (
+        assert sys.modules[mod_name].__dict__ is namespace, (
             "the returned namespace must BE the registered module's own __dict__")
         fn = _k1_build(namespace)
         with _dynamo_config.patch(caching_precompile=True):
@@ -115,8 +147,7 @@ def test_k1_codegen_exec_namespace_survives_a_graph_break_resume(r: SubTestResul
         r.fail("K1 codegen_exec_namespace", f"{type(e).__name__}: {e}")
     finally:
         torch._dynamo.reset()
-        __import__("sys").modules.pop(CP._codegen_module_name(filename), None)
-        import linecache
+        sys.modules.pop(CP._codegen_module_name(filename), None)
         linecache.cache.pop(filename, None)
         try:
             CP._LINECACHE_KEYS.remove(filename)
@@ -130,7 +161,6 @@ def test_k1_module_is_bounded_and_evicted_with_its_linecache_entry(r: SubTestRes
     forever (B3#1's own stated risk for the 'point at a real, shared module' alternative
     this fix deliberately avoids)."""
     print("\n--- K1: the synthetic module is evicted alongside its linecache entry ---")
-    import sys as _sys
     saved_keys = list(CP._LINECACHE_KEYS)
     saved_max = CP._LINECACHE_MAX
     # Start from an empty deque: with real keys queued, the eviction below would pop THEIR
@@ -149,8 +179,8 @@ def test_k1_module_is_bounded_and_evicted_with_its_linecache_entry(r: SubTestRes
         assert len(still_present) == CP._LINECACHE_MAX, still_present
         for n in names:
             mod_name = CP._codegen_module_name(n)
-            in_linecache = n in __import__("linecache").cache
-            in_modules = mod_name in _sys.modules
+            in_linecache = n in linecache.cache
+            in_modules = mod_name in sys.modules
             assert in_linecache == in_modules, (
                 f"{n}: linecache present={in_linecache} but sys.modules present="
                 f"{in_modules} -- the two registries drifted apart")
@@ -160,8 +190,8 @@ def test_k1_module_is_bounded_and_evicted_with_its_linecache_entry(r: SubTestRes
         r.fail("K1 bounded eviction", f"{type(e).__name__}: {e}")
     finally:
         for n in names:
-            _sys.modules.pop(CP._codegen_module_name(n), None)
-            __import__("linecache").cache.pop(n, None)
+            sys.modules.pop(CP._codegen_module_name(n), None)
+            linecache.cache.pop(n, None)
         CP._LINECACHE_MAX = saved_max
         CP._LINECACHE_KEYS.clear()
         CP._LINECACHE_KEYS.extend(saved_keys)
@@ -172,6 +202,7 @@ def test_k1_module_is_bounded_and_evicted_with_its_linecache_entry(r: SubTestRes
 # when the real invocation always fails. Fix: resolve only after that first call
 # completes or raises. ──────────────────────────────────────────────────────────────
 
+@_isolated
 def test_k2_verdict_settles_false_when_the_first_real_call_fails(r: SubTestResult):
     """RED against the pre-fix ordering: a wrap that succeeds (`entry[1]` is a real
     backend name) but whose compiled callable raises on its very first real invocation
@@ -216,6 +247,7 @@ def test_k2_verdict_settles_false_when_the_first_real_call_fails(r: SubTestResul
         FC.reset_for_test()
 
 
+@_isolated
 def test_k2_verdict_settles_true_only_after_a_successful_real_call(r: SubTestResult):
     """GREEN companion: when the first real invocation actually succeeds, the verdict
     still settles True (K2 must not turn every compile permanently False)."""
@@ -261,6 +293,7 @@ def test_k2_verdict_settles_true_only_after_a_successful_real_call(r: SubTestRes
 # fingerprint says nothing about the SAME program on CUDA). Fix: widen the key to
 # (fingerprint, device_type, precision), mirroring compiled.py's own cache_key. ──────────
 
+@_isolated
 def test_k3_memo_key_distinguishes_device_and_precision(r: SubTestResult):
     """RED against the pre-K3 bare-fingerprint key: a fingerprint resolved False on one
     (device, precision) must NOT settle the verdict for the SAME fingerprint on a
@@ -293,6 +326,7 @@ def test_k3_memo_key_distinguishes_device_and_precision(r: SubTestResult):
         FC.reset_for_test()
 
 
+@_isolated
 def test_k3_persistence_round_trips_the_composite_key(r: SubTestResult):
     """The composite key must still round-trip through `snapshot_items()`/
     `adopt_persisted()` (what `warm_state.py` reads/writes) as a flat string -> bool
@@ -324,6 +358,7 @@ def test_k3_persistence_round_trips_the_composite_key(r: SubTestResult):
 # statements with no lock -- two pools racing the SAME key could both observe "not yet
 # pending" and both proceed. Fix: hold a lock across the check-and-set. ────────────────
 
+@_isolated
 def test_k4_begin_attempt_is_atomic_under_concurrent_callers(r: SubTestResult):
     """Forces the exact interleaving B3#3 describes: thread A's check (`key in _pending`)
     is made deliberately slow (standing in for a real thread switch mid-check, the same
@@ -450,15 +485,12 @@ def test_k6_fncalls_compile_record_shares_the_lru_helper(r: SubTestResult):
     identical for a store that only ever inserts each key ONCE -- R1#2's own finding
     calls this drift "presently harmless", the point is closing the copy-by-hand risk
     before a FUTURE change to the eviction policy has three places to land instead of
-    one): `record`'s compiled bytecode must reference `lru_put`, checked past the
-    docstring text (which itself mentions the helper's name in prose) by requiring the
-    call SHAPE `lru_put(`, not a bare substring match."""
+    one): `record`'s body must contain a real CALL to `lru_put` (an AST check, so the
+    docstring and comments that mention the helper's name do not count)."""
     print("\n--- K6: fncalls_compile.record() calls the shared lru_util.lru_put, not a "
           "hand-copy ---")
-    import inspect
     try:
-        src = inspect.getsource(FC.record)
-        assert "lru_put(" in src, (
+        assert _calls_lru_put(FC.record), (
             "record() must call lru_util.lru_put(...) -- found no such call in its body "
             "(a docstring mentioning the helper's name does not count)")
         r.ok("K6: fncalls_compile.record() calls lru_util.lru_put(...)")
@@ -469,25 +501,25 @@ def test_k6_fncalls_compile_record_shares_the_lru_helper(r: SubTestResult):
 def test_k6_three_lru_stores_share_one_helper(r: SubTestResult):
     """graphed._blacklist_add / compiled._blacklist_add / fncalls_compile.record all
     reuse `lru_util.lru_put` now -- confirmed by reading each of the three source
-    bodies for the call SHAPE (`lru_put(`, never a bare substring that could also match
-    a docstring mentioning the helper's name), not by re-deriving the eviction
+    bodies for a real CALL to `lru_put` (an AST check, never a substring that a docstring
+    mentioning the helper's name would satisfy), not by re-deriving the eviction
     behaviour a third time."""
     print("\n--- K6: all three LRU stores call the one shared helper ---")
-    import inspect
     from TEX_Wrangle.tex_runtime import graphed as G
     try:
         sites = {
-            "graphed._blacklist_add": inspect.getsource(G._blacklist_add),
-            "compiled._blacklist_add": inspect.getsource(C._blacklist_add),
-            "fncalls_compile.record": inspect.getsource(FC.record),
+            "graphed._blacklist_add": G._blacklist_add,
+            "compiled._blacklist_add": C._blacklist_add,
+            "fncalls_compile.record": FC.record,
         }
-        missing = [name for name, src in sites.items() if "lru_put(" not in src]
+        missing = [name for name, fn in sites.items() if not _calls_lru_put(fn)]
         assert not missing, f"these sites do not call lru_util.lru_put(...): {missing}"
         r.ok(f"K6: {len(sites)} LRU sites all call lru_util.lru_put(...)")
     except Exception as e:
         r.fail("K6 shared LRU helper", f"{type(e).__name__}: {e}")
 
 
+@_isolated
 def test_k6_warm_state_snapshot_and_load_round_trip_both_stores(r: SubTestResult):
     """The de-duplicated `_persisted_stores()`-driven snapshot/load path must still
     round-trip BOTH stores correctly -- this is the regression guard for the

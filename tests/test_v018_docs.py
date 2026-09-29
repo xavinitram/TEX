@@ -26,15 +26,11 @@ already asserts ("Every one of them is listed in README.md") is machine-checked 
 directions.
 """
 from helpers import *
+from helpers import line_count as _loc
 import ast
 import re
 
 _PKG = Path(__file__).resolve().parent.parent
-
-
-def _loc(path: Path) -> int:
-    with open(path, encoding="utf-8") as f:
-        return sum(1 for _ in f)
 
 
 #: DOC-7c's drift band. 20 % on `tex_runtime/codegen.py` is ±624 lines — wider than the

@@ -378,7 +378,7 @@ def test_join49_pixel_identity_join_dag(r: SubTestResult):
     join DAG (bg pass-through + fg gauss_blur + a per-pixel join reading both), windowed
     per `chain_windows_dag`'s own plan, produces PIXELS equal to the whole-frame cook — not
     merely a plausible-looking window. Runs on CPU always; CUDA is exercised by the
-    lease-gated test below."""
+    device-gated test below."""
     print("\n--- JOIN-49: pixel-identity proof, 3-stage join DAG, CPU ---")
     _run_pixel_identity(r, "cpu")
 

@@ -18,7 +18,7 @@ proof rows the existing JOINWIRE-50b suite did not yet cover by name.
    row exists to prove that by construction, not merely by argument.
 2. **An approximate path declines the window, through the checkpointed route.** `gauss_blur`
    past `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` (256) and `bilateral_filter` past
-   `_BILATERAL_EXACT_RADIUS_MAX` (24, i.e. `spatial_sigma > 8.0`) both decline ROI narrowing
+   `_BILATERAL_EXACT_RADIUS_MAX` (40, i.e. `spatial_sigma > 40/3`) both decline ROI narrowing
    (FIX-APPROX A1, `tex_roi._reach_of`'s `approx_above` element) at the SAME per-stage
    `cook_stage_list`/`tex_engine.cook` call every DAG stage already goes through -- so a
    checkpointed DAG stage using one of these builtins past its threshold must serve

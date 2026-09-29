@@ -9,8 +9,8 @@ deterministic-in-practice path.
 
 The one genuine exposure is that torch does not *promise* atomic-add ordering, so a
 future torch upgrade could break run-to-run scatter determinism. This test pins that:
-- CUDA scatter (plain + 1024-way collision stress) must be bitwise identical across 5
-  runs. **GATED on a band by default** (A1-4, v0.19: was WARN-first in v0.18): measured
+- CUDA scatter (plain + a collision variant, both cooked on the interpreter's no-binding
+  default grid; see the note above `_SCATTER`) must be bitwise identical across 5 runs. **GATED on a band by default** (A1-4, v0.19: was WARN-first in v0.18): measured
   bitwise-0.0, and a torch atomic-add reorder is a discrete jump well above the 1e-9 band,
   so gating catches a real regression without flapping. Set `TEX_DETERMINISM_SOFT=1` to
   DOWNGRADE to a warning (the old behavior) if a future torch upgrade forces a re-band.
@@ -154,7 +154,7 @@ def test_prlp5_the_determinism_comparator_is_not_inert(r: SubTestResult):
         ("a reordered accumulation", [same, reordered], _CUDA_DET_BAND, False, False, "out"),
         ("soft mode downgrades it", [same, reordered], _CUDA_DET_BAND, True, False, "warn"),
         ("soft mode leaves a clean run alone", [same], _CUDA_DET_BAND, True, True, "within"),
-        # One fp32 ulp at 0.25 is ~1.5e-8, comfortably above the 1e-9 band: the band is tight
+        # One fp32 ulp at 0.25 is ~3.0e-8 (2^-25), comfortably above the 1e-9 band: the band is tight
         # enough that a single-ulp drift is a decision, which is the claim the pin makes.
         ("one fp32 ulp is already out of band", [a_ulp], _CUDA_DET_BAND, False, False, "out"),
         # The CPU caveat's loose bound is the half that runs on every box.

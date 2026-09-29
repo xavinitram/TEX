@@ -67,6 +67,7 @@ codegen rows are not measurable and the affected rows SKIP rather than pass.
 """
 import os
 import sys
+import time
 
 from helpers import *
 # By name, not by star: `helpers.__all__` is pinned to its v0.35.0 set (HOOK-4), because
@@ -207,7 +208,7 @@ _FRAME_CEILING = {"blur_chain": 340, "fetch_stencil": 650}
 #: `python tests/test_perf7_compiled_cold.py -q -s`, each row prints its own). One extra
 #: frame on `blur_chain` is PERF-2's `_host_scalar` call inside `fn_gauss_blur` — one Python
 #: frame in place of a device readback, which is the trade that lane recorded; the rest of
-#: the drift is later, unrelated frame growth the ceiling (340/400) already has room for.
+#: the drift is later, unrelated frame growth the ceilings (340/650) already have room for.
 #: `fetch_stencil`'s v0.37.0 reading of 321 no longer describes the SAME code path this box
 #: takes at head (see the `_FRAME_CEILING` note above: v0.37.0 could never reach a real
 #: Dynamo trace here at all) — kept for its historical value, not as a tight comparison.
@@ -328,10 +329,17 @@ def _cook(prepared, count: bool):
         execute_compiled(program, dict(bindings), type_map, "cpu", fp,
                          output_names=out_names, used_builtins=used)
         return None
+    from TEX_Wrangle.tex_runtime import warm_state as _ws
     pool = _compiled._COMPILE_POOL
+    last_persist = _ws._last_persist
     _compiled._COMPILE_POOL = _InlinePool()
     try:
         clear_compiled_cache()
+        # `clear_compiled_cache` forgets the fn-calls verdict, so this cook records it again
+        # and `warm_state.persist` runs once its 5 s throttle has lapsed: a snapshot write
+        # and reload sized by whatever the cache dir holds (about 140 extra frames). That is
+        # neither the cold path nor deterministic, so the throttle is held shut for the cook.
+        _ws._last_persist = time.time()
         f = _Frames()
         with f:
             execute_compiled(program, dict(bindings), type_map, "cpu", fp,
@@ -339,6 +347,7 @@ def _cook(prepared, count: bool):
         return f.counts
     finally:
         _compiled._COMPILE_POOL = pool
+        _ws._last_persist = last_persist
 
 
 def _cold_counts(name: str):
