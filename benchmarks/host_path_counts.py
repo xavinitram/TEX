@@ -1628,7 +1628,7 @@ def _git_sha() -> str:
     return sha + "-dirty" if porcelain.strip() else sha
 
 
-def environment(res=None, window=None, ticks=None, device=None) -> dict:
+def environment(res=None, window=None, ticks=None, device=None, prof1=None) -> dict:
     """`res`/`window`/`ticks`/`device` are the MEASUREMENT SHAPE (TRK-100): a saved
     baseline is coupled to the shape it was taken at, and until these fields existed
     nothing recorded that, so `--compare` between two saves taken at different
@@ -1645,7 +1645,8 @@ def environment(res=None, window=None, ticks=None, device=None) -> dict:
             "package_dir": _PKG,
             "tex_cache_dir": _CACHE_DIR_AT_START,
             "tex_cache_warmth": _CACHE_WARMTH_AT_START,
-            "res": res, "window": window, "ticks": ticks, "device": device}
+            "res": res, "window": window, "ticks": ticks, "device": device,
+            "prof1": prof1}
 
 
 def _print_block(title: str, rows: dict, *, hide_zero: bool = True):
@@ -1745,7 +1746,7 @@ def compare(current: dict, baseline_path: str, scenario=None) -> int:
     with open(baseline_path, "r", encoding="utf-8") as fh:
         base = json.load(fh)
     benv, cenv = base.get("env", {}) or {}, current.get("env", {}) or {}
-    shape_fields = ("res", "window", "ticks", "device")
+    shape_fields = ("res", "window", "ticks", "device", "prof1")
     mismatched = [f for f in shape_fields
                   if benv.get(f) is not None and cenv.get(f) is not None
                   and benv.get(f) != cenv.get(f)]
@@ -1757,7 +1758,8 @@ def compare(current: dict, baseline_path: str, scenario=None) -> int:
             print(f"    {f}: baseline={benv.get(f)!r}  current={cenv.get(f)!r}")
         print(f"    re-save the baseline at THIS shape first: --res {cenv.get('res')} "
               f"--window {cenv.get('window')} --ticks {cenv.get('ticks')} "
-              f"--device {cenv.get('device')}")
+              f"--device {cenv.get('device')} "
+              f"--prof1 {'on' if cenv.get('prof1') else 'off'}")
         return 1
     base_runs = base.get("runs", [])
     cur_runs = current.get("runs", [current])
@@ -1945,7 +1947,8 @@ def main(argv=None) -> int:
                     only=set(a.scenario) if a.scenario else None, top=a.top)
         report(r)
         runs.append(r)
-    payload = {"env": environment(a.res, a.window, a.ticks, a.device), "runs": runs}
+    payload = {"env": environment(a.res, a.window, a.ticks, a.device,
+                                  prof1=(a.prof1 == "on")), "runs": runs}
     if a.save:
         os.makedirs(os.path.dirname(os.path.abspath(a.save)) or ".", exist_ok=True)
         with open(a.save, "w", encoding="utf-8") as fh:

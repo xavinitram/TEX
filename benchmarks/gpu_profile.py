@@ -38,16 +38,16 @@ def kernel_count(prog, H, W):
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
             run(st); torch.cuda.synchronize()
     except Exception as e:
-        return None, None
+        raise RuntimeError(f"torch profiler failed: {str(e)[:60]}") from e
     n_kernels = 0
     gpu_us = 0.0
     for e in prof.key_averages():
-        dt = getattr(e, "device_type", None)
-        is_cuda = (str(dt).endswith("CUDA"))
-        cu = getattr(e, "cuda_time_total", 0) or getattr(e, "device_time_total", 0) or 0
-        if is_cuda or cu > 0:
-            n_kernels += int(getattr(e, "count", 0) or 0)
-            gpu_us += cu
+        # Only rows that ARE device work: a CPU-op row (aten::add) carries its children's
+        # kernel time in cuda_time_total, so counting `cu > 0` rows would count it twice.
+        if not str(getattr(e, "device_type", None)).endswith("CUDA"):
+            continue
+        n_kernels += int(getattr(e, "count", 0) or 0)
+        gpu_us += getattr(e, "cuda_time_total", 0) or getattr(e, "device_time_total", 0) or 0
     return n_kernels, gpu_us / 1000.0  # us total / 1000 = ms-ish (per profiled run)
 
 
@@ -69,6 +69,7 @@ for name in PROGS:
             t[r] = gpu_ms(p, r, r)
         except Exception as e:
             t[r] = None
+            print(f"  ({name} {r}^2 failed: {type(e).__name__}: {str(e)[:50]})")
     row = "".join((f"{t[r]:>9.3f}" if t.get(r) is not None else f"{'--':>9}") for r in RES)
     ratio = (t[2048] / t[64]) if (t.get(2048) and t.get(64)) else None
     # compute-bound would scale (2048/64)^2 = 1024x; launch-bound ~1x
@@ -89,4 +90,4 @@ for name in PROGS:
         print(f"  {name:<18} kernels~{nk:>4}  gpu_busy~{gpu_ms_:>7.3f}ms  wall~{wall:>7.3f}ms"
               f"  launch_overhead~{max(0, wall - gpu_ms_):>6.3f}ms")
     except Exception as e:
-        print(f"  {name:<18} (profiler failed: {str(e)[:40]})")
+        print(f"  {name:<18} (kernel count failed: {str(e)[:60]})")

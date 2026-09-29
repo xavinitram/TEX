@@ -119,10 +119,16 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
     # did, with no error, warning, or nonzero exit code anywhere.
     writer_error: dict = {}
     fetcher_error: dict = {}
+    # At most `lookahead` frames are fetched and not yet consumed by a cook: the fetcher
+    # takes a slot before each fetch and the cook returns it once it has used the frame.
+    slots = threading.Semaphore(max(1, lookahead))
 
     def fetcher():
         try:
             for i in range(frames):
+                while not slots.acquire(timeout=0.05):
+                    if stop.is_set():
+                        return
                 if stop.is_set():
                     return
                 try:
@@ -155,7 +161,10 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
     jobs = []
     for i in range(frames):
         def cook_one(cancel, _i=i):
-            out = _cook(promises[_i].value, device, cancel)
+            try:
+                out = _cook(promises[_i].value, device, cancel)
+            finally:
+                slots.release()
             writes.put(streams.egress(out))
             return True
         jobs.append(q.submit(cook_one, klass=Q.COMMITTED, inputs=[promises[i]]))
@@ -253,7 +262,7 @@ def main():
     t_over, q = measure_overlapped(args.frames, args.res, dev, args.in_stall,
                                    args.out_stall, p, args.lookahead)
     print(f"  overlapped          {t_over * 1000:9.1f} ms   ({p.fetches} fetches, "
-          f"waiting-peak seen by the queue: {q.stats.submitted} submitted)")
+          f"{q.stats.submitted} jobs submitted to the queue)")
 
     p = arm()
     t_tierb = measure_queue_prefetch(args.frames, args.res, dev, args.out_stall, p)

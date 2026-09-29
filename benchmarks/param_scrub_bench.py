@@ -32,6 +32,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+# A fresh cache dir per run: with the package-local disk cache the "cold" cook and the
+# recook control would hit compiled artifacts left by an earlier invocation.
+if not os.environ.get("TEX_CACHE_DIR"):
+    import tempfile
+    os.environ["TEX_CACHE_DIR"] = tempfile.mkdtemp(prefix="tex_param_scrub_")
+
 import torch
 from TEX_Wrangle import tex_engine
 
