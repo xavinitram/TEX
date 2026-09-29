@@ -22,6 +22,7 @@ import math
 import os
 import threading
 import time
+import types
 import torch
 
 from . import tier_trace as _tier_trace   # a leaf (collections/threading only): no import cycle
@@ -400,8 +401,8 @@ def _is_kernel_load_failure(exc: BaseException) -> bool:
 
     Deliberately conservative: an exception that does NOT carry an `ImportError`/`OSError`
     anywhere in its `.inner_exception` / `__cause__` / `__context__` chain returns False,
-    so a real compile bug (a genuine `InductorError` with no such cause) still surfaces
-    rather than being silently demoted to eager — the one thing this must never do.
+    so a real compile bug (a genuine `InductorError` with no such cause) never disables
+    Inductor process-wide; `_TieredCache._tier_failed` handles it per key and records it.
 
     Bounded to 10 hops (ordinary wrapping is 1-2 deep) so a contrived or accidentally
     self-referential chain cannot spin; it simply stops looking and returns False.
@@ -438,6 +439,7 @@ class _TieredCache:
         self._compile_attempted: set = set()
         self._call_count: dict = {}
         self._settled: set = set()   # (key, shape, dtype) signatures past the profiling window
+        self._fallback: dict = {}    # key -> the tier a promotion replaced (see _tier_failed)
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -479,6 +481,7 @@ class _TieredCache:
             # while the old tier's signatures still read as settled, and serves an
             # unsettled value from it — the exact defect _settle exists to prevent.
             self.forget_settled(key)
+            self._fallback[key] = self.cache.get(key)
             self.cache[key] = built
             _tier_trace.record_noise_compile(self.name, (time.perf_counter() - _t0) * 1000.0)  # P6
         except Exception as e:
@@ -550,12 +553,14 @@ class _TieredCache:
         out = eager_fn(*args) if fn is None else self._settle(key, fn, eager_fn, args)
         # A host asked which tier served this cook (tier_trace's noise-tier record). Unasked,
         # this attribute read is all a call pays. The tier is read off the callable that served,
-        # never off the result: eager if none was held or _settle just demoted the key.
+        # never off the result: eager if none was held or _settle just demoted the key, and
+        # the cache's current callable if _settle moved a promoted key back to its trace.
         if _tier_trace._noise_tiers.record is not None:
+            held = self.cache.get(key)
             _tier_trace.note_noise_tier(
                 self.name, key,
-                "eager" if fn is None or self.cache.get(key) is False else
-                "trace" if isinstance(fn, torch.jit.ScriptFunction) else "promoted")
+                "eager" if fn is None or held is False else
+                "trace" if isinstance(held, torch.jit.ScriptFunction) else "promoted")
         return out
 
     def _settle(self, key, fn, eager_fn, args):
@@ -605,8 +610,8 @@ class _TieredCache:
         TRK-193: on this box's torch, that load failure can arrive wrapped in
         `torch._inductor.exc.InductorError` (a `RuntimeError` subclass) rather than as a
         bare `ImportError`/`OSError`, so the guard below is `_is_kernel_load_failure`, not
-        an exception-type catch — see that predicate's docstring. A match this predicate
-        REJECTS (a real compile bug) re-raises immediately rather than falling back.
+        an exception-type catch — see that predicate's docstring. Any other exception goes
+        to `_tier_failed`, which lets eager decide whether it is the tier's or the program's.
         """
         sig = (key,) + tuple((tuple(a.shape), a.stride(), a.dtype)
                              for a in args if isinstance(a, torch.Tensor))
@@ -650,7 +655,7 @@ class _TieredCache:
                 out = nxt
         except Exception as e:
             if not _is_kernel_load_failure(e):
-                raise
+                return self._tier_failed(key, fn, eager_fn, args, e)
             return self._run_or_fall_back(key, fn, eager_fn, args, exc=e)
 
         # Never converged. Demote the key to eager for the rest of the process: store()
@@ -679,7 +684,7 @@ class _TieredCache:
         this path gets the identical guard rather than a bare `fn(*args)`. TRK-193: the
         guard is `_is_kernel_load_failure`, not an exception-type catch, so a torch build
         that wraps the load failure in `InductorError` is still caught; anything that
-        predicate rejects re-raises immediately rather than being treated as `exc`.
+        predicate rejects goes to `_tier_failed` instead.
 
         Demoting to eager (never back to jit.trace) matches the "never converged" ending
         below: once a key's cached callable is known to raise on load, there is no cheap way
@@ -694,15 +699,53 @@ class _TieredCache:
                 return fn(*args)
             except Exception as e:
                 if not _is_kernel_load_failure(e):
-                    raise
+                    return self._tier_failed(key, fn, eager_fn, args, e)
                 exc = e
         self.cache[key] = False
         self.forget_settled(key)
         _disable_inductor_after_kernel_block(exc)
         return eager_fn(*args)
 
+    def _tier_failed(self, key, fn, eager_fn, args, exc):
+        """`fn` (a trace or promoted tier) raised `exc`, which is not a kernel-load failure.
+
+        Eager is the oracle, so it decides. If eager raises too, the error is the program's
+        and reaches the cook unchanged, with the key left alone. If eager answers, the
+        failure belonged to the tier: a promoted key goes back to the trace it replaced (and
+        the failure is recorded, like a failed promotion), a trace goes to eager. Measured in
+        long processes: Dynamo's recompile limit (`FailOnRecompileLimitHit` under
+        `fullgraph=True`) and a C++ build failure at a new signature, both raised out of
+        the cook before this. Out-of-memory is re-raised untouched for the engine's own
+        OOM handling, and does not demote anything.
+        """
+        if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
+            raise exc
+        out = eager_fn(*args)
+        promoted = not isinstance(fn, torch.jit.ScriptFunction)
+        with self._lock:
+            if self.cache.get(key) is fn:      # the first thread to see it demotes
+                prev = self._fallback.pop(key, None) if promoted else None
+                self.cache[key] = prev if callable(prev) else False
+        self.forget_settled(key)
+        nxt = self.get(key)
+        if promoted:
+            try:
+                dev = next(a.device.type for a in args if isinstance(a, torch.Tensor))
+                _tier_trace.record_noise_compile_failure(self.name, dev, exc, key=key)
+            except Exception:
+                pass
+        # Serve through the trace (settled) rather than eager, so the frames after this one
+        # come from the same tier as this one.
+        if nxt is None or nxt is fn:
+            return out
+        return self._settle(key, nxt, eager_fn, args)
+
 
 _simplex_cache = _TieredCache("simplex")
+
+
+# Only a test swaps this (to Dynamo's "eager" backend, which needs no compiler).
+_NOISE_COMPILE_BACKEND = "inductor"
 
 
 def _compile_noise(fn):
@@ -711,15 +754,30 @@ def _compile_noise(fn):
     guards -- the measured 134x / 5.6 s recompile stall. Verified: 1 graph across
     512/1024/2048, within ~1 fp32 ULP of the static-compiled path (invariant-#2 gate),
     full compile speedup kept (~13-18x over eager). The cache key stays shape-UNAWARE
-    (one entry), so no per-shape re-trace fragility."""
-    return torch.compile(fn, backend='inductor', fullgraph=True, dynamic=True)
+    (one entry), so no per-shape re-trace fragility.
+
+    Each promotion compiles a COPY of `fn` with its own code object. Dynamo files its
+    specializations per code object and, under `fullgraph=True`, raises once one holds
+    `recompile_limit` (8) of them. Every fbm octave count is a closure over the one
+    `fbm_fn` code, so they all shared one budget of 8 and the next new signature raised."""
+    own = types.FunctionType(fn.__code__.replace(), fn.__globals__, fn.__name__,
+                             fn.__defaults__, fn.__closure__)
+    return torch.compile(own, backend=_NOISE_COMPILE_BACKEND, fullgraph=True, dynamic=True)
+
+
+def _warm_coords(device):
+    """Two DISTINCT warm-up coordinate tensors. Passing one tensor as both x and y compiles
+    an aliased ("duplicate tensors") specialization no real call reuses, so the first real
+    call paid a second compile and each promotion spent two of Dynamo's slots. Built without
+    the RNG so a promotion never advances the host's global generator."""
+    x = torch.arange(64 * 64, dtype=torch.float32, device=device).reshape(1, 64, 64) / 64.0
+    return x, x.transpose(1, 2).contiguous()
 
 
 def _compile_simplex(device):
     """Compile simplex with Inductor and warm it on the target device."""
     compiled = _compile_noise(_simplex2d_fast)
-    dummy = torch.rand(1, 64, 64, device=device)
-    compiled(dummy, dummy)
+    compiled(*_warm_coords(device))
     return compiled
 
 
@@ -886,8 +944,7 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
 
     def _compile_fbm():
         compiled = _compile_noise(_make_fbm_fast_fn(octaves))
-        dummy = torch.rand(1, 64, 64, device=x.device)
-        compiled(dummy, dummy)
+        compiled(*_warm_coords(x.device))
         return compiled
 
     return _fbm_cache.call(
@@ -1021,9 +1078,8 @@ def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torc
 
     def _compile_worley():
         compiled = _compile_noise(fn)
-        dummy = torch.rand(1, 64, 64, device=ref.device)
-        warmup_dx, warmup_dy = _get_worley_offsets(dummy.device, dummy.dim())
-        compiled(dummy, dummy, warmup_dx, warmup_dy)
+        wx, wy = _warm_coords(ref.device)
+        compiled(wx, wy, *_get_worley_offsets(ref.device, wx.dim()))
         return compiled
 
     return _worley_cache.call(

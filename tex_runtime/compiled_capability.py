@@ -288,6 +288,82 @@ class _DaemonProbePool:
         return fut
 
 
+class _CompilePool:
+    """`compiled._COMPILE_POOL` / `_WARM_POOL`: one daemon worker, started on first submit,
+    whose queue is DRAINED at interpreter exit by `_drain_compile_pools_at_exit`.
+
+    These were `ThreadPoolExecutor(max_workers=1)`, whose exit hook joins every worker it
+    ever started. The join is wanted for a live pool (a prewarm child exits right after
+    queueing its compiles and relies on it to run them), but K5 (`compiled._pool_for`)
+    ABANDONS a pool whose job is stuck, and the exit hook still joined that stuck worker:
+    once any pool had been abandoned, the process could never exit. Now only the pools
+    `compiled` currently holds are drained, and never past K5's own stuck bound."""
+
+    def __init__(self, thread_name: str) -> None:
+        self._name = thread_name
+        self._q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._cv = threading.Condition()
+        self._unfinished = 0
+        self._thread: "threading.Thread | None" = None
+
+    def _run(self) -> None:
+        while True:
+            fut, fn = self._q.get()
+            if fut.set_running_or_notify_cancel():
+                try:
+                    fut.set_result(fn())
+                except BaseException as exc:   # propagate to the future, never crash the worker
+                    fut.set_exception(exc)
+            del fut, fn
+            with self._cv:
+                self._unfinished -= 1
+                self._cv.notify_all()
+
+    def submit(self, fn) -> Future:
+        fut: Future = Future()
+        with self._cv:
+            self._unfinished += 1
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+                self._thread.start()
+        self._q.put((fut, fn))
+        return fut
+
+    def drain(self, stuck) -> None:
+        """Wait until every submitted job has finished, or `stuck()` turns True."""
+        with self._cv:
+            while self._unfinished and not stuck():
+                self._cv.wait(0.25)
+
+
+def _drain_compile_pools_at_exit() -> None:
+    compiled = sys.modules.get(__name__.rpartition(".")[0] + ".compiled")
+    if compiled is None:
+        return
+    for name, attr in (("compile", "_COMPILE_POOL"), ("warm", "_WARM_POOL")):
+        pool = getattr(compiled, attr, None)
+        if not isinstance(pool, _CompilePool):
+            continue
+
+        def stuck(name=name):
+            since = compiled._pool_busy_since.get(name)
+            return since is not None and \
+                compiled._time.monotonic() - since > compiled._POOL_STUCK_BOUND_S
+        try:
+            pool.drain(stuck)
+        except Exception:
+            pass
+
+
+# Registered with threading's own exit hooks (where concurrent.futures drains its pools), so it
+# runs BEFORE plain atexit callbacks such as warm_state's final flush.
+try:
+    threading._register_atexit(_drain_compile_pools_at_exit)
+except Exception:
+    import atexit
+    atexit.register(_drain_compile_pools_at_exit)
+
+
 _capability_pool: "_DaemonProbePool | None" = None
 # A plain Lock (not RLock): _get_capability_pool() takes this lock ITSELF to create the
 # pool, so compile_capability_async() below must never still be holding it when it calls

@@ -13,7 +13,6 @@ torch.compile handles shape-based recompilation internally via guards.
 """
 from __future__ import annotations
 
-import concurrent.futures
 import glob
 import logging
 import math
@@ -50,7 +49,8 @@ from .pacing_heavy import program_has_any_heavy_stmt as _program_has_any_heavy_s
 from .compiled_capability import (_count_tensor_ops, _max_loop_depth, _select_backend,
                                   compile_capability, compile_capability_async,
                                   _reset_capability_cache_for_test,
-                                  _probe_cuda_inductor, _probe_cpu_inductor, _OP_TYPES)
+                                  _probe_cuda_inductor, _probe_cpu_inductor, _OP_TYPES,
+                                  _CompilePool)
 from .compiled_exec_support import (_show_once, _maybe_triton_hint, _ensure_inductor_cache_dir,
                                     _timed, _timed_deferred, _deferred_ev,
                                     _contiguous_bindings, _WARM_CLONE_CAP_BYTES,
@@ -404,20 +404,20 @@ def _get_or_make_codegen_fn(program: Any, type_map: dict | None,
 # A long-lived worker provides the same dynamo-TLS isolation as a fresh pool
 # per call (the entire compile+run stays off the main thread) without paying
 # OS thread create/destroy on every frame of a batch/video workload.
-_COMPILE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_COMPILE_POOL = _CompilePool("tex-compile")
 
 # C1 (B1#1): a SEPARATE single-thread worker for any job carrying a `warm_call` (CC-5's
 # paid-in-the-background lazy first-call cost, 10-30s of real Dynamo trace + Inductor
 # lowering). `_run_cached_compiled`/`_compile_and_run` block on `_COMPILE_POOL` futures --
 # sharing ONE worker with a warm job stalled any other program's cook behind it, with no
 # timeout. A wrap-only job has nothing slow to isolate and keeps using `_COMPILE_POOL`.
-_WARM_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_WARM_POOL = _CompilePool("tex-warm")
 
 # K5 (v0.50.0 Phase C, B3#4/B3#5): neither `_COMPILE_POOL` nor `_WARM_POOL` times out a
 # job, and each is `max_workers=1` -- a genuinely stuck one (a real compiler stall: an
 # MSVC subprocess, a Triton autotune spin) blocks every LATER submission to that SAME
-# pool forever, since a Python thread cannot be forcibly killed and `ThreadPoolExecutor`
-# has no "abandon the running job" operation. COMPILETRY-50's one-ever fall-through
+# pool forever, since a Python thread cannot be forcibly killed and a pool has no
+# "abandon the running job" operation. COMPILETRY-50's one-ever fall-through
 # attempt widened the population of programs that can reach this real-compile risk (a
 # `_has_fn_calls` program used to never attempt a real compile at all). Rather than try
 # to bound the stuck call itself (unsafe -- native code, a blocking subprocess), a
@@ -431,17 +431,17 @@ _POOL_STUCK_BOUND_S = 30.0
 _pool_busy_since: dict[str, float] = {}
 
 
-def _pool_for(name: str) -> "concurrent.futures.ThreadPoolExecutor":
+def _pool_for(name: str) -> _CompilePool:
     """The live pool for `name` ("compile"/"warm"), replacing it with a fresh
-    `ThreadPoolExecutor(max_workers=1)` first if its current job has been running past
+    `_CompilePool` first if its current job has been running past
     `_POOL_STUCK_BOUND_S` -- see the module comment above `_POOL_STUCK_BOUND_S`."""
     global _COMPILE_POOL, _WARM_POOL
     busy_since = _pool_busy_since.get(name)
     if busy_since is not None and (_time.monotonic() - busy_since) > _POOL_STUCK_BOUND_S:
         if name == "compile":
-            _COMPILE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _COMPILE_POOL = _CompilePool("tex-compile")
         else:
-            _WARM_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _WARM_POOL = _CompilePool("tex-warm")
         _pool_busy_since.pop(name, None)
     return _COMPILE_POOL if name == "compile" else _WARM_POOL
 

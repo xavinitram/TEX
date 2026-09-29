@@ -458,6 +458,10 @@ def test_example_files_compiled(r: SubTestResult):
     except Exception:
         pass
 
+    # ONE worker for every program: a fresh pool per program started a thread per program,
+    # and each thread that runs a parallel CPU op keeps a torch thread team alive after it
+    # exits (OS threads that pile up in a whole-suite process).
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     for tex_path in tex_files:
         name = tex_path.stem
         try:
@@ -479,11 +483,9 @@ def test_example_files_compiled(r: SubTestResult):
                 codegen_fallback += 1
 
             # Run with timeout — torch.compile can hang on complex programs
-            # No `with`: leaving a `with ThreadPoolExecutor` block waits for the worker,
-            # which would turn this guard into a wait for the very compile it guards
-            # against. A worker that outlives the timeout keeps running in the background
-            # (a thread cannot be killed); the suite moves on.
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            # A timed-out compile keeps its worker busy (a thread cannot be killed), so a
+            # timeout abandons that pool and starts a fresh one; otherwise the one worker
+            # is reused, which keeps the CPU runtime's per-thread pools from piling up.
             future = pool.submit(
                 execute_compiled,
                 program, bindings, type_map, "cpu", fp,
@@ -493,6 +495,7 @@ def test_example_files_compiled(r: SubTestResult):
                 result = future.result(timeout=_PER_PROGRAM_TIMEOUT)
             except concurrent.futures.TimeoutError:
                 pool.shutdown(wait=False, cancel_futures=True)
+                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 timed_out += 1
                 # Emit a named skip, never a silent drop: the timeout is
                 # load-dependent (a program that compiles in 10s alone can
@@ -502,7 +505,6 @@ def test_example_files_compiled(r: SubTestResult):
                 r.skip(f"example compiled: {name}",
                        f"torch.compile exceeded {_PER_PROGRAM_TIMEOUT}s")
                 continue
-            pool.shutdown(wait=False)
 
             # Verify we got outputs
             if isinstance(result, dict):
@@ -544,6 +546,7 @@ def test_example_files_compiled(r: SubTestResult):
             except Exception:
                 pass
 
+    pool.shutdown(wait=True)
     example_failed = r.failed - start_failed
     example_passed = len(tex_files) - example_failed - timed_out
     timeout_note = f", timed out: {timed_out}" if timed_out else ""

@@ -1182,47 +1182,52 @@ def test_trk193_is_kernel_load_failure_predicate(r: SubTestResult):
 
 
 def test_trk193_unrelated_runtime_error_not_swallowed(r: SubTestResult):
-    """The widened `except Exception` in `_settle` and `_run_or_fall_back` (TRK-193) must
-    still let a genuine, unrelated compile bug surface rather than demoting the key to
-    eager and hiding it — `_is_kernel_load_failure` is what keeps that promise. Direct
-    `_TieredCache` probes, mirroring `test_v031_noise_cold_path_shape`'s style; no shared
-    module-global state is touched because nothing here ever reaches
-    `_disable_inductor_after_kernel_block`."""
-    print("\n--- TRK-193: an unrelated RuntimeError is never swallowed as a kernel-load "
-          "failure ---")
+    """An exception that is NOT a kernel-load failure never reaches
+    `_disable_inductor_after_kernel_block` (process-wide), and never vanishes either: eager
+    decides. When eager answers, the failure was the tier's, so the key is demoted per key and
+    the cook gets eager's value; when eager raises too, the error is the program's and reaches
+    the caller, with the key untouched. Direct `_TieredCache` probes; the process-wide hook is
+    replaced by a recorder so no shared state is touched."""
+    print("\n--- TRK-193: an unrelated RuntimeError is a per-key fallback, never process-wide ---")
     from TEX_Wrangle.tex_runtime import noise
 
-    fails = []
+    fails, disabled = [], []
 
     def _boom(*args):
         raise RuntimeError("a genuine compile bug, unrelated to any kernel load")
 
-    probe = noise._TieredCache("probe-trk193-settle-unrelated")
-    probe.cache["k"] = _boom
+    saved = noise._disable_inductor_after_kernel_block
+    noise._disable_inductor_after_kernel_block = lambda exc: disabled.append(exc)
     try:
-        probe._settle("k", _boom, lambda a: a * 4.0, (torch.ones(3),))
-        fails.append("_settle swallowed an unrelated RuntimeError instead of re-raising it")
-    except RuntimeError as e:
-        if "genuine compile bug" not in str(e):
-            fails.append(f"_settle re-raised the wrong exception: {e!r}")
-    if probe.cache.get("k") is False:
-        fails.append("_settle demoted the key to eager for an unrelated RuntimeError")
+        for label, call in (("_settle", "_settle"), ("_run_or_fall_back", "_run_or_fall_back")):
+            probe = noise._TieredCache("probe-trk193-" + label)
+            probe.cache["k"] = _boom
+            got = getattr(probe, call)("k", _boom, lambda a: a * 4.0, (torch.ones(3),))
+            if not torch.equal(got, torch.full((3,), 4.0)):
+                fails.append(f"{label} did not answer from eager: {got!r}")
+            if probe.cache.get("k") is not False:
+                fails.append(f"{label} left the failing tier in place")
 
-    probe2 = noise._TieredCache("probe-trk193-fallback-unrelated")
-    try:
-        probe2._run_or_fall_back("k2", _boom, lambda a: a * 5.0, (torch.ones(3),))
-        fails.append("_run_or_fall_back swallowed an unrelated RuntimeError")
-    except RuntimeError as e:
-        if "genuine compile bug" not in str(e):
-            fails.append(f"_run_or_fall_back re-raised the wrong exception: {e!r}")
-    if probe2.cache.get("k2") is False:
-        fails.append("_run_or_fall_back demoted the key to eager for an unrelated RuntimeError")
+            probe2 = noise._TieredCache("probe-trk193-genuine-" + label)
+            probe2.cache["k"] = _boom
+            try:
+                getattr(probe2, call)("k", _boom, _boom, (torch.ones(3),))
+                fails.append(f"{label} swallowed an error eager raises too")
+            except RuntimeError as e:
+                if "genuine compile bug" not in str(e):
+                    fails.append(f"{label} raised the wrong exception: {e!r}")
+            if probe2.cache.get("k") is not _boom:
+                fails.append(f"{label} demoted the key for an error eager raises too")
+    finally:
+        noise._disable_inductor_after_kernel_block = saved
+    if disabled:
+        fails.append(f"an unrelated RuntimeError disabled Inductor process-wide: {disabled}")
 
     if fails:
-        r.fail("unrelated RuntimeError not swallowed", "; ".join(fails))
+        r.fail("unrelated RuntimeError", "; ".join(fails))
     else:
-        r.ok("_settle and _run_or_fall_back both re-raise an unrelated RuntimeError instead "
-             "of demoting the key to eager")
+        r.ok("an unrelated RuntimeError falls back per key when eager answers, surfaces when "
+             "eager raises too, and never disables Inductor process-wide")
 
 
 def test_trk193_try_upgrade_disables_on_wrapped_inductor_error(r: SubTestResult):

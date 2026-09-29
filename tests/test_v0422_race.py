@@ -61,6 +61,37 @@ def test_v0422_race_restore_pinned_h2d_survives_concurrent_readers(r):
         c = tex_results.ResultCache(cache_dir=d, budget_mb=_RAM_BUDGET_MB)
         errors = []
         restores_before = c.restores
+        # The SAME _READERS threads serve every round (released together by `start`, reporting
+        # back through `done`). A fresh thread per reader per round leaked one CPU thread team
+        # of the torch parallel runtime per thread (it outlives the Python thread): 160 threads
+        # here left ~3700 OS threads in the whole-suite process.
+        start = threading.Barrier(_READERS + 1)
+        done = threading.Barrier(_READERS + 1)
+        round_ = {}
+
+        def reader(idx):
+            for _ in range(_ITERATIONS):
+                try:
+                    start.wait()
+                except threading.BrokenBarrierError:
+                    return
+                key, frame, it = round_["key"], round_["frame"], round_["it"]
+                try:
+                    got = c.get(key, copy=False)
+                    if got is not None and not torch.equal(got, frame):
+                        errors.append(f"iter={it} reader={idx}: get() served content "
+                                      f"that does not match the frame written for {key!r}")
+                except Exception as e:
+                    errors.append(f"iter={it} reader={idx}: get() raised {e!r}")
+                try:
+                    done.wait()
+                except threading.BrokenBarrierError:
+                    return
+
+        threads = [threading.Thread(target=reader, args=(j,), daemon=True)
+                   for j in range(_READERS)]
+        for t in threads:
+            t.start()
         for it in range(_ITERATIONS):
             key = f"race{it}"
             frame = _frame(res=_RES, device="cuda", scale=1.0 + it * 0.001)
@@ -82,24 +113,17 @@ def test_v0422_race_restore_pinned_h2d_survives_concurrent_readers(r):
             c.set_vram_budget(None)
             c.set_budget(_RAM_BUDGET_MB)
 
-            barrier = threading.Barrier(_READERS)
-
-            def reader(idx):
-                barrier.wait()
-                got = c.get(key, copy=False)
-                if got is not None and not torch.equal(got, frame):
-                    errors.append(f"iter={it} reader={idx}: get() served content "
-                                  f"that does not match the frame written for {key!r}")
-
-            threads = [threading.Thread(target=reader, args=(j,), daemon=True)
-                       for j in range(_READERS)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=30.0)
-            hung = [t.name for t in threads if t.is_alive()]
-            if hung:
-                errors.append(f"iter={it}: reader thread(s) still alive: {hung}")
+            round_.update(key=key, frame=frame, it=it)
+            try:
+                start.wait(timeout=30.0)
+                done.wait(timeout=30.0)
+            except threading.BrokenBarrierError:
+                errors.append(f"iter={it}: a reader never finished its get() within 30s")
+                start.abort()
+                done.abort()
+                break
+        for t in threads:
+            t.join(timeout=30.0)
         restored = c.restores - restores_before
         ok = not errors and restored > 0
         r.ok(f"[cuda] {_ITERATIONS} spill/restore rounds x {_READERS} readers released "
