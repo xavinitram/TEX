@@ -556,6 +556,12 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
     Returns the frame, or None when `speculative=True` and the pool refused the insert
     (backpressure — the caller is a prefetch and has nothing to report).
     """
+    return _materialize(source_key, t, mode, speculative, None)
+
+
+def _materialize(source_key, t, mode, speculative, before_install):
+    """`materialize`, with a hook run after the provider's read and before the pool takes
+    the frame (a prefetch passes its cancel check, so a cancelled read installs nothing)."""
     # P0-A: the generation and the provider are read ATOMICALLY.
     #
     # Two separate reads left a window — narrow, ~2 bytecodes, but the same shape as v0.33.2's
@@ -644,6 +650,8 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
         # the POOL, and above them it was paid by two paths that never reach the pool: an
         # unkeyed source (`source_key == ""`, which CACHE-6's precedent says is never cached)
         # and a fetch whose generation changed. ~17 ms per 4K frame, bought for nothing.
+        if before_install is not None:
+            before_install()
         if not getattr(prov, "frames_are_owned", False):
             _t0 = time.perf_counter()
             frame = frame.clone()
@@ -753,9 +761,8 @@ def declare_window(queue, source_key: str, t0: float, t1: float, *,
             # Drop-on-landing: a shed or cancelled prefetch that is already inside the
             # provider's read cannot be stopped from outside. What TEX guarantees is that
             # its result is never installed, and this is where that is guaranteed.
-            frame = materialize(source_key, _t, mode, speculative=True)
-            if cancel is not None:
-                cancel.check()
+            frame = _materialize(source_key, _t, mode, True,
+                                 cancel.check if cancel is not None else None)
             return frame is not None
         jobs.append(queue.submit(_prefetch, klass=SPECULATIVE, reason=PREFETCH,
                                  confidence=confidence, feeds_profile=False))
