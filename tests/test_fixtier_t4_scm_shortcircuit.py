@@ -52,6 +52,13 @@ def _bindings(res: int = 20):
 
 
 def test_fixtier_t4_scm_never_called_at_scale_one(r: SubTestResult):
+    # A warm on-disk codegen entry from an earlier run would serve a function built without
+    # the counting wrapper, so the scale=0.5 leg would never reach it: start from a cold cache.
+    with cold_engine_state():
+        _run_counting_cooks(r)
+
+
+def _run_counting_cooks(r: SubTestResult):
     print("\n--- FIX-TIER T4: _SCM is never invoked for a scale==1.0 pixel_args= call site ---")
     calls = {"n": 0}
     real = _stdlib_core._scale_pixel_arg
