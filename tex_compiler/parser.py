@@ -45,7 +45,6 @@ Grammar (simplified):
                | '(' expr ')' | vec_constructor | mat_constructor | cast_expr
 """
 from __future__ import annotations
-import copy
 import re as _re
 
 from .lexer import Token, TokenType
@@ -57,7 +56,7 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
-    BindingIndexAccess, BindingSampleAccess, ErrorNode,
+    BindingIndexAccess, BindingSampleAccess, ErrorNode, clone_tree,
 )
 from .diagnostics import (make_diagnostic, get_keyword_hint, get_v020_reserved_hint,
                           get_type_hint, TEXMultiError)
@@ -866,12 +865,11 @@ class Parser:
                 if isinstance(expr, BindingIndexAccess):
                     return Assignment(loc=loc, target=expr, value=value, op=op)
                 # Clone the lvalue for the read side: passes that mutate the
-                # AST in place assume no shared subtrees (see _clone_expr in
-                # the optimizer).
+                # AST in place assume no shared subtrees.
                 return Assignment(
                     loc=loc,
                     target=expr,
-                    value=BinOp(loc=loc, op=op, left=copy.deepcopy(expr), right=value),
+                    value=BinOp(loc=loc, op=op, left=clone_tree(expr), right=value),
                 )
 
         # Plain assignment
@@ -910,7 +908,7 @@ class Parser:
         return Assignment(
             loc=loc,
             target=target,
-            value=BinOp(loc=loc, op=op, left=copy.deepcopy(target), right=one),
+            value=BinOp(loc=loc, op=op, left=clone_tree(target), right=one),
         )
 
     def parse_block(self) -> list[ASTNode]:

@@ -1,21 +1,17 @@
 """
 TEX Optimizer — AST transformation passes for compile-time optimization.
 
-Passes:
-  1. Constant folding: evaluate expressions with all-literal operands at compile time
-  2. Algebraic simplification: x*1 -> x, pow(x,2) -> x*x, etc.
-     (NOTE: x*0 -> 0 is deliberately NOT done — it's shape-unsafe when x is a
-      spatial tensor; see _fold_binop.)
-  3. Dead code elimination
-  4. Common Subexpression Elimination (CSE)
-  5. Loop-Invariant Code Motion (LICM): hoist pure expressions out of loops
+`PASSES` is the pipeline and its order is load-bearing (see the comment above it): literal
+locals are propagated, constants folded (algebraic simplification happens in the same walk),
+dead code removed, common subexpressions merged, dead code removed again, loop invariants
+hoisted, and small constant-trip loops unrolled. `x*0 -> 0` is deliberately NOT done: it is
+shape-unsafe when x is a spatial tensor (see `_fold_binop`).
 
-All passes preserve semantic equivalence. Applied after type checking, before
-interpretation. Operates on the AST in-place (mutates nodes).
+Every pass preserves semantics. `optimize()` runs after type checking and its result is
+type-checked again before the interpreter or codegen consume it. It mutates the AST in place.
 """
 from __future__ import annotations
 import contextvars
-import copy
 import math
 import struct
 from collections.abc import Callable
@@ -27,7 +23,7 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral, SourceLoc,
-    try_extract_static_range,
+    try_extract_static_range, clone_tree,
     iter_child_nodes as _iter_children,
     NodeVisitor,
 )
@@ -42,11 +38,6 @@ _TYPE_TO_NAME = {
     TEXType.MAT3: "mat3", TEXType.MAT4: "mat4",
 }
 
-
-def _clone_expr(expr: ASTNode) -> ASTNode:
-    """Deep-copy an expression subtree so it is not aliased into multiple tree
-    positions. Passes that mutate the AST in place assume no shared subtrees."""
-    return copy.deepcopy(expr)
 
 # Pure math functions safe for constant folding (no side effects, deterministic)
 _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
@@ -156,19 +147,20 @@ def optimize(program: Program, type_map: dict | None = None) -> Program:
 
 # ── UC-4: constant propagation of literal locals ──────────────────────
 
-def _expr_reads_name(expr, names) -> bool:
-    """True if `expr` contains an Identifier read of any name in `names`.
+def _names_read(expr, names) -> set:
+    """The members of `names` that `expr` reads as an Identifier.
 
     Only plain Identifiers count — the names in `subs` are local scalars, and
     _subst_expr only rewrites matching Identifier nodes (never BindingRef), so
-    this exactly predicts whether substitution would change anything here."""
+    this exactly predicts what substitution would change here."""
+    found = set()
     stack = [expr]
     while stack:
         n = stack.pop()
         if type(n) is Identifier and n.name in names:
-            return True
+            found.add(n.name)
         stack.extend(_iter_children(n))
-    return False
+    return found
 
 
 def _subst_all_literals(expr, subs: dict) -> ASTNode:
@@ -183,10 +175,12 @@ def _subst_all_literals(expr, subs: dict) -> ASTNode:
     # post-optimize re-type-check rejects. (Root cause of the bilateral_approx
     # `_licm0` int/float TypeCheckError: the untouched `v + float(dy)/ih` line
     # was rebuilt, and the fresh node reused a freed INT node's id.)
-    if not _expr_reads_name(expr, subs):
+    read = _names_read(expr, subs)
+    if not read:
         return expr
     for name, (val, is_int) in subs.items():
-        expr = _subst_expr(expr, name, val, is_int)
+        if name in read:   # each rebuild costs the whole expression: only the names it reads
+            expr = _subst_expr(expr, name, val, is_int)
     return expr
 
 
@@ -567,11 +561,11 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         if _has_side_effects(args[0]):
             pass
         elif exp == 2.0:
-            return BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
+            return BinOp(loc=node.loc, op="*", left=args[0], right=clone_tree(args[0]))
         # pow(x, 3) -> x * x * x
         elif exp == 3.0:
-            x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
-            return BinOp(loc=node.loc, op="*", left=x_sq, right=_clone_expr(args[0]))
+            x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=clone_tree(args[0]))
+            return BinOp(loc=node.loc, op="*", left=x_sq, right=clone_tree(args[0]))
         # pow(x, 0.5) -> sqrt(x) is NOT applied: fn_sqrt clamps its arg to min 0
         # while fn_pow preserves NaN for negative bases with fractional exponents
         # (pow(-2, 0.5) is NaN). Rewriting to sqrt would silently turn NaN into 0
@@ -713,40 +707,22 @@ def _has_side_effects(expr: ASTNode) -> bool:
 
     Function calls count because user functions can persist scatter writes to
     bindings; indexed/sampled binding reads count because they can raise at
-    runtime (e.g. fetching from a non-image binding). Wrapper nodes (casts,
-    swizzles, indexing, constructors) recurse so a wrapped call or binding
-    read is still preserved.
+    runtime (e.g. fetching from a non-image binding). Every other node is as
+    impure as its children, so a wrapped call or binding read is still preserved.
     """
-    if isinstance(expr, FunctionCall):
-        # Pure builtins (the CSE/LICM whitelist) have no side effects — but a
-        # wrapped binding read or impure arg still does, so recurse into args
-        # (Q-2: type_checker forbids redefining builtin names, so name-keyed
-        # purity can't be spoofed). Non-whitelisted / user calls stay impure.
-        if expr.name in _CSE_PURE_FUNCTIONS:
-            return any(_has_side_effects(a) for a in expr.args)
-        return True
-    if isinstance(expr, BinOp):
-        return _has_side_effects(expr.left) or _has_side_effects(expr.right)
-    if isinstance(expr, UnaryOp):
-        return _has_side_effects(expr.operand)
-    if isinstance(expr, TernaryOp):
-        return (_has_side_effects(expr.condition) or
-                _has_side_effects(expr.true_expr) or
-                _has_side_effects(expr.false_expr))
-    if isinstance(expr, VecConstructor):
-        return any(_has_side_effects(a) for a in expr.args)
-    if isinstance(expr, MatConstructor):
-        return any(_has_side_effects(a) for a in expr.args)
-    if isinstance(expr, ArrayLiteral):
-        return any(_has_side_effects(e) for e in expr.elements)
-    if isinstance(expr, CastExpr):
-        return _has_side_effects(expr.expr)
-    if isinstance(expr, ChannelAccess):
-        return _has_side_effects(expr.object)
-    if isinstance(expr, ArrayIndexAccess):
-        return _has_side_effects(expr.array) or _has_side_effects(expr.index)
-    if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        return True  # Reads from bindings — preserve
+    stack = [expr]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, FunctionCall):
+            # Pure builtins (the CSE/LICM whitelist) have no side effects — but a wrapped
+            # binding read or impure arg still does, so the args are walked too (Q-2: the
+            # checker forbids redefining builtin names, so name-keyed purity can't be
+            # spoofed). Non-whitelisted / user calls stay impure.
+            if n.name not in _CSE_PURE_FUNCTIONS:
+                return True
+        elif isinstance(n, (BindingIndexAccess, BindingSampleAccess)):
+            return True  # Reads from bindings — preserve
+        stack.extend(_iter_children(n))
     return False
 
 
