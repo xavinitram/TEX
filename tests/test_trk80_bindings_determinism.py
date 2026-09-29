@@ -90,11 +90,12 @@ def test_trk80_generate_bindings_is_repeatable_within_one_process(rb, ex_denoise
             assert v1 == v2, f"binding {k!r} differs between two generate_bindings calls"
 
 
-def test_trk80_generate_bindings_is_repeatable_across_processes(rb, ex_denoise):
-    """The other half of the reproduction: the same program measured ALONE (a fresh process,
-    nothing else has touched the RNG) must draw the identical tensors a process that ran 60
-    other programs first would draw for it — the seed is a function of (name, shape) only,
-    never of how many `torch.rand` calls happened earlier in this process."""
+def test_trk80_generate_bindings_is_independent_of_global_rng_state(rb, ex_denoise):
+    """The other half of the reproduction: the same program measured after heavy RNG churn
+    (as if 60 other programs had run first) must draw the identical tensors it draws from a
+    freshly seeded RNG — the seed is a function of (name, shape) only, never of how many
+    `torch.rand` calls happened earlier. (One process: a process-dependent seed would not be
+    caught here.)"""
     torch.manual_seed(0)
     for _ in range(137):                   # simulate "measured after 60 others" RNG churn
         torch.rand(4096)
@@ -119,6 +120,8 @@ def test_trk80_a_different_shape_still_draws_different_data(rb, ex_denoise):
     small = rb.generate_bindings(ex_denoise, 1, 32, 32, device="cpu")
     big = rb.generate_bindings(ex_denoise, 1, 96, 96, device="cpu")
     assert small["image"].shape != big["image"].shape
+    assert small["image"].std().item() > 0 and big["image"].std().item() > 0,         "a draw collapsed to one constant image"
+    assert not torch.equal(small["image"], big["image"][:, :32, :32]),         "the two shapes drew the same data"
 
 
 def test_trk80_tier_classification_probe_not_gated(rb, ex_denoise):
