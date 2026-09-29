@@ -38,7 +38,7 @@ from ..tex_compiler.ast_nodes import (
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
 from .codegen_masked import MaskedEmitMixin
-from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin
+from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin, _num_src
 from .codegen_stencil import (
     _StencilInfo, _ast_equal, _is_ident, _try_detect_stencil, _try_detect_inline_stencil, detect_stencil_route,
 )
@@ -1058,13 +1058,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         In scalar loop mode, returns a bare Python float literal instead.
         """
+        src = _num_src(value)
         if self._scalar_loop:
-            return repr(float(value))
+            return src
+        # Keyed by value, so 0.0 and -0.0 share a tensor: the interpreter's literal
+        # cache does the same, and the oracle decides which zero a program sees.
         cached = self._const_cache.get(value)
         if cached is not None:
             return cached
         var = self._tmp()
-        self._preamble.append(f"    {var} = _torch.scalar_tensor({value!r}, dtype=_torch.float32, device=_dev)")
+        self._preamble.append(f"    {var} = _torch.scalar_tensor({src}, dtype=_torch.float32, device=_dev)")
         self._const_cache[value] = var
         return var
 
@@ -1197,7 +1200,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             for value, var in self._const_cache.items():
                 rounded = _dtype_rounded(value, torch.float32)
                 if rounded is not None:
-                    preamble_lines.append(f"    {var}.{_HOST_SCALAR_ATTR} = {rounded!r}")
+                    preamble_lines.append(f"    {var}.{_HOST_SCALAR_ATTR} = {_num_src(rounded)}")
         preamble = "\n".join(preamble_lines)
         body = "\n".join(self._lines)
         # Hoisted constants go before the main body so they're available
@@ -3639,7 +3642,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             if cached is not None:
                 return cached
             var = self._tmp()
-            vals_repr = ", ".join(repr(v) for v in values)
+            vals_repr = ", ".join(_num_src(v) for v in values)
             self._preamble.append(
                 f"    {var} = _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
                 f".reshape(" + ", ".join(["1"] * 3) + f", {n}).expand(*_sp, {n})"

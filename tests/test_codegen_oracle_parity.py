@@ -529,3 +529,19 @@ def test_array_index_by_counter_or_literal_reads_no_device_value(monkeypatch):
     monkeypatch.undo()
     assert tier_trace.last().tier == "codegen"
     assert calls == [], f"{len(calls)} device reads for 32 counter and 2 literal accesses"
+
+
+# ── a non-finite literal is emitted as a value, not as an undefined name ──────────────────
+
+def test_non_finite_literal_emits_a_defined_value():
+    import math
+    from TEX_Wrangle.tex_runtime.codegen import _CodeGen
+    from TEX_Wrangle.tex_runtime.codegen_stdfns import _num_src
+    for v in (math.inf, -math.inf, 1.5, -0.0):
+        assert eval(_num_src(v)) == v
+    assert math.isnan(eval(_num_src(math.nan)))
+    cg = _CodeGen({})
+    var = cg._get_const(-math.inf)
+    ns = {"_torch": torch, "_dev": "cpu"}
+    exec(cg._preamble[-1].strip(), ns)
+    assert ns[var].item() == -math.inf

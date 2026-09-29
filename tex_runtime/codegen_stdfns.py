@@ -7,6 +7,8 @@ from `codegen.py` as a mixin. Every handler uses only `self.*` state, so mixing
 The `@_emits` decorator + `_EMIT_DISPATCH` registry live here (co-located with the
 handlers they register); `codegen.py` imports the registry to build `_fn_dispatch`.
 """
+import math
+
 from ..tex_compiler.ast_nodes import BindingRef, FunctionCall, NumberLiteral
 
 
@@ -14,6 +16,13 @@ _IMG_REDUCE_OPS = {
     "img_sum": "sum", "img_mean": "mean",
     "img_min": "amin", "img_max": "amax",
 }
+
+
+def _num_src(value) -> str:
+    """Python source for a numeric literal: its repr, or `float('inf')`/`float('nan')`,
+    since a bare `inf`/`nan` is an undefined name in the generated module."""
+    v = float(value)
+    return repr(v) if math.isfinite(v) else f"float({repr(v)!r})"
 
 
 _EMIT_DISPATCH: dict[str, str] = {}  # STR-6: stdlib name -> _CodeGen handler attr
@@ -187,18 +196,19 @@ class _EmitStdFnsMixin:
                 # Both bounds constant: the scalar torch.clamp overload (one kernel),
                 # matching fn_clamp's Python-number fast path.
                 self._emit(f"{tmp} = _torch.clamp({args[0]}, "
-                           f"{node.args[1].value}, {node.args[2].value})")
+                           f"{_num_src(node.args[1].value)}, {_num_src(node.args[2].value)})")
             else:
                 # Mixed/spatial bounds: torch.clamp rejects a (Tensor, scalar, Tensor)
                 # combo, so a program with one tensor bound used to fall back to the
                 # interpreter (correct but no codegen). clamp_min().clamp_max() accepts
                 # scalar OR tensor bounds and is BIT-IDENTICAL to fn_clamp's spatial
                 # torch.minimum(torch.maximum(x, lo), hi) (clamp == min(max(...)), exact).
-                lo = node.args[1].value if lo_const else args[1]
-                hi = node.args[2].value if hi_const else args[2]
+                lo = _num_src(node.args[1].value) if lo_const else args[1]
+                hi = _num_src(node.args[2].value) if hi_const else args[2]
                 self._emit(f"{tmp} = {args[0]}.clamp_min({lo}).clamp_max({hi})")
         elif name == "step" and len(args) == 2:
-            threshold = node.args[0].value if isinstance(node.args[0], NumberLiteral) else args[0]
+            threshold = (_num_src(node.args[0].value) if isinstance(node.args[0], NumberLiteral)
+                         else args[0])
             self._emit(f"{tmp} = ({args[1]} >= {threshold}).float()")
         elif name == "smoothstep" and len(args) == 3:
             num, den = self._emit_bp(f"{args[2]} - {args[0]}", f"{args[1]} - {args[0]} + _SAFE_EPS")
