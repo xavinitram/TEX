@@ -559,7 +559,7 @@ class MaskedEmitMixin:
         params_str = ", ".join(params + ["_depth=0"])
         self._emit(f"def _uf_{stmt.name}({params_str}):")
         self._indent += 1
-        self._emit(f"if _depth > {MAX_CALL_DEPTH}: raise RuntimeError("
+        self._emit(f"if _depth >= {MAX_CALL_DEPTH}: raise RuntimeError("
                    f"'Maximum function call depth exceeded in {stmt.name}()')")
 
         saved_locals = self._local_vars

@@ -1708,7 +1708,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         params_str = ", ".join(params + ["_depth=0"])
         self._emit(f"def _uf_{stmt.name}({params_str}):")
         self._indent += 1
-        self._emit(f"if _depth > {MAX_CALL_DEPTH}: raise RuntimeError('Maximum function call depth exceeded in {stmt.name}()')")
+        self._emit(f"if _depth >= {MAX_CALL_DEPTH}: raise RuntimeError('Maximum function call depth exceeded in {stmt.name}()')")
 
         # Save and swap local vars context for function body
         saved_locals = self._local_vars

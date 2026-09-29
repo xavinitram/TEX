@@ -545,3 +545,27 @@ def test_non_finite_literal_emits_a_defined_value():
     ns = {"_torch": torch, "_dev": "cpu"}
     exec(cg._preamble[-1].strip(), ns)
     assert ns[var].item() == -math.inf
+
+
+# ── user-function call depth: the 65th nested call raises on both tiers ──────────────────
+
+def _recursion(n, masked):
+    head = "//!tex 0.25\nfor (int j = 0; j < 20; j++) { if (@A.g > 2.0) { break; } }\n" if masked else ""
+    return (head + "float f(float k) { if (k <= 1.0) { return 1.0; } return f(k - 1.0) + 1.0; }\n"
+            f"@OUT = vec3(f({n}.0) + @A.r * 0.0);")
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["0.23", "masked 0.25"])
+def test_call_depth_limit_matches_interpreter(masked):
+    ref, _ = assert_parity(_recursion(64, masked), {"A": _img()})
+    assert ref["OUT"].max().item() == 64.0
+    code = _recursion(65, masked)
+    bindings = {"A": _img()}
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, _refs, _assigned, _params, used = get_cache().compile_ast(program, bt, source=code)
+    tier_trace.reset()
+    # Codegen raises, the route hands the cook to the interpreter, which raises E6060.
+    with pytest.raises(Exception, match="call depth"):
+        _codegen_only_execute(program, _clone(bindings), tm, "cpu", output_names=["OUT"],
+                              used_builtins=used, fingerprint=None, time_context=None)
