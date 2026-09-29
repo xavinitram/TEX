@@ -506,7 +506,8 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     """Extract a fully static for-loop as (var_name, start, stop, step).
 
     Matches: for (int VAR = START; VAR < END; VAR = VAR + STEP)
-    where START, END, STEP are all NumberLiterals (possibly after constant folding).
+    where START, END, STEP are all NumberLiterals (possibly after constant folding) and the
+    body never assigns VAR.
     Returns None if the pattern doesn't match.
 
     Shared by both the interpreter and codegen to avoid duplication.
@@ -565,6 +566,9 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     # the bound: the general loop runs to the iteration cap (or not at all when start is
     # already past the bound), and a static range would say something else.
     if step <= 0:
+        return None
+    # A body that writes the counter changes the pass count; only the general loop sees it.
+    if loop_var in collect_assigned_vars(node.body)[0]:
         return None
     return (loop_var, start, end, step)
 

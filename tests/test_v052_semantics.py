@@ -180,3 +180,22 @@ def test_masked_call_reads_the_definition_scope():
     A = _img()
     ref = run_tiers(code, {"A": A})
     assert torch.equal(ref["OUT"][..., 0], (A[..., 0] > 0.5).float())
+
+
+# ── A loop whose body writes its own counter runs the passes C would ─────────────────────
+# The static and uniform-range fast paths precompute the counter's values, so they must not
+# serve a loop whose body changes the counter.
+
+@pytest.mark.parametrize("code,want", [
+    ("float c = 0.0; for (int i = 0; i < 4; i++) { i = i + 1; c = c + 1.0; } @OUT = vec4(c);", 2.0),
+    ("float c = 0.0; for (int i = 0; i < 100; i++) { i++; c = c + 1.0; } @OUT = vec4(c);", 50.0),
+    ("float c = 0.0; for (int i = 0; i < 9; i = i + 1) { c = c + i; i = i * 2; } @OUT = vec4(c);", 11.0),
+    ("float c = 0.0; for (int i = 0; i < $n; i++) { i = i + 2; c = c + 1.0; } @OUT = vec4(c);", 3.0),
+    ("//!tex 0.25\nfloat c = 0.0; for (int i = 0; i < 4; i++) { i = i + 1; c = c + 1.0; }"
+     " @OUT = vec4(c);", 2.0),
+    ("float c = 0.0; for (int i = 0; i < 3; i++) { for (int j = 0; j < 2; j++) { c = c + 1.0; } }"
+     " @OUT = vec4(c);", 6.0),
+], ids=["static", "static-long", "static-mul", "uniform-bound", "masked", "inner-own-counter"])
+def test_loop_body_writing_its_counter(code, want):
+    ref = run_tiers(code, {"A": _img(), "n": 8})
+    assert torch.allclose(ref["OUT"], torch.full_like(ref["OUT"], want))

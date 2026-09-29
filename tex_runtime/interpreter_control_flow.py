@@ -340,6 +340,8 @@ class _ControlFlowMixin:
         # for BOTH env vars AND bindings (UC-3b: a bound reading @A while the body
         # reassigns @A resolves once and diverges from per-iteration semantics).
         body_assigned, body_bindings = self._collect_assigned_vars(node.body)
+        if loop_var in body_assigned:   # the body moves the counter: see try_extract_static_range
+            return False
         forbidden = body_assigned | {loop_var}
         names: set[str] = set()
         bind_names: set[str] = set()
