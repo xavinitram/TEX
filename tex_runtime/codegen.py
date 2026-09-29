@@ -3405,16 +3405,40 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             raise _Unsupported(f"Unknown unary op: {node.op}")
         return tmp
 
+    def _emit_guarded_expr(self, guard: str, node: ASTNode) -> str:
+        """Emit `node`'s code under `guard`, or bare when it needs no statement (a leaf)."""
+        self._emit(guard)
+        mark = len(self._lines)
+        self._indent += 1
+        val = self._emit_expr(node)
+        self._indent -= 1
+        if len(self._lines) == mark:
+            self._lines.pop()
+        return val
+
     def _emit_ternary(self, node: TernaryOp) -> str:
         cond = self._emit_expr(node.condition)
-        true_val = self._emit_expr(node.true_expr)
-        false_val = self._emit_expr(node.false_expr)
         tmp = self._tmp()
 
         # Scalar loop mode: simple Python ternary
         if self._scalar_loop:
+            true_val = self._emit_expr(node.true_expr)
+            false_val = self._emit_expr(node.false_expr)
             self._emit(f"{tmp} = {true_val} if float({cond}) > 0.5 else {false_val}")
             return tmp
+
+        # A 0-dim condition runs only the taken arm, as the interpreter does (a recursive
+        # base case must not evaluate its recursive arm); a per-pixel one runs both. Each
+        # arm's code is emitted once, under its own guard.
+        sc, ct = self._tmp(), self._tmp()
+        self._emit(f"{sc} = not _torch.is_tensor({cond}) or {cond}.dim() == 0")
+        self._emit(f"{ct} = {sc} and float({cond}) > 0.5")
+        true_val = self._emit_guarded_expr(f"if not {sc} or {ct}:", node.true_expr)
+        false_val = self._emit_guarded_expr(f"if not {sc} or not {ct}:", node.false_expr)
+        self._emit(f"if {sc}:")
+        self._indent += 1
+        self._emit(f"{tmp} = {true_val} if {ct} else {false_val}")
+        self._indent -= 1
 
         # Check if string handling is needed via type_map
         true_type = self.type_map.get(id(node.true_expr))
@@ -3423,19 +3447,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                         and false_type is not None and false_type != TEXType.STRING)
 
         if not both_numeric:
-            # String ternary guard (causes graph break)
-            self._emit(f"if isinstance({true_val}, str) or isinstance({false_val}, str):")
+            # String ternary guard (causes graph break); the condition is per-pixel here
+            self._emit(f"elif isinstance({true_val}, str) or isinstance({false_val}, str):")
             self._indent += 1
-            self._emit(f"_cs = {cond}.float().mean().item() if _torch.is_tensor({cond}) and {cond}.dim() > 0 else (float({cond}.item()) if _torch.is_tensor({cond}) else float({cond}))")
-            self._emit(f"{tmp} = {true_val} if _cs > 0.5 else {false_val}")
+            self._emit(f"{tmp} = {true_val} if {cond}.float().mean().item() > 0.5 else {false_val}")
             self._indent -= 1
-            self._emit(f"elif not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
-        else:
-            # Both arms are numeric — skip string guard (no graph break)
-            self._emit(f"if not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
-        self._indent += 1
-        self._emit(f"{tmp} = {true_val} if float({cond}) > 0.5 else {false_val}")
-        self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
         atv = self._tmp()

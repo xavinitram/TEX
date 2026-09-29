@@ -645,3 +645,22 @@ _SCALAR_READ_ONLY_ROWS = [
 def test_scalar_loop_keeps_read_only_locals_tensors(label, code, extra):
     bindings = {k: (_img() if v is None else v) for k, v in extra.items()}
     assert_parity(code, bindings)
+
+
+# ── a ternary on a 0-dim condition runs only the taken arm, as the interpreter does ──────
+
+_TERNARY_ROWS = [
+    ("recursive base case", "float f(float n) { return n <= 1.0 ? 1.0 : n * f(n - 1.0); }\n"
+     "@OUT = vec3(f(5.0)) + @A.rgb * 0.0;"),
+    ("per-pixel condition", "@OUT = @A.r > 0.5 ? @A.rgb * 2.0 : vec3(0.1);"),
+    ("0-dim condition, leaf arms", "float c = 0.7; @OUT = c > 0.5 ? @A.rgb : vec3(0.2);"),
+    ("nested", "float c = u; @OUT = vec3(c > 0.5 ? (v > 0.5 ? 1.0 : 2.0) : (c > 0.2 ? 3.0 : 4.0));"),
+    ("string arms, per-pixel condition", 'string s = @A.r > 0.5 ? "aa" : "b"; @OUT = vec3(float(len(s)));'),
+    ("string arms, 0-dim condition",
+     'float k = 0.2; string s = k > 0.5 ? "aa" : "b"; @OUT = vec3(float(len(s))) + @A.rgb * 0.0;'),
+]
+
+
+@pytest.mark.parametrize("label,code", _TERNARY_ROWS, ids=[r[0] for r in _TERNARY_ROWS])
+def test_ternary_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img()}, atol=0.0)
