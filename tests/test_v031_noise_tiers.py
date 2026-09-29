@@ -948,22 +948,28 @@ def test_v031_noise_promotion_failure_recorded(r: SubTestResult):
              "serving the key, and reads unavailable/measured in capabilities()")
 
 
-_KERNEL_BLOCK_CHILD = _CHILD_HEAD + r'''
+# Both blocked-kernel children (TRK-182 bare, TRK-193 wrapped) share this body; only how the
+# post-warm-up kernel raises differs. `@@PREAMBLE@@` holds definitions the raise needs and
+# `@@RAISE@@` is the raise statement itself.
+#
+# The warm-up dummy (64x64, the shape try_upgrade's compile_fn always warms with) succeeds,
+# matching a real Inductor build whose FIRST specialization compiles fine — the block hits the
+# cook's own (24x32) shape, a LATER, differently-shaped kernel, exactly what production
+# measured (a fresh .pyd for the cook's own resolution, not the warm-up probe).
+_BLOCKED_KERNEL_TEMPLATE = _CHILD_HEAD + r'''
 import warnings
 dev = "cpu"
 key, cache = device_key(dev), noise._simplex_cache
 noise._inductor_available["cpu"] = True
 
-# TRK-182: the warm-up dummy (64x64, the shape try_upgrade's compile_fn always warms with)
-# succeeds, matching a real Inductor build whose FIRST specialization compiles fine — the
-# block hits a LATER, differently-shaped kernel, exactly what production measured (a fresh
-# .pyd for the cook's own resolution, not the warm-up probe).
+_MSG = ("DLL load failed while importing kernel: An Application "
+        "Control policy has blocked this file.")
+@@PREAMBLE@@
 def _factory(device):
     def _kernel(x, y):
         if tuple(x.shape[-2:]) == (64, 64):
             return x + y
-        raise ImportError("DLL load failed while importing kernel: An Application "
-                           "Control policy has blocked this file.")
+        @@RAISE@@
     dummy = torch.rand(1, 64, 64, device=device)
     _kernel(dummy, dummy)
     return _kernel
@@ -993,6 +999,34 @@ print(json.dumps({
     "kernel_warnings": kernel_warnings,
 }))
 '''
+
+_KERNEL_BLOCK_CHILD = (_BLOCKED_KERNEL_TEMPLATE
+                       .replace("@@PREAMBLE@@", "")
+                       .replace("@@RAISE@@", "raise ImportError(_MSG)"))
+
+
+def _blocked_kernel_failures(result: dict) -> list:
+    """The TRK-182/193 judgement over a child's JSON: every problem found, empty when clean."""
+    fails = []
+    digests = result["digests"]
+    if len(digests) != 5:
+        fails.append(f"expected 5 cooks, got {len(digests)}")
+    elif len(set(digests)) != 1:
+        fails.append(f"pixels changed across the blocked promotion (not eager-parity): "
+                     f"{result['tiers']} -> {digests}")
+    if result["tiers"] and result["tiers"][-1] != "eager":
+        fails.append(f"the key did not settle on the eager tier after the block: "
+                     f"{result['tiers']}")
+    if result["inductor_cpu_available"] is not False:
+        fails.append(f"Inductor was not disabled process-wide on CPU after the block: "
+                     f"{result['inductor_cpu_available']!r}")
+    if result["inductor_cuda_available"] is not False:
+        fails.append(f"Inductor was not disabled process-wide on CUDA after the block: "
+                     f"{result['inductor_cuda_available']!r}")
+    if len(result["kernel_warnings"]) != 1:
+        fails.append(f"expected exactly one kernel-block warning across 5 cooks, got "
+                     f"{len(result['kernel_warnings'])}: {result['kernel_warnings']}")
+    return fails
 
 
 def test_trk182_blocked_kernel_load_falls_back_to_eager(r: SubTestResult):
@@ -1025,25 +1059,7 @@ def test_trk182_blocked_kernel_load_falls_back_to_eager(r: SubTestResult):
         r.fail("TRK-182 kernel block", f"child printed no parseable JSON: {e}\n{out}")
         return
 
-    fails = []
-    digests = result["digests"]
-    if len(digests) != 5:
-        fails.append(f"expected 5 cooks, got {len(digests)}")
-    elif len(set(digests)) != 1:
-        fails.append(f"pixels changed across the blocked promotion (not eager-parity): "
-                     f"{result['tiers']} -> {digests}")
-    if result["tiers"] and result["tiers"][-1] != "eager":
-        fails.append(f"the key did not settle on the eager tier after the block: "
-                     f"{result['tiers']}")
-    if result["inductor_cpu_available"] is not False:
-        fails.append(f"Inductor was not disabled process-wide on CPU after the block: "
-                     f"{result['inductor_cpu_available']!r}")
-    if result["inductor_cuda_available"] is not False:
-        fails.append(f"Inductor was not disabled process-wide on CUDA after the block: "
-                     f"{result['inductor_cuda_available']!r}")
-    if len(result["kernel_warnings"]) != 1:
-        fails.append(f"expected exactly one kernel-block warning across 5 cooks, got "
-                     f"{len(result['kernel_warnings'])}: {result['kernel_warnings']}")
+    fails = _blocked_kernel_failures(result)
 
     if fails:
         r.fail("TRK-182 kernel block", "; ".join(fails))
@@ -1078,64 +1094,11 @@ def _make_wrapped_inductor_error(msg):
             return wrapped
 
 
-_INDUCTOR_ERROR_CHILD = _CHILD_HEAD + r'''
-import warnings
-dev = "cpu"
-key, cache = device_key(dev), noise._simplex_cache
-noise._inductor_available["cpu"] = True
-
-_MSG = ("DLL load failed while importing kernel: An Application "
-        "Control policy has blocked this file.")
-
-def _make_wrapped(msg):
-    from inspect import currentframe
-    from torch._inductor.exc import InductorError
-    try:
-        raise ImportError(msg)
-    except ImportError as e:
-        try:
-            raise InductorError(e, currentframe()).with_traceback(e.__traceback__) from None
-        except InductorError as wrapped:
-            return wrapped
-
-# Same shape as TRK-182's own child: the warm-up dummy (64x64) succeeds, so the promotion
-# installs cleanly; the block hits the cook's own (24x32) shape — the same "warm-up
-# contained it, the real call was not" gap — except this time wrapped in InductorError,
-# not raised bare, which is exactly what TRK-193 says escapes TRK-182's own except clause.
-def _factory(device):
-    def _kernel(x, y):
-        if tuple(x.shape[-2:]) == (64, 64):
-            return x + y
-        raise _make_wrapped(_MSG)
-    dummy = torch.rand(1, 64, 64, device=device)
-    _kernel(dummy, dummy)
-    return _kernel
-noise._compile_simplex = _factory
-
-torch.manual_seed(5)
-img = torch.rand(1, 24, 32, 4, device=dev)
-prog = ''' + repr(_SIMPLEX_PROG) + r'''
-
-with warnings.catch_warnings(record=True) as caught:
-    warnings.simplefilter("always")
-    digests = []
-    tiers = []
-    for _ in range(5):                       # > _COMPILE_AFTER_CALLS: crosses the promotion
-        out = tex_engine.cook(prog, {"A": img}, device_mode=dev, precision="fp32").outputs["OUT"]
-        digests.append(digest(out))
-        tiers.append(_tier_of(cache, key))
-
-kernel_warnings = [str(w.message) for w in caught
-                   if "compiled noise kernel failed to load" in str(w.message)]
-
-print(json.dumps({
-    "digests": digests,
-    "tiers": tiers,
-    "inductor_cpu_available": noise._inductor_available.get("cpu"),
-    "inductor_cuda_available": noise._inductor_available.get("cuda"),
-    "kernel_warnings": kernel_warnings,
-}))
-'''
+# TRK-193: the same block, but the kernel raises the wrapped shape. The child cannot import
+# the test module, so the builder's own source is injected.
+_INDUCTOR_ERROR_CHILD = (_BLOCKED_KERNEL_TEMPLATE
+                         .replace("@@PREAMBLE@@", inspect.getsource(_make_wrapped_inductor_error))
+                         .replace("@@RAISE@@", "raise _make_wrapped_inductor_error(_MSG)"))
 
 
 def test_trk193_wrapped_inductor_error_falls_back_to_eager(r: SubTestResult):
@@ -1164,25 +1127,7 @@ def test_trk193_wrapped_inductor_error_falls_back_to_eager(r: SubTestResult):
         r.fail("TRK-193 wrapped InductorError", f"child printed no parseable JSON: {e}\n{out}")
         return
 
-    fails = []
-    digests = result["digests"]
-    if len(digests) != 5:
-        fails.append(f"expected 5 cooks, got {len(digests)}")
-    elif len(set(digests)) != 1:
-        fails.append(f"pixels changed across the blocked promotion (not eager-parity): "
-                     f"{result['tiers']} -> {digests}")
-    if result["tiers"] and result["tiers"][-1] != "eager":
-        fails.append(f"the key did not settle on the eager tier after the block: "
-                     f"{result['tiers']}")
-    if result["inductor_cpu_available"] is not False:
-        fails.append(f"Inductor was not disabled process-wide on CPU after the block: "
-                     f"{result['inductor_cpu_available']!r}")
-    if result["inductor_cuda_available"] is not False:
-        fails.append(f"Inductor was not disabled process-wide on CUDA after the block: "
-                     f"{result['inductor_cuda_available']!r}")
-    if len(result["kernel_warnings"]) != 1:
-        fails.append(f"expected exactly one kernel-block warning across 5 cooks, got "
-                     f"{len(result['kernel_warnings'])}: {result['kernel_warnings']}")
+    fails = _blocked_kernel_failures(result)
 
     if fails:
         r.fail("TRK-193 wrapped InductorError", "; ".join(fails))
