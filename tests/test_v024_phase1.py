@@ -200,6 +200,9 @@ def test_roi4_reach_pinning(r: SubTestResult):
     # Perturb ONE pixel of an input; a halo op's output can change only within its kernel
     # radius of that pixel. The measured spread must be <= the reach the descriptor declares
     # (the reach ROI-3 narrows by). A wrong multiplier (gauss's 3x) makes measured > declared.
+    # The input is a constant field and the centre is pushed to the extreme the op is
+    # sensitive to (below the field for erode/min, above it for the rest), so the spread is
+    # deterministic: it is never 0, and for the pure-kernel ops it equals the radius.
     B, H, W, C = 1, 41, 41, 4
     cy, cx = H // 2, W // 2
     #  fn,           extra-args,   builds a program on @A of shape [B,H,W,C]
@@ -213,10 +216,11 @@ def test_roi4_reach_pinning(r: SubTestResult):
     for dev in _DEVICES:
         for name, extra in fns:
             try:
-                torch.manual_seed(3)
-                base = torch.rand(B, H, W, C, device=dev)
+                base = torch.full((B, H, W, C), 0.5, device=dev)
                 pert = base.clone()
-                pert[:, cy, cx, :] += 0.5   # perturb the centre pixel
+                # perturb the centre pixel; the bilateral needs a bump inside its range sigma,
+                # or the centre is an outlier every neighbour ignores
+                pert[:, cy, cx, :] = {"erode": 0.0, "bilateral_filter": 0.6}.get(name, 1.0)
                 args = ", ".join(str(float(a)) for a in extra)
                 code = f"@OUT = {name}(@A, {args});"
                 prog, tm, outs = _compile(code, {"A": TEXType.VEC4})
@@ -236,6 +240,11 @@ def test_roi4_reach_pinning(r: SubTestResult):
                 assert measured <= declared, (
                     f"{name}{extra}: measured reach {measured} > declared {declared} "
                     f"(narrowing would under-pad → seams)")
+                assert measured > 0, f"{name}{extra}: the perturbation moved nothing (probe is blind)"
+                if name in ("erode", "dilate"):
+                    assert measured == declared, (
+                        f"{name}{extra}: a pure kernel reaches exactly its radius, "
+                        f"measured {measured} != declared {declared}")
                 r.ok(f"reach[{dev}] {name}{extra}: measured {measured} <= declared {declared}")
             except Exception as e:
                 r.fail(f"ROI-4 reach {name}{extra} [{dev}]", f"{type(e).__name__}: {e}")
@@ -378,13 +387,13 @@ def test_roi4_differential_oracle(r: SubTestResult):
     import os, random
     seed = int(os.environ.get("TEX_ROI_FUZZ_SEED", "20260718"))
     N = int(os.environ.get("TEX_ROI_FUZZ_N", "40"))
-    rng = random.Random(seed)
     B, H, W = 1, 28, 36
     btypes = {"A": TEXType.VEC4, "B": TEXType.VEC4}
     worst = 0.0
     fails = 0
     checked = 0
     for dev in _DEVICES:
+        rng = random.Random(seed)      # per device, so every lane sees the same programs
         for i in range(N):
             # Every program carries a partial-broadcast COMPANION output (@ROW=iy/ih, a
             # [B,H,1]) and, on some, a pointwise SETUP local — so the fuzz lane exercises
@@ -430,7 +439,11 @@ def test_roi4_differential_oracle(r: SubTestResult):
                 fails += 1
                 if fails <= 5:
                     r.fail("ROI-4 oracle exception", f"[{dev}] {code!r}: {type(e).__name__}: {e}")
-    if fails == 0:
+    if checked < N * len(_DEVICES) // 4:
+        r.fail("ROI-4 oracle vacuous",
+               f"only {checked} ROI cooks ran for {N} programs x {len(_DEVICES)} device(s) "
+               "(roi_plan declined most of them, or the generator drifted)")
+    elif fails == 0:
         r.ok(f"differential oracle: {checked} (program × ROI) cooks match whole-frame "
              f"(worst maxdiff {worst:.2e} < {_TOL:.0e}) over seed {seed}")
     else:
@@ -450,6 +463,7 @@ def test_roi4_partition_assembly(r: SubTestResult):
         for code in programs:
             try:
                 plan = tex_roi.roi_plan(code, {})
+                assert plan.executable, f"{code!r}: no longer ROI-executable, so the stitch below proves nothing"
                 prog, tm, outs = _compile(code, {"A": TEXType.VEC4})
                 torch.manual_seed(7)
                 A = torch.rand(B, H, W, 4, device=dev)

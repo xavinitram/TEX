@@ -15,10 +15,13 @@ CACHE-2  tex_results.ResultCache — the engine frame cache (RAM byte-budget + d
 CACHE-3  warm_state.json (graph-capture verdicts/blacklists + backend probes) + prewarm.
 CACHE-4  layered cache epochs (AST ⊑ CODEGEN ⊑ VERDICT) so a codegen-only edit no longer
         cold-starts the parsed-program (.pkl) tier; mono-hash demoted to a completeness
-        tripwire; a fail-safe oracle spot-check catches a wrong no-bump.
+        tripwire; a source-truth round-trip check on the persisted .pkl.
 
 CPU-pinned for determinism; CUDA looped when present.
 """
+import functools
+import os
+
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, compile_and_run, make_img)
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib  # noqa: F401  (populates REGISTRY)
@@ -346,7 +349,7 @@ def test_cache2_spill_restore_bit_exact(r: SubTestResult):
             assert restored.device.type == ("cuda" if dev == "cuda" else "cpu"), \
                 "restored to the wrong device"
             assert torch.equal(restored.cpu(), frames[0].cpu()), "spill/restore was not bit-exact"
-            assert st["restores"] >= 0
+            assert c.stats()["restores"] >= 1, "the restore was not counted"
             r.ok(f"[{dev}] spill/restore bit-exact; RAM stayed under budget ({st['spills']} spills)")
         except Exception as e:
             r.fail(f"[{dev}] CACHE-2 spill/restore", f"{type(e).__name__}: {e}")
@@ -438,6 +441,32 @@ def test_cache3_warm_state_roundtrip(r: SubTestResult):
         compiled._compile_blacklist.pop("fp_bad_warm_test", None)
 
 
+def _keeps_warm_state_file(fn):
+    """Put warm_state.json back the way it was (or absent) after a test overwrites it, so a
+    developer's persisted verdicts survive a run that had no scratch cache dir."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from TEX_Wrangle.tex_runtime import warm_state
+        p = warm_state._path()
+        prior = None
+        if p is not None and os.path.exists(p):
+            with open(p, "rb") as f:
+                prior = f.read()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if p is not None:
+                if prior is None:
+                    if os.path.exists(p):
+                        os.remove(p)
+                else:
+                    with open(p, "wb") as f:
+                        f.write(prior)
+            warm_state._reset_for_test()
+    return wrapper
+
+
+@_keeps_warm_state_file
 def test_cache3_version_tag_guard(r: SubTestResult):
     print("\n--- CACHE-3: a warm_state from another environment is ignored ---")
     from TEX_Wrangle.tex_runtime import warm_state, graphed
@@ -461,6 +490,7 @@ def test_cache3_version_tag_guard(r: SubTestResult):
         graphed._capturable_memo.pop("fp_alien", None)
 
 
+@_keeps_warm_state_file
 def test_house50_h2_version_tag_survives_an_is_available_leak(r: SubTestResult):
     """HOUSE-50/H2 (TRK-225): a leaked `torch.cuda.is_available` patch (several tests in
     this suite set it to a lambda and restore it in a `finally`, e.g.
@@ -640,14 +670,15 @@ def test_cache4_codegen_edit_spares_pkl(r: SubTestResult):
         r.fail("CACHE-4 codegen-spares-pkl", f"{type(e).__name__}: {e}")
 
 
-def test_cache4_failsafe_oracle(r: SubTestResult):
-    print("\n--- CACHE-4: fail-safe — a reloaded persisted .pkl matches SOURCE ground truth ---")
-    # The spot-check that catches a WRONG epoch partition (an AST-file edit that changes the
-    # optimized program but bumps no epoch, so a STALE .pkl is served). The ground truth must be
-    # INDEPENDENT of the disk cache: parse + typecheck + interpret straight from SOURCE, bypassing
-    # get_cache / the .pkl entirely. (An earlier version compiled BOTH sides through the cache —
-    # both hit the same .pkl, so it could never detect drift; that was a tautology.) The .cg
-    # (codegen-epoch) tier is guarded by the separate codegen==interpreter differential suite.
+def test_cache4_pkl_roundtrip_matches_source(r: SubTestResult):
+    print("\n--- CACHE-4: a reloaded persisted .pkl matches SOURCE ground truth ---")
+    # A round-trip check, NOT a stale-artifact detector: the .pkl below is written by the
+    # current code moments before it is read back, so an epoch partition that failed to bump
+    # cannot be seen here (that is the tripwire and layering tests' job). What it does catch is
+    # a persist/reload that changes the optimized program. The ground truth is INDEPENDENT of
+    # the disk cache: parse + typecheck + interpret straight from SOURCE, bypassing get_cache /
+    # the .pkl entirely. The .cg (codegen-epoch) tier is guarded by the separate
+    # codegen==interpreter differential suite.
     from TEX_Wrangle import tex_cache as C, tex_api
     from TEX_Wrangle.tex_compiler.types import TEXType
     from TEX_Wrangle.tex_compiler.lexer import Lexer
@@ -671,10 +702,10 @@ def test_cache4_failsafe_oracle(r: SubTestResult):
         cache._memory.clear()                # force a disk reload on the next compile
         reloaded = tex_api.execute(tex_api.compile(code, bt), {"A": A.clone()})["OUT"]
         assert torch.allclose(truth, reloaded, atol=1e-6), \
-            "the persisted .pkl drifted from source ground truth (a wrong epoch partition)"
+            "the persisted .pkl reloaded to a program that differs from source ground truth"
         r.ok("persisted .pkl matches source-independent ground truth (real oracle, not a tautology)")
     except Exception as e:
-        r.fail("CACHE-4 fail-safe oracle", f"{type(e).__name__}: {e}")
+        r.fail("CACHE-4 pkl round-trip", f"{type(e).__name__}: {e}")
 
 
 def test_cache4_ast_epoch_folds_language_version(r: SubTestResult):
@@ -879,32 +910,3 @@ def test_cache1_pixel_moving_flags(r: SubTestResult):
         r.ok("latent_channel_count (`ic`) discriminates the key at equal output shape")
     except Exception as e:
         r.fail("CACHE-1 latent_channel_count key", f"{type(e).__name__}: {e}")
-
-
-def main():
-    r = SubTestResult()
-    test_eng12_output_is_born_frozen(r)
-    test_eng12_two_strata(r)
-    test_eng12_frozen_frame_reenters_scatter(r)
-    test_cache1_key_construction(r)
-    test_cache1_not_a_content_hash(r)
-    test_cache1_engine_integration(r)
-    test_cache1_playhead_keys(r)
-    test_cache1_precision_and_batch(r)
-    test_cache1_pixel_moving_flags(r)
-    test_cache2_hit_is_bit_exact(r)
-    test_cache2_spill_restore_bit_exact(r)
-    test_cache2_verify_drop_and_replace(r)
-    test_cache3_warm_state_roundtrip(r)
-    test_cache3_version_tag_guard(r)
-    test_cache3_prewarm(r)
-    test_cache4_epoch_tripwire(r)
-    test_cache4_layering(r)
-    test_cache4_codegen_edit_spares_pkl(r)
-    test_cache4_failsafe_oracle(r)
-    return 0 if r.summary() else 1
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(main())
