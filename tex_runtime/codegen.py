@@ -539,6 +539,8 @@ _INLINE_TORCH_1ARG: dict[str, str] = {
 }
 
 # 2-arg torch functions: fn(a, b) -> torch.XXX(a, b)
+# max/min emit the interpreter's own maximum/minimum, never a clamp: on a tie clamp keeps x
+# while maximum/minimum pick an operand by kernel and layout, so a signed zero would differ.
 _INLINE_TORCH_2ARG: dict[str, str] = {
     "max": "maximum", "min": "minimum",
     "atan2": "atan2", "hypot": "hypot",

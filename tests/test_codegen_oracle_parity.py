@@ -447,3 +447,37 @@ _ARM_HEADER_ROWS = [
 def test_masked_arm_for_header_writes_the_outer_variable(label, code):
     ref, _ = assert_parity(code, {"A": _img()})
     assert ref["OUT"][..., 1].max().item() == 4.0  # the arm ran and left k at its bound
+
+
+# ── min/max: the interpreter's own maximum/minimum, operand emitted once ──────────────
+#
+# On a tie clamp keeps x while maximum/minimum pick an operand by kernel and layout, so a
+# clamp shortcut can return the other signed zero; atan2(0, ±0) turns that into 0 against pi.
+
+def _signed_zeros():
+    z = torch.zeros(1, 4, 4, 4)
+    z[..., 0] = -0.0
+    return z
+
+
+_MINMAX_ROWS = [
+    "max(0.0, @Z.r)", "max(@Z.r, 0.0)", "min(max(0.0, @Z.r), 1.0)", "min(max(@Z.r, 0.0), 1.0)",
+    "max(min(@Z.g, -0.0), -1.0)", "max(min(1.0, @Z.r), 0.0)",
+]
+
+
+@pytest.mark.parametrize("expr", _MINMAX_ROWS)
+def test_minmax_literal_keeps_the_interpreters_signed_zero(expr):
+    assert_parity(f"@OUT = vec3(atan2(0.0, {expr}));", {"Z": _signed_zeros()}, atol=0.0)
+
+
+def test_nested_min_max_emits_its_operand_once():
+    code = "@OUT = vec3(min(max(@A.r * 2.0 - 0.5, 0.0), 1.0), max(min(@A.g * 3.0, 0.8), 0.1), 0.0);"
+    bindings = {"A": _img()}
+    assert_parity(code, bindings, atol=0.0)
+    bt = {n: infer_binding_type(v) for n, v in bindings.items()}
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+    src = try_compile(program, tm)._tex_src
+    assert "clamp" not in src and src.count("_torch.maximum(") == 2, src
+    assert src.count("_bind['A'][..., 0]") == 1 and src.count("_bind['A'][..., 1]") == 1, src

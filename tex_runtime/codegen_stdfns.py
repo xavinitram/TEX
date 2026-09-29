@@ -72,55 +72,6 @@ class _EmitStdFnsMixin:
         # codegen stays bit-exact with the interpreter for every exponent.
         return None
 
-    @_emits("max", "min")
-    def _emit_fn_minmax(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit max/min with clamp specializations and nested-clamp detection."""
-        if len(args) != 2:
-            return None
-        name = node.name
-        # Detect min(max(x, lo), hi) or max(min(x, hi), lo) → torch.clamp
-        inner_name = "max" if name == "min" else "min"
-        for outer_const_idx in (0, 1):
-            if not isinstance(node.args[outer_const_idx], NumberLiteral):
-                continue
-            inner_idx = 1 - outer_const_idx
-            inner_node = node.args[inner_idx]
-            if (isinstance(inner_node, FunctionCall)
-                    and inner_node.name == inner_name
-                    and len(inner_node.args) == 2):
-                for inner_const_idx in (0, 1):
-                    if isinstance(inner_node.args[inner_const_idx], NumberLiteral):
-                        inner_val_idx = 1 - inner_const_idx
-                        if name == "min":
-                            lo = inner_node.args[inner_const_idx].value
-                            hi = node.args[outer_const_idx].value
-                        else:
-                            hi = inner_node.args[inner_const_idx].value
-                            lo = node.args[outer_const_idx].value
-                        # torch.clamp(x, lo, hi) only equals the nested
-                        # max(min(x,hi),lo) when lo<=hi. With inverted bounds
-                        # clamp returns hi while the nested form returns lo, so
-                        # fall through to the plain maximum/minimum composition.
-                        if lo > hi:
-                            continue
-                        inner_arg = self._emit_expr(inner_node.args[inner_val_idx])
-                        self._emit(f"{tmp} = _torch.clamp({inner_arg}, {lo}, {hi})")
-                        return tmp
-        # Single constant arg → clamp_min/clamp_max
-        clamp_fn = "clamp_min" if name == "max" else "clamp_max"
-        if isinstance(node.args[1], NumberLiteral):
-            self._emit(f"{tmp} = _torch.{clamp_fn}({args[0]}, {node.args[1].value})")
-            return tmp
-        if isinstance(node.args[0], NumberLiteral):
-            self._emit(f"{tmp} = _torch.{clamp_fn}({args[1]}, {node.args[0].value})")
-            return tmp
-        # No constant → standard torch.maximum/minimum
-        torch_fn = "maximum" if name == "max" else "minimum"
-        self._emit(f"{tmp} = _torch.{torch_fn}({args[0]}, {args[1]})")
-        return tmp
-
     @_emits("lerp")
     def _emit_fn_lerp(
         self, node: FunctionCall, args: list[str], tmp: str,
