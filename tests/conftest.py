@@ -4,6 +4,8 @@ Pytest configuration for TEX test suite.
 The tests use a shared SubTestResult object (r) to accumulate pass/fail counts.
 This fixture provides it and asserts no failures at the end of each test.
 """
+import faulthandler
+
 import pytest
 import torch
 from helpers import SubTestResult
@@ -48,3 +50,14 @@ def _race43_stream_leak_guard(request):
             f"{request.node.nodeid} left the current CUDA stream non-default "
             f"(was {current.cuda_stream!r}, default is {default.cuda_stream!r}) — reset "
             f"to default so later tests are unaffected")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Every test has finished; the process should now exit. If it is still alive after
+    `_EXIT_WATCHDOG_S` (a thread the interpreter is joining never returns), print every
+    thread's stack to stderr and exit 1, so a hang at shutdown is a named red and not a
+    process someone has to find and kill."""
+    faulthandler.dump_traceback_later(_EXIT_WATCHDOG_S, exit=True)
+
+
+_EXIT_WATCHDOG_S = 600
