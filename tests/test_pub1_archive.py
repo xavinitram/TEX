@@ -83,8 +83,8 @@ _DIR_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+/$")
 # into this LINE census via a `_JS_ONLY` pattern (PUB-2, 2026-09-19); that fold is GONE (NEG-5):
 # a line count over a 405 KB single-line minified bundle can only ever say "at least one", never
 # how many, so it could not see an added call move at all. JS network-token coverage now lives
-# in its own occurrence-counted-per-file ratchet, below `_ALLOWED_IGNORED_IMPORTS` — see
-# `_NETWORK_JS_RE`. `network` keeps its Python-shaped regex here for `.py`/other non-JS sources
+# in its own occurrence-counted-per-file ratchet, `_NETWORK_JS_RE` / `_NETWORK_JS_PINS`,
+# defined above `_ALLOWED_IGNORED_IMPORTS`. `network` keeps its Python-shaped regex here for `.py`/other non-JS sources
 # only, pinned at 0 (there are none), so a stray `socket.connect(`/`requests.get(` etc. anywhere
 # in the shipped surface still reds.
 _FAMILIES = {

@@ -21,7 +21,7 @@ sources and an open set of parameter valuations. So the PRE-CHANGE implementatio
 below — captured from base sha `c9dde51`, self-contained so that patching a `tex_roi` helper
 mutates the SHIPPED side only — and the two are run against each other over every shipped
 `examples/*.tex`, the ten-stage host-demo comp, and a hand-written corpus of the shapes where
-a value (F2) or a name boundary (F4) is known to move the answer. `_ORACLE_SENSITIVE_ROWS`
+a value (F2) or a name boundary (F4) is known to move the answer. `test_perf4_lazy_oracle_sensitive_rows`
 and `test_perf4_halo_corpus_is_not_vacuous` pin that the corpora really contain such shapes,
 so neither comparison can pass by being empty.
 
@@ -62,11 +62,9 @@ from TEX_Wrangle.tex_marshalling import sigil_names
 
 # The isolation every oracle row in BOTH front-end files needs, defined once beside PERF-1's
 # rows and imported here (the suite already imports one test module from another —
-# `tests/compat_corpus.py` takes `test_integration._prepare_example`). Its docstring carries
-# the whole diagnosis: the analysis parse memos key a whole AST on the source text while the
-# tree they hold depends on the process-global plane-wire flag, so an earlier file that parsed
-# a dotted example with plane wires ON makes `test_perf4_lazy_answers_are_identical` below
-# report `examples/aov_relight.tex`'s plane reads as moved answers.
+# `tests/compat_corpus.py` takes `test_integration._prepare_example`). Since PERF-8 the
+# analysis memos are keyed on the plane-wire profile, so this is belt-and-braces isolation:
+# it starts every oracle row from empty memos rather than guarding a flag-blind key.
 from test_perf1_roi_walk_memo import isolated_analysis
 
 # Bound HERE, at import, so the oracles below keep calling the real helpers while a test
@@ -204,10 +202,11 @@ def _mutant_has_ungrounded_halo(program, *, shallow_value=False, ignore_unground
 def _base_lazy_required_bindings(code: str, param_values: dict | None = None):
     """`tex_lazy.lazy_required_bindings` at the base sha: UNMEMOIZED, a FRESH parse per call.
 
-    Everything after the parse is the shipped code — this file imports the same
-    `_substitute_params` / `_fold_all` / `_propagate_literal_locals` / `_prune_static_flow` /
-    `_collect_binding_refs` the module uses, so the oracle differs from the implementation in
-    exactly the thing under test and drifts with the analysis if the analysis ever changes."""
+    Everything after the parse is the shipped pipeline, spelled out step for step (substitute,
+    snapshot, fold, propagate, snapshot, fold, revert unverified folds, prune, collect) with
+    the module's own helpers, so the oracle differs from the implementation in exactly the
+    thing under test. If the shipped pipeline gains or reorders a step, this copy must follow
+    it, or the identity row compares two different analyses."""
     param_values = param_values or {}
     try:
         program = parse_and_split(code, {})
@@ -220,9 +219,12 @@ def _base_lazy_required_bindings(code: str, param_values: dict | None = None):
         if subs:
             for stmt in stmts:
                 _substitute_params(stmt, subs)
+        pre_fold_1 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
         stmts = _propagate_literal_locals(stmts)
+        pre_fold_2 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
+        _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
         stmts = tex_lazy._prune_static_flow(stmts)
         return tex_lazy._collect_binding_refs(stmts)
     except Exception:

@@ -48,8 +48,6 @@ from TEX_Wrangle.tex_compiler.ast_nodes import iter_child_nodes
 from TEX_Wrangle.tex_marshalling import param_only_names
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "perf5_goldens", "fingerprints.json")
 #: Minted at the sha before the fingerprint call-count change, by running `TEXCache.fingerprint`
 #: and `param_only_names` over the corpus `_sources()` builds and writing the answers out. A row
 #: carries the source's sha256 so a golden can never be checked against a source that moved under
@@ -57,6 +55,9 @@ _GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 #: DELIBERATELY (a source really did change): the `wires` map types every `@` base VEC4 and every
 #: `$`-only name FLOAT; the `typed` map types every name by `sha256(name)[:8] % 4` over
 #: `(vec4, vec3, float, int)`, so the binding VALUES differ row to row.
+_GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "perf5_goldens", "fingerprints.json")
+#: Fewest rows the golden may carry: a truncated golden would check a smaller corpus.
 _MIN_ROWS = 120
 
 

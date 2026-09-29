@@ -91,9 +91,9 @@ def test_trk116_shipped_corpus_is_unaffected(r: SubTestResult):
     ChannelAccess. So `examples/aov_relight.tex` (the one corpus program with a `p@` wire)
     never reaches `_check_channel_access`'s PLANES arm through this harness at all — it
     compiles clean, to a real output hash — and this fix, which only touches that arm,
-    provably cannot move it. Recorded here as a real, current hash rather than "no error",
-    so a future change that starts reaching the PLANES arm through this path would be
-    caught as a moved hash, not silently absorbed."""
+    provably cannot move it. This row only checks that the program still compiles to a real
+    output (not an `ERROR:`) and that the corpus census keeps its reach; the hash itself
+    is pinned by `tests/test_v034_r2_archive.py`'s golden comparison."""
     print("\n--- TRK-116: the shipped corpus's compute_all() outcome is untouched ---")
     try:
         total = 0

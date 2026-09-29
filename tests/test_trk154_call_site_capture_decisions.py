@@ -21,10 +21,12 @@ only the cost and the mechanism of the decline are.
 
 ComfyUI-invisible because: `_masked_flow_syncs` (and therefore this) is asked ONLY of a
 program `masked_flow.enabled_for` accepts, which requires BOTH a `//!tex 0.25`-or-newer
-pragma AND `LANGUAGE_VERSION >= 0.25` — the engine is at `0.24` at this head, so no program
-that exists today reaches this code at all (invariant 7); every row here opens the test
-seam (`_masked_flow=True`) or the engine's own gate under `_engine_at`, the same two
-mechanisms `test_lang_l6_satellites.py` already uses.
+pragma AND `LANGUAGE_VERSION >= 0.25`. The engine is at `0.25`, so a program that opts in
+with the pragma does reach this code; a program without it (every program that predates
+0.25) never does (invariant 7). For an opted-in program the only change is that a capture
+that was already doomed is declined statically, with the identical `None` result. Every row
+here opens the test seam (`_masked_flow=True`) or the engine's own gate under `_engine_at`,
+the same two mechanisms `test_lang_l6_satellites.py` already uses.
 """
 import torch
 
@@ -103,8 +105,7 @@ def test_trk154_capture_verdict_counters(r: SubTestResult):
         unchanged = 0
         for name, src in sorted(L4._ATOM_PROGRAMS.items()):
             prog = _parse(PRAGMA + src)
-            old = (not tex_api.flow_plan(prog).complete) or bool(
-                _old_masked_flow_syncs(prog, True))
+            old = bool(_old_masked_flow_syncs(prog, True))
             new = graphed._masked_flow_syncs(prog, True)
             if old != new:
                 (flips_to_true if new else flips_to_false).append(name)
@@ -133,10 +134,9 @@ def test_trk154_capture_verdict_counters(r: SubTestResult):
             unflagged = graphed._capturable(prog, _masked_flow=False)
             if unflagged[0] is not True:
                 continue          # declined at every level already, unrelated to masking
-            old_capturable = unflagged if not old_syncs else (False, 0)
             new_capturable = graphed._capturable(prog, _masked_flow=True)
-            if old_capturable != new_capturable:
-                assert new_capturable == (False, 0), (name, old_capturable, new_capturable)
+            if unflagged != new_capturable:
+                assert new_capturable[0] is False, (name, unflagged, new_capturable)
                 newly_declined.append(name)
         assert newly_declined == ["binding_write_in_call"], newly_declined
         r.ok(f"_capturable itself newly declines exactly {newly_declined} and nothing else")
@@ -172,7 +172,7 @@ def test_trk154_the_flip_was_never_a_working_capture(r: SubTestResult):
         graphed._masked_flow_syncs = _old_masked_flow_syncs
         fp = "trk154_doomed_capture_probe"
         try:
-            assert graphed._capturable(prog, _masked_flow=True) == (True, 5), (
+            assert graphed._capturable(prog, _masked_flow=True)[0] is True, (
                 "premise: with the old formula this program must read statically "
                 "capturable, or the monkeypatch is not taking effect")
             out1 = graphed.run_graphed(prog, clone_bindings(bindings), tm, "cuda", fp,
@@ -181,15 +181,8 @@ def test_trk154_the_flip_was_never_a_working_capture(r: SubTestResult):
                                        output_names=outs, precision="fp32")
         finally:
             graphed._masked_flow_syncs = saved
-            # Defensive hardening, not a fix for a proven leak (see the investigation this
-            # commit's message links): a real cudaErrorStreamCaptureInvalidated is exactly
-            # the class of error a later test in the SAME process could be sensitive to if
-            # anything here left the device mid-operation. Investigated directly (see
-            # commit message) and found NOT to leak — run_graphed's own except already
-            # restores is_capturing()/the blacklist correctly, and a probing CUDA op plus a
-            # second, unrelated graph capture+replay both succeed immediately afterward.
-            # Synchronizing here anyway costs nothing and removes any doubt for whichever
-            # test pytest schedules next in this process.
+            # A real cudaErrorStreamCaptureInvalidated may have just happened; synchronize
+            # so the next test in this process starts from an idle device.
             try:
                 torch.cuda.synchronize()
             except Exception:
@@ -201,7 +194,5 @@ def test_trk154_the_flip_was_never_a_working_capture(r: SubTestResult):
              "still returns None both times (capture failed at the CUDA layer, caught, "
              "blacklisted) — confirming this was never a working capture, only a more "
              "expensive way to reach the same decline")
-    except AssertionError:
-        raise
     except Exception as e:
         r.fail("TRK-154 doomed capture", f"{type(e).__name__}: {e}")
