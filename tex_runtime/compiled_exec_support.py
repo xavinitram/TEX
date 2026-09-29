@@ -283,3 +283,40 @@ def _capture_in_flight() -> bool:
         return is_capturing()
     except Exception:
         return False
+
+
+# A loop-iteration or call-depth limit is the program's own bug, not a compile failure. These are
+# the phrases the interpreter (E6010/E6060) and the generated code raise it with.
+_USER_LIMIT_PHRASES = ("maximum iteration limit", "would exceed 1024 iterations",
+                       "iterations without finishing", "function call depth")
+
+
+def _is_user_limit(exc: BaseException) -> bool:
+    """True when `exc` is TEX's loop-iteration or call-depth limit, not a compile defect."""
+    if getattr(exc, "code", None) in ("E6010", "E6060"):
+        return True
+    msg = str(exc).lower()
+    return any(p in msg for p in _USER_LIMIT_PHRASES)
+
+
+def _is_transient_failure(exc: BaseException) -> bool:
+    """True for a failure that says nothing about the program: out of memory, or a dead or
+    cancelled worker."""
+    import concurrent.futures as _cf
+    return (isinstance(exc, (MemoryError, _cf.CancelledError, _cf.BrokenExecutor))
+            or type(exc).__name__ == "OutOfMemoryError"
+            or "out of memory" in str(exc).lower())
+
+
+def _settle_fncalls(fingerprint, device_type: str, precision: str, backend, exc=None) -> None:
+    """Settle the remembered fn-calls compile attempt. A failure that is a loop limit, a
+    transient one, or a missing toolchain is not a fact about the program, so it forgets the
+    attempt instead of recording a persisted `False`."""
+    from . import fncalls_compile
+    if exc is not None:
+        low = str(exc).lower()
+        if (_is_user_limit(exc) or _is_transient_failure(exc)
+                or "triton" in low or "cl.exe" in low or "cl is not found" in low):
+            fncalls_compile.discard_attempt(fingerprint, device_type, precision)
+            return
+    fncalls_compile.resolve_attempt(fingerprint, device_type, precision, backend)

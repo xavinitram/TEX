@@ -323,6 +323,16 @@ _NOT_A_CACHE = {
                                  "coordination state _pool_for reads to decide whether to "
                                  "abandon a stuck pool for a fresh one, not a cache of any "
                                  "value; empty whenever no job is in flight on either pool",
+    "autotier._NON_DURABLE": "keys whose current tier verdict was recorded for this process "
+                             "only (a transient failure), so persisting the table leaves them "
+                             "out -- a marker on verdicts, not a cache of any value",
+    "compiled_promotion._transient_failed": "cache keys whose last compile or trial failure "
+                                            "looked transient (out of memory, a dead worker); "
+                                            "consumed by the next verdict write -- a one-shot "
+                                            "note, not a cache of any value",
+    "tex_results_keys._RESULT_EPOCH": "a one-slot memo of the hash of the cook pipeline's own "
+                                      "source files, computed once per process -- a constant, "
+                                      "not a cache of cook values",
     # ── Observability: bounded rings and accumulators of MEASUREMENTS. ──
     "tier_trace._ring": "bounded tier-decision trace ring (diagnostics; oldest dropped)",
     "tier_trace._noise_ring": "bounded noise-tier trace ring (diagnostics)",

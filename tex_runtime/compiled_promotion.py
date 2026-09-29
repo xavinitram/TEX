@@ -33,7 +33,7 @@ from typing import Any
 
 import torch
 
-from .compiled_exec_support import _contiguous_bindings, _timed
+from .compiled_exec_support import _contiguous_bindings, _is_transient_failure, _timed
 from .host import _cancel_check  # SCHED-3 seam
 
 # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation of a freshly-promoted
@@ -56,10 +56,7 @@ _transient_failed: set = set()
 
 def _note_failure(cache_key, exc) -> None:
     """Remember that the failure just seen under `cache_key` is not a property of the program."""
-    if (isinstance(exc, (MemoryError, concurrent.futures.CancelledError,
-                         concurrent.futures.BrokenExecutor))
-            or type(exc).__name__ == "OutOfMemoryError"
-            or "out of memory" in str(exc).lower()):
+    if _is_transient_failure(exc):
         _transient_failed.add(cache_key)
 
 
@@ -130,10 +127,11 @@ def _submit_trial(cache_key, program, bindings, type_map, device,
         # the real invocation, the same way `_submit_bg_compile`'s job does -- a TRIAL
         # invocation that never returns must not silently poison every OTHER
         # fingerprint's future submissions to `_WARM_POOL` forever.
-        _mark_pool_busy("warm")
+        busy_token = _mark_pool_busy("warm")
         try:
             with torch.inference_mode():
-                entry = _compiled_cache.get(cache_key)
+                from .lru_util import lru_get
+                entry = lru_get(_compiled_cache, cache_key)
                 if entry is None:
                     return None, None
                 compiled_fn, _b = entry
@@ -141,7 +139,7 @@ def _submit_trial(cache_key, program, bindings, type_map, device,
                                            latent_channel_count, output_names, scale=scale)
                 return _timed(call, device_type)
         finally:
-            _mark_pool_free("warm")
+            _mark_pool_free("warm", busy_token)
 
     try:
         _trial_futures[cache_key] = _pool_for("warm").submit(_worker)

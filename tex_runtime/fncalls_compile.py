@@ -87,7 +87,8 @@ def verdict(fp: str | None, device_type: str, precision: str) -> bool | None:
     key = _key(fp, device_type, precision)
     if key is None:
         return None
-    v = _memo.get(key)
+    from .lru_util import lru_get
+    v = lru_get(_memo, key)
     if v is None:
         try:
             from . import warm_state as _ws
@@ -95,8 +96,6 @@ def verdict(fp: str | None, device_type: str, precision: str) -> bool | None:
             v = _memo.get(key)
         except Exception:
             pass
-    else:
-        _memo.move_to_end(key)
     return v
 
 
@@ -136,6 +135,15 @@ def resolve_attempt(fp: str | None, device_type: str, precision: str,
         return
     _pending.discard(key)
     record(key, backend is not None)
+
+
+def discard_attempt(fp: str | None, device_type: str, precision: str) -> None:
+    """Forget a granted attempt without recording a verdict: the failure it ended in was not
+    a fact about the program (a loop limit, out of memory, a missing toolchain), so a later
+    cook may be granted the attempt again."""
+    key = _key(fp, device_type, precision)
+    if key is not None:
+        _pending.discard(key)
 
 
 def record(key: str, ok: bool) -> None:

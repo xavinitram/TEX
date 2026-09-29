@@ -28,3 +28,14 @@ def lru_put(d: "OrderedDict[Any, Any]", key: Any, value: Any, max_size: int) -> 
     d.move_to_end(key)
     while len(d) > max_size:
         d.popitem(last=False)
+
+
+def lru_get(d: "OrderedDict[Any, Any]", key: Any, default: Any = None) -> Any:
+    """`d[key]` marked most-recently-used, or `default`. Another thread may evict `key`
+    between the lookup and the touch; that reads as a miss instead of raising."""
+    try:
+        value = d[key]
+        d.move_to_end(key)
+    except KeyError:
+        return default
+    return value
