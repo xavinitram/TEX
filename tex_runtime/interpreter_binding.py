@@ -22,7 +22,7 @@ from ..tex_compiler.ast_nodes import (
     BindingRef, ChannelAccess, Identifier, VarDecl,
 )
 from ..tex_compiler.types import CHANNEL_MAP, TEXType, TYPE_NAME_MAP, base_is_vector
-from .masked_flow import scatter_keep as _masked_flow_scatter_keep
+from .masked_flow import scatter_keep as _masked_flow_scatter_keep, scatter_scale as _masked_flow_scatter_scale
 # PHASEC-OBSROUTE follow-up: `InterpreterError` used to sit in a top-level
 # `from .interpreter import InterpreterError` here, contradicting this docstring's own
 # claim (above) that it is deferred — and, like R1's tex_engine_tiers fix, importing THIS
@@ -315,7 +315,12 @@ class _BindingExecMixin:
             # read side exactly, including falling through to ONE shared raise.
             sp = self.spatial_shape
             result = None
-            if (sp is not None and base.dim() == len(sp)
+            if base.dim() == 0 and not base_is_vector(self.type_map, target.object):
+                # A uniform scalar: `a.r = v` means `a = v`, owning its buffer as below.
+                if idx == 0:
+                    result = value.clone() if isinstance(value, torch.Tensor) else value
+                nchan = 1
+            elif (sp is not None and base.dim() == len(sp)
                     and not base_is_vector(self.type_map, target.object)):
                 if idx == 0:
                     # `m.r = v` on a channel-less scalar means `m = v` — but it MUST own its
@@ -599,9 +604,6 @@ class _BindingExecMixin:
             buf.index_put_(idx, flat_v, accumulate=True)
         elif op == "-":
             buf.index_put_(idx, -flat_v, accumulate=True)
-        elif op == "*":
-            buf[idx] *= flat_v
-        elif op == "/":
-            eps = ZERO_GUARD_EPS.get(flat_v.dtype, SAFE_EPSILON) if isinstance(flat_v, torch.Tensor) else SAFE_EPSILON
-            buf[idx] /= torch.where(flat_v == 0, eps, flat_v)
+        elif op == "*" or op == "/":
+            _masked_flow_scatter_scale(buf, idx, flat_v, op == "/")
 

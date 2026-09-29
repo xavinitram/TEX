@@ -207,11 +207,10 @@ def base_is_vector(type_map: dict, node) -> bool:
     invariant-#2 break. Codegen bails on the exact complement of this predicate, handing every
     ambiguous base to the interpreter, so the tiers now agree by construction.
 
-    The interpreter ANDs a runtime rank test on top (`base.dim() == len(spatial_shape)`), because
-    it alone can tell a spatially-broadcast scalar (identity `.r`) from a 0-dim uniform scalar
-    (which has no spatial axis to be identity over, and errors as it always has). That extra
-    conjunct can only ever make the interpreter MORE conservative than codegen's bail, never less
-    — which is what keeps the superset relation safe. Keep it that way: one definition, four sites.
+    The interpreter ANDs a runtime rank test on top (rank 0 or `len(spatial_shape)`): `.r` is
+    identity on a uniform or spatially-broadcast scalar, while any other rank indexes the last
+    axis. Codegen bails on every non-vector base, so the rank test runs in the interpreter only.
+    Keep it that way: one definition, four sites.
     """
     t = type_map.get(id(node))
     return t is not None and t.is_vector

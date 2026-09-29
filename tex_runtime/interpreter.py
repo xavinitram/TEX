@@ -833,8 +833,9 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             # Rank test FIRST (cheap): a vec base is [B,H,W,C], one rank higher, so the common
             # `@image.r` short-circuits before the type lookup. `base_is_vector` is the shared
             # tier-agreement predicate — codegen bails on its exact complement.
+            # A 0-dim (uniform) scalar has no channel axis either, so `.r` on it is identity too.
             sp = self.spatial_shape
-            if (sp is not None and base.dim() == len(sp)
+            if ((base.dim() == 0 or (sp is not None and base.dim() == len(sp)))
                     and not base_is_vector(self.type_map, node.object)):
                 if idx == 0:
                     return base

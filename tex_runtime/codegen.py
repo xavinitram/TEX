@@ -1622,10 +1622,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"_sb.index_put_((_fb, _fy, _fx), _fv, accumulate=True)")
         elif op == "-":
             self._emit(f"_sb.index_put_((_fb, _fy, _fx), -_fv, accumulate=True)")
-        elif op == "*":
-            self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] * _fv")
-        elif op == "/":
-            self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] / _tw(_fv == 0, _SAFE_EPS, _fv)")
+        elif op == "*" or op == "/":
+            # Every colliding source applies its factor: the interpreter's own reduction.
+            self._emit(f"_MF.scatter_scale(_sb, (_fb, _fy, _fx), _fv, {op == '/'})")
 
         if masked_scatter:
             self._indent -= 1
@@ -1675,6 +1674,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         for vname in sorted(body_vars):  # sorted → deterministic local naming order
             if vname not in self._local_vars:  # don't overwrite params
                 self._local_vars[vname] = f"_ufl_{vname}"  # never `_uf_<x>`: that names a function
+        self._capture_outer_reads(stmt, saved_locals, body_vars)
 
         saved_in_fn = self._in_user_function
         self._in_user_function = True
@@ -1712,6 +1712,18 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._local_vars = saved_locals
         self._spatial_vars = saved_spatial_vars
         self._indent -= 1
+
+    def _capture_outer_reads(self, stmt: FunctionDef, outer: dict, body_vars: set[str]):
+        """Bind each enclosing local the body reads to a local of the emitted def, read at
+        call time. A function sees the variables visible where it is defined (shadows were
+        renamed apart by the checker), and a def-local copy is never a Python closure
+        write, which a scalar loop in the body would otherwise make."""
+        own = body_vars | {pname for _, pname in stmt.params}
+        for name in sorted(self._collect_read_vars(stmt.body) - own):
+            local = outer.get(name)
+            if local is not None and local.isidentifier():
+                self._local_vars[name] = f"_fo_{name}"
+                self._emit(f"_fo_{name} = {local}")
 
     def _enter_function_scope(self, stmt: FunctionDef, body_vars: set[str]):
         """Scope the two emit-time memos a function body would otherwise leak.
@@ -3403,9 +3415,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         # User-defined function call
         if name in self._user_functions:
-            args_str = ", ".join(args)
-            depth_arg = ", _depth=_depth+1" if self._in_user_function else ""
-            self._emit(f"{tmp} = _uf_{name}({args_str}{depth_arg})")
+            if self._in_user_function:
+                args = args + ["_depth=_depth+1"]
+            self._emit(f"{tmp} = _uf_{name}({', '.join(args)})")
             return tmp
 
         # SCALE-CG-48: a `pixel_args=`-tagged builtin's pixel-unit argument(s) are
@@ -3612,9 +3624,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             for i, a in enumerate(args):
                 arg_type = self.type_map.get(id(node.args[i]))
                 if arg_type is not None and arg_type.is_vector:
-                    # Vector channel slices are already spatial — skip _es()
+                    # A vector need not be full-grid (a whole-image reduction is [B,1,1,C]),
+                    # so each channel is broadcast like a scalar, as the interpreter does.
                     for ch in range(arg_type.channels):
-                        component_exprs.append(f"{a}[..., {ch}]")
+                        component_exprs.append(f"_es({a}[..., {ch}], _sp)")
                 else:
                     component_exprs.append(f"_es({a}, _sp)")
 
@@ -3661,34 +3674,31 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                            f"or {value}.dtype is _torch.float32 else {value}.float()")
                 return tmp
 
+        tmp = self._tmp()
+        if node.target_type == "string":
+            # The interpreter's own text (`str()`): 6 significant digits, whole numbers as
+            # ints, NaN/Inf as 'nan'/'inf', a field averaged with its one-time warning.
+            fn = self._get_fn_local("str")
+            if self._scalar_loop:
+                value = (f"(_torch.scalar_tensor(float({value})) "
+                         f"if isinstance({value}, (int, float)) else {value})")
+            self._emit(f"{tmp} = {fn}({value})")
+            return tmp
+
         # Scalar loop mode: Python float casts
         if self._scalar_loop:
-            tmp = self._tmp()
-            if node.target_type == "int":
-                self._emit(f"{tmp} = float(_math.floor(float({value})))")
+            if node.target_type == "int":   # floor, and NaN/Inf pass through as in torch.floor
+                self._emit(f"{tmp} = float({value})")
+                self._emit(f"{tmp} = float(_math.floor({tmp})) if _math.isfinite({tmp}) else {tmp}")
             elif node.target_type == "float":
                 self._emit(f"{tmp} = float({value})")
-            elif node.target_type == "string":
-                self._emit(f"{tmp} = str({value})")
             else:
                 self._emit(f"{tmp} = {value}")
             return tmp
 
-        tmp = self._tmp()
-
-        if node.target_type == "string":
-            self._emit(f"if _torch.is_tensor({value}):")
-            self._indent += 1
-            self._emit(f"_cv = {value}.item() if {value}.dim() == 0 else {value}.float().mean().item()")
-            self._emit(f"{tmp} = str(int(_cv)) if _cv == int(_cv) else str(_cv)")
-            self._indent -= 1
-            self._emit(f"else:")
-            self._indent += 1
-            self._emit(f"{tmp} = str({value})")
-            self._indent -= 1
-        elif node.target_type == "int":
+        if node.target_type == "int":
             # floor() matches interpreter semantics (round toward -inf, not truncate)
-            self._emit(f"{tmp} = _torch.floor({value}) if _torch.is_tensor({value}) else _torch.scalar_tensor(_math.floor({value}), dtype=_torch.float32, device=_dev)")
+            self._emit(f"{tmp} = _torch.floor({value} if _torch.is_tensor({value}) else _torch.scalar_tensor(float({value}), dtype=_torch.float32, device=_dev))")
         elif node.target_type == "float":
             self._emit(f"{tmp} = {value}.float() if _torch.is_tensor({value}) else _torch.scalar_tensor(float({value}), dtype=_torch.float32, device=_dev)")
         else:

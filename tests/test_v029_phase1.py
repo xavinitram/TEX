@@ -368,14 +368,19 @@ def test_spatial_scalar_channel_access(r: SubTestResult):
     # crashed with "more than one element ... single memory location".
     IMG = make_img(1, 4, 4, 3, seed=9)
     src_before = IMG.clone()
-    # (A LOCAL scalar has no channels to write -- `float a; a.r = v` is E3301 -- so the identity
-    # write only exists on a scalar @binding, which is what these arms drive.)
-    errs = [d for d in tex_api.check("float a = @IN.r; a.r = 0.5; @OUT = vec4(a, a, a, 1.0);",
-                                     {"IN": TEXType.VEC3}) if d.severity == "error"]
-    if errs and errs[0].code == "E3301":
-        r.ok("a local scalar's `.r` write is compile-rejected (E3301)")
-    else:
-        r.fail("spatial-scalar local write", f"expected E3301, got {[e.code for e in errs]}")
+    # The same holds for a local scalar and for a scalar @binding: `.r =` writes the whole value.
+    out = tex_api.execute(tex_api.compile(
+        "float a = @IN.r; float b2 = @IN.g; a.r = b2; a = a + 0.5; @OUT = vec4(a, b2, b2, 1.0);",
+        {"IN": TEXType.VEC3}), {"IN": IMG}, device="cpu")
+    r.ok("`m.r = v` owns its buffer: the caller's input is not mutated")         if torch.equal(IMG, src_before) else r.fail("spatial-scalar alias", "the INPUT tensor was mutated")
+    r.ok("`m.r = v` then `m + k`: the aliased source keeps its value")         if torch.allclose(out["OUT"][..., 1], src_before[..., 1], atol=1e-6)         else r.fail("spatial-scalar alias", "the RHS local was corrupted by the later in-place add")
+    try:   # a 0-dim RHS must not produce an expanded (stride-0) buffer that a later op mutates
+        tex_api.execute(tex_api.compile(
+            "float lum = @IN.r; lum.r = 0.5; lum = lum * 2.0; @OUT = vec4(lum, lum, lum, 1.0);",
+            {"IN": TEXType.VEC3}), {"IN": IMG.clone()}, device="cpu")
+        r.ok("`m.r = <0-dim>` then in-place op does not crash on a stride-0 view")
+    except RuntimeError as e:
+        r.fail("spatial-scalar alias", f"0-dim RHS produced a non-owned buffer: {str(e)[:60]}")
     out = tex_api.execute(tex_api.compile(
         "float b2 = @IN.g; @M.r = b2; @M = @M + 0.5; @OUT = vec4(@M, b2, b2, 1.0);",
         {"IN": TEXType.VEC3, "M": TEXType.FLOAT}),

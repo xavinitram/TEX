@@ -506,7 +506,8 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     """Extract a fully static for-loop as (var_name, start, stop, step).
 
     Matches: for (int VAR = START; VAR < END; VAR = VAR + STEP)
-    where START, END, STEP are all NumberLiterals (possibly after constant folding).
+    where START, END, STEP are all NumberLiterals (possibly after constant folding) and the
+    body never assigns VAR.
     Returns None if the pattern doesn't match.
 
     Shared by both the interpreter and codegen to avoid duplication.
@@ -566,6 +567,9 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     # already past the bound), and a static range would say something else.
     if step <= 0:
         return None
+    # A body that writes the counter changes the pass count; only the general loop sees it.
+    if loop_var in collect_assigned_vars(node.body)[0]:
+        return None
     return (loop_var, start, end, step)
 
 
@@ -614,3 +618,91 @@ def collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
             env_vars |= e
             binding_names |= b
     return env_vars, binding_names
+
+
+def rename_shadowing_locals(program: Program, outer_names) -> None:
+    """Give every local that shadows an outer-scope name a name of its own, in place.
+
+    The checker resolves names lexically, but both runtimes keep ONE flat variable table
+    per call. Without this, a shadow declared in a block overwrote the outer variable past
+    the block's end, and a user function read a caller's same-named local instead of the
+    variable visible where the function is defined. After renaming, no two variables that
+    can be live at once share a name, so the flat table resolves every read the way the
+    checker typed it. Scopes are the checker's: each if/else branch, a `for` (header and
+    body), a `while`, and a function (parameters and body). `outer_names` are the names
+    visible before the first statement (the built-in variables); they share the top-level
+    scope, so a top-level declaration is never renamed.
+    """
+    taken = set(outer_names)
+    stack: list[ASTNode] = [program]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (VarDecl, ArrayDecl)):
+            taken.add(node.name)
+        elif isinstance(node, Identifier):
+            taken.add(node.name)
+        elif isinstance(node, FunctionDef):
+            taken.update(p for _, p in node.params)
+        stack.extend(iter_child_nodes(node))
+    scopes: list[dict] = [{n: n for n in outer_names}]
+
+    def declare(name: str) -> str:
+        if name in scopes[-1]:
+            return scopes[-1][name]
+        new = name
+        if len(scopes) > 1 and any(name in s for s in scopes[:-1]):
+            k = 1
+            while f"{name}_{k}" in taken:
+                k += 1
+            new = f"{name}_{k}"
+            taken.add(new)
+        scopes[-1][name] = new
+        return new
+
+    def expr(node) -> None:
+        if isinstance(node, Identifier):
+            for s in reversed(scopes):
+                if node.name in s:
+                    node.name = s[node.name]
+                    return
+            return
+        for child in iter_child_nodes(node):
+            expr(child)
+
+    def block(stmts) -> None:
+        scopes.append({})
+        for s in stmts:
+            stmt(s)
+        scopes.pop()
+
+    def stmt(node) -> None:
+        if isinstance(node, (VarDecl, ArrayDecl)):
+            for child in iter_child_nodes(node):
+                expr(child)
+            node.name = declare(node.name)
+        elif isinstance(node, IfElse):
+            expr(node.condition)
+            block(node.then_body)
+            block(node.else_body)
+        elif isinstance(node, ForLoop):
+            scopes.append({})
+            for part in (node.init, node.condition, node.update):
+                if part is not None:
+                    stmt(part)
+            for s in node.body:
+                stmt(s)
+            scopes.pop()
+        elif isinstance(node, WhileLoop):
+            expr(node.condition)
+            block(node.body)
+        elif isinstance(node, FunctionDef):
+            scopes.append({})
+            node.params = [(t, declare(p)) for t, p in node.params]
+            for s in node.body:
+                stmt(s)
+            scopes.pop()
+        else:
+            expr(node)
+
+    for s in program.statements:     # top level shares the built-ins' scope, as in the checker
+        stmt(s)

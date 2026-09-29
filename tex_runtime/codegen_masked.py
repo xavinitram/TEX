@@ -572,6 +572,7 @@ class MaskedEmitMixin:
         for vname in sorted(body_vars):
             if vname not in self._local_vars:
                 self._local_vars[vname] = f"_ufl_{vname}"  # never `_uf_<x>`: that names a function
+        self._capture_outer_reads(stmt, saved_locals, body_vars)
 
         saved_in_fn = self._in_user_function
         self._in_user_function = True
@@ -644,8 +645,9 @@ class MaskedEmitMixin:
         self._emit(f"if _MF.m_any({_STATE}.live):")
         self._indent += 1
         args = [self._emit_expr(a) for a in node.args]
-        depth_arg = ", _depth=_depth+1" if self._in_user_function else ""
-        self._emit(f"{tmp} = _uf_{node.name}({', '.join(args)}{depth_arg})")
+        if self._in_user_function:
+            args.append("_depth=_depth+1")
+        self._emit(f"{tmp} = _uf_{node.name}({', '.join(args)})")
         self._indent -= 1
         self._emit("else:")
         self._indent += 1

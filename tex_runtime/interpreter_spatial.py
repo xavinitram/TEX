@@ -21,6 +21,7 @@ import math
 import torch
 
 from ..tex_compiler.ast_nodes import Program
+from .lru_util import lru_get, lru_put
 # PHASEC-OBSROUTE follow-up: `_BUILTINS_LRU_MAX`/`_COORD_RAMP_LRU_MAX`/
 # `_SCALAR_BUILTIN_DEFAULTS` used to sit in a top-level `from .interpreter import ...`
 # here, contradicting this docstring's own claim (above) that the names this module does
@@ -83,21 +84,12 @@ class _SpatialContextMixin:
         computed once over the full extent instead of once per window."""
         from .interpreter import _COORD_RAMP_LRU_MAX
         key = (self._device_str, size)
-        hit = self._coord_ramp_lru.get(key)
+        hit = lru_get(self._coord_ramp_lru, key)
         if hit is not None:
-            try:
-                self._coord_ramp_lru.move_to_end(key)
-            except KeyError:      # a memory sweep on another thread emptied the LRU meanwhile
-                pass
             return hit
         ramp = torch.arange(0, max(size, 0), dtype=torch.float32, device=self.device)
         norm = ramp / max(size - 1, 1)
-        self._coord_ramp_lru[key] = (ramp, norm)
-        if len(self._coord_ramp_lru) > _COORD_RAMP_LRU_MAX:
-            try:
-                self._coord_ramp_lru.popitem(last=False)
-            except KeyError:
-                pass
+        lru_put(self._coord_ramp_lru, key, (ramp, norm), _COORD_RAMP_LRU_MAX)
         return ramp, norm
 
     def _create_builtins(self, program: Program,
@@ -127,12 +119,8 @@ class _SpatialContextMixin:
         # runs only AFTER a miss (below), for the coordinate build (the sole `roi` consumer).
         cache_key = (self.spatial_shape, self._device_str, self._dtype, used,
                      self.latent_channel_count, tile, roi, batch_slice)
-        hit = self._builtins_lru.get(cache_key)
+        hit = lru_get(self._builtins_lru, cache_key)
         if hit is not None:
-            try:
-                self._builtins_lru.move_to_end(cache_key)
-            except KeyError:      # a memory sweep on another thread emptied the LRU meanwhile
-                pass
             self.env.update(hit)
             self._set_time_builtins(used)   # ENG-7: never cached — see _TIME_BUILTIN_NAMES
             return
@@ -221,20 +209,14 @@ class _SpatialContextMixin:
         if "ic" in used:
             self.env["ic"] = torch.scalar_tensor(float(self.latent_channel_count), dtype=self._dtype, device=self.device)
 
-        # Store only builtin tensors in cache (not user variables). cache_key is a
-        # fresh key here (we returned above on a hit), so the insert already lands
-        # MRU — no move_to_end needed (mirrors compiled._env_cached).
+        # Store only builtin tensors in cache (not user variables).
         # ENG-7: _CACHEABLE_BUILTIN_NAMES, not _BUILTIN_NAMES — the host-time builtins are
         # not a function of this key. ORDER IS LOAD-BEARING: the store must stay ABOVE
         # `_set_time_builtins`, so a playhead is never in `env` when the entry is taken.
         # (The filter is the belt to that braces — see _CACHEABLE_BUILTIN_NAMES.)
-        self._builtins_lru[cache_key] = {k: v for k, v in self.env.items()
-                                         if k in _CACHEABLE_BUILTIN_NAMES}
-        while len(self._builtins_lru) > _BUILTINS_LRU_MAX:
-            try:
-                self._builtins_lru.popitem(last=False)
-            except KeyError:
-                break
+        lru_put(self._builtins_lru, cache_key,
+                {k: v for k, v in self.env.items() if k in _CACHEABLE_BUILTIN_NAMES},
+                _BUILTINS_LRU_MAX)
         self._set_time_builtins(used)
 
     def _set_time_builtins(self, used: frozenset[str]) -> None:

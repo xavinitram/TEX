@@ -199,7 +199,6 @@ _BAREWORD_BUDGET = {
     "tex_runtime/graphed.py": 1,
     "tests/test_v044_cancel44.py": 1,
     "tests/test_v043_rider_a_capture_pending.py": 1,
-    "tests/test_v040_phase1.py": 1,
     "tests/test_simp3_skip_budget.py": 1,
     "tests/test_simp3_consumer_registries.py": 1,
     "tests/test_seam45_embedding_host_seam.py": 1,
