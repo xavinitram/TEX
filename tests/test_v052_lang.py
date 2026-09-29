@@ -163,6 +163,30 @@ def test_widening_is_idempotent_on_recheck():
     assert type(init).__name__ == "VecConstructor" and type(init.args[0]).__name__ != "VecConstructor"
 
 
+# ── A per-pixel `if` merges variables a for-loop HEADER assigns ─────────────────────────────
+
+def _half_mask():
+    A = torch.zeros(1, 2, 2, 4)
+    A[0, :, 1, 0] = 1.0            # r = 1 only at x = 1
+    return A
+
+
+@pytest.mark.parametrize("pragma", ["", "//!tex 0.25\n"])
+def test_for_header_assignment_does_not_leak_out_of_per_pixel_if(pragma):
+    code = pragma + ("int i = 0; if (@A.r > 0.5) { for (i = 0; i < 3; i++) { } } "
+                     "@OUT = vec4(float(i), 0.0, 0.0, 1.0);")
+    ref = run_both(code, {"A": _half_mask()})
+    assert ref["OUT"][0, :, :, 0].tolist() == [[0.0, 3.0], [0.0, 3.0]]
+
+
+@pytest.mark.parametrize("pragma", ["", "//!tex 0.25\n"])
+def test_for_update_assignment_does_not_leak_out_of_per_pixel_if(pragma):
+    code = pragma + ("float j = 0.0; if (@A.r > 0.5) { for (int k = 0; k < 3; j += 1.0) { k++; } } "
+                     "@OUT = vec4(j, 0.0, 0.0, 1.0);")
+    ref = run_both(code, {"A": _half_mask()})
+    assert ref["OUT"][0, :, :, 0].tolist() == [[0.0, 3.0], [0.0, 3.0]]
+
+
 def test_vec_array_literal_elements_widen():
     A = _a()
     run_both("vec4 a[2] = {@A.rgb, vec4(0.5)}; @OUT = a[0];", {"A": A},

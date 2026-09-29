@@ -612,7 +612,10 @@ def collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
             env_vars |= e1 | e2
             binding_names |= b1 | b2
         elif isinstance(stmt, (ForLoop, WhileLoop)):
-            e, b = collect_assigned_vars(stmt.body)
+            body = stmt.body
+            if isinstance(stmt, ForLoop):   # the header's init/update assign too
+                body = [s for s in (stmt.init, stmt.update) if s is not None] + list(body)
+            e, b = collect_assigned_vars(body)
             env_vars |= e
             binding_names |= b
     return env_vars, binding_names
