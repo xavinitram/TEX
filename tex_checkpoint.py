@@ -306,8 +306,9 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
 
         # P0-8: an EMPTY cache cannot serve any cut, so minting a key per cut and probing the disk
         # tier for each is pure prologue on the exact cook that has the least to gain — the first
-        # one. `stats()` is O(1) for this question. A cache with RAM entries or an unknown/populated
-        # disk tier still walks the loop; only the provably-empty case short-circuits.
+        # one. `_cache_is_provably_empty` answers from the RAM/spill bookkeeping in O(1). A cache
+        # with RAM entries or an unknown/populated disk tier still walks the loop; only the
+        # provably-empty case short-circuits.
         if _cache_is_provably_empty(result_cache):
             return _full()
 
@@ -356,13 +357,18 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
     boundary that falls out. Returns the cuts actually materialized.
 
     ONE cook, not N segment cooks: `compile_fused` exports a tapped stage's handoff as
-    `@_tap_s{i}` (tex_fusion.py:520,574), which is an assignment of a local the program already
-    computed — so arming a tap costs no arithmetic and every checkpoint is harvested in a
-    single pass. Verified bit-exact against the standalone prefix cook, CPU and CUDA.
+    `@_tap_s{i}` (`tap_exports` in `tex_fusion.compile_fused`), which is an assignment of a
+    local the program already computed — so arming a tap costs no arithmetic and every
+    checkpoint is harvested in a single pass. Verified bit-exact against the standalone prefix
+    cook, CPU and CUDA.
 
-    Preemption-safe by construction: the `put`s happen AFTER the cook returns, so a harvest
-    that a SCHED-4 interactive arrival preempts publishes nothing and simply re-queues. A
-    partially-harvested chain is never a partially-populated cache.
+    Preemption-safe: a batch's `put`s happen AFTER its cook returns, so a harvest preempted by
+    a SCHED-4 interactive arrival mid-batch publishes nothing for that batch and re-queues.
+    A chain needing more than one tap batch (`_tap_budget`) is not atomic: batches already
+    finished stay published, each boundary individually valid.
+
+    Cuts the serve loop would skip (a user tap deeper than the cut) or that are already
+    resident in RAM are not re-cooked; the return value includes the resident ones.
     """
     cuts = _resolve_cuts(stages, result_cache, cuts,
                          latent_channel_count=latent_channel_count, upstream=upstream,
@@ -373,8 +379,22 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
 
     from . import tex_engine
 
-    done: list[int] = []
-    pending = sorted(cuts, reverse=True)          # DEEPEST first — see `_tap_budget`
+    from .tex_fusion import unservable_prefix_taps
+    keys: dict = {}
+    resident: list[int] = []
+    todo: list[int] = []
+    for k in cuts:
+        if unservable_prefix_taps(stages, k):
+            continue                              # `cook_checkpointed` never serves this cut
+        keys[k] = tex_engine.boundary_lineage_key(
+            stages, k, device, precision, upstream=upstream, time_context=time_context,
+            latent_channel_count=latent_channel_count, scale=scale)
+        (resident if _resident(result_cache, keys[k]) else todo).append(k)
+    if not todo:
+        return sorted(resident)
+
+    done: list[int] = resident[:]
+    pending = sorted(todo, reverse=True)          # DEEPEST first — see `_tap_budget`
     while pending:
         batch = pending[:_tap_budget()]
         tapped = [dict(st) for st in stages]
@@ -389,10 +409,7 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
             b = out.get(f"_tap_s{k - 1}")
             if b is None:
                 continue
-            key = tex_engine.boundary_lineage_key(
-                stages, k, device, precision, upstream=upstream, time_context=time_context,
-                latent_channel_count=latent_channel_count, scale=scale)
-            result_cache.put(key, b, canvas={"shape": list(b.shape)})
+            result_cache.put(keys[k], b, canvas={"shape": list(b.shape)})
             harvested.append(k)
         done.extend(harvested)
         # Retry on GROUND TRUTH, not on a predicted budget. `_tap_budget()` assumes the chain
@@ -429,6 +446,15 @@ def _tap_budget() -> int:
     came back, so being wrong here costs an extra pass rather than a missing checkpoint."""
     from .tex_engine import MAX_OUTPUTS
     return max(1, int(MAX_OUTPUTS) - 1)
+
+
+def _resident(result_cache, key) -> bool:
+    """True when `key` is in the cache's RAM tier now (`key in cache` changes nothing). A
+    duck-typed cache without membership reads as not resident, so it is harvested as before."""
+    try:
+        return key in result_cache
+    except Exception:
+        return False
 
 
 def _cache_is_provably_empty(result_cache) -> bool:
