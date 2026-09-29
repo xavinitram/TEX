@@ -16,7 +16,7 @@ this item:
    window and relies on `atexit` to flush the tail. `atexit` does not run on `os._exit`, a
    SIGKILL, or a hard crash — so up to five seconds of learned verdicts were lost, which is
    not "at most the in-flight cook". Fixed with a JOURNAL (below): the coalescing window keeps
-   its performance job, and durability moves to an append that costs microseconds.
+   its performance job, and durability moves to an append that costs ~0.2 ms.
 
 2. **`os.replace` is atomic, not durable.** Atomicity survives a process crash (the page cache
    outlives the process). It does not survive a machine crash: the rename can land while the
@@ -41,7 +41,7 @@ this item:
 wholesale:
 
     load()     read the snapshot, then replay the journal on top of it
-    learn()    append one line to the journal (write + flush; ~µs, off the cook's hot path)
+    learn()    append one line to the journal (write + flush; ~0.2 ms, off the cook's hot path)
     persist()  write the snapshot atomically, THEN clear the journal
 
 The ordering in `persist()` is the whole correctness argument, and it is deliberately the
@@ -70,17 +70,22 @@ import tempfile
 TMP_PREFIX = ".tex-tmp-"
 
 
-def sweep_temps(directory: str) -> int:
+def sweep_temps(directory: str, *, min_age_s: float = 600.0) -> int:
     """Delete this module's orphaned temps under `directory`. Returns how many went.
 
     Only ever removes files this module minted (both the prefix AND the suffix must match),
-    so it can be pointed at a shared cache directory without touching a peer's data."""
+    so it can be pointed at a shared cache directory without touching a peer's data. A temp
+    younger than `min_age_s` may be a live writer's between `mkstemp` and `os.replace` (a
+    reattach in a running process, a second process on the same directory), so it stays."""
     n = 0
     try:
+        now = time.time()
         with os.scandir(directory) as it:
             for entry in it:
                 if entry.name.startswith(TMP_PREFIX) and entry.name.endswith(".tmp"):
                     try:
+                        if now - entry.stat().st_mtime < min_age_s:
+                            continue
                         os.remove(entry.path)
                         n += 1
                     except OSError:
@@ -555,18 +560,13 @@ def sign_pickle(path, data, *, fsync: bool = False) -> bool:
     return atomic_write(str(path), _body, fsync=fsync)
 
 
-#: R4 (B3#2): how many CONSECUTIVE `_UNREADABLE` verdicts for the SAME path, within this
-#: process, before `load_verified` stops calling it transient and reports `_UNVERIFIED` instead
-#: — the exact action every caller already takes for "give up on this file" (delete + its own
-#: accounting). Below this, an open()/read() failure is exactly the transient case RESTORE-462
-#: (`ea8a1d6`) protects (a sharing violation, a momentary EMFILE, a network hiccup) and must
-#: leave the file for a retry to find good. Nothing distinguished that from a PERMANENT failure
-#: (a real disk I/O error, a permission grant that never returns): `_UNREADABLE` never deletes
-#: the file or clears its cache membership, so a permanently-unreadable entry was retried —
-#: one real syscall — on every single restore/load for that key, forever. Chosen well above any
-#: plausible transient retry count (the existing single-flaky-open regression test trips this
-#: exactly once) and finite, so the self-heal (a re-`put()` of the same key, which every caller
-#: already does after a miss) is reachable instead of permanently blocked by a dead entry.
+#: How many CONSECUTIVE `_UNREADABLE` verdicts for the SAME path, within this process, before
+#: `load_verified` reports `_UNVERIFIED` instead (the caller then gives up on the file and
+#: deletes it). Below this, an open()/read() failure is treated as transient (a sharing
+#: violation, a momentary EMFILE) and the file is left for a retry. `_UNREADABLE` never deletes
+#: anything, so without a bound a permanently unreadable entry would cost one syscall on every
+#: load of that key forever. Well above any plausible transient retry count, and finite so the
+#: self-heal (a re-`put()` of the key) stays reachable.
 _UNREADABLE_STREAK_LIMIT = 8
 _unreadable_streak: dict[str, int] = {}
 _unreadable_streak_lock = threading.Lock()
@@ -617,7 +617,7 @@ def load_verified(path):
     R4: `_UNREADABLE` is BOUNDED. `_UNREADABLE_STREAK_LIMIT` consecutive open/read failures on
     the SAME path escalate this call's verdict to `_UNVERIFIED` instead — every caller already
     treats that as license to delete the file, which is exactly what a permanently-unreadable
-    entry needs (a transient failure never reaches the limit; see the constant's docstring)."""
+    entry needs (a transient failure never reaches the limit; see the comment on `_UNREADABLE_STREAK_LIMIT`)."""
     spath = str(path)
     try:
         with open(spath, "rb") as f:
@@ -647,6 +647,10 @@ def load_verified(path):
 # ── the journal ──────────────────────────────────────────────────────────────
 
 
+#: Re-entrant: `drop_prefix` clears through `clear()` while holding it.
+_journal_lock = threading.RLock()
+
+
 class Journal:
     """An append-only sidecar next to a snapshot file, so incrementally-learned state is
     durable the moment it is learned instead of when the snapshot next happens to be written.
@@ -655,14 +659,16 @@ class Journal:
     the one malformed line, which `replay()` skips, and the file stays readable by a human
     debugging a recovery.
 
-    `append` flushes but does NOT fsync. HONEST COST, because an earlier draft of this docstring
-    said "microseconds" and that was wrong: open + write + flush + close measures **186 µs** on
-    this box, against 5.4 µs through a held handle. It runs once per newly-learned capturability
-    verdict (from `graphed`, on the first cook of a program), not per cook — so it is a
-    once-per-program cost on the cook thread, not a per-frame one. A held handle would recover
-    the difference but would block a peer process's `os.replace` over the same path on Windows,
-    which is the compaction this class exists to allow. The bound ENG-13 states is a PROCESS
-    crash, and a flushed write survives that; `persist()`'s snapshot is where the fsync lands."""
+    `append` flushes but does NOT fsync. Open + write + flush + close costs ~0.2 ms, paid once
+    per newly-learned capturability verdict (from `graphed`, on the first cook of a program),
+    not per cook. A held handle would be cheaper but would block a peer process's `os.replace`
+    over the same path on Windows, which is the compaction this class exists to allow. The
+    bound ENG-13 states is a PROCESS crash, and a flushed write survives that; `persist()`'s
+    snapshot is where the fsync lands.
+
+    `append`, `clear` and `drop_prefix` share one in-process lock, so compaction cannot drop a
+    record another thread appended meanwhile. A second PROCESS on the same directory is not
+    covered."""
 
     __slots__ = ("path",)
 
@@ -671,7 +677,7 @@ class Journal:
 
     def append(self, record: dict) -> bool:
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
+            with _journal_lock, open(self.path, "a", encoding="utf-8") as f:
                 # LEADING newline as well as trailing: a crash mid-append leaves a partial
                 # line with no terminator, and appending straight onto it merges the torn
                 # record with this one — losing BOTH while returning True. The extra byte
@@ -726,11 +732,12 @@ class Journal:
 
     def clear(self) -> None:
         """Drop the journal entirely. Only safe when nothing can have been appended since the
-        snapshot was taken — prefer `drop_prefix`, which is safe unconditionally."""
-        try:
-            os.remove(self.path)
-        except OSError:
-            pass
+        snapshot was taken — prefer `drop_prefix`, which keeps records appended meanwhile."""
+        with _journal_lock:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
 
     def drop_prefix(self, n: int) -> None:
         """Discard the first `n` records and KEEP the rest.
@@ -741,20 +748,23 @@ class Journal:
         compactor counts what it is superseding, and only that many records go.
 
         Rewrites via the shared atomic write, so a crash mid-compaction leaves either the old
-        journal or the trimmed one, never a torn one."""
+        journal or the trimmed one, never a torn one. The read-and-replace runs under the
+        journal lock, so an `append` from another thread lands before or after it, never in
+        the gap."""
         if n <= 0:
             return
-        try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-                rest = [line for line in f if line.strip()][n:]
-        except OSError:
-            return
-        if not rest:
-            self.clear()
-            return
-        # LINES, not records: no JSON round-trip in either direction, and a malformed line is
-        # one the snapshot never adopted, so dropping it with the prefix is exactly right.
-        atomic_write(self.path, "".join(rest).encode("utf-8"))
+        with _journal_lock:
+            try:
+                with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                    rest = [line for line in f if line.strip()][n:]
+            except OSError:
+                return
+            if not rest:
+                self.clear()
+                return
+            # LINES, not records: no JSON round-trip in either direction, and a malformed line
+            # is one the snapshot never adopted, so dropping it with the prefix is exactly right.
+            atomic_write(self.path, "".join(rest).encode("utf-8"))
 
     def exists(self) -> bool:
         return os.path.exists(self.path)

@@ -191,7 +191,7 @@ _TIER1_SPEC = {
     'tex_provider:set_media_budget_mb': ('function', (('mb', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_provider:source_flags': ('function', (('source_keys', 'VAR_POSITIONAL', False),)),
     'tex_recovery:atomic_write': ('function', (('path', 'POSITIONAL_OR_KEYWORD', False), ('write', 'POSITIONAL_OR_KEYWORD', False), ('fsync', 'KEYWORD_ONLY', True))),
-    'tex_recovery:sweep_temps': ('function', (('directory', 'POSITIONAL_OR_KEYWORD', False),)),
+    'tex_recovery:sweep_temps': ('function', (('directory', 'POSITIONAL_OR_KEYWORD', False), ('min_age_s', 'KEYWORD_ONLY', True))),
     'tex_results:ResultCache': ('class', None),
     'tex_results:ResultCache.put': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('key', 'POSITIONAL_OR_KEYWORD', False), ('tensor', 'POSITIONAL_OR_KEYWORD', False), ('canvas', 'KEYWORD_ONLY', True), ('quality', 'KEYWORD_ONLY', True), ('storage', 'KEYWORD_ONLY', True), ('kind', 'KEYWORD_ONLY', True), ('home', 'KEYWORD_ONLY', True), ('mask_eligible', 'KEYWORD_ONLY', True))),
     'tex_results:ResultCache.stats': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False),)),
