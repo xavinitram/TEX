@@ -516,3 +516,35 @@ def _crop(full, roi):
     like `load_counts_harness`/`retry_on_os_policy_kernel_block` above."""
     x0, y0, w, h, _W, _H = roi
     return full[:, y0:y0 + h, x0:x0 + w]
+
+
+class TripToken:
+    """A CancelToken that raises `CookCancelled` on its Nth `check()` (n >= 1); `calls` counts
+    the polls made so far. The one shared trip-on-Nth-check token the cancellation tests use.
+
+    Deliberately NOT in `helpers.__all__` (HOOK-4 pins that list): import it by name."""
+
+    def __init__(self, n: int):
+        self.n = n
+        self.calls = 0
+
+    def check(self) -> None:
+        self.calls += 1
+        if self.calls >= self.n:
+            from TEX_Wrangle.tex_runtime.host import CookCancelled
+            raise CookCancelled("test: tripped")
+
+
+def recount_bytes(cache):
+    """`(recount, maintained)` for a `tex_results.ResultCache`: the per-device byte buckets
+    recomputed from its entries, and the buckets as the cache maintains them, both read under
+    the cache lock so they are one snapshot. A mismatch is a lost or duplicated accounting
+    update.
+
+    Deliberately NOT in `helpers.__all__` (HOOK-4 pins that list): import it by name."""
+    from TEX_Wrangle import tex_results
+    with cache._lock:
+        recount = {"cuda": 0, "cpu": 0}
+        for e in cache._ram.values():
+            recount[tex_results._dev_bucket(e.device)] += e.nbytes
+        return recount, dict(cache._bytes_by_dev)

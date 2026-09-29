@@ -43,7 +43,7 @@ _DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]
 
 def _both_tiers(code, bindings, B=1, H=4, W=4):
     """(interp OUT, codegen OUT). A decline is a failure: these rows pin BOTH tiers."""
-    interp, cg = run_both(code, bindings, B=B, H=H, W=W)
+    interp, cg = run_both(code, bindings)
     if cg is None:
         raise AssertionError("codegen declined the program, so only one tier was measured")
     return interp["OUT"], cg["OUT"]

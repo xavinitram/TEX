@@ -27,7 +27,7 @@ from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img, run_b
 from TEX_Wrangle import tex_engine, tex_api
 from TEX_Wrangle.tex_runtime import host as _host
 from TEX_Wrangle.tex_runtime.host import CookCancelled
-from test_v027_phase1 import _TripToken   # the SCHED-3 trip token (defined with its own tests)
+from helpers import TripToken   # the shared trip-on-Nth-check token
 
 
 def _tiers_agree(i, c):
@@ -368,19 +368,32 @@ def test_spatial_scalar_channel_access(r: SubTestResult):
     # crashed with "more than one element ... single memory location".
     IMG = make_img(1, 4, 4, 3, seed=9)
     src_before = IMG.clone()
+    # (A LOCAL scalar has no channels to write -- `float a; a.r = v` is E3301 -- so the identity
+    # write only exists on a scalar @binding, which is what these arms drive.)
+    errs = [d for d in tex_api.check("float a = @IN.r; a.r = 0.5; @OUT = vec4(a, a, a, 1.0);",
+                                     {"IN": TEXType.VEC3}) if d.severity == "error"]
+    if errs and errs[0].code == "E3301":
+        r.ok("a local scalar's `.r` write is compile-rejected (E3301)")
+    else:
+        r.fail("spatial-scalar local write", f"expected E3301, got {[e.code for e in errs]}")
     out = tex_api.execute(tex_api.compile(
-        "float a = @IN.r; float b2 = @IN.g; a.r = b2; a = a + 0.5; @OUT = vec4(a, b2, b2, 1.0);",
-        {"IN": TEXType.VEC3}), {"IN": IMG}, device="cpu")
-    r.ok("`m.r = v` owns its buffer: the caller's input is not mutated") \
-        if torch.equal(IMG, src_before) else r.fail("spatial-scalar alias", "the INPUT tensor was mutated")
-    r.ok("`m.r = v` then `m + k`: the aliased source keeps its value") \
-        if torch.allclose(out["OUT"][..., 1], src_before[..., 1], atol=1e-6) \
-        else r.fail("spatial-scalar alias", "the RHS local was corrupted by the later in-place add")
+        "float b2 = @IN.g; @M.r = b2; @M = @M + 0.5; @OUT = vec4(@M, b2, b2, 1.0);",
+        {"IN": TEXType.VEC3, "M": TEXType.FLOAT}),
+        {"IN": IMG, "M": torch.zeros(1, 4, 4)}, device="cpu")
+    if torch.equal(IMG, src_before):
+        r.ok("`@m.r = v` owns its buffer: the caller's input is not mutated")
+    else:
+        r.fail("spatial-scalar alias", "the INPUT tensor was mutated")
+    if torch.allclose(out["OUT"][..., 1], src_before[..., 1], atol=1e-6):
+        r.ok("`@m.r = v` then `@m + k`: the aliased source keeps its value")
+    else:
+        r.fail("spatial-scalar alias", "the RHS local was corrupted by the later in-place add")
     try:   # a 0-dim RHS must not produce an expanded (stride-0) buffer that a later op mutates
         tex_api.execute(tex_api.compile(
-            "float lum = @IN.r; lum.r = 0.5; lum = lum * 2.0; @OUT = vec4(lum, lum, lum, 1.0);",
-            {"IN": TEXType.VEC3}), {"IN": IMG.clone()}, device="cpu")
-        r.ok("`m.r = <0-dim>` then in-place op does not crash on a stride-0 view")
+            "@M.r = 0.5; @M = @M * 2.0; @OUT = vec4(@M, @M, @M, 1.0);",
+            {"IN": TEXType.VEC3, "M": TEXType.FLOAT}),
+            {"IN": IMG.clone(), "M": torch.zeros(1, 4, 4)}, device="cpu")
+        r.ok("`@m.r = <0-dim>` then in-place op does not crash on a stride-0 view")
     except RuntimeError as e:
         r.fail("spatial-scalar alias", f"0-dim RHS produced a non-owned buffer: {str(e)[:60]}")
     # the @binding write-back arm was equally aliased pre-fix — a later op on the RHS local must
@@ -414,7 +427,7 @@ class _CancelHost(_host.NullHostServices):
     raise_if_interrupted() re-surfaces a (fake) clean host interrupt — the ComfyUI adapter's
     behaviour, headlessly. Inherits Null's memory/OOM answers so the engine cooks normally."""
     def __init__(self, trip_n):
-        self._tok = _TripToken(trip_n)
+        self._tok = TripToken(trip_n)
 
     def cancel_token(self):
         return self._tok

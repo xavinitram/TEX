@@ -69,7 +69,7 @@ def test_trk142_fn_param_spatial_arg_matches_interpreter(r: SubTestResult):
     interpreter bit-exactly (invariant 2) when `f` is called with a spatial arg."""
     print("\n--- TRK-142: a function parameter fed a spatial arg is not fast-pathed as scalar ---")
     bindings = {"A": make_img(1, 1, 4, 3, seed=142)}
-    assert_equiv(r, "trk142_fn_param_spatial_arg", _CODE, bindings, B=1, H=1, W=4)
+    assert_equiv(r, "trk142_fn_param_spatial_arg", _CODE, bindings)
 
 
 def test_trk142_codegen_actually_ran(r: SubTestResult):
@@ -79,7 +79,7 @@ def test_trk142_codegen_actually_ran(r: SubTestResult):
     print("\n--- TRK-142: codegen serves this program (does not merely decline it) ---")
     bindings = {"A": make_img(1, 1, 4, 3, seed=142)}
     try:
-        _interp_res, cg_res = run_both(_CODE, bindings, B=1, H=1, W=4)
+        _interp_res, cg_res = run_both(_CODE, bindings)
         if cg_res is None:
             r.fail("codegen serves the TRK-142 program", "try_compile declined it (cg_res is None)")
         else:
@@ -104,4 +104,4 @@ def test_trk142_fn_param_scalar_arg_still_scalar_fast_path(r: SubTestResult):
     }
     @OUT = vec4(f(2.0), 0.0, 0.0, 1.0);
     """
-    assert_equiv(r, "trk142_fn_param_scalar_arg_control", code, {}, B=1, H=1, W=4)
+    assert_equiv(r, "trk142_fn_param_scalar_arg_control", code, {})
