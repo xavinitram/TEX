@@ -175,14 +175,13 @@ def test_sched2_placement(r: SubTestResult):
     # CLASS (an exact-string `in` check would spuriously drop it to CPU with a needless D2H).
     from TEX_Wrangle.tex_scheduler import _greedy, _toposort
     gn = [SchedNode(id=0, inputs=(), pin="cuda:0"), SchedNode(id=1, inputs=(0,))]
-    gdev = _greedy(_toposort(gn), {n.id: n for n in gn}, {0: ["cuda:0"], 1: ["cpu", "cuda"]}, "cpu")
+    gdev = _greedy(_toposort(gn), {0: ["cuda:0"], 1: ["cpu", "cuda"]}, "cpu")
     r.ok("greedy: cuda:0 pin -> consumer follows GPU class") if gdev[1] == "cuda" \
         else r.fail("SCHED-2 dev-class", f"{gdev}")
     # greedy any-GPU fan-in (resolve_device rule): a node with one cpu + one cuda input -> GPU.
     fn = [SchedNode(id=0, inputs=(), pin="cpu"), SchedNode(id=1, inputs=(), pin="cuda"),
           SchedNode(id=2, inputs=(0, 1))]
-    fdev = _greedy(_toposort(fn), {n.id: n for n in fn},
-                   {0: ["cpu"], 1: ["cuda"], 2: ["cpu", "cuda"]}, "cpu")
+    fdev = _greedy(_toposort(fn), {0: ["cpu"], 1: ["cuda"], 2: ["cpu", "cuda"]}, "cpu")
     r.ok("greedy: fan-in with any GPU input -> GPU") if fdev[2] == "cuda" \
         else r.fail("SCHED-2 any-gpu", f"{fdev}")
 

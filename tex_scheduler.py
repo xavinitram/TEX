@@ -132,18 +132,24 @@ def _free_bytes(device: str) -> float | None:
         return None
 
 
-def _candidates(node: SchedNode, devices: list[str]) -> list[str]:
+def _candidates(node: SchedNode, devices: list[str], free: dict | None = None) -> list[str]:
     """The devices a node MAY run on: its pin alone if pinned (a pin is honoured even if it
     over-budgets — the user asked), else every available device the node's estimated peak fits
     in. A CUDA device that can't be sized (no free-mem answer) is kept — refusing a placement
-    for lack of data is the wrong direction; an actual OOM is the engine's ladder to catch."""
+    for lack of data is the wrong direction; an actual OOM is the engine's ladder to catch.
+
+    `free` is the plan's device -> free-bytes snapshot: each device is asked once per plan, so
+    every node is judged against the same figure."""
     if node.pin is not None:
         return [node.pin]
+    if free is None:
+        free = {}
     out = []
     for dev in devices:
         if node.peak_bytes and _dev_type(dev) == "cuda":
-            free = _free_bytes(dev)
-            if free is not None and node.peak_bytes > free:
+            if dev not in free:
+                free[dev] = _free_bytes(dev)
+            if free[dev] is not None and node.peak_bytes > free[dev]:
                 continue        # provably won't fit — drop this device for this node
         out.append(dev)
     return out or ["cpu"]       # never leave a node with nowhere to run
@@ -191,6 +197,34 @@ def _is_linear_chain(order: list[SchedNode]) -> bool:
 
 # ── Cost of a full assignment ────────────────────────────────────────────────
 
+def _memoised_cook(fn: Callable) -> Callable:
+    """`fn(node, device)` cached by (node.id, device) for the life of one plan."""
+    seen: dict = {}
+
+    def call(node, device):
+        k = (node.id, device)
+        try:
+            return seen[k]
+        except KeyError:
+            v = seen[k] = fn(node, device)
+            return v
+    return call
+
+
+def _memoised_transfer(fn: Callable) -> Callable:
+    """`fn(nbytes, src, dst)` cached by its arguments for the life of one plan."""
+    seen: dict = {}
+
+    def call(nbytes, src, dst):
+        k = (nbytes, src, dst)
+        try:
+            return seen[k]
+        except KeyError:
+            v = seen[k] = fn(nbytes, src, dst)
+            return v
+    return call
+
+
 def _cook(node, device, cook_cost, greedy_dev) -> float:
     c = cook_cost(node, device)
     if c is not None:
@@ -210,15 +244,17 @@ def _consumer_count(order) -> dict:
 
 
 def _assignment_cost(order, dev_of, by_id, cook_cost, transfer_cost, greedy_dev,
-                     boundary: str | None = None) -> float:
+                     boundary: str | None = None, consumers: dict | None = None) -> float:
     """Total wall-cost of an assignment: every node's cook + every graph edge's transfer +
     the BOUNDARY transfers — a source's external input arrives on `boundary` (an H2D if the
     source runs on CUDA) and a sink's output must return to `boundary` (a D2H). Without the
     boundary terms the solver would trivially pile everything onto the fastest cook device,
     ignoring the up/download the greedy baseline avoids by staying put. `out_nbytes` sizes the
-    boundary payloads (input≈output for the image ops this targets)."""
+    boundary payloads (input≈output for the image ops this targets). `consumers` is
+    `_consumer_count(order)`, hoisted by a caller that scores many assignments of one graph."""
     total = 0.0
-    consumers = _consumer_count(order) if boundary is not None else None
+    if boundary is not None and consumers is None:
+        consumers = _consumer_count(order)
     for n in order:
         total += _cook(n, dev_of[n.id], cook_cost, greedy_dev)
         for u in n.inputs:
@@ -233,7 +269,7 @@ def _assignment_cost(order, dev_of, by_id, cook_cost, transfer_cost, greedy_dev,
 
 # ── Greedy baseline (the correctness fallback = resolve_device's auto rule) ───
 
-def _greedy(order, by_id, cand, default_device) -> dict:
+def _greedy(order, cand, default_device) -> dict:
     """Each node runs where its input already is, else the default device — pins win. This mirrors
     `tex_engine.resolve_device`'s auto rule faithfully: land on GPU if ANY input is already on GPU
     (a fan-in node follows the accelerator, not merely its first edge — the resolve_device
@@ -317,10 +353,12 @@ def _enumerate(order, by_id, cand, cook_cost, transfer_cost, greedy_dev, boundar
     ids = [n.id for n in order]
     choices = [cand[nid] for nid in ids]
     best_dev, best_cost = None, None
+    consumers = _consumer_count(order)
     idx = [0] * len(ids)
     while True:
         dev_of = {ids[k]: choices[k][idx[k]] for k in range(len(ids))}
-        cost = _assignment_cost(order, dev_of, by_id, cook_cost, transfer_cost, greedy_dev, boundary)
+        cost = _assignment_cost(order, dev_of, by_id, cook_cost, transfer_cost, greedy_dev,
+                                boundary, consumers)
         if best_cost is None or cost < best_cost:
             best_cost, best_dev = cost, dev_of
         # odometer increment
@@ -365,8 +403,21 @@ def plan_placement(nodes: list[SchedNode], *, devices: list[str] | None = None,
                for n in nodes}
         return Placement(dev, 0.0, "greedy", "unorderable graph (cycle/dangling) -> per-node default")
 
-    cand = {n.id: _candidates(n, devices) for n in order}
-    greedy_dev = _greedy(order, by_id, cand, default_device)
+    # The providers are pure per (node, device) / (nbytes, src, dst) but the default ones are
+    # slow (an autotier lookup, a bandwidth probe), and the solvers ask for the same answers
+    # once per assignment: memoise them for this plan.
+    cook_cost = _memoised_cook(cook_cost)
+    transfer_cost = _memoised_transfer(transfer_cost)
+
+    free: dict = {}
+    cand = {n.id: _candidates(n, devices, free) for n in order}
+    greedy_dev = _greedy(order, cand, default_device)
+    # A node with an unmeasured candidate cannot be compared: the placeholder for "unknown" is
+    # not on the scale of measured milliseconds, so it would look nearly free next to a real
+    # cost and win. Such a node defers to greedy, as the module docstring promises.
+    for n in order:
+        if len(cand[n.id]) > 1 and any(cook_cost(n, d) is None for d in cand[n.id]):
+            cand[n.id] = [greedy_dev[n.id]]
 
     method, note = "greedy", ""
     if len(devices) < 2:
@@ -397,15 +448,20 @@ def _apply_hysteresis(order, by_id, fresh, prev, cand, cook_cost, transfer_cost,
     plans (the roadmap's anti-flap requirement). A node with no previous placement, or whose
     previous device is no longer a candidate (pin/budget change), takes the fresh choice."""
     kept = dict(fresh)
-    cost_fresh = _assignment_cost(order, kept, by_id, cook_cost, transfer_cost, greedy_dev, boundary)
+    consumers = _consumer_count(order)
+    cost_fresh = _assignment_cost(order, kept, by_id, cook_cost, transfer_cost, greedy_dev,
+                                  boundary, consumers)
     for n in order:
         p = prev.get(n.id)
         if p is None or p not in cand[n.id] or p == kept.get(n.id):
             continue
         trial = {**kept, n.id: p}
-        cost_keep = _assignment_cost(order, trial, by_id, cook_cost, transfer_cost, greedy_dev, boundary)
+        cost_keep = _assignment_cost(order, trial, by_id, cook_cost, transfer_cost, greedy_dev,
+                                     boundary, consumers)
+        # Measured against the FRESH plan's cost, not the running one: the dead-band bounds
+        # the TOTAL regression from all the keeps together.
         if cost_keep - cost_fresh <= hysteresis_ms:
-            kept, cost_fresh = trial, cost_keep     # within the dead-band → keep the old device
+            kept = trial                            # within the dead-band → keep the old device
     return kept
 
 
