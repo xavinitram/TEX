@@ -3624,9 +3624,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             for i, a in enumerate(args):
                 arg_type = self.type_map.get(id(node.args[i]))
                 if arg_type is not None and arg_type.is_vector:
-                    # Vector channel slices are already spatial — skip _es()
+                    # A vector need not be full-grid (a whole-image reduction is [B,1,1,C]),
+                    # so each channel is broadcast like a scalar, as the interpreter does.
                     for ch in range(arg_type.channels):
-                        component_exprs.append(f"{a}[..., {ch}]")
+                        component_exprs.append(f"_es({a}[..., {ch}], _sp)")
                 else:
                     component_exprs.append(f"_es({a}, _sp)")
 

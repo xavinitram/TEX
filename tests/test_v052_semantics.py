@@ -241,3 +241,14 @@ def test_scalar_field_widens_to_the_declared_vector(code, n):
 def test_cast_of_any_float(code, want):
     ref = run_tiers(code, {"A": _img()})
     assert torch.allclose(ref["OUT"], torch.full_like(ref["OUT"], want), equal_nan=True)
+
+
+# ── A whole-image reduction ([B,1,1,C]) inside a vector constructor serves on codegen ───
+
+@pytest.mark.parametrize("fn", ["img_sum", "img_mean", "img_min", "img_max", "img_median"])
+@pytest.mark.parametrize("C", [3, 4])
+def test_reduction_in_a_vector_constructor(fn, C):
+    A = _img(C=C, W=6)
+    ref = run_tiers(f"@OUT = vec4({fn}(@A.rgb), u);", {"A": A})
+    assert tuple(ref["OUT"].shape) == (1, 4, 6, 4)
+    assert torch.equal(ref["OUT"][0, 0, 0, :3], ref["OUT"][0, 3, 5, :3])

@@ -68,11 +68,10 @@ def test_tst5_tier_trace(r: SubTestResult):
         r.skip("TST-5 graph record", "no CUDA on this box")
 
 
-# The stdlib calls whose codegen run crashes on a 3-channel image input and self-falls-back
-# to the interpreter (the whole-image reductions mix a [1,1,1] scalar with [B,H,W] planes).
-# The parity rows below compare the interpreter with itself for exactly these, so the set is
-# pinned: a NEW fallback fails, and a fixed one fails until it is removed from this set.
-_CG_FALLBACK_KNOWN = frozenset({"img_sum", "img_mean", "img_min", "img_max", "img_median"})
+# The stdlib calls whose codegen run crashes and self-falls-back to the interpreter: the
+# parity rows below would compare the interpreter with itself for these, so the set is
+# pinned. A NEW fallback fails, and a fixed one fails until it is removed from this set.
+_CG_FALLBACK_KNOWN = frozenset()
 
 
 def _cg_fallback_problem(fell_back, expected):
@@ -188,9 +187,7 @@ def test_tst2_edge_matrix(r: SubTestResult):
                         fails.append(f"{name}: fp16 non-finite (NaN/inf on normal pixels)")
             except Exception as e:
                 fails.append(f"{name}: {type(e).__name__}: {str(e)[:45]}")
-        # a 1x1 image has no [B,H,W] plane to mismatch, so nothing falls back there
-        problem = _cg_fallback_problem(
-            fell_back, frozenset() if edge == "1x1" else _CG_FALLBACK_KNOWN)
+        problem = _cg_fallback_problem(fell_back, _CG_FALLBACK_KNOWN)
         if problem:
             fails.append(problem)
         if fails:
