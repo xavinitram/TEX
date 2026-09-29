@@ -1,21 +1,19 @@
 """
 TEX Optimizer — AST transformation passes for compile-time optimization.
 
-Passes:
-  1. Constant folding: evaluate expressions with all-literal operands at compile time
-  2. Algebraic simplification: x*1 -> x, pow(x,2) -> x*x, etc.
-     (NOTE: x*0 -> 0 is deliberately NOT done — it's shape-unsafe when x is a
-      spatial tensor; see _fold_binop.)
-  3. Dead code elimination
-  4. Common Subexpression Elimination (CSE)
-  5. Loop-Invariant Code Motion (LICM): hoist pure expressions out of loops
+`PASSES` is the pipeline and its order is load-bearing (see the comment above it): literal
+locals are propagated, constants folded (algebraic simplification happens in the same walk),
+dead code removed, common subexpressions merged, dead code removed again, loop invariants
+hoisted, and small constant-trip loops unrolled. `x*0 -> 0` is deliberately NOT done: it is
+shape-unsafe when x is a spatial tensor (see `_fold_binop`).
 
-All passes preserve semantic equivalence. Applied after type checking, before
-interpretation. Operates on the AST in-place (mutates nodes).
+Every pass preserves semantics. `optimize()` runs after type checking and its result is
+type-checked again before the interpreter or codegen consume it. It mutates the AST in place.
 """
 from __future__ import annotations
-import copy
+import contextvars
 import math
+import struct
 from collections.abc import Callable
 
 from .ast_nodes import (
@@ -25,7 +23,7 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral, SourceLoc,
-    try_extract_static_range,
+    try_extract_static_range, clone_tree,
     iter_child_nodes as _iter_children,
     NodeVisitor,
 )
@@ -40,11 +38,6 @@ _TYPE_TO_NAME = {
     TEXType.MAT3: "mat3", TEXType.MAT4: "mat4",
 }
 
-
-def _clone_expr(expr: ASTNode) -> ASTNode:
-    """Deep-copy an expression subtree so it is not aliased into multiple tree
-    positions. Passes that mutate the AST in place assume no shared subtrees."""
-    return copy.deepcopy(expr)
 
 # Pure math functions safe for constant folding (no side effects, deterministic)
 _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
@@ -67,7 +60,7 @@ _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
     "pow": math.pow, "pow2": lambda x: 2.0 ** x, "pow10": lambda x: 10.0 ** x,
     "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
     "min": min, "max": max,
-    "clamp": lambda x, lo, hi: max(lo, min(x, hi)),
+    "clamp": lambda x, lo, hi: min(hi, max(x, lo)),   # torch.clamp: hi wins when lo > hi
     "lerp": lambda a, b, t: a + (b - a) * t,
     "mix": lambda a, b, t: a + (b - a) * t,  # Alias for lerp
     # Mirror fn_smoothstep exactly: clamp((x-e0)/(e1-e0+SAFE_EPSILON), 0, 1)
@@ -84,9 +77,28 @@ _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
 }
 
 
-def _fold_all(statements: list) -> list:
+# Whether a fold may drop a non-literal operand (a literal-condition ternary's dead arm,
+# `pow(x, 0)`'s x, `lerp`'s unused end). A dropped spatial operand takes the result's broadcast
+# shape with it, so the compile pipeline keeps it (`keep_shapes=True`); the input-requirement
+# analyses (`tex_lazy`, `tex_roi`) call `_fold_all` bare and want the dropped operand's inputs
+# gone. A context variable, so concurrent compiles never see each other's.
+_KEEP_SHAPES: contextvars.ContextVar[bool] = contextvars.ContextVar("tex_fold_keep_shapes",
+                                                                    default=True)
+
+
+def _may_drop(operand: ASTNode) -> bool:
+    """A fold may discard `operand` when it is a literal (it carries no shape) or the caller
+    does not compile the result (see `_KEEP_SHAPES`)."""
+    return isinstance(operand, NumberLiteral) or not _KEEP_SHAPES.get()
+
+
+def _fold_all(statements: list, *, keep_shapes: bool = False) -> list:
     """Constant folding + algebraic simplification, per statement."""
-    return [_opt_stmt(s) for s in statements]
+    token = _KEEP_SHAPES.set(keep_shapes)
+    try:
+        return [_opt_stmt(s) for s in statements]
+    finally:
+        _KEEP_SHAPES.reset(token)
 
 
 # STR-5: the optimization pipeline as data. ORDER IS LOAD-BEARING and documented
@@ -98,7 +110,7 @@ def _fold_all(statements: list) -> list:
 # glue adapting the heterogeneous pass signatures — no pass logic lives here.
 PASSES = [
     ("const-propagate-locals", lambda s, tm: _propagate_literal_locals(s)),
-    ("const-fold",             lambda s, tm: _fold_all(s)),
+    ("const-fold",             lambda s, tm: _fold_all(s, keep_shapes=True)),
     ("dce",                    lambda s, tm: _eliminate_dead_code(s)),
     ("cse",                    lambda s, tm: _eliminate_common_subexpressions(s, tm)),
     ("dce-repeat",             lambda s, tm: _eliminate_dead_code(s)),
@@ -135,19 +147,20 @@ def optimize(program: Program, type_map: dict | None = None) -> Program:
 
 # ── UC-4: constant propagation of literal locals ──────────────────────
 
-def _expr_reads_name(expr, names) -> bool:
-    """True if `expr` contains an Identifier read of any name in `names`.
+def _names_read(expr, names) -> set:
+    """The members of `names` that `expr` reads as an Identifier.
 
     Only plain Identifiers count — the names in `subs` are local scalars, and
     _subst_expr only rewrites matching Identifier nodes (never BindingRef), so
-    this exactly predicts whether substitution would change anything here."""
+    this exactly predicts what substitution would change here."""
+    found = set()
     stack = [expr]
     while stack:
         n = stack.pop()
         if type(n) is Identifier and n.name in names:
-            return True
+            found.add(n.name)
         stack.extend(_iter_children(n))
-    return False
+    return found
 
 
 def _subst_all_literals(expr, subs: dict) -> ASTNode:
@@ -162,10 +175,12 @@ def _subst_all_literals(expr, subs: dict) -> ASTNode:
     # post-optimize re-type-check rejects. (Root cause of the bilateral_approx
     # `_licm0` int/float TypeCheckError: the untouched `v + float(dy)/ih` line
     # was rebuilt, and the fresh node reused a freed INT node's id.)
-    if not _expr_reads_name(expr, subs):
+    read = _names_read(expr, subs)
+    if not read:
         return expr
     for name, (val, is_int) in subs.items():
-        expr = _subst_expr(expr, name, val, is_int)
+        if name in read:   # each rebuild costs the whole expression: only the names it reads
+            expr = _subst_expr(expr, name, val, is_int)
     return expr
 
 
@@ -350,9 +365,13 @@ def _opt_expr(expr: ASTNode) -> ASTNode:
         expr.condition = _opt_expr(expr.condition)
         expr.true_expr = _opt_expr(expr.true_expr)
         expr.false_expr = _opt_expr(expr.false_expr)
-        # Fold: literal_cond ? a : b -> a or b
+        # Fold: literal_cond ? a : b -> a or b, when the dropped arm is a literal (a
+        # dropped spatial arm would take the result's broadcast shape with it)
         if isinstance(expr.condition, NumberLiteral):
-            return expr.true_expr if expr.condition.value > 0.5 else expr.false_expr
+            keep, drop = ((expr.true_expr, expr.false_expr) if expr.condition.value > 0.5
+                          else (expr.false_expr, expr.true_expr))
+            if _may_drop(drop):
+                return keep
         return expr
 
     if isinstance(expr, VecConstructor):
@@ -472,14 +491,28 @@ def _fold_binop(node: BinOp) -> ASTNode:
     return node
 
 
-def _eval_binop_const(op: str, a: float, b: float) -> float | None:
-    """Evaluate a binary operation on two constant values. Returns None on error."""
+def _f32(x: float) -> float | None:
+    """`x` rounded to fp32, the type the runtime computes in; None when it is not finite
+    there (a folded inf/nan would also be emitted as a bare name by codegen)."""
     try:
-        if op == "+": return a + b
-        if op == "-": return a - b
-        if op == "*": return a * b
-        if op == "/": return a / b if b != 0 else None
-        if op == "%": return math.fmod(a, b) if b != 0 else None
+        r = struct.unpack("f", struct.pack("f", x))[0]
+    except (OverflowError, struct.error):
+        return None
+    return r if math.isfinite(r) else None
+
+
+def _eval_binop_const(op: str, a: float, b: float) -> float | None:
+    """Evaluate a binary operation on two constant values as the fp32 runtime does.
+    Returns None (no fold) on error or a non-finite result. '%' is not folded: the
+    runtime's fp32 remainder is not Python's fmod on doubles."""
+    a, b = _f32(a), _f32(b)
+    if a is None or b is None:
+        return None
+    try:
+        if op == "+": return _f32(a + b)
+        if op == "-": return _f32(a - b)
+        if op == "*": return _f32(a * b)
+        if op == "/": return _f32(a / b) if b != 0 else None
         if op == "==": return 1.0 if a == b else 0.0
         if op == "!=": return 1.0 if a != b else 0.0
         if op == "<": return 1.0 if a < b else 0.0
@@ -517,19 +550,22 @@ def _fold_function(node: FunctionCall) -> ASTNode:
     # pow(x, 0) -> 1, pow(x, 1) -> x
     if name == "pow" and len(args) == 2 and _is_num_lit(args[1]):
         exp = _num_val(args[1])
-        if exp == 0.0:
+        if exp == 0.0 and _may_drop(args[0]):
             return _make_num(1.0, node.loc)
         if exp == 1.0:
             return args[0]
         # pow(x, 2) -> x * x (strength reduction). Deep-copy the repeated uses so
         # the same subtree is not aliased into multiple positions (later passes
-        # mutate in place and assume no shared subtrees).
-        if exp == 2.0:
-            return BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
+        # mutate in place and assume no shared subtrees). Only for an operand that is
+        # safe to evaluate twice: a blur, a sample or a user call stays one pow call.
+        if _has_side_effects(args[0]):
+            pass
+        elif exp == 2.0:
+            return BinOp(loc=node.loc, op="*", left=args[0], right=clone_tree(args[0]))
         # pow(x, 3) -> x * x * x
-        if exp == 3.0:
-            x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
-            return BinOp(loc=node.loc, op="*", left=x_sq, right=_clone_expr(args[0]))
+        elif exp == 3.0:
+            x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=clone_tree(args[0]))
+            return BinOp(loc=node.loc, op="*", left=x_sq, right=clone_tree(args[0]))
         # pow(x, 0.5) -> sqrt(x) is NOT applied: fn_sqrt clamps its arg to min 0
         # while fn_pow preserves NaN for negative bases with fractional exponents
         # (pow(-2, 0.5) is NaN). Rewriting to sqrt would silently turn NaN into 0
@@ -537,12 +573,13 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         # pow(x, -1) -> 1 / x is NOT applied: division goes through the zero guard
         # (finite ~1e8 at x == 0) while pow(0, -1) is inf.
 
-    # lerp(a, b, 0) -> a, lerp(a, b, 1) -> b
+    # lerp(a, b, 0) -> a, lerp(a, b, 1) -> b, only when the dropped operand is a literal:
+    # a dropped spatial operand would take the result's shape with it.
     if name in ("lerp", "mix") and len(args) == 3 and _is_num_lit(args[2]):
         t = _num_val(args[2])
-        if t == 0.0:
+        if t == 0.0 and _may_drop(args[1]):
             return args[0]
-        if t == 1.0:
+        if t == 1.0 and _may_drop(args[0]):
             return args[1]
 
     # sqrt(x*x) -> abs(x) — only when the argument is exactly x*x
@@ -560,9 +597,9 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         if fn is not None:
             try:
                 float_args = [_num_val(a) for a in args]
-                result = fn(*float_args)
-                if isinstance(result, (int, float)) and math.isfinite(result):
-                    return _make_num(float(result), node.loc)
+                result = fn(*float_args) if name != "mod" else None   # see _eval_binop_const
+                if isinstance(result, (int, float)) and _f32(result) is not None:
+                    return _make_num(_f32(result), node.loc)
             except (ValueError, ZeroDivisionError, OverflowError, TypeError):
                 pass
 
@@ -670,40 +707,22 @@ def _has_side_effects(expr: ASTNode) -> bool:
 
     Function calls count because user functions can persist scatter writes to
     bindings; indexed/sampled binding reads count because they can raise at
-    runtime (e.g. fetching from a non-image binding). Wrapper nodes (casts,
-    swizzles, indexing, constructors) recurse so a wrapped call or binding
-    read is still preserved.
+    runtime (e.g. fetching from a non-image binding). Every other node is as
+    impure as its children, so a wrapped call or binding read is still preserved.
     """
-    if isinstance(expr, FunctionCall):
-        # Pure builtins (the CSE/LICM whitelist) have no side effects — but a
-        # wrapped binding read or impure arg still does, so recurse into args
-        # (Q-2: type_checker forbids redefining builtin names, so name-keyed
-        # purity can't be spoofed). Non-whitelisted / user calls stay impure.
-        if expr.name in _CSE_PURE_FUNCTIONS:
-            return any(_has_side_effects(a) for a in expr.args)
-        return True
-    if isinstance(expr, BinOp):
-        return _has_side_effects(expr.left) or _has_side_effects(expr.right)
-    if isinstance(expr, UnaryOp):
-        return _has_side_effects(expr.operand)
-    if isinstance(expr, TernaryOp):
-        return (_has_side_effects(expr.condition) or
-                _has_side_effects(expr.true_expr) or
-                _has_side_effects(expr.false_expr))
-    if isinstance(expr, VecConstructor):
-        return any(_has_side_effects(a) for a in expr.args)
-    if isinstance(expr, MatConstructor):
-        return any(_has_side_effects(a) for a in expr.args)
-    if isinstance(expr, ArrayLiteral):
-        return any(_has_side_effects(e) for e in expr.elements)
-    if isinstance(expr, CastExpr):
-        return _has_side_effects(expr.expr)
-    if isinstance(expr, ChannelAccess):
-        return _has_side_effects(expr.object)
-    if isinstance(expr, ArrayIndexAccess):
-        return _has_side_effects(expr.array) or _has_side_effects(expr.index)
-    if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        return True  # Reads from bindings — preserve
+    stack = [expr]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, FunctionCall):
+            # Pure builtins (the CSE/LICM whitelist) have no side effects — but a wrapped
+            # binding read or impure arg still does, so the args are walked too (Q-2: the
+            # checker forbids redefining builtin names, so name-keyed purity can't be
+            # spoofed). Non-whitelisted / user calls stay impure.
+            if n.name not in _CSE_PURE_FUNCTIONS:
+                return True
+        elif isinstance(n, (BindingIndexAccess, BindingSampleAccess)):
+            return True  # Reads from bindings — preserve
+        stack.extend(_iter_children(n))
     return False
 
 
@@ -1526,7 +1545,8 @@ def _unroll_small_loops(stmts: list[ASTNode]) -> list[ASTNode]:
             static = try_extract_static_range(stmt)
             if (static is not None
                     and len(stmt.body) <= _UNROLL_MAX_BODY_STMTS
-                    and not _contains_break_continue(stmt.body)):
+                    and not _contains_break_continue(stmt.body)
+                    and static[0] not in _collect_written_vars(stmt.body)):
                 var_name, start, stop, step = static
                 n_iters = len(range(start, stop, step))
                 if 0 < n_iters <= _UNROLL_MAX_ITERS:

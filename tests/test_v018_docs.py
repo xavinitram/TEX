@@ -253,7 +253,6 @@ _NOT_A_CACHE = {
                                      "filled at import by the emit decorators",
     "ast_nodes._CHILD_FIELDS": "reflection over a closed set of AST node classes: one entry "
                                "per node type, no key derived from user data, never evicted",
-    "ast_nodes._CLONE_FIELDS": "reflection over the same closed set (see _CHILD_FIELDS)",
     "stdlib_registry.REGISTRY": "the REG-1 stdlib registry itself -- the declaration of what "
                                 "exists, populated by @stdlib at import",
     "stdlib_registry._NON_SPATIAL_CACHE": "REG-1c: a single memoized VIEW derived from "

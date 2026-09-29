@@ -252,7 +252,7 @@ class Lexer:
 
     def __init__(self, source: str, *, dotted_bindings: bool = True):
         self.source = source
-        self.pos = 0  # CT-2: the byte offset is the sole cursor (no line/col)
+        self.pos = 0  # CT-2: the character offset is the sole cursor (no line/col)
         self.tokens: list[Token] = []
         self.dotted_bindings = bool(dotted_bindings)
 
@@ -263,7 +263,7 @@ class Lexer:
                           code=code, hint=hint, end_col=end_col)
 
     def loc(self) -> SourceLoc:
-        # CT-2: capture only the byte offset; line/col are resolved lazily by
+        # CT-2: capture only the character offset; line/col are resolved lazily by
         # SourceLoc, and only if a diagnostic ever renders this location.
         return SourceLoc.from_offset(self.pos, self.source)
 
@@ -283,22 +283,16 @@ class Lexer:
         self.pos += 1
         return ch
 
-    def _advance_run(self, end: int):
-        """Move pos to `end` (batched replacement for repeated advance() calls).
-        CT-2: no line/col bookkeeping — the byte offset is the only cursor."""
-        self.pos = end
-
     def skip_whitespace(self):
         src = self.source
         n = len(src)
         i = self.pos
         while i < n and src[i] in " \t\r\n":
             i += 1
-        if i > self.pos:
-            self._advance_run(i)
+        self.pos = i
 
     def skip_line_comment(self):
-        # Leave the terminating "\n" for skip_whitespace (line stays exact)
+        # Leave the terminating "\n" for skip_whitespace
         end = self.source.find("\n", self.pos)
         if end == -1:
             end = len(self.source)
@@ -311,11 +305,11 @@ class Lexer:
         if end == -1:
             raise self._error("Unterminated block comment. Did you forget a closing `*/`?",
                               start_loc, code="E1001")
-        self._advance_run(end + 2)
+        self.pos = end + 2
 
     def read_number(self) -> Token:
-        # Numbers never contain newlines, so the scan runs on a local index
-        # and commits pos/col once at the end (line stays exact).
+        # The scan runs on a local index and commits pos once at the end. A leading
+        # `.` (`.5`, `.5e3`) enters here too: an empty integer run, then the fraction.
         start_loc = self.loc()
         start_pos = self.pos
         src = self.source
@@ -399,8 +393,7 @@ class Lexer:
         src = self.source
         n = len(src)
         while self.pos < n:
-            # Batch the plain run up to the next terminator. Runs are
-            # newline-free (\n terminates), so col stays exact for esc_loc.
+            # Batch the plain run up to the next terminator (a quote, an escape or \n).
             i = self.pos
             while i < n and src[i] not in '"\\\n':
                 i += 1
@@ -487,6 +480,8 @@ class Lexer:
     def tokenize(self) -> list[Token]:
         """Tokenize the entire source, returning a list of tokens ending with EOF."""
         self.tokens = []
+        if self.pos == 0 and self.source.startswith("\ufeff"):
+            self.pos = 1   # a UTF-8 BOM (Notepad, PowerShell 5) is not program text
         while self.pos < len(self.source):
             self.skip_whitespace()
             if self.pos >= len(self.source):
@@ -512,15 +507,7 @@ class Lexer:
 
             # Float literal starting with dot (e.g., .5)
             if ch == "." and _is_ascii_digit(self.peek_ahead()):
-                start_loc = self.loc()
-                start_pos = self.pos
-                src = self.source
-                n = len(src)
-                i = self.pos + 1  # .
-                while i < n and _is_ascii_digit(src[i]):
-                    i += 1
-                self.pos = i
-                self.tokens.append(Token(TokenType.FLOAT_LIT, src[start_pos:i], start_loc))
+                self.tokens.append(self.read_number())
                 continue
 
             # String literals
@@ -545,8 +532,7 @@ class Lexer:
 
             # Multi-character operators (check longest match first). At the
             # last char the slice is 1 char long, misses the dict, and falls
-            # through to the single-char lookup. No 2-char operator contains
-            # a newline, so col += 2 is exact.
+            # through to the single-char lookup.
             start_loc = self.loc()
             pair = self.source[self.pos:self.pos + 2]
             tt = TWO_CHAR_TOKENS.get(pair)

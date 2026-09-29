@@ -3,11 +3,18 @@ TEX Parser — recursive-descent parser producing an AST from tokens.
 
 Grammar (simplified):
   program     = statement*
-  statement   = func_def | var_decl | param_decl | assignment | if_else | for_loop | while_loop | return_stmt | expr_stmt
+  statement   = const_decl | array_decl | func_def | var_decl | param_decl | assignment
+              | if_else | for_loop | while_loop | 'break' ';' | 'continue' ';'
+              | return_stmt | expr_stmt
+  const_decl  = 'const' type_kw IDENT '=' expr ';'
+              | 'const' type_kw IDENT '[' INT? ']' '=' array_literal ';'
+  array_decl  = type_kw IDENT '[' INT? ']' ('=' (array_literal | expr))? ';'
+  array_literal = '{' (expr (',' expr)*)? '}'
   func_def    = type_kw IDENT '(' param_list ')' block
   param_list  = (type_kw IDENT (',' type_kw IDENT)*)?
   var_decl    = type_kw IDENT ('=' expr)? ';'
-  param_decl  = ('$'|typed_'$') IDENT ('=' expr)? ';'
+  param_decl  = ('$'|typed_'$') IDENT ('=' expr)? metadata? ';'
+  metadata    = '[' IDENT ':' literal (',' IDENT ':' literal)* ']'
   assignment  = lvalue '=' expr ';'
                | lvalue '+=' expr ';'   (desugars to lvalue = lvalue + expr)
                | lvalue '-=' expr ';'
@@ -17,6 +24,8 @@ Grammar (simplified):
                | lvalue '--'  ';'
   if_else     = 'if' '(' expr ')' block ('else' (if_else | block))?
   for_loop    = 'for' '(' for_init ';' expr ';' for_update ')' block
+                (the initializer is required; `for_update` is one assignment / `++` / `--`)
+  while_loop  = 'while' '(' expr ')' block
   return_stmt = 'return' expr ';'
   block       = '{' statement* '}'
   expr        = ternary
@@ -28,28 +37,45 @@ Grammar (simplified):
   addition    = multiply (('+' | '-') multiply)*
   multiply    = unary (('*' | '/' | '%') unary)*
   unary       = ('-' | '!') unary | postfix
-  postfix     = primary ('.' IDENT | '[' args ']' | '(' args ')')*
-  primary     = NUMBER | IDENT | AT_BINDING | DOLLAR_BINDING
+  postfix     = primary ('.' IDENT | '[' expr ']')*
+              | IDENT '(' args ')'                    (a call)
+              | binding ('[' args ']' | '(' args ')')  (fetch @img[x, y] / sample @img(u, v))
+  primary     = NUMBER | STRING | IDENT | AT_BINDING | DOLLAR_BINDING
                | TYPED_AT_BINDING | TYPED_DOLLAR_BINDING
-               | '(' expr ')' | vec_constructor | cast_expr
+               | '(' expr ')' | vec_constructor | mat_constructor | cast_expr
 """
 from __future__ import annotations
-import copy
 import re as _re
 
 from .lexer import Token, TokenType
+
+_FP32_MAX = 3.4028234663852886e38
 from .ast_nodes import (
     SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
-    BindingIndexAccess, BindingSampleAccess, ErrorNode,
+    BindingIndexAccess, BindingSampleAccess, ErrorNode, clone_tree,
 )
 from .diagnostics import (make_diagnostic, get_keyword_hint, get_v020_reserved_hint,
                           get_type_hint, TEXMultiError)
 
+# What can follow a statement-leading name that is an assignment target.
+_ASSIGN_CONTINUATIONS = frozenset({
+    TokenType.ASSIGN, TokenType.PLUS_ASSIGN, TokenType.MINUS_ASSIGN, TokenType.STAR_ASSIGN,
+    TokenType.SLASH_ASSIGN, TokenType.PLUS_PLUS, TokenType.MINUS_MINUS,
+    TokenType.DOT, TokenType.LBRACKET})
+
+# Tokens whose absence is reported just after the previous token (see `Parser.expect`).
+_CLOSING_TOKENS = frozenset({TokenType.SEMI, TokenType.RPAREN, TokenType.RBRACE, TokenType.RBRACKET})
+
 TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC2, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
+
+# Tokens `_synchronize` stops in front of (it never consumes them).
+_STATEMENT_START = frozenset({
+    TokenType.KW_IF, TokenType.KW_FOR, TokenType.KW_WHILE, TokenType.KW_BREAK,
+    TokenType.KW_CONTINUE, TokenType.KW_RETURN, *TYPE_KEYWORDS})
 
 COMPOUND_ASSIGN_OPS = {
     TokenType.PLUS_ASSIGN: "+",
@@ -94,13 +120,19 @@ def _header_pragma_matches(source: str, pattern, *, skip_block_comments: bool):
             i += 1
             continue                      # an ordinary leading line comment — keep scanning
         if skip_block_comments and line.startswith("/*"):
-            if "*/" in line[2:]:
-                i += 1                     # closes on the SAME line — still header, continue
-                continue
+            end = line.find("*/", 2)
+            if end < 0:
+                i += 1
+                while i < n and "*/" not in lines[i]:
+                    i += 1                 # skip every line of the block body
+                if i >= n:
+                    break
+                line = lines[i]
+                end = line.find("*/")
+            rest = line[end + 2:].strip()
+            if rest and not rest.startswith("//"):
+                break                      # code after the closing `*/` ends the header
             i += 1
-            while i < n and "*/" not in lines[i]:
-                i += 1                     # skip every line of the block body
-            i += 1                         # and the line holding its closing `*/`
             continue
         break                              # first real code (or, unless skipped, a block comment)
 
@@ -140,6 +172,31 @@ def scale_pragma(source: str):
             return "never"
         verdict = verdict or value
     return verdict
+
+
+def _token_text(tok: Token) -> str:
+    """The token as written in the source: a binding keeps its sigil and type prefix and a string
+    its quotes (`Token.value` holds only the name or the contents)."""
+    tt = tok.type
+    if tt == TokenType.AT_BINDING:
+        return "@" + tok.value
+    if tt == TokenType.DOLLAR_BINDING:
+        return "$" + tok.value
+    if tt == TokenType.TYPED_AT_BINDING:
+        return f"{tok.prefix}@{tok.value}"
+    if tt == TokenType.TYPED_DOLLAR_BINDING:
+        return f"{tok.prefix}${tok.value}"
+    if tt == TokenType.STRING_LIT:
+        return f'"{tok.value}"'
+    return tok.value
+
+
+def _token_end_col(tok: Token, text: str):
+    """Exclusive end column of a one-line token, or None when its source width is unknown
+    (a string with escapes is wider than its value)."""
+    if tok.type == TokenType.STRING_LIT and ("\\" in tok.value or "\n" in tok.value):
+        return None
+    return tok.loc.col + len(text)
 
 
 class ParseError(Exception):
@@ -223,10 +280,22 @@ class Parser:
             # Describe what we got in plain language
             if tok.type == TokenType.EOF:
                 got_desc = "but the program ends here"
+                end_col = None
             else:
-                got_desc = f"but found `{tok.value}` instead"
-            raise self._make_error(f"{what}, {got_desc}.", tok.loc,
-                                   code=code, hint=hint)
+                text = _token_text(tok)
+                got_desc = f"but found `{text}` instead"
+                end_col = _token_end_col(tok, text)
+            loc = tok.loc
+            if tt in _CLOSING_TOKENS and self.pos > 0:
+                # A missing closer belongs just after the last token written, not on the next
+                # statement (possibly lines away, or past the last line at end of input).
+                prev = self.tokens[self.pos - 1]
+                end = _token_end_col(prev, _token_text(prev))
+                if end is not None and (tok.type == TokenType.EOF or tok.loc.line > prev.loc.line):
+                    loc = SourceLoc(prev.loc.line, end)
+                    end_col = end + 1
+            raise self._make_error(f"{what}, {got_desc}.", loc,
+                                   code=code, hint=hint, end_col=end_col)
         return self.advance()
 
     def match(self, *types: TokenType) -> Token | None:
@@ -235,24 +304,58 @@ class Parser:
         return None
 
     def _make_error(self, message: str, loc: SourceLoc, *,
-                    code: str = "E2000", hint: str = "") -> ParseError:
+                    code: str = "E2000", hint: str = "", end_col: int | None = None) -> ParseError:
         """Create a ParseError with source context."""
-        return ParseError(message, loc, source=self._source, code=code, hint=hint)
+        return ParseError(message, loc, source=self._source, code=code, hint=hint,
+                          end_col=end_col)
+
+    def _literal_value(self, tok: Token) -> int | float:
+        """A numeric token's value: hex-aware for INT_LIT, and a positioned E2000 instead of
+        a raw ValueError or a silent inf for a literal the fp32 runtime cannot hold."""
+        if tok.type == TokenType.INT_LIT:
+            try:
+                return int(tok.value, 16) if tok.value[:2] in ("0x", "0X") else int(tok.value)
+            except ValueError:   # past Python's int-digit limit
+                raise self._make_error(f"Integer literal `{tok.value[:20]}...` is too long.",
+                                       tok.loc, code="E2000",
+                                       hint="Use a value at or below 2**53.") from None
+        val = float(tok.value)
+        if not (abs(val) <= _FP32_MAX):
+            raise self._make_error(
+                f"Float literal `{tok.value}` is outside the float range (about 3.4e38).",
+                tok.loc, code="E2000",
+                hint="Values are 32-bit floats; use a literal at or below 3.4e38.")
+        return val
 
     def _synchronize(self):
-        """Panic-mode recovery: skip tokens until a synchronization point."""
+        """Panic-mode recovery at top level: skip tokens until a synchronization point.
+
+        A `{ ... }` group met on the way is skipped whole (with the `else` and `;` that
+        continue it), so a bad statement header does not leave its body behind to be re-parsed
+        as top-level code."""
+        depth = 0
         while self.peek() != TokenType.EOF:
-            # Stop AFTER consuming a semicolon
-            if self.peek() == TokenType.SEMI:
-                self.advance()
-                return
-            # Stop BEFORE a statement-starting token (don't consume it)
-            if self.peek() in (TokenType.RBRACE, TokenType.KW_IF,
-                               TokenType.KW_FOR, TokenType.KW_WHILE,
-                               TokenType.KW_BREAK, TokenType.KW_CONTINUE,
-                               TokenType.KW_RETURN,
-                               *TYPE_KEYWORDS):
-                return
+            tt = self.peek()
+            if tt == TokenType.LBRACE:
+                depth += 1
+            elif tt == TokenType.RBRACE:
+                if depth == 0:
+                    return                      # a stray `}`: leave it for the caller
+                depth -= 1
+                if depth == 0:
+                    self.advance()
+                    if self.peek() == TokenType.SEMI:
+                        self.advance()          # `x = {1};` ends at its `;`
+                        return
+                    if self.peek() != TokenType.KW_ELSE:
+                        return
+                    continue                    # `else { ... }` belongs to the same statement
+            elif depth == 0:
+                if tt == TokenType.SEMI:
+                    self.advance()              # stop AFTER a semicolon
+                    return
+                if tt in _STATEMENT_START:
+                    return                      # stop BEFORE a statement-starting token
             self.advance()
 
     def _skip_statement(self):
@@ -307,9 +410,13 @@ class Parser:
             start_pos = self.pos
             try:
                 stmts.append(self.parse_statement())
+            except RecursionError:
+                # Recursive descent: ~12 frames per `(` level, one per unary operator.
+                raise self._make_error(
+                    "This expression is nested too deeply to compile.", self.loc(),
+                    hint="Split it into several statements with intermediate variables.") from None
             except ParseError as e:
                 self._errors.append(e)
-                stmts.append(ErrorNode(loc=e.loc, error_message=str(e)))
                 self._synchronize()
                 # Guarantee forward progress. _synchronize() returns WITHOUT
                 # consuming a statement-starting sync token (e.g. a stray `}`),
@@ -328,15 +435,15 @@ class Parser:
             diagnostics = [e.diagnostic for e in self._errors if e.diagnostic]
             raise TEXMultiError(diagnostics)
 
-        # LANG-L1: carry the header pragma onto the compiled program as its declared
-        # language LEVEL, a request rather than a capability — nothing reads it yet.
+        # LANG-L1: carry the header pragma onto the program as its declared language LEVEL.
+        # A request, not a capability; `tex_fusion` refuses to fuse stages whose levels differ.
         return Program(loc=loc, statements=stmts, language=language_pragma(self._source))
 
     # -- Statements -----------------------------------------------------
 
     def parse_statement(self) -> ASTNode:
-        # const qualifier: const type_kw IDENT = expr;
         """Parse one statement (declaration / assignment / control-flow / expression / return)."""
+        # const qualifier: const type_kw IDENT = expr;
         if self.peek() == TokenType.KW_CONST:
             return self._parse_const_decl()
 
@@ -402,10 +509,12 @@ class Parser:
                        code="E2010", hint="Add `;` after the return value.")
             return ReturnStmt(loc=loc, value=value)
 
-        # Check for foreign keywords (const, let, var, etc.)
+        # Foreign keywords (`let`, `var`, `switch`, ...). A statement that continues as an
+        # assignment (`out = 2.0;`, `case++;`, `in.x = 1;`) is a variable named like one, which
+        # declaring and reading already allow.
         if self.peek() == TokenType.IDENT:
             kw_hint = get_keyword_hint(self.current().value)
-            if kw_hint is not None:
+            if kw_hint is not None and self.peek_ahead() not in _ASSIGN_CONTINUATIONS:
                 tok = self.current()
                 raise self._make_error(
                     f"Unexpected keyword '{tok.value}'.",
@@ -426,7 +535,8 @@ class Parser:
         return self.parse_assignment_or_expr()
 
     def parse_var_decl(self) -> VarDecl:
-        """Parse a typed variable declaration `T name = expr;` (or its array/param form)."""
+        """Parse a scalar, vector or string declaration `T name (= expr)? ;`. Arrays and `$params`
+        have their own parsers."""
         loc = self.loc()
         type_tok = self.advance()  # consume type keyword
         type_name = type_tok.value
@@ -441,7 +551,7 @@ class Parser:
         return VarDecl(loc=loc, type_name=type_name, name=name_tok.value, initializer=initializer)
 
     def _parse_const_decl(self) -> VarDecl:
-        """Parse a `$`-parameter / const declaration with its widget metadata."""
+        """Parse `const T name = expr;` or `const T name[N] = {...};`."""
         loc = self.loc()
         self.advance()  # consume 'const'
         if self.peek() not in TYPE_KEYWORDS:
@@ -477,7 +587,7 @@ class Parser:
                        initializer=initializer, is_const=True)
 
     def parse_function_def(self) -> FunctionDef:
-        """Parse a user `def name(params) { body }` function definition."""
+        """Parse a user function definition `ret_type name(type a, ...) { body }`."""
         loc = self.loc()
         return_type = self.advance().value  # consume type keyword
 
@@ -567,13 +677,9 @@ class Parser:
         else — an identifier, a `(`, a `$binding` — is rejected here (literals only)."""
         neg = self.match(TokenType.MINUS)
         tok = self.current()
-        if tok.type == TokenType.INT_LIT:
+        if tok.type in (TokenType.INT_LIT, TokenType.FLOAT_LIT):
             self.advance()
-            val = int(tok.value, 16) if tok.value[:2] in ("0x", "0X") else int(tok.value)
-            return -val if neg else val
-        if tok.type == TokenType.FLOAT_LIT:
-            self.advance()
-            val = float(tok.value)
+            val = self._literal_value(tok)
             return -val if neg else val
         if tok.type == TokenType.STRING_LIT and not neg:
             self.advance()
@@ -598,7 +704,7 @@ class Parser:
         size = None
         if self.peek() == TokenType.INT_LIT:
             size_tok = self.advance()
-            size = int(size_tok.value, 16) if size_tok.value[:2] in ("0x", "0X") else int(size_tok.value)
+            size = self._literal_value(size_tok)
             if size <= 0:
                 raise self._make_error(f"Array size must be positive, got {size}.",
                                       size_tok.loc, code="E2004")
@@ -612,6 +718,9 @@ class Parser:
             else:
                 # Array copy: float b[3] = a;
                 initializer = self.parse_expr()
+        if size is None and isinstance(initializer, ArrayLiteral) and not initializer.elements:
+            raise self._make_error("An array needs at least one element; `{}` has none.",
+                                   loc, code="E2004", hint="Give it a size or elements, e.g. float a[] = {0.0};")
 
         self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this array declaration",
                    code="E2010", hint="Every statement in TEX ends with `;`.")
@@ -756,12 +865,11 @@ class Parser:
                 if isinstance(expr, BindingIndexAccess):
                     return Assignment(loc=loc, target=expr, value=value, op=op)
                 # Clone the lvalue for the read side: passes that mutate the
-                # AST in place assume no shared subtrees (see _clone_expr in
-                # the optimizer).
+                # AST in place assume no shared subtrees.
                 return Assignment(
                     loc=loc,
                     target=expr,
-                    value=BinOp(loc=loc, op=op, left=copy.deepcopy(expr), right=value),
+                    value=BinOp(loc=loc, op=op, left=clone_tree(expr), right=value),
                 )
 
         # Plain assignment
@@ -791,13 +899,16 @@ class Parser:
         """Desugar i++ -> i = i + 1, i-- -> i = i - 1
 
         The read side gets a clone of the lvalue: passes that mutate the AST
-        in place assume no shared subtrees.
+        in place assume no shared subtrees. A scatter target (`@OUT[x,y]++`) keeps
+        `op`, so colliding writes accumulate exactly as `@OUT[x,y] += 1` does.
         """
         one = NumberLiteral(loc=loc, value=1.0, is_int=True)
+        if isinstance(target, BindingIndexAccess):
+            return Assignment(loc=loc, target=target, value=one, op=op)
         return Assignment(
             loc=loc,
             target=target,
-            value=BinOp(loc=loc, op=op, left=copy.deepcopy(target), right=one),
+            value=BinOp(loc=loc, op=op, left=clone_tree(target), right=one),
         )
 
     def parse_block(self) -> list[ASTNode]:
@@ -805,7 +916,13 @@ class Parser:
         self.expect(TokenType.LBRACE, "I expected `{` to start a block")
         stmts: list[ASTNode] = []
         while self.peek() != TokenType.RBRACE and self.peek() != TokenType.EOF:
-            stmts.append(self.parse_statement())
+            try:
+                stmts.append(self.parse_statement())
+            except ParseError as e:
+                # Record it and resume at the next statement of THIS block, so one bad
+                # statement does not report its closing `}` (and `else`) as further errors.
+                self._errors.append(e)
+                self._skip_statement()
         self.expect(TokenType.RBRACE, "I expected `}` to close this block")
         return stmts
 
@@ -963,24 +1080,22 @@ class Parser:
         # Numeric literals
         if tok.type == TokenType.INT_LIT:
             self.advance()
-            if tok.value.startswith("0x") or tok.value.startswith("0X"):
-                val = int(tok.value, 16)
-            else:
-                val = int(tok.value)
-            # NumberLiteral stores value as a Python float; ints above 2**53
-            # cannot be represented exactly as IEEE-754 doubles and would be
-            # silently rounded despite is_int=True. Fail loudly instead.
+            val = self._literal_value(tok)
+            # `NumberLiteral` stores a Python float, exact only to 2**53, so a larger literal
+            # is refused. Between 2**24 and 2**53 the literal parses exactly but the run-time
+            # int is fp32 and rounds it (`int x = 2147483647` reads back as 2147483648): that
+            # is accepted, since refusing it would break working sentinel constants.
             if abs(val) > (1 << 53):
                 raise self._make_error(
                     f"Integer literal `{tok.value}` is too large to represent "
                     f"exactly (exceeds 2**53).",
-                    tok.loc, code="E2000",
-                    hint="Use a value at or below 2**53 for exact integers.")
+                    tok.loc, code="E2000", end_col=_token_end_col(tok, tok.value),
+                    hint="Whole numbers are 32-bit floats, exact only up to 16777216 (2**24).")
             return NumberLiteral(loc=tok.loc, value=float(val), is_int=True)
 
         if tok.type == TokenType.FLOAT_LIT:
             self.advance()
-            return NumberLiteral(loc=tok.loc, value=float(tok.value), is_int=False)
+            return NumberLiteral(loc=tok.loc, value=self._literal_value(tok), is_int=False)
 
         # String literals
         if tok.type == TokenType.STRING_LIT:
@@ -1042,14 +1157,15 @@ class Parser:
                 "The program ended in the middle of an expression.",
                 tok.loc, code="E2003",
                 hint="An operator or open bracket may be missing the value that follows it.")
+        text = _token_text(tok)
         raise self._make_error(
-            f"I didn't expect `{tok.value}` here.",
-            tok.loc, code="E2003",
+            f"I didn't expect `{text}` here.",
+            tok.loc, code="E2003", end_col=_token_end_col(tok, text),
             hint="A value was expected at this point — a number, variable, @input, or vec(...).")
 
     def _parse_vec_constructor(self) -> VecConstructor:
         """Parse a `vecN(...)` constructor call."""
-        tok = self.advance()  # vec3 or vec4
+        tok = self.advance()  # vec2, vec3 or vec4
         size = 2 if tok.type == TokenType.KW_VEC2 else 3 if tok.type == TokenType.KW_VEC3 else 4
         self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
         args: list[ASTNode] = []
@@ -1075,8 +1191,8 @@ class Parser:
 
     def _parse_cast(self) -> CastExpr:
         """Parse an explicit `type(expr)` cast."""
-        tok = self.advance()  # float or int
+        tok = self.advance()  # float, int or string
         self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
         expr = self.parse_expr()
-        self.expect(TokenType.RPAREN, f"Expected ')' after cast")
+        self.expect(TokenType.RPAREN, "Expected ')' after cast")
         return CastExpr(loc=tok.loc, target_type=tok.value, expr=expr)

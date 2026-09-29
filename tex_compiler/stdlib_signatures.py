@@ -13,10 +13,17 @@ from .types import TEXType  # STR-1: leaf type module — breaks the old cycle w
 
 
 def _passthrough_type(arg_types: list[TEXType]) -> TEXType:
-    """Return the type of the first argument (with promotion for mixed)."""
+    """Return the type of the first argument."""
     if not arg_types:
         return TEXType.FLOAT
     return arg_types[0]
+
+
+def _float_passthrough(arg_types: list[TEXType]) -> TEXType:
+    """The first argument's type, but FLOAT for an int: the row's values are fractional
+    (sin, sqrt, a colour transfer) or 0/1 masks (isnan), never an int."""
+    t = _passthrough_type(arg_types)
+    return TEXType.FLOAT if t == TEXType.INT else t
 
 
 def _curl_return_type(arg_types: list[TEXType]) -> TEXType:
@@ -44,6 +51,71 @@ def _promote_args(arg_types: list[TEXType]) -> TEXType:
     return result
 
 
+def _float_promote(arg_types: list[TEXType]) -> TEXType:
+    """`_promote_args`, but FLOAT for all-int arguments (pow, lerp, fit, hypot ...)."""
+    t = _promote_args(arg_types)
+    return TEXType.FLOAT if t == TEXType.INT else t
+
+
+def _blend_type(arg_types: list[TEXType]) -> TEXType:
+    """A blend mode keeps its BASE's width (a vec4 base keeps its alpha; the blend operand
+    is read for its first channels only)."""
+    return _float_passthrough(arg_types)
+
+
+# ── Argument rules ("accepts"): None when the call's argument types are valid, else
+# (index, what the argument must be). The checker turns a violation into E5003, where the
+# runtime would crash on a raw tensor-shape error or return a wrongly shaped value.
+
+def _same_width(arg_types: list[TEXType]):
+    """Element-wise rows: the vector arguments must share one width (a scalar broadcasts)."""
+    first = None
+    for i, t in enumerate(arg_types):
+        if t.is_vector:
+            if first is None:
+                first = t
+            elif t != first:
+                return i, f"a {first.value} like the other vector argument"
+    return None
+
+
+def _scalar_args(arg_types: list[TEXType]):
+    """Noise and SDF rows take scalar coordinates and parameters."""
+    for i, t in enumerate(arg_types):
+        if not t.is_scalar:
+            return i, "a scalar (int or float)"
+    return None
+
+
+def _color_arg(arg_types: list[TEXType]):
+    """Colour-space rows and luma read three colour channels."""
+    if arg_types and arg_types[0] not in (TEXType.VEC3, TEXType.VEC4):
+        return 0, "a vec3 or vec4 colour"
+    return None
+
+
+def _rgba_args(arg_types: list[TEXType]):
+    """Porter-Duff rows and (un)premultiply read a straight-alpha vec4."""
+    for i, t in enumerate(arg_types):
+        if t != TEXType.VEC4:
+            return i, "a vec4 with alpha"
+    return None
+
+
+def _vector_base(arg_types: list[TEXType]):
+    """Blend modes: the base must be a vector (its width is the result's)."""
+    if arg_types and not arg_types[0].is_vector:
+        return 0, "a vector (vec2, vec3 or vec4)"
+    return None
+
+
+def _array_arg(arg_types: list[TEXType]):
+    """Array reductions take an array."""
+    if arg_types and arg_types[0] != TEXType.ARRAY:
+        return 0, "an array"
+    return None
+
+
 def _select_type(arg_types: list[TEXType]) -> TEXType:
     """select(cond, a, b): the result is the promoted type of the two ARMS (a, b) —
     arg 0 (cond) never enters the promotion, unlike lerp/clamp where every argument is
@@ -53,32 +125,26 @@ def _select_type(arg_types: list[TEXType]) -> TEXType:
 
 
 def _float_type(arg_types: list[TEXType]) -> TEXType:
-    """Always FLOAT, whatever the arguments are. Its rows: `patch_dist` (ASK-13, a per-pixel
-    scalar field regardless of the image's channel count — the mean is taken over channels
-    too), `worley_id` (a per-cell hash id), and `img_width` / `img_height` (one number for the
-    image, not one per channel). A NAMED helper
-    per AGENTS.md's stdlib recipe ("a named helper, not a lambda"), even though the
-    table's other FLOAT-returning rows below (dot/length/distance/luma/determinant)
-    are still lambdas; not touched here, since a REG-1 mechanical move is a different
-    change than adding a row."""
+    """Always FLOAT, whatever the arguments are: one scalar per pixel (or per image), not one
+    per channel (`length`, `dot`, `luma`, the noise family, `patch_dist`, `img_width` ...)."""
     return TEXType.FLOAT
 
 
 # Function signatures: name -> {args: (min, max), return: type_or_callable}
 FUNCTION_SIGNATURES: dict[str, dict] = {
     # Math — scalar or element-wise on vectors
-    "sin":       {"args": (1, 1), "return": _passthrough_type},
-    "cos":       {"args": (1, 1), "return": _passthrough_type},
-    "tan":       {"args": (1, 1), "return": _passthrough_type},
-    "asin":      {"args": (1, 1), "return": _passthrough_type},
-    "acos":      {"args": (1, 1), "return": _passthrough_type},
-    "atan":      {"args": (1, 1), "return": _passthrough_type},
-    "atan2":     {"args": (2, 2), "return": _promote_args},
+    "sin":       {"args": (1, 1), "return": _float_passthrough},
+    "cos":       {"args": (1, 1), "return": _float_passthrough},
+    "tan":       {"args": (1, 1), "return": _float_passthrough},
+    "asin":      {"args": (1, 1), "return": _float_passthrough},
+    "acos":      {"args": (1, 1), "return": _float_passthrough},
+    "atan":      {"args": (1, 1), "return": _float_passthrough},
+    "atan2":     {"args": (2, 2), "return": _float_promote, "accepts": _same_width},
     "sincos":    {"args": (1, 1), "return": lambda _: TEXType.VEC2},   # sincos(x) → vec2(sin, cos)
-    "sqrt":      {"args": (1, 1), "return": _passthrough_type},
-    "pow":       {"args": (2, 2), "return": _promote_args},
-    "exp":       {"args": (1, 1), "return": _passthrough_type},
-    "log":       {"args": (1, 1), "return": _passthrough_type},
+    "sqrt":      {"args": (1, 1), "return": _float_passthrough},
+    "pow":       {"args": (2, 2), "return": _float_promote, "accepts": _same_width},
+    "exp":       {"args": (1, 1), "return": _float_passthrough},
+    "log":       {"args": (1, 1), "return": _float_passthrough},
     "abs":       {"args": (1, 1), "return": _passthrough_type},
     "sign":      {"args": (1, 1), "return": _passthrough_type},
     "floor":     {"args": (1, 1), "return": _passthrough_type},
@@ -86,89 +152,88 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "round":     {"args": (1, 1), "return": _passthrough_type},
     "trunc":     {"args": (1, 1), "return": _passthrough_type},
     "fract":     {"args": (1, 1), "return": _passthrough_type},
-    "mod":       {"args": (2, 2), "return": _promote_args},
+    "mod":       {"args": (2, 2), "return": _promote_args, "accepts": _same_width},
 
-    "log2":      {"args": (1, 1), "return": _passthrough_type},
-    "log10":     {"args": (1, 1), "return": _passthrough_type},
-    "pow2":      {"args": (1, 1), "return": _passthrough_type},
-    "pow10":     {"args": (1, 1), "return": _passthrough_type},
-    "sinh":      {"args": (1, 1), "return": _passthrough_type},
-    "cosh":      {"args": (1, 1), "return": _passthrough_type},
-    "tanh":      {"args": (1, 1), "return": _passthrough_type},
-    "hypot":     {"args": (2, 2), "return": _promote_args},
-    "isnan":     {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # always returns float (0.0/1.0)
-    "isinf":     {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # always returns float (0.0/1.0)
-    "degrees":   {"args": (1, 1), "return": _passthrough_type},
-    "radians":   {"args": (1, 1), "return": _passthrough_type},
-    "spow":      {"args": (2, 2), "return": _promote_args},            # safe power — sign(x)*pow(abs(x),y)
-    "sdiv":      {"args": (2, 2), "return": _promote_args},            # safe division — 0 when b≈0
+    "log2":      {"args": (1, 1), "return": _float_passthrough},
+    "log10":     {"args": (1, 1), "return": _float_passthrough},
+    "pow2":      {"args": (1, 1), "return": _float_passthrough},
+    "pow10":     {"args": (1, 1), "return": _float_passthrough},
+    "sinh":      {"args": (1, 1), "return": _float_passthrough},
+    "cosh":      {"args": (1, 1), "return": _float_passthrough},
+    "tanh":      {"args": (1, 1), "return": _float_passthrough},
+    "hypot":     {"args": (2, 2), "return": _float_promote, "accepts": _same_width},
+    "isnan":     {"args": (1, 1), "return": _float_passthrough},  # 0.0/1.0 per component
+    "isinf":     {"args": (1, 1), "return": _float_passthrough},  # 0.0/1.0 per component
+    "degrees":   {"args": (1, 1), "return": _float_passthrough},
+    "radians":   {"args": (1, 1), "return": _float_passthrough},
+    "spow":      {"args": (2, 2), "return": _float_promote, "accepts": _same_width},            # safe power — sign(x)*pow(abs(x),y)
+    "sdiv":      {"args": (2, 2), "return": _float_promote, "accepts": _same_width},            # safe division — 0 when b≈0
 
     # Clamping and interpolation — the runtime broadcasts a vector in ANY
     # argument position (e.g. step(0.5, @vec)), so these promote across all
     # args rather than passing through the first arg's type.
-    "min":       {"args": (2, 2), "return": _promote_args},
-    "max":       {"args": (2, 2), "return": _promote_args},
-    "clamp":     {"args": (3, 3), "return": _promote_args},
-    "lerp":      {"args": (3, 3), "return": _promote_args},
-    "mix":       {"args": (3, 3), "return": _promote_args},     # alias for lerp
+    "min":       {"args": (2, 2), "return": _promote_args, "accepts": _same_width},
+    "max":       {"args": (2, 2), "return": _promote_args, "accepts": _same_width},
+    "clamp":     {"args": (3, 3), "return": _promote_args, "accepts": _same_width},
+    "lerp":      {"args": (3, 3), "return": _float_promote, "accepts": _same_width},
+    "mix":       {"args": (3, 3), "return": _float_promote, "accepts": _same_width},     # alias for lerp
     "select":    {"args": (3, 3), "return": _select_type},      # select(cond, a, b): promote a/b, not cond
-    "fit":       {"args": (5, 5), "return": _promote_args},      # fit(val, old_min, old_max, new_min, new_max)
-    "smoothstep": {"args": (3, 3), "return": _promote_args},
-    "step":      {"args": (2, 2), "return": _promote_args},
+    "fit":       {"args": (5, 5), "return": _float_promote, "accepts": _same_width},      # fit(val, old_min, old_max, new_min, new_max)
+    "smoothstep": {"args": (3, 3), "return": _float_promote, "accepts": _same_width},
+    "step":      {"args": (2, 2), "return": _promote_args, "accepts": _same_width},
 
     # Vector operations — always return float (scalar result)
-    "dot":       {"args": (2, 2), "return": lambda _: TEXType.FLOAT},
-    "length":    {"args": (1, 1), "return": lambda _: TEXType.FLOAT},
-    "distance":  {"args": (2, 2), "return": lambda _: TEXType.FLOAT},
+    "dot":       {"args": (2, 2), "return": _float_type, "accepts": _same_width},
+    "length":    {"args": (1, 1), "return": _float_type},
+    "distance":  {"args": (2, 2), "return": _float_type, "accepts": _same_width},
 
     # Vector operations — return vector
-    "normalize": {"args": (1, 1), "return": _passthrough_type},
+    "normalize": {"args": (1, 1), "return": _float_passthrough},
     "cross":     {"args": (2, 2), "return": lambda _: TEXType.VEC3},
-    "reflect":   {"args": (2, 2), "return": _passthrough_type},
+    "reflect":   {"args": (2, 2), "return": _passthrough_type, "accepts": _same_width},
 
     # Matrix operations
     "transpose":   {"args": (1, 1), "return": _passthrough_type},                  # transpose(mat) — transpose matrix
-    "determinant": {"args": (1, 1), "return": lambda _: TEXType.FLOAT},            # determinant(mat) — scalar
+    "determinant": {"args": (1, 1), "return": _float_type},            # determinant(mat) — scalar
     "inverse":     {"args": (1, 1), "return": _passthrough_type},                  # inverse(mat) — matrix inverse
 
     # Debugging
     # LX-5: debug_print(label, value[, x, y]) — records value at a pixel, returns value
     # unchanged (so @OUT is bit-identical). Return type = the value arg's type.
-    "debug_print": {"args": (2, 4),
-                    "return": lambda a: a[1] if len(a) > 1 else TEXType.FLOAT},
+    "debug_print": {"args": (2, 4), "return": lambda a: a[1]},
 
     # Color operations
-    "luma":      {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # luminance of vec3/vec4
-    "hsv2rgb":   {"args": (1, 1), "return": _passthrough_type},
-    "rgb2hsv":   {"args": (1, 1), "return": _passthrough_type},
-    "srgb_to_linear": {"args": (1, 1), "return": _passthrough_type},   # SL-3 color management
-    "linear_to_srgb": {"args": (1, 1), "return": _passthrough_type},
-    "oklab_from_rgb": {"args": (1, 1), "return": _passthrough_type},   # linear RGB <-> OKLab (Ottosson)
-    "oklab_to_rgb":   {"args": (1, 1), "return": _passthrough_type},
+    "luma":      {"args": (1, 1), "return": _float_type, "accepts": _color_arg},  # luminance of vec3/vec4
+    "hsv2rgb":   {"args": (1, 1), "return": _float_passthrough, "accepts": _color_arg},
+    "rgb2hsv":   {"args": (1, 1), "return": _float_passthrough, "accepts": _color_arg},
+    "srgb_to_linear": {"args": (1, 1), "return": _float_passthrough},   # SL-3 color management
+    "linear_to_srgb": {"args": (1, 1), "return": _float_passthrough},
+    "oklab_from_rgb": {"args": (1, 1), "return": _float_passthrough, "accepts": _color_arg},   # linear RGB <-> OKLab (Ottosson)
+    "oklab_to_rgb":   {"args": (1, 1), "return": _float_passthrough, "accepts": _color_arg},
     # COLOR-1 (v0.40): Rec.709 transfer (distinct curve from sRGB) + ACEScg<->linear matrix
-    "rec709_to_linear": {"args": (1, 1), "return": _passthrough_type},
-    "linear_to_rec709": {"args": (1, 1), "return": _passthrough_type},
-    "acescg_to_linear": {"args": (1, 1), "return": _passthrough_type},
-    "linear_to_acescg": {"args": (1, 1), "return": _passthrough_type},
+    "rec709_to_linear": {"args": (1, 1), "return": _float_passthrough},
+    "linear_to_rec709": {"args": (1, 1), "return": _float_passthrough},
+    "acescg_to_linear": {"args": (1, 1), "return": _float_passthrough, "accepts": _color_arg},
+    "linear_to_acescg": {"args": (1, 1), "return": _float_passthrough, "accepts": _color_arg},
     # COLOR-1 (v0.40) lane B: 3D LUT lookup. arg 0 (rgb) alone decides the result type —
     # arg 1 (lut) is a bound tensor, not a value being blended (unlike _promote_args's use
     # for e.g. `over`), so passthrough is correct here, not promotion.
     "apply_lut3d":    {"args": (2, 2), "return": _passthrough_type},
     # SL-1 compositing (Porter-Duff, straight-alpha vec4)
-    "premultiply":   {"args": (1, 1), "return": _passthrough_type},
-    "unpremultiply": {"args": (1, 1), "return": _passthrough_type},
-    "over":          {"args": (2, 2), "return": _promote_args},
-    "under":         {"args": (2, 2), "return": _promote_args},
-    "atop":          {"args": (2, 2), "return": _promote_args},
+    "premultiply":   {"args": (1, 1), "return": _passthrough_type, "accepts": _rgba_args},
+    "unpremultiply": {"args": (1, 1), "return": _passthrough_type, "accepts": _rgba_args},
+    "over":          {"args": (2, 2), "return": lambda _: TEXType.VEC4, "accepts": _rgba_args},
+    "under":         {"args": (2, 2), "return": lambda _: TEXType.VEC4, "accepts": _rgba_args},
+    "atop":          {"args": (2, 2), "return": lambda _: TEXType.VEC4, "accepts": _rgba_args},
     # SL-2 blend modes (per-channel base⊗blend)
-    "screen":        {"args": (2, 2), "return": _promote_args},
-    "overlay":       {"args": (2, 2), "return": _promote_args},
-    "hard_light":    {"args": (2, 2), "return": _promote_args},
-    "soft_light":    {"args": (2, 2), "return": _promote_args},
-    "color_dodge":   {"args": (2, 2), "return": _promote_args},
-    "color_burn":    {"args": (2, 2), "return": _promote_args},
-    "linear_light":  {"args": (2, 2), "return": _promote_args},
-    "vivid_light":   {"args": (2, 2), "return": _promote_args},
+    "screen":        {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "overlay":       {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "hard_light":    {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "soft_light":    {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "color_dodge":   {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "color_burn":    {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "linear_light":  {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
+    "vivid_light":   {"args": (2, 2), "return": _blend_type, "accepts": _vector_base},
     # SL-4 morphology (image, radius)
     "erode":         {"args": (2, 2), "return": _passthrough_type},
     "dilate":        {"args": (2, 2), "return": _passthrough_type},
@@ -203,29 +268,29 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "sample_time":    {"args": (4, 4), "return": lambda _: TEXType.VEC4},
 
     # Noise (all support optional z for 3D: 2 args = 2D, 3 args = 3D)
-    "perlin":      {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # perlin(x, y, z?) — Perlin noise
-    "simplex":     {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # simplex(x, y, z?) — Simplex noise
-    "fbm":         {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # fbm(x, y, octaves) or fbm(x, y, z, octaves)
-    "worley_f1":   {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # worley_f1(x, y, z?) — Worley F1
-    "worley_f2":   {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # worley_f2(x, y, z?) — Worley F2
-    "voronoi":     {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # voronoi(x, y, z?) — alias for worley_f1
-    "worley_id":   {"args": (2, 3), "return": _float_type},              # ASK-5: worley_id(x, y, z?) — per-cell hash id
-    "curl":        {"args": (2, 3), "return": _curl_return_type},         # curl(x, y) → vec2; curl(x, y, z) → vec3
-    "ridged":      {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # ridged(x, y, octaves) or ridged(x, y, z, octaves)
-    "billow":      {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # billow(x, y, octaves) or billow(x, y, z, octaves)
-    "turbulence":  {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # turbulence(x, y, octaves) or turbulence(x, y, z, octaves)
-    "flow":        {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # flow(x, y, time) or flow(x, y, z, time)
-    "alligator":   {"args": (2, 4), "return": lambda _: TEXType.FLOAT},  # alligator(x, y, z?, octaves?)
+    "perlin":      {"args": (2, 3), "return": _float_type, "accepts": _scalar_args},  # perlin(x, y, z?) — Perlin noise
+    "simplex":     {"args": (2, 3), "return": _float_type, "accepts": _scalar_args},  # simplex(x, y, z?) — Simplex noise
+    "fbm":         {"args": (3, 4), "return": _float_type, "accepts": _scalar_args},  # fbm(x, y, octaves) or fbm(x, y, z, octaves)
+    "worley_f1":   {"args": (2, 3), "return": _float_type, "accepts": _scalar_args},  # worley_f1(x, y, z?) — Worley F1
+    "worley_f2":   {"args": (2, 3), "return": _float_type, "accepts": _scalar_args},  # worley_f2(x, y, z?) — Worley F2
+    "voronoi":     {"args": (2, 3), "return": _float_type, "accepts": _scalar_args},  # voronoi(x, y, z?) — alias for worley_f1
+    "worley_id":   {"args": (2, 3), "return": _float_type, "accepts": _scalar_args},              # ASK-5: worley_id(x, y, z?) — per-cell hash id
+    "curl":        {"args": (2, 3), "return": _curl_return_type, "accepts": _scalar_args},         # curl(x, y) → vec2; curl(x, y, z) → vec3
+    "ridged":      {"args": (3, 4), "return": _float_type, "accepts": _scalar_args},  # ridged(x, y, octaves) or ridged(x, y, z, octaves)
+    "billow":      {"args": (3, 4), "return": _float_type, "accepts": _scalar_args},  # billow(x, y, octaves) or billow(x, y, z, octaves)
+    "turbulence":  {"args": (3, 4), "return": _float_type, "accepts": _scalar_args},  # turbulence(x, y, octaves) or turbulence(x, y, z, octaves)
+    "flow":        {"args": (3, 4), "return": _float_type, "accepts": _scalar_args},  # flow(x, y, time) or flow(x, y, z, time)
+    "alligator":   {"args": (2, 4), "return": _float_type, "accepts": _scalar_args},  # alligator(x, y, z?, octaves?)
 
     # SDF primitives — signed distance fields (negative inside, positive outside)
-    "sdf_circle":  {"args": (3, 3), "return": lambda _: TEXType.FLOAT},  # sdf_circle(px, py, radius)
-    "sdf_box":     {"args": (4, 4), "return": lambda _: TEXType.FLOAT},  # sdf_box(px, py, half_w, half_h)
-    "sdf_line":    {"args": (6, 6), "return": lambda _: TEXType.FLOAT},  # sdf_line(px, py, ax, ay, bx, by)
-    "sdf_polygon": {"args": (4, 4), "return": lambda _: TEXType.FLOAT},  # sdf_polygon(px, py, radius, sides)
+    "sdf_circle":  {"args": (3, 3), "return": _float_type, "accepts": _scalar_args},  # sdf_circle(px, py, radius)
+    "sdf_box":     {"args": (4, 4), "return": _float_type, "accepts": _scalar_args},  # sdf_box(px, py, half_w, half_h)
+    "sdf_line":    {"args": (6, 6), "return": _float_type, "accepts": _scalar_args},  # sdf_line(px, py, ax, ay, bx, by)
+    "sdf_polygon": {"args": (4, 4), "return": _float_type, "accepts": _scalar_args},  # sdf_polygon(px, py, radius, sides)
 
     # Smooth blending
-    "smin":        {"args": (3, 3), "return": _promote_args},             # smin(a, b, k) — polynomial smooth min
-    "smax":        {"args": (3, 3), "return": _promote_args},             # smax(a, b, k) — polynomial smooth max
+    "smin":        {"args": (3, 3), "return": _float_promote, "accepts": _same_width},             # smin(a, b, k) — polynomial smooth min
+    "smax":        {"args": (3, 3), "return": _float_promote, "accepts": _same_width},             # smax(a, b, k) — polynomial smooth max
 
     # Gradient sampling
     "sample_grad": {"args": (3, 3), "return": lambda _: TEXType.VEC2},   # sample_grad(@A, u, v) — luminance gradient
@@ -263,11 +328,11 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     # Array operations
     "sort":      {"args": (1, 1), "return": lambda _: TEXType.ARRAY},             # sort(arr) — ascending sort, returns new array
     "reverse":   {"args": (1, 1), "return": lambda _: TEXType.ARRAY},             # reverse(arr) — reverse order, returns new array
-    "arr_sum":   {"args": (1, 1), "return": lambda _: TEXType.FLOAT},             # arr_sum(arr) — sum of elements
-    "arr_min":   {"args": (1, 1), "return": lambda _: TEXType.FLOAT},             # arr_min(arr) — minimum element
-    "arr_max":   {"args": (1, 1), "return": lambda _: TEXType.FLOAT},             # arr_max(arr) — maximum element
-    "median":    {"args": (1, 1), "return": lambda _: TEXType.FLOAT},             # median(arr) — median element
-    "arr_avg":   {"args": (1, 1), "return": lambda _: TEXType.FLOAT},             # arr_avg(arr) — mean of elements
+    "arr_sum":   {"args": (1, 1), "return": _float_type, "accepts": _array_arg},             # arr_sum(arr) — sum of elements
+    "arr_min":   {"args": (1, 1), "return": _float_type, "accepts": _array_arg},             # arr_min(arr) — minimum element
+    "arr_max":   {"args": (1, 1), "return": _float_type, "accepts": _array_arg},             # arr_max(arr) — maximum element
+    "median":    {"args": (1, 1), "return": _float_type, "accepts": _array_arg},             # median(arr) — median element
+    "arr_avg":   {"args": (1, 1), "return": _float_type, "accepts": _array_arg},             # arr_avg(arr) — mean of elements
 
     # String array operations
     "join":      {"args": (2, 2), "return": TEXType.STRING},                      # join(arr, sep) — concatenate with separator

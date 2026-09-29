@@ -298,7 +298,7 @@ _FOREIGN_KEYWORD_HINTS: dict[str, str] = {
     "var":     "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "auto":    "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "def":     "TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
-    "fn":      "fn is a built-in variable (normalized frame). Define functions with: float myFunc(float x) { return x; }",
+    "fn":      "fn is a built-in variable (the frame count). Define functions with: float myFunc(float x) { return x; }",
     "func":    "TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
     "function":"TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
     "class":   "TEX is expression-based — there are no classes or structs.",
@@ -353,7 +353,7 @@ _BUILTIN_VAR_HINTS: dict[str, str] = {
     "v": "the normalized y coordinate (0..1)",
     "ix": "the integer pixel x", "iy": "the integer pixel y",
     "iw": "the image width in pixels", "ih": "the image height in pixels",
-    "px": "one pixel's width in u (1/iw)", "py": "one pixel's width in v (1/ih)",
+    "px": "one pixel's width in u (1/iw)", "py": "one pixel's height in v (1/ih)",
     "fi": "the frame index", "fn": "the frame count", "ic": "the input channel count",
     "PI": "the constant pi", "TAU": "the constant 2*pi", "E": "Euler's number",
     # ENG-7 (v0.22): reserving these three CAN break a program that declared its own
@@ -400,21 +400,19 @@ def get_keyword_hint(keyword: str) -> str | None:
     return _FOREIGN_KEYWORD_HINTS.get(keyword)
 
 
-# A5-1: identifiers reserved for the v0.20 multi-pass execution model. Unlike the foreign
-# keywords above, these are only rejected in the future BLOCK position (`pass { … }`,
+# A5-1: identifiers reserved for multi-pass blocks, which TEX does not have. Unlike the
+# foreign keywords above, these are only rejected in the BLOCK position (`pass { … }`,
 # `stage { … }`) so they stay usable as ordinary variable names elsewhere — the parser
 # fires this only when the word is followed by `{` (or `;` for bare `pass`). The hint
 # points at what to do today, mirroring the `struct` rejection's spirit.
 _V020_RESERVED_HINTS: dict[str, str] = {
-    "pass":   "`pass { … }` (multi-pass) isn't supported yet — it's the v0.20 execution "
-              "model. For a multi-stage pipeline today, chain TEX Wrangle nodes; see the "
-              "wiki 'Batch and Temporal Processing'.",
-    "stage":  "`stage { … }` (multi-stage) isn't supported yet — it's the v0.20 multi-pass "
-              "model. Chain TEX Wrangle nodes for now.",
+    "pass":   "`pass { … }` (multi-pass) isn't supported. For a multi-stage pipeline, "
+              "chain TEX Wrangle nodes; see the wiki 'Batch and Temporal Processing'.",
+    "stage":  "`stage { … }` (multi-stage) isn't supported. Chain TEX Wrangle nodes.",
     "kernel": "TEX has no `kernel { … }` blocks — every program is already a per-pixel "
               "kernel. Write the expression directly and assign @OUT.",
     "image":  "There's no `image { … }` block — inputs are @A..@H and output is @OUT. A "
-              "multi-stage pipeline is chained TEX nodes today (v0.20 adds in-node passes).",
+              "multi-stage pipeline is chained TEX Wrangle nodes.",
 }
 
 
@@ -459,16 +457,16 @@ def compile_error_from(e, source: str) -> TEXCompileError:
     The compiler's error taxonomy lives HERE, beside the public type — not in every module that
     has to translate it. Both compile implementations use it: `tex_engine._compile_or_raise`
     (the cache path) and `tex_fusion.compile_fused`'s per-stage validation (which parses and
-    type-checks each stage directly, never through the cache). Pair it with `RAW_COMPILE_ERRORS`
+    type-checks each stage directly, never through the cache). Pair it with `raw_compile_errors()`
     in the `except` clause so a new phase type is added in one place:
 
         try:
             ...compile...
-        except RAW_COMPILE_ERRORS as e:
+        except raw_compile_errors() as e:
             raise compile_error_from(e, src) from e
 
-    Both v0.29 audits found a bug of the form "someone forgot a member of the 4-name tuple";
-    keeping the tuple and the translator together is what stops the next one.
+    Keeping the exception tuple and the translator together means a new phase type cannot be
+    caught in one place and missed in another.
     """
     if isinstance(e, TEXMultiError):
         return TEXCompileError(e.diagnostics)
@@ -492,7 +490,10 @@ def raw_compile_errors() -> tuple:
         from .lexer import LexerError
         from .parser import ParseError
         from .type_checker import TypeCheckError
-        _RAW_COMPILE_ERRORS = (LexerError, ParseError, TypeCheckError, TEXMultiError)
+        # RecursionError: a tree walk past the stack on a deeply nested or very long
+        # expression (the optimizer's walkers); it becomes an unpositioned E2000.
+        _RAW_COMPILE_ERRORS = (LexerError, ParseError, TypeCheckError, TEXMultiError,
+                               RecursionError)
     return _RAW_COMPILE_ERRORS
 
 
@@ -503,6 +504,11 @@ def diagnostic_from_exc(e, source: str) -> TEXDiagnostic:
     message. Shared by `tex_engine._compile_or_raise` (the ENG-4 raiser), `tex_api.compile`,
     and `tex_api.check()` — it lives HERE, not in tex_api, so the single raiser can reach it
     without an import cycle."""
+    if isinstance(e, RecursionError):
+        return make_diagnostic(code="E2000", message="This program is nested too deeply to compile.",
+                               loc=None, source=source, phase="compile",
+                               hint="Split long or deeply nested expressions into several "
+                                    "statements with intermediate variables.")
     if hasattr(e, "_build_diagnostic"):
         e._build_diagnostic()
     diag = getattr(e, "diagnostic", None)
