@@ -2,11 +2,13 @@
 //
 // Reduces the colour palette by snapping each channel to the nearest
 // of N evenly-spaced intensity steps: floor(x * levels) / (levels - 1).
+// It floors, so values bias slightly dark and no level count is an exact
+// identity (256 levels is only about 8-bit, within ~0.4%).
 //
 // Inputs:  @image (vec3)
 // Outputs: @OUT   (vec3)
 
-i$levels = 4;   // number of output levels per channel (2 = threshold, 256 = identity)
+i$levels = 4;   // number of output levels per channel (2 = threshold, 256 = about 8-bit)
 
 vec3 src = @image;
 float n = float($levels);

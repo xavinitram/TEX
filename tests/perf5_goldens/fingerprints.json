@@ -2119,20 +2119,20 @@
   {
    "key": "examples/normalize_mask.tex",
    "param_only_names": [],
-   "sha256_source": "23f5df11e50ab88e6f246d26ba7c438a584e96efcfa309611a8df8250b3976aa",
+   "sha256_source": "0aa0f3bbec73886230a5c0930b82f5ddbb050380311a234f16bbf4542bf147b4",
    "typed": {
     "binding_types": {
      "OUT": "vec3",
      "mask": "int"
     },
-    "fingerprint": "7c9e06e0aea12d76dd879831460c550d0240491ac72f2cfd025d528030ee1934"
+    "fingerprint": "aefac403d2c86940cd64b10b84f8422970d43aa78fc8ef45af4d3ad9471440c4"
    },
    "wires": {
     "binding_types": {
      "OUT": "vec4",
      "mask": "vec4"
     },
-    "fingerprint": "4c2dd02568a8d77f65fc3fcde3078d71d6fa301f75c6289fc4f61b57703f83b8"
+    "fingerprint": "0b8a55a886bb7f536a93f747778a6f8e571c79a0b251af710301cfadce1cc63c"
    }
   },
   {
@@ -2189,14 +2189,14 @@
    "param_only_names": [
     "block_size"
    ],
-   "sha256_source": "5768bb053edbc6f451441dea79e2683d1b5d3f80d804ec29a4580d9ccfacae5b",
+   "sha256_source": "f4943efafb47a88907e687fcbf6554d35c756562f50e46cef7f11b4958d04e40",
    "typed": {
     "binding_types": {
      "OUT": "vec3",
      "block_size": "float",
      "image": "vec4"
     },
-    "fingerprint": "4133106fdc12dd1804865bc16e1b4a3ebea05c503d44c36d8067ee9524563da7"
+    "fingerprint": "678f9dce3c2800822d8574f50e2eec10d84056e59d32c329e9b87ba827b3d5e0"
    },
    "wires": {
     "binding_types": {
@@ -2204,7 +2204,7 @@
      "block_size": "float",
      "image": "vec4"
     },
-    "fingerprint": "000e82a1b0f82acb1dae9312d208f4af5357240eb484cf86477a46ada58606f2"
+    "fingerprint": "c858b5a1269f67d42ea35056d097efd1774171d8236bd29c8e083f39fd5578de"
    }
   },
   {
@@ -2212,14 +2212,14 @@
    "param_only_names": [
     "levels"
    ],
-   "sha256_source": "c0a7eea62bd12a91ec82606a04a49cbe0920655d9da48d8bfd5a0ce1df6fae79",
+   "sha256_source": "f4ab286e7919651c903fa6cb4f9d21a96c4cf58037dd59848387b73fe4248a38",
    "typed": {
     "binding_types": {
      "OUT": "vec3",
      "image": "vec4",
      "levels": "vec4"
     },
-    "fingerprint": "b134205b494f1aebf6812895797e0d74d2417ba405798630b561ce418c838ede"
+    "fingerprint": "d2fa1c2efa2bb9d95c946abe1883a0b2b3ff949d73c6ed6073918fc87e39da1d"
    },
    "wires": {
     "binding_types": {
@@ -2227,7 +2227,7 @@
      "image": "vec4",
      "levels": "float"
     },
-    "fingerprint": "158c6380c45cc5c6a8ca278ca9f194944c4489e1cff22a49214b9c1000e88e1f"
+    "fingerprint": "ec0c87ce3a9a7ed701de6a41dc6cb9ef4485ae760a32bb99d32a4667764e4e0a"
    }
   },
   {
