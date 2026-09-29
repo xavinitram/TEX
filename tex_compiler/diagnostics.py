@@ -298,7 +298,7 @@ _FOREIGN_KEYWORD_HINTS: dict[str, str] = {
     "var":     "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "auto":    "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "def":     "TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
-    "fn":      "fn is a built-in variable (normalized frame). Define functions with: float myFunc(float x) { return x; }",
+    "fn":      "fn is a built-in variable (the frame count). Define functions with: float myFunc(float x) { return x; }",
     "func":    "TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
     "function":"TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
     "class":   "TEX is expression-based — there are no classes or structs.",
@@ -353,7 +353,7 @@ _BUILTIN_VAR_HINTS: dict[str, str] = {
     "v": "the normalized y coordinate (0..1)",
     "ix": "the integer pixel x", "iy": "the integer pixel y",
     "iw": "the image width in pixels", "ih": "the image height in pixels",
-    "px": "one pixel's width in u (1/iw)", "py": "one pixel's width in v (1/ih)",
+    "px": "one pixel's width in u (1/iw)", "py": "one pixel's height in v (1/ih)",
     "fi": "the frame index", "fn": "the frame count", "ic": "the input channel count",
     "PI": "the constant pi", "TAU": "the constant 2*pi", "E": "Euler's number",
     # ENG-7 (v0.22): reserving these three CAN break a program that declared its own
@@ -400,21 +400,19 @@ def get_keyword_hint(keyword: str) -> str | None:
     return _FOREIGN_KEYWORD_HINTS.get(keyword)
 
 
-# A5-1: identifiers reserved for the v0.20 multi-pass execution model. Unlike the foreign
-# keywords above, these are only rejected in the future BLOCK position (`pass { … }`,
+# A5-1: identifiers reserved for multi-pass blocks, which TEX does not have. Unlike the
+# foreign keywords above, these are only rejected in the BLOCK position (`pass { … }`,
 # `stage { … }`) so they stay usable as ordinary variable names elsewhere — the parser
 # fires this only when the word is followed by `{` (or `;` for bare `pass`). The hint
 # points at what to do today, mirroring the `struct` rejection's spirit.
 _V020_RESERVED_HINTS: dict[str, str] = {
-    "pass":   "`pass { … }` (multi-pass) isn't supported yet — it's the v0.20 execution "
-              "model. For a multi-stage pipeline today, chain TEX Wrangle nodes; see the "
-              "wiki 'Batch and Temporal Processing'.",
-    "stage":  "`stage { … }` (multi-stage) isn't supported yet — it's the v0.20 multi-pass "
-              "model. Chain TEX Wrangle nodes for now.",
+    "pass":   "`pass { … }` (multi-pass) isn't supported. For a multi-stage pipeline, "
+              "chain TEX Wrangle nodes; see the wiki 'Batch and Temporal Processing'.",
+    "stage":  "`stage { … }` (multi-stage) isn't supported. Chain TEX Wrangle nodes.",
     "kernel": "TEX has no `kernel { … }` blocks — every program is already a per-pixel "
               "kernel. Write the expression directly and assign @OUT.",
     "image":  "There's no `image { … }` block — inputs are @A..@H and output is @OUT. A "
-              "multi-stage pipeline is chained TEX nodes today (v0.20 adds in-node passes).",
+              "multi-stage pipeline is chained TEX Wrangle nodes.",
 }
 
 
