@@ -92,18 +92,14 @@ def test_string_array_write_floors_a_fractional_index_like_the_read():
     assert out[0, 0, 0, 0].item() == 4.0 and out[0, 0, 0, 1].item() == 3.0
 
 
-def test_matrix_array_element_write():
-    src = ("mat3 a[2]; a[0] = mat3(2.0); a[1] = mat3(5.0); mat3 m = a[0]; mat3 n = a[1]; "
-           "vec3 r = m * vec3(1.0, 1.0, 1.0); vec3 q = n * vec3(1.0, 1.0, 1.0); "
-           "@OUT = vec4(r.x, q.x, 0.0, 1.0);")
-    out = _cook(src, {"A": _img()})
-    assert out[0, 0, 0, 0].item() == 2.0 and out[0, 0, 0, 1].item() == 5.0
-
-
-def test_matrix_array_per_pixel_index_is_a_diagnostic():
-    src = ("mat4 a[2]; a[int(@A.r * 2.0)] = mat4(2.0); mat4 m = a[0]; "
-           "@OUT = m * vec4(1.0, 1.0, 1.0, 1.0);")
-    with pytest.raises(InterpreterError, match="array of matrices"):
+@pytest.mark.parametrize("src", [
+    "mat3 a[2]; a[0] = mat3(2.0); mat3 m = a[0]; @OUT = vec4(m * vec3(1.0, 1.0, 1.0), 1.0);",
+    "mat4 a[2]; a[int(@A.r * 2.0)] = mat4(2.0); mat4 m = a[0]; @OUT = m * vec4(1.0, 1.0, 1.0, 1.0);",
+])
+def test_matrix_arrays_are_a_compile_error(src):
+    """Arrays of matrices are not part of the language (E3101); the checker refuses them
+    before the interpreter's own matrix-array guard can be reached."""
+    with pytest.raises(Exception, match="Arrays of 'mat"):
         _cook(src, {"A": _img()})
 
 

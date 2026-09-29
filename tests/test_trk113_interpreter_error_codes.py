@@ -94,7 +94,17 @@ def test_trk113_e6004_channel_assign_target_not_a_variable_or_binding(r: SubTest
         code = ("vec3 f(vec3 v) { return v; } "
                 "f(vec3(1.0, 2.0, 3.0)).r = 9.0; @OUT = vec4(1.0);")
         _run(code, {}, {})
-    _expect_code(r, "E6004", "a channel write whose target is a function call", go)
+    # The checker now refuses a call result as an assignment target, so E6004 is a
+    # runtime backstop only; the row pins the compile-time refusal that reaches the user.
+    try:
+        go()
+    except Exception as e:
+        if "assignment target" in str(e):
+            r.ok("a channel write whose target is a function call: refused at compile time")
+        else:
+            r.fail("a channel write whose target is a function call", f"wrong error: {e}")
+    else:
+        r.fail("a channel write whose target is a function call", "no error raised")
 
 
 def test_trk113_e6005_array_index_assign_target_not_a_variable_or_binding(r: SubTestResult):
@@ -104,7 +114,17 @@ def test_trk113_e6005_array_index_assign_target_not_a_variable_or_binding(r: Sub
         code = ("float arr[3] = {1.0, 2.0, 3.0}; sort(arr)[0] = 9.0; "
                 "@OUT = vec4(arr[0]);")
         _run(code, {}, {})
-    _expect_code(r, "E6005", "an array-index write whose target is a function call", go)
+    # The checker now refuses a call result as an assignment target, so E6005 is a
+    # runtime backstop only; the row pins the compile-time refusal that reaches the user.
+    try:
+        go()
+    except Exception as e:
+        if "assignment target" in str(e):
+            r.ok("an array-index write whose target is a function call: refused at compile time")
+        else:
+            r.fail("an array-index write whose target is a function call", f"wrong error: {e}")
+    else:
+        r.fail("an array-index write whose target is a function call", "no error raised")
 
 
 def test_trk113_e6006_scatter_write_channel_count_mismatch(r: SubTestResult):
