@@ -14,8 +14,11 @@ all before this one).
 
 Method, per `docs/brief-conventions.md`'s three measurement rules plus two more this
 family of comparisons has needed every time it was run by hand:
-  1. discard the first leg (per-flag warm-up) — each flag gets its OWN `TEX_CACHE_DIR`,
-     so the second flag's timing is never reading what the first flag's cook compiled.
+  1. discard the first leg (per-flag warm-up). The per-flag `TEX_CACHE_DIR` values are
+     set before each cook, but `TEXCache` reads the variable once per process, so both
+     flags share the cache created by the first cook: the recorded `cache_dir_*` fields
+     are provenance labels, not isolation. The discarded warm-up leg is what keeps the
+     second flag from timing a cold compile.
   2. import TEX_Wrangle from the WORKTREE's parent, never an installed tree — the same
      `sys.path` shape `roi_scrub_bench.py` already uses.
   3. every printed and saved figure names the box it was taken on (from `torch`, at
@@ -24,7 +27,7 @@ family of comparisons has needed every time it was run by hand:
      blocks, so neither flag gets a systematic first-in-round advantage from cache
      warmth or clock ramp.
   5. take a NULL CONTROL: split each flag's own timed samples into two disjoint halves
-     (by round parity) and compare them against each other. A ratio smaller than this
+     (the first half of the run against the second) and compare them against each other. A ratio smaller than this
      null spread is not a measured difference — it is the box's own noise floor.
 
 The program is the ROI-executable shape `roi_scrub_bench.py` already uses: pointwise +
@@ -99,8 +102,8 @@ def _timed_ms(fn, device: str) -> float:
 
 
 def _null_spread(xs: list) -> tuple:
-    """Split-half self-comparison: same flag, two disjoint halves, against each
-    other. The spread this reports is the noise floor a real effect must clear."""
+    """Split-half self-comparison: same flag, the first half of the samples against the
+    second. The spread this reports is the noise floor a real effect must clear."""
     half = len(xs) // 2
     a, b = xs[:half], xs[half:]
     ma, mb = statistics.median(a), statistics.median(b)
