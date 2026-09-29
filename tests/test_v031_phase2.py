@@ -197,20 +197,24 @@ def test_v031_pred1_admission_arithmetic(r: SubTestResult):
     print("\n--- v0.31 PRED-1: admission by confidence x predicted cost ---")
     # A 10 ms floor, so the rows straddle it rather than all clearing the 2 ms default.
     _FLOOR = 10.0
+    # The verdicts are literals, not recomputed from the product. Every confidence here clears
+    # the per-factor confidence bound and every cost the cost bound (those have their own row
+    # below), so each refusal is the saving floor alone.
     rows = [
-        # (confidence, cost_ms, why this row exists)
-        (0.9, 40.0, "likely and expensive — the case speculation exists for"),
-        (0.02, 400.0, "a long render nobody will probably want (0.02 x 400 = 8)"),
-        (1.0, 0.3, "certain but trivial — there is no latency to hide"),
-        (0.4, 30.0, "12 ms of expected saving — over the floor on both terms"),
+        # (confidence, cost_ms, admitted, why this row exists)
+        (0.9, 40.0, True, "likely and expensive — the case speculation exists for"),
+        (0.5, 10.0, False, "5 ms of expected saving — under the floor on the product alone"),
+        (1.0, 0.3, False, "certain but trivial — there is no latency to hide"),
+        (0.4, 30.0, True, "12 ms of expected saving — over the floor on both terms"),
+        (0.5, 20.0, True, "exactly on the floor (10 ms) — admitted"),
+        (0.5, 19.9, False, "just under the floor (9.95 ms) — refused"),
     ]
     policy = _pol(min_value_ms=_FLOOR, max_pending=99)
-    for conf, cost, why in rows:
+    for conf, cost, expect, why in rows:
         job = Q.Job(id=0, klass=Q.SPECULATIVE, fn=lambda c: None,
                     confidence=conf, cost_ms=cost)
         got = policy.admit(job)
-        expect = (conf * cost) >= _FLOOR
-        r.ok(f"conf {conf} x {cost} ms = {job.score:.1f} -> "
+        r.ok(f"conf {conf} x {cost} ms = {job.score:.2f} -> "
              f"{'admit' if got else 'refuse'}  ({why})") if got == expect else \
             r.fail("PRED-1 arithmetic",
                    f"conf={conf} cost={cost} score={job.score} admitted={got}, expected {expect}")
