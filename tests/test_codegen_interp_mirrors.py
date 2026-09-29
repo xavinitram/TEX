@@ -75,3 +75,9 @@ def test_signed_zero_literal_keeps_its_sign(first, expr):
     # The +0.0 literal appears first, so a constant cache keyed by value would hand the
     # -0.0 literal its tensor.
     _parity(f"@OUT = vec3(atan2(0.0, {first}), atan2(0.0, {expr}), 0.0);", "fp32")
+
+
+def test_float_cast_of_an_fp16_value_is_float32():
+    # 100000 is past fp16's range: the interpreter's float() promotes, so the product is finite.
+    ref = _parity("@OUT = vec3(float(@A.r) * 100000.0);", "fp16")
+    assert torch.isfinite(ref).all()

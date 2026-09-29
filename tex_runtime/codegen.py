@@ -3757,11 +3757,17 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
     def _emit_cast(self, node: CastExpr) -> str:
         value = self._emit_expr(node.expr)
 
-        # Fast path: float cast on already-float/int source is a no-op
+        # A numeric source: float32 passes through, anything else converts (an int64
+        # `$param`, an fp16 value), as the interpreter's cast does.
         if node.target_type == "float":
             src_type = self.type_map.get(id(node.expr))
             if src_type is not None and src_type in (TEXType.FLOAT, TEXType.INT):
-                return value
+                if self._scalar_loop:
+                    return value
+                tmp = self._tmp()
+                self._emit(f"{tmp} = {value} if not _torch.is_tensor({value}) "
+                           f"or {value}.dtype is _torch.float32 else {value}.float()")
+                return tmp
 
         # Scalar loop mode: Python float casts
         if self._scalar_loop:

@@ -664,3 +664,19 @@ _TERNARY_ROWS = [
 @pytest.mark.parametrize("label,code", _TERNARY_ROWS, ids=[r[0] for r in _TERNARY_ROWS])
 def test_ternary_matches_interpreter(label, code):
     assert_parity(code, {"A": _img()}, atol=0.0)
+
+
+# ── float() of an int `$param` is a float32 value, as in the interpreter ─────────────────
+
+_FLOAT_CAST_ROWS = [
+    ("scatter write of float($n)",
+     "float a[4];\nfor (int i = 0; i < 4; i++) { a[i] = float(i); }\n"
+     "a[int(@A.r * 4.0) - 1] = float($n) * float($n);\n@OUT = vec3(a[0], a[1], a[2]) + @A.rgb * 0.0;"),
+    ("arithmetic on float($n)",
+     "float acc = @A.r; float x = float($n);\nacc = acc * 0.5 + (0.25 - (float($n) * x));\n@OUT = vec3(acc);"),
+]
+
+
+@pytest.mark.parametrize("label,code", _FLOAT_CAST_ROWS, ids=[r[0] for r in _FLOAT_CAST_ROWS])
+def test_float_cast_of_an_int_param_matches_interpreter(label, code):
+    assert_parity(code, {"A": _img(), "n": 3})
