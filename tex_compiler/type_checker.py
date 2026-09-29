@@ -59,6 +59,11 @@ from .diagnostics import (
 _FUNCTION_SIGNATURES: dict | None = None
 
 
+def _accepts_any(arg_types) -> None:
+    """The default argument rule of a signature row: any types (the count is checked apart)."""
+    return None
+
+
 def _function_signatures() -> dict:
     global _FUNCTION_SIGNATURES
     if _FUNCTION_SIGNATURES is None:
@@ -1566,12 +1571,6 @@ class TypeChecker:
                     f"{node.name}() needs a matrix (mat3 or mat4), but got {arg_types[0].value}.",
                     node.loc, code="E5003",
                     hint="Build a matrix first with mat3(...) or mat4(...).")
-        elif node.name in ("hsv2rgb", "rgb2hsv") and arg_types:
-            if not arg_types[0].is_vector:
-                self._error(
-                    f"{node.name}() needs a color vector (vec3 or vec4), but got {arg_types[0].value}.",
-                    node.loc, code="E5003",
-                    hint="Pass an RGB/HSV color, e.g. vec3(r, g, b).")
         elif node.name == "dot":
             for i, at in enumerate(arg_types):
                 if not at.is_vector:
@@ -1613,10 +1612,17 @@ class TypeChecker:
                         hint="select() picks between two numeric/vector values; strings "
                              "and matrices aren't supported.")
 
+        sig = _function_signatures().get(node.name)
+        bad = sig.get("accepts", _accepts_any)(arg_types) if sig is not None else None
+        if bad is not None:
+            i, what = bad
+            self._error(f"{node.name}() argument {i + 1} needs {what}, but got {arg_types[i].value}.",
+                        node.loc, code="E5003",
+                        hint=f"See {node.name}() in the ? help panel for its argument types.")
+
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
         user_fn = self._user_functions.get(node.name)
-        if (user_fn is not None and len(user_fn["params"]) == len(arg_types)
-                and _function_signatures().get(node.name) is None):
+        if sig is None and user_fn is not None and len(user_fn["params"]) == len(arg_types):
             node.args = [self._widen(a, ptype, at) for a, (ptype, _), at
                          in zip(node.args, user_fn["params"], arg_types)]
         self._set_type(node, result_type)

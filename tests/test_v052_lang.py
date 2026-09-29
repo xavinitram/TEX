@@ -243,3 +243,57 @@ def test_in_range_literals_parse():
     for code in ("@OUT = vec4(3.4028234e38);", "float a[0x4]; @OUT = vec4(a[1]);",
                  "f$k = 0.5 [max: 1e30]; @OUT = vec4($k);"):
         assert _parse_error_code(code) is None, code
+
+
+# ── Builtin signatures: result types and argument kinds match the runtime ──────────────────
+
+_V3 = {"A": TEXType.VEC3}
+_V4 = {"A": TEXType.VEC4}
+
+
+@pytest.mark.parametrize("code,want", [
+    ("int n = 2; int r = sqrt(n);", ["E3200"]),
+    ("int n = 2; int r = sin(n);", ["E3200"]),
+    ("int n = 2; int r = smoothstep(0, 4, n);", ["E3200"]),
+    ("int n = 2; int r = fit(n, 0, 4, 0, 1);", ["E3200"]),
+    ("int n = 2; int r = pow(n, 2);", ["E3200"]),
+    ("int n = 2; float r = sqrt(n);", []),
+    ("int a = 2; int b = 3; int r = min(a, b) + abs(a) + floor(b) + mod(b, a);", []),
+], ids=["sqrt", "sin", "smoothstep", "fit", "pow", "float-ok", "int-rows-ok"])
+def test_fractional_builtins_of_ints_are_float(code, want):
+    assert check_errors(code + " @OUT = vec4(1.0);") == want
+
+
+def test_isnan_of_a_vector_is_a_vector():
+    assert check_errors("float b = isnan(@A); @OUT = vec4(b);", _V4) == ["E3200"]
+    A = _a()
+    A[0, 0, 0, 1] = float("nan")
+    ref = run_both("vec4 b = isnan(@A) + isinf(@A); @OUT = b;", {"A": A})
+    assert ref["OUT"][0, 0, 0].tolist() == [0.0, 1.0, 0.0, 0.0]
+
+
+def test_blend_keeps_the_base_width():
+    A = _a()
+    ref = run_both("vec4 c = screen(@A.rgb, @A); @OUT = c;", {"A": A})
+    out = ref["OUT"]
+    assert tuple(out.shape) == (1, 4, 4, 4)
+    assert torch.allclose(out[..., 3], torch.ones_like(out[..., 3]))
+    assert check_errors("vec4 c = screen(0.5, @A); @OUT = c;", _V4) == ["E5003"]
+
+
+@pytest.mark.parametrize("code,bt", [
+    ("vec3 a = vec3(1.0); vec4 b = vec4(0.5); @OUT = vec4(min(a, b));", {}),
+    ("@OUT = lerp(@A, @B, 0.5);", {"A": TEXType.VEC3, "B": TEXType.VEC4}),
+    ("@OUT = vec4(dot(@A.rgb, @A.rg));", _V4),
+    ("vec2 r = rgb2hsv(@A.rg); @OUT = vec4(r, 0.0, 1.0);", _V4),
+    ("@OUT = vec4(luma(@A.r));", _V4),
+    ("@OUT = vec4(perlin(0.5, @A.rg).x);", _V4),
+    ("@OUT = vec4(sdf_circle(@A.rg, 0.5, 0.2));", _V4),
+    ("@OUT = vec4(arr_sum(@A.r));", _V4),
+    ("@OUT = over(@A, @A);", _V3),
+    ("@OUT = vec4(premultiply(@A), 1.0);", _V3),
+], ids=["min-v3v4", "lerp-v3v4", "dot-v3v2", "rgb2hsv-v2", "luma-scalar", "perlin-vec",
+        "sdf-vec", "arr_sum-scalar", "over-v3", "premultiply-v3"])
+def test_builtin_argument_kinds_are_checked(code, bt):
+    assert "E5003" in check_errors(code, bt)
+
