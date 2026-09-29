@@ -438,3 +438,36 @@ def test_unroll_leaves_a_loop_that_writes_its_counter():
     assert any(type(st).__name__ == "ForLoop" for st in prog.statements)
     run_both("float s = @A.r * 0.0; for (int i = 0; i < 4; i++) { s += 1.0; i = i + 1; } @OUT = vec4(s);",
              {"A": _a()})
+
+
+# ── Parser robustness ───────────────────────────────────────────────────────────────────
+
+def test_code_after_a_closing_block_comment_ends_the_header():
+    from TEX_Wrangle.tex_compiler.parser import scale_pragma
+    assert scale_pragma("/* hdr */\n//!tex scale: never\n@OUT = @A;") == "never"
+    assert scale_pragma("/* hdr */ float x = 1.0;\n//!tex scale: never\n@OUT = @A;") is None
+    assert scale_pragma("/* a\n b */ float x = 1.0;\n//!tex scale: never\n@OUT = @A;") is None
+    assert scale_pragma("/* a\n b */\n//!tex scale: safe\n@OUT = @A;") == "safe"
+
+
+def test_empty_array_literal_without_size_is_a_parse_error():
+    assert _parse_error_code("float a[] = {}; @OUT = vec4(1.0);") == "E2004"
+
+
+def _compile_error_code(code):
+    from TEX_Wrangle.tex_engine import cook
+    from TEX_Wrangle.tex_compiler.diagnostics import TEXCompileError
+    try:
+        cook(code, {"A": _a()}, device_mode="cpu")
+    except TEXCompileError as e:
+        return e.diagnostics[0].code
+    return None
+
+
+def test_deep_nesting_is_a_compile_error_not_a_crash():
+    assert _compile_error_code("@OUT = vec4(" + "(" * 400 + "@A.r" + ")" * 400 + ");") == "E2000"
+    assert _compile_error_code("float x = " + " + ".join(["@A.r"] * 1500) + "; @OUT = vec4(x);") == "E2000"
+
+
+def test_select_condition_must_be_a_scalar():
+    assert "E5003" in check_errors("float a[2] = {0.0, 1.0}; @OUT = vec4(select(a, 1.0, 0.0));", _V4)

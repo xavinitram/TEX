@@ -96,13 +96,19 @@ def _header_pragma_matches(source: str, pattern, *, skip_block_comments: bool):
             i += 1
             continue                      # an ordinary leading line comment — keep scanning
         if skip_block_comments and line.startswith("/*"):
-            if "*/" in line[2:]:
-                i += 1                     # closes on the SAME line — still header, continue
-                continue
+            end = line.find("*/", 2)
+            if end < 0:
+                i += 1
+                while i < n and "*/" not in lines[i]:
+                    i += 1                 # skip every line of the block body
+                if i >= n:
+                    break
+                line = lines[i]
+                end = line.find("*/")
+            rest = line[end + 2:].strip()
+            if rest and not rest.startswith("//"):
+                break                      # code after the closing `*/` ends the header
             i += 1
-            while i < n and "*/" not in lines[i]:
-                i += 1                     # skip every line of the block body
-            i += 1                         # and the line holding its closing `*/`
             continue
         break                              # first real code (or, unless skipped, a block comment)
 
@@ -327,9 +333,13 @@ class Parser:
             start_pos = self.pos
             try:
                 stmts.append(self.parse_statement())
+            except RecursionError:
+                # Recursive descent: ~12 frames per `(` level, one per unary operator.
+                raise self._make_error(
+                    "This expression is nested too deeply to compile.", self.loc(),
+                    hint="Split it into several statements with intermediate variables.") from None
             except ParseError as e:
                 self._errors.append(e)
-                stmts.append(ErrorNode(loc=e.loc, error_message=str(e)))
                 self._synchronize()
                 # Guarantee forward progress. _synchronize() returns WITHOUT
                 # consuming a statement-starting sync token (e.g. a stray `}`),
@@ -628,6 +638,9 @@ class Parser:
             else:
                 # Array copy: float b[3] = a;
                 initializer = self.parse_expr()
+        if size is None and isinstance(initializer, ArrayLiteral) and not initializer.elements:
+            raise self._make_error("An array needs at least one element; `{}` has none.",
+                                   loc, code="E2004", hint="Give it a size or elements, e.g. float a[] = {0.0};")
 
         self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this array declaration",
                    code="E2010", hint="Every statement in TEX ends with `;`.")

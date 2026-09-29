@@ -260,7 +260,12 @@ class TypeChecker:
         self._scopes[0].update(_BUILTIN_VAR_SEED)
 
         for stmt in program.statements:
-            self._check_stmt(stmt)
+            try:
+                self._check_stmt(stmt)
+            except RecursionError:   # a very long operator chain: the walk recurses per level
+                self._error("This statement is nested too deeply to compile.", stmt.loc,
+                            code="E2000", hint="Split it into several statements with "
+                            "intermediate variables.")
 
         if self._collect_warnings:
             self._compute_warnings()   # W7xxx advisories (opt-in — off on the cook path)
@@ -1650,7 +1655,7 @@ class TypeChecker:
             # matrix operands either (matching the ternary `?:`'s numeric-arm rule,
             # E3400, but as E5003 since select is a function call, not an operator).
             cond_t = arg_types[0]
-            if cond_t.is_vector or cond_t.is_matrix or cond_t.is_string:
+            if not (cond_t.is_scalar or cond_t == TEXType.VOID):
                 self._error(
                     f"select()'s condition needs a scalar (int or float), but got {cond_t.value}.",
                     node.loc, code="E5003",

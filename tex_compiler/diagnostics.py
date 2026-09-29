@@ -459,16 +459,16 @@ def compile_error_from(e, source: str) -> TEXCompileError:
     The compiler's error taxonomy lives HERE, beside the public type — not in every module that
     has to translate it. Both compile implementations use it: `tex_engine._compile_or_raise`
     (the cache path) and `tex_fusion.compile_fused`'s per-stage validation (which parses and
-    type-checks each stage directly, never through the cache). Pair it with `RAW_COMPILE_ERRORS`
+    type-checks each stage directly, never through the cache). Pair it with `raw_compile_errors()`
     in the `except` clause so a new phase type is added in one place:
 
         try:
             ...compile...
-        except RAW_COMPILE_ERRORS as e:
+        except raw_compile_errors() as e:
             raise compile_error_from(e, src) from e
 
-    Both v0.29 audits found a bug of the form "someone forgot a member of the 4-name tuple";
-    keeping the tuple and the translator together is what stops the next one.
+    Keeping the exception tuple and the translator together means a new phase type cannot be
+    caught in one place and missed in another.
     """
     if isinstance(e, TEXMultiError):
         return TEXCompileError(e.diagnostics)
@@ -492,7 +492,10 @@ def raw_compile_errors() -> tuple:
         from .lexer import LexerError
         from .parser import ParseError
         from .type_checker import TypeCheckError
-        _RAW_COMPILE_ERRORS = (LexerError, ParseError, TypeCheckError, TEXMultiError)
+        # RecursionError: a tree walk past the stack on a deeply nested or very long
+        # expression (the optimizer's walkers); it becomes an unpositioned E2000.
+        _RAW_COMPILE_ERRORS = (LexerError, ParseError, TypeCheckError, TEXMultiError,
+                               RecursionError)
     return _RAW_COMPILE_ERRORS
 
 
@@ -503,6 +506,11 @@ def diagnostic_from_exc(e, source: str) -> TEXDiagnostic:
     message. Shared by `tex_engine._compile_or_raise` (the ENG-4 raiser), `tex_api.compile`,
     and `tex_api.check()` — it lives HERE, not in tex_api, so the single raiser can reach it
     without an import cycle."""
+    if isinstance(e, RecursionError):
+        return make_diagnostic(code="E2000", message="This program is nested too deeply to compile.",
+                               loc=None, source=source, phase="compile",
+                               hint="Split long or deeply nested expressions into several "
+                                    "statements with intermediate variables.")
     if hasattr(e, "_build_diagnostic"):
         e._build_diagnostic()
     diag = getattr(e, "diagnostic", None)
