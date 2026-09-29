@@ -590,8 +590,9 @@ def test_v033_cache11_touch_promote_matches_touch_when_nothing_is_demoted(r):
     NO door reached (not even `_promote`, which has nothing demoted to act on). This is the
     negative half; the positive half (an actually-demoted frame) gets its own CUDA-only row
     below, because a resident-only box can never exercise it."""
-    empty_ok = tex_results.ResultCache(
-        cache_dir=tempfile.mkdtemp()).touch_promote("anything") is False
+    with tempfile.TemporaryDirectory() as d0:
+        empty_ok = tex_results.ResultCache(
+            cache_dir=d0).touch_promote("anything") is False
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d, budget_mb=64)
         gone = _frame(res=32, scale=0.25)

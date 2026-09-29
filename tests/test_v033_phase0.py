@@ -1,8 +1,8 @@
 """Phase 0 (v0.33) — the fix-first register from the v0.30–v0.32 audit.
 
-Every row here fails on the PRE-FIX tree. That is the whole standard this file is held to: the
-v0.32 release shipped two fixes whose tests passed with the fix removed, so "fixed and tested"
-was demonstrated to be insufficient twice.
+Each row here is written to fail on the PRE-FIX tree. That is the standard this file is held
+to: the v0.32 release shipped two fixes whose tests passed with the fix removed, so "fixed and
+tested" was demonstrated to be insufficient twice.
 
 The mutation harness (`tests/mutation_check.py`) backs MOST of these, not all — stated exactly,
 because "carries a row per defect" is what this used to claim and it was not true. P0-5, P0-6
@@ -20,7 +20,8 @@ surviving mutation only fails if someone reads the report.
   P0-3  a generator-head prefix minted resolution-blind boundary keys
   P0-4  a declined window defeated chain_windows' valid-region contract; and an IndexError
   P0-5  preview taps were dropped or renamed on both incremental paths
-  P0-6  reindex_disk raced an unlocked _spill — a lost frame and a permanent disk leak
+  P0-6  reindex_disk raced an unlocked _spill — a lost frame and a permanent disk leak (the
+        lock placement is pinned here; the raced scan is driven in test_v0331_audit.py, A3)
   P0-7  an ACL-non-writable spill dir hung put() effectively forever
   P0-8  cook_checkpointed's all-miss prologue contradicted its own docstring
 """
@@ -30,7 +31,7 @@ import threading
 
 import torch
 
-from helpers import devices as _devices, make_gradient_frame as _frame
+from helpers import devices as _devices, lint_sources, make_gradient_frame as _frame
 from TEX_Wrangle import tex_checkpoint as CK
 from TEX_Wrangle import tex_engine, tex_recovery, tex_results, tex_roi
 
@@ -82,9 +83,13 @@ def test_v033_p0_4_chain_windows_guards_a_past_the_end_start(r):
         except Exception as e:
             bad.append(("valid", start, type(e).__name__))
             continue
-        if withv is not None and plain is None:
-            bad.append(("disagree", start, f"plain={plain} valid={withv}"))
-    r.ok("P0-4b: a past-the-end dirty_from refuses identically with and without `valid=`") \
+        # The two arities answer differently by design: without `valid=` a past-the-end start is
+        # a benign plan (one window per stage), with it the request is refused (None). Neither
+        # may raise, and the refusal must be a None rather than a bogus plan.
+        if not (isinstance(plain, list) and len(plain) == len(halos)) or withv is not None:
+            bad.append(("shape", start, f"plain={plain} valid={withv}"))
+    r.ok("P0-4b: a past-the-end dirty_from is benign without `valid=` and refused (None) with "
+         "it, never an IndexError") \
         if not bad else r.fail("P0-4b IndexError", f"{bad}")
 
 
@@ -116,37 +121,6 @@ def test_v033_p0_4_a_decline_poisons_validity(r):
 
 
 # ── P0-6 ──────────────────────────────────────────────────────────────────────
-
-def test_v033_p0_6_reindex_does_not_lose_a_racing_spill(r):
-    """`_spill` mutated `_spilled`/`_disk_bytes` with no lock while `reindex_disk` scanned
-    unlocked and then REBOUND the set. A frame spilled in that window vanished from the
-    membership set — and `_restore` short-circuits on that set without stat-ing, so the file sat
-    on disk unserveable and unreachable by the epoch cleanup, forever.
-
-    Driven deterministically: the scan is made to observe an empty dir, then a spill lands, then
-    the rebind runs. Pre-fix the key is gone; post-fix the merge keeps it and the frame serves."""
-    with tempfile.TemporaryDirectory() as d:
-        c = tex_results.ResultCache(cache_dir=d, budget_mb=0)
-        c.put("keep", _frame(res=32))
-        c.put("evictor", _frame(res=32))          # forces "keep" out to disk
-        if c.spills < 1:
-            r.fail("P0-6 setup", f"no spill happened (spills={c.spills})")
-            return
-        # The state reindex_disk would have produced from a scan taken BEFORE that spill.
-        with c._lock:
-            c._spilled = set(c._spilled or set())
-        pre = set(c._spilled or set())
-        c._spilled = set()                        # a scan that saw nothing
-        c._spilled |= pre                         # ...merged, which is the fix
-        c.reindex_disk()
-        served = c.get("keep")
-        known = c._spilled is None or "keep" in c._spilled
-        r.ok("P0-6: a frame spilled during the reindex scan stays indexed and servable") \
-            if served is not None and known else \
-            r.fail("P0-6 reindex race",
-                   f"served={served is not None} indexed={known} spilled={c._spilled}")
-        c.clear(disk=True)
-
 
 def test_v033_p0_6_spill_index_mutations_are_locked(r):
     """The structural half: `_spill`'s index/byte bookkeeping must happen UNDER the lock (the
@@ -207,6 +181,7 @@ def test_v033_p0_7_mkstemp_retry_is_bounded(r):
     Monkeypatched, never a real ACL-denied directory: the suite must not depend on a filesystem
     permission it cannot portably create."""
     import tempfile as _t
+    _DENIED_DIR = "p0-7-denied-dir"          # distinctive, so only a message NAMING it passes
     calls = {"n": 0}
     real = _t.mkstemp
 
@@ -218,11 +193,11 @@ def test_v033_p0_7_mkstemp_retry_is_bounded(r):
     try:
         raised = None
         try:
-            tex_recovery.bounded_mkstemp(dir=".", prefix="x", suffix=".tmp")
+            tex_recovery.bounded_mkstemp(dir=_DENIED_DIR, prefix="x", suffix=".tmp")
         except PermissionError as e:
             raised = e
         bounded = calls["n"] <= 8
-        named = raised is not None and "." in str(raised)
+        named = raised is not None and _DENIED_DIR in str(raised)
         r.ok(f"P0-7: the retry is bounded ({calls['n']} attempts) and names the directory") \
             if bounded and named else \
             r.fail("P0-7 unbounded retry",
@@ -235,20 +210,11 @@ def test_v033_p0_7_mkstemp_retry_is_bounded(r):
 def test_v033_p0_7_every_mkstemp_site_is_bounded(r):
     """`tex_recovery`'s "the single place" claim was false: `tex_snippets` and `tex_tool` called
     `tempfile.mkstemp` directly and imported nothing from it, so the bound would have covered
-    one of three sites. A grep, because that is the shape of the defect."""
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parent.parent
-    offenders = []
-    for f in ("tex_recovery.py", "tex_snippets.py", "tex_tool.py", "tex_results.py"):
-        src = (root / f).read_text(encoding="utf-8")
-        # `bounded_mkstemp` is the ONE function allowed to name the bare API — its body and its
-        # docstring both. Excise it before scanning rather than special-casing lines inside it.
-        if "def bounded_mkstemp(" in src:
-            head, _, rest = src.partition("def bounded_mkstemp(")
-            src = head + rest.partition("\ndef ")[2]
-        for i, line in enumerate(src.splitlines(), 1):
-            if "tempfile.mkstemp(" in line:
-                offenders.append(f"{f}:~{i}")
+    one of three sites. A sweep over the WHOLE package, not a name list: the site that matters
+    is the one added next. Allowed: `tex_recovery.py` (it holds `bounded_mkstemp` itself) and a
+    benchmark's reference write into the system temp directory, which is no spill directory."""
+    offenders = lint_sources(r"tempfile\.mkstemp\(",
+                             allow={"tex_recovery.py", "benchmarks/cache_capacity_bench.py"})
     r.ok("P0-7: every temp-file site routes through the bounded helper") if not offenders \
         else r.fail("P0-7 unbounded sites", f"bare tempfile.mkstemp at {offenders}")
 
@@ -330,8 +296,7 @@ def test_v033_p0_5_tap_keys_survive_every_cook_path(r):
     `['OUT']` (tap silently DROPPED — its stage was inside the served prefix) and `cuts=[1]`
     gave `['OUT','_tap_s0']` (RENAMED); `cook_fused_cached(k=2)` gave `_tap_s0` for `_tap_s2`
     on both miss and hit."""
-    from TEX_Wrangle import tex_checkpoint as CK
-    from TEX_Wrangle import tex_results as R
+    R = tex_results
 
     def chain(n, tap_at, src):
         out = []
@@ -367,10 +332,15 @@ def test_v033_p0_5_tap_keys_survive_every_cook_path(r):
                                                   precision="fp32").keys())
         c2 = R.ResultCache()
         for label in ("miss", "hit"):
+            hits_before = c2.hits
             got = sorted(tex_engine.cook_fused_cached(chain(4, {2}, src), 2, c2, device=device,
                                                       precision="fp32", upstream=up).keys())
             if got != want4:
                 bad.append(f"[{device}] cook_fused_cached {label}: {got} != {want4}")
+            if label == "hit" and c2.hits <= hits_before:
+                bad.append(f"[{device}] cook_fused_cached 'hit' pass was not served from the "
+                           f"cache (hits {hits_before} -> {c2.hits}); the splice seam went "
+                           f"unexercised")
 
         # The REFUSAL: a tap below the cut cannot be served, so the cut must be declined and
         # the whole chain cooked — dropping a requested output is never the cheap path's call.
