@@ -2,27 +2,29 @@
 TEX Type Checker — semantic analysis pass over the AST.
 
 Resolves:
-  - Variable types and scopes
-  - @ binding types (from input metadata)
-  - Expression types with automatic promotion rules
-  - Channel access validity
-  - Function signature matching
+  - Variable, array, `$param`, const and user-function declarations, and their scopes
+  - @ binding types (from input metadata) and the outputs the program assigns
+  - Expression types with the promotion rules below
+  - Channel access validity, function signatures and argument kinds
+  - W7xxx advisories (unused variable, shadowing, ...) when `check()` arms them
 
 Type promotion rules:
   int -> float (implicit)
-  float -> vec2 (broadcast)
-  float -> vec3 (broadcast)
-  float -> vec4 (broadcast)
-  vec2 -> vec3 (pads with 0)
-  vec3 -> vec4 (adds alpha=1.0)
+  float -> vec2/vec3/vec4 (broadcast)
+  vec2 -> vec3 (pads with 0), any widening to vec4 (adds alpha=1.0): on declaration,
+      assignment, return and a user-function argument the checker writes the widening into
+      the AST as a `vecN(...)` constructor (`_widen`), so both tiers run it identically
   vec4 -> vec3 (drops extra channels) — implicit on assignment/declaration,
-                or explicit via .rgb/.xyz swizzle
+      or explicit via .rgb/.xyz swizzle
+  Arithmetic between vectors of different widths is typed as the wider one and the narrower
+  operand is zero-padded (no alpha=1 there).
 
-Output types:
-  float: scalar per-pixel value
-  int: integer per-pixel value (stored as float tensor)
-  vec3: 3-channel image (RGB)
-  vec4: 4-channel image (RGBA)
+Output types (what an `@name = ...` assignment may produce):
+  float, int: a scalar per pixel (an int is stored as a float tensor)
+  string
+  vec2, vec3, vec4: an image of 2, 3 or 4 channels
+  array: only when the host enables array wires (the engine profile)
+  Matrices and planes are rejected as outputs (E3203).
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -222,8 +224,14 @@ class TypeChecker:
     # OFF on the compile path (invariant #7: no warning bookkeeping during a normal cook).
     _collect_warnings: bool = False
     warnings: list = field(default_factory=list)            # list[TEXDiagnostic]
-    _used_var_names: set = field(default_factory=set)       # local names read (W7001)
-    _declared_locals: list = field(default_factory=list)    # [(name, loc)] declared (W7001)
+    # W7001 keys a local by the scope that declares it, so a same-named inner variable's
+    # reads do not count for an outer one. `_scope_ids` runs parallel to `_scopes`.
+    _used_var_names: set = field(default_factory=set)       # {(name, scope id)} read
+    _declared_locals: list = field(default_factory=list)    # [(name, loc, scope id)] declared
+    _scope_ids: list = field(default_factory=lambda: [0])
+    _scope_serial: int = 0
+    _write_ident: ASTNode | None = None   # the write target's root Identifier: not a read
+    _wire_refs: set = field(default_factory=set)   # names read or written as @wire (E3202)
 
     @property
     def inferred_out_type(self) -> TEXType | None:
@@ -253,6 +261,10 @@ class TypeChecker:
         self.warnings = []
         self._used_var_names = set()
         self._declared_locals = []
+        self._scope_ids = [0]
+        self._scope_serial = 0
+        self._write_ident = None
+        self._wire_refs = set()
 
         # Pre-populate built-in variables (ix/iy/u/v/…, and ENG-7's timeline trio
         # frame/fps/time — HOST time fed as builtin VALUES per cook, never $params,
@@ -314,6 +326,8 @@ class TypeChecker:
         self._scopes.append({})
         self._array_scopes.append({})
         self._const_scopes.append(set())
+        self._scope_serial += 1
+        self._scope_ids.append(self._scope_serial)
 
     def _pop_scope(self):
         for name in self._scope_fns.pop():
@@ -321,6 +335,7 @@ class TypeChecker:
         self._scopes.pop()
         self._array_scopes.pop()
         self._const_scopes.pop()
+        self._scope_ids.pop()
 
     def _is_const(self, name: str) -> bool:
         """Check if a variable is declared const, respecting shadowing.
@@ -339,6 +354,19 @@ class TypeChecker:
         for scope in reversed(self._array_scopes):
             if name in scope:
                 return scope[name]
+        return None
+
+    def _array_elem_type(self, expr: ASTNode) -> TEXType | None:
+        """The element type of an array-valued expression: an array variable, `sort()` /
+        `reverse()` of one (same elements) or `split()` (strings). None when not derivable."""
+        if isinstance(expr, Identifier):
+            info = self._lookup_array_info(expr.name)
+            return info.element_type if info else None
+        if isinstance(expr, FunctionCall):
+            if expr.name == "split":
+                return TEXType.STRING
+            if expr.name in ("sort", "reverse") and len(expr.args) == 1:
+                return self._array_elem_type(expr.args[0])
         return None
 
     def _error(self, msg: str, loc: SourceLoc, *, code: str = "E3000",
@@ -365,7 +393,7 @@ class TypeChecker:
         or the timeline builtins — those are not 'unused local' candidates."""
         if not self._collect_warnings:
             return
-        self._declared_locals.append((name, loc))
+        self._declared_locals.append((name, loc, self._scope_ids[-1]))
         # W7003 shadow: a local hiding an OUTER-scope name or a builtin (top-of-scope
         # collisions are already the E3001 error; this catches the nested-scope case).
         if any(name in s for s in self._scopes[:-1]):
@@ -388,8 +416,8 @@ class TypeChecker:
                            SourceLoc(1, 1),
                            hint=f"Reference it with @{name}, or disconnect the wire.")
         # W7001 unused variable: a declared local that is never read.
-        for name, loc in self._declared_locals:
-            if name not in self._used_var_names:
+        for name, loc, scope_id in self._declared_locals:
+            if (name, scope_id) not in self._used_var_names:
                 self._warn("W7001", f"Variable '{name}' is declared but never used.",
                            loc, hint="Remove it, or use it — an unused local is usually "
                            "a typo or leftover.")
@@ -438,8 +466,8 @@ class TypeChecker:
         handler(self, node)
 
     def _check_error_node(self, node: ErrorNode):
-        """An ErrorNode (parser recovery) type-checks as VOID; its error was already reported."""
-        return  # Skip — already reported by parser
+        """An ErrorNode (parser recovery) is skipped and left untyped; the parser already
+        reported its error."""
 
     def _check_expr_statement(self, node: ExprStatement):
         """Type-check a bare-expression statement (evaluated for its effect)."""
@@ -580,18 +608,19 @@ class TypeChecker:
                         node.loc, code="E3102",
                         hint="Try assigning from another array variable or an array literal {1, 2, 3}.")
             return size
+        src_elem = self._array_elem_type(node.initializer)
+        if src_elem is not None and src_elem != elem_type:
+            self._error(
+                f"Expected {elem_type.value} array, but the source is a {src_elem.value} array.",
+                node.loc,
+                code="E3101",
+                hint="Both arrays need to have the same element type for copying.",
+            )
         if not isinstance(node.initializer, Identifier):
             return size
         src_info = self._lookup_array_info(node.initializer.name)
         if src_info is None:
             return size
-        if src_info.element_type != elem_type:
-            self._error(
-                f"Expected {elem_type.value} array, but the source is a {src_info.element_type.value} array.",
-                node.loc,
-                code="E3101",
-                hint="Both arrays need to have the same element type for copying.",
-            )
         if size is not None and size != src_info.size:
             self._error(
                 f"Array size mismatch: expected [{size}] but the source has [{src_info.size}] elements.",
@@ -625,13 +654,26 @@ class TypeChecker:
                        hint=f"They stay distinct ($'{node.name}' vs '{node.name}'), but "
                        "the shared name is easy to confuse — consider renaming the param.")
 
-        # Check for @wire / $param name conflict
-        if node.name in self.referenced_bindings:
+        # A name is either an @wire or a $param, not both (the wire read after the
+        # declaration is caught in `_check_binding_ref`).
+        if node.name in self._wire_refs:
             self._error(
                 f"'{node.name}' is used as both @wire and $parameter.",
                 node.loc, code="E3202",
                 hint="A name must be either @wire or $param, not both. Try renaming one of them.",
             )
+        if self.strict_redeclare:   # the post-optimization re-check sees unrolled copies
+            if len(self._scopes) > 1:
+                self._error(
+                    f"The parameter ${node.name} must be declared at the top level, not inside "
+                    f"a block or function.", node.loc, code="E3200",
+                    hint="Move the declaration to the top of the program.")
+            elif node.name in self.param_declarations:
+                self._error(
+                    f"The parameter ${node.name} is declared more than once.",
+                    node.loc, code="E3001",
+                    hint="`$name = value;` declares a parameter's default; it does not assign "
+                         "to it. Declare it once, and copy it into a local to change it.")
 
         # Check default literal type (if present)
         if node.default_expr is not None:
@@ -676,7 +718,12 @@ class TypeChecker:
 
     def _check_assignment(self, node: Assignment):
         """Type-check an assignment: the value must be assignable to the target's type."""
-        target_type = self._check_expr(node.target)
+        # A write is not a read: the root variable of the target is not marked used (W7001).
+        self._write_ident = self._write_root_node(node.target)
+        try:
+            target_type = self._check_expr(node.target)
+        finally:
+            self._write_ident = None
         value_type = self._check_expr(node.value)
 
         root = self._write_root(node.target)
@@ -816,10 +863,17 @@ class TypeChecker:
             return
 
         # Check target is assignable
-        if isinstance(node.target, (Identifier, BindingRef, ChannelAccess, ArrayIndexAccess)):
+        if self._is_assign_target(node.target):
             # Array-to-array assignment (arr = sort(arr))
             if target_type.is_array and value_type.is_array:
-                pass  # compatible — sizes checked at runtime
+                # Sizes are checked at runtime; the element types must agree now.
+                dst_elem = self._array_elem_type(node.target)
+                src_elem = self._array_elem_type(node.value)
+                if dst_elem is not None and src_elem is not None and dst_elem != src_elem:
+                    self._error(
+                        f"Expected {dst_elem.value} array, but found a {src_elem.value} array.",
+                        node.loc, code="E3101",
+                        hint="Both arrays need to have the same element type.")
             elif target_type.is_array and not value_type.is_array:
                 self._error(
                     f"Expected an array value, but found '{value_type.value}'.",
@@ -847,7 +901,8 @@ class TypeChecker:
         else:
             self._error("This expression doesn't work as an assignment target.",
                         node.loc, code="E4000",
-                        hint="The left side of '=' must be a variable, @binding, or array element.")
+                        hint="The left side of '=' must be a variable, @binding, one of their "
+                             "channels (.r), or an array element (a[i]).")
 
         self._set_type(node, TEXType.VOID)
 
@@ -1042,8 +1097,8 @@ class TypeChecker:
         return TEXType.STRING
 
     def _check_array_literal_expr(self, node: ArrayLiteral) -> TEXType:
-        # Standalone array literals only appear in declarations (handled there)
-        """Infer an array literal's element type and fixed size from its elements."""
+        """A `{...}` outside an array declaration (which handles its own literal) is always
+        E3900."""
         self._error("Array literal '{...}' can only appear in array declarations.",
                     node.loc, code="E3900",
                     hint="Try: float arr[] = {1, 2, 3}; — array literals need a declaration.")
@@ -1053,8 +1108,10 @@ class TypeChecker:
     def _check_identifier(self, node: Identifier) -> TEXType:
         """Resolve an identifier to its declared variable/builtin type in the current scope."""
         t = self._lookup_var(node.name)
-        if self._collect_warnings and t is not None:
-            self._used_var_names.add(node.name)   # LANG-2: mark the local as read (W7001)
+        if self._collect_warnings and t is not None and node is not self._write_ident:
+            idx = self._scope_index(node.name)   # LANG-2: mark the local as read (W7001)
+            if idx is not None:
+                self._used_var_names.add((node.name, self._scope_ids[idx]))
         if t is None:
             # Collect all variables in scope for suggestions
             all_vars = set()
@@ -1077,6 +1134,14 @@ class TypeChecker:
     def _check_binding_ref(self, node: BindingRef) -> TEXType:
         """Resolve an @/$ binding reference to its input/parameter type."""
         self.referenced_bindings.add(node.name)
+        if node.kind != "param":
+            self._wire_refs.add(node.name)
+            if node.name in self.param_declarations:
+                self._error(
+                    f"'{node.name}' is used as both @wire and $parameter.",
+                    node.loc, code="E3202",
+                    hint="A name must be either @wire or $param, not both. "
+                         "Try renaming one of them.")
 
         # $ parameter bindings — type from declaration or type hint
         if node.kind == "param":
@@ -1120,10 +1185,23 @@ class TypeChecker:
         self._set_type(node, t)
         return t
 
+    def _check_binding_access_args(self, node, arg_types: list[TEXType], syntax: str):
+        """A `$param` is one value, not an image; the coordinates and frame are numbers."""
+        if node.binding.kind == "param":
+            self._error(f"${node.binding.name} is a parameter, not an image, so it can't be "
+                        f"used with {syntax}.", node.loc, code="E3201",
+                        hint=f"Read it as ${node.binding.name}, or wire the image in as an @input.")
+        for i, t in enumerate(arg_types):
+            if not t.is_scalar:
+                self._error(f"Argument {i + 1} of {syntax} needs to be int or float, but found "
+                            f"'{t.value}'.", node.args[i].loc, code="E5003",
+                            hint="Use a number: a pixel index or a 0-1 coordinate.")
+
     def _check_binding_index_access(self, node: BindingIndexAccess) -> TEXType:
         """Type-check @Image[ix, iy] or @Image[ix, iy, frame]."""
         binding_type = self._check_expr(node.binding)
         arg_types = [self._check_expr(a) for a in node.args]
+        self._check_binding_access_args(node, arg_types, "@binding[...]")
         if len(arg_types) < 2 or len(arg_types) > 3:
             self._error(
                 f"@binding[...] expects 2 or 3 arguments (x, y [, frame]), got {len(arg_types)}.",
@@ -1139,6 +1217,7 @@ class TypeChecker:
         """Type-check @Image(u, v) or @Image(u, v, frame)."""
         binding_type = self._check_expr(node.binding)
         arg_types = [self._check_expr(a) for a in node.args]
+        self._check_binding_access_args(node, arg_types, "@binding(...)")
         if len(arg_types) < 2 or len(arg_types) > 3:
             self._error(
                 f"@binding(...) expects 2 or 3 arguments (u, v [, frame]), got {len(arg_types)}.",
@@ -1547,11 +1626,7 @@ class TypeChecker:
                         hint="Use a numeric expression for the index, e.g. arr[0] or arr[i].")
 
         # Resolve element type from array info
-        elem_type = TEXType.FLOAT  # default
-        if isinstance(node.array, Identifier):
-            arr_info = self._lookup_array_info(node.array.name)
-            if arr_info:
-                elem_type = arr_info.element_type
+        elem_type = self._array_elem_type(node.array) or TEXType.FLOAT
 
         self._set_type(node, elem_type)
         return elem_type
@@ -1573,17 +1648,14 @@ class TypeChecker:
         # Array aggregate functions: return element type for vector arrays
         if node.name in ("arr_sum", "arr_min", "arr_max", "median", "arr_avg"):
             if arg_types and arg_types[0] == TEXType.ARRAY:
-                if isinstance(node.args[0], Identifier):
-                    arr_info = self._lookup_array_info(node.args[0].name)
-                    if arr_info:
-                        if arr_info.element_type == TEXType.STRING:
-                            self._error(f"'{node.name}' doesn't work on string arrays.",
-                                        node.loc, code="E5003",
-                                        hint="This function only works on numeric arrays (int, float, vec).")
-                        elif arr_info.element_type.is_vector:
-                            result_type = arr_info.element_type
-                            self._set_type(node, result_type)
-                            return result_type
+                elem = self._array_elem_type(node.args[0])
+                if elem == TEXType.STRING:
+                    self._error(f"'{node.name}' doesn't work on string arrays.",
+                                node.loc, code="E5003",
+                                hint="This function only works on numeric arrays (int, float, vec).")
+                elif elem is not None and elem.is_vector:
+                    self._set_type(node, elem)
+                    return elem
 
         # Image reduction validation (+ ASK-4's shape reads, which take the same
         # numeric-argument contract even though they aren't reductions).
@@ -1723,11 +1795,16 @@ class TypeChecker:
         # Check argument count
         min_args, max_args = sig["args"]
         if not (min_args <= len(arg_types) <= max_args):
+            plural = "" if max_args == 1 else "s"
+            fixed = min_args == max_args
             self._error(
-                f"'{name}()' expects {min_args}-{max_args} arguments, but got {len(arg_types)}.",
+                f"'{name}()' expects {'exactly ' if fixed else ''}"
+                f"{min_args if fixed else f'{min_args}-{max_args}'} argument{plural}, "
+                f"but got {len(arg_types)}.",
                 loc,
                 code="E5002",
-                hint=f"Check the function signature: {name}() takes {min_args} to {max_args} arguments.",
+                hint=f"Check the function signature: {name}() takes "
+                     f"{min_args if fixed else f'{min_args} to {max_args}'} argument{plural}.",
             )
             return sig["return"](arg_types) if callable(sig["return"]) else sig["return"]
 
@@ -1740,11 +1817,29 @@ class TypeChecker:
     # -- Assignment compatibility ---------------------------------------
 
     @staticmethod
+    def _is_assign_target(target: ASTNode) -> bool:
+        """The target shapes the runtime can write: a variable or @binding, a channel or an
+        element of one (`x.r`, `a[i]`), and (checked apart) a scatter `@OUT[x, y]`."""
+        if isinstance(target, (Identifier, BindingRef)):
+            return True
+        if isinstance(target, ChannelAccess):
+            return isinstance(target.object, (Identifier, BindingRef))
+        if isinstance(target, ArrayIndexAccess):
+            return isinstance(target.array, (Identifier, BindingRef))
+        return False
+
+    @staticmethod
     def _write_root(target: ASTNode) -> str | None:
         """The local a write lands in (`x`, `x.r`, `x[i]`), or None for a binding."""
-        if isinstance(target, (ChannelAccess, ArrayIndexAccess)):
+        node = TypeChecker._write_root_node(target)
+        return node.name if node is not None else None
+
+    @staticmethod
+    def _write_root_node(target: ASTNode) -> Identifier | None:
+        """The Identifier at the root of a write target, or None for a binding target."""
+        while isinstance(target, (ChannelAccess, ArrayIndexAccess)):
             target = target.object if isinstance(target, ChannelAccess) else target.array
-        return target.name if isinstance(target, Identifier) else None
+        return target if isinstance(target, Identifier) else None
 
     def _scope_index(self, name: str) -> int | None:
         """Index in `_scopes` of the innermost scope declaring `name` (None if undeclared)."""
@@ -1825,25 +1920,12 @@ class TypeChecker:
 
     def _infer_binding_from_channel(self, target: ChannelAccess) -> TEXType:
         """Infer binding type from channel assignment like @X.r = expr or @X.rgb = expr."""
-        binding = target.object
-        name = binding.name if isinstance(binding, BindingRef) else "OUT"
         channels = target.channels
-
-        # .a or .w implies vec4 (alpha/w channel)
-        if any(ch in ("a", "w") for ch in channels):
+        # vec4 when the swizzle reaches alpha/w or has 4 components, or the binding is
+        # already vec4; otherwise vec3 (the smallest displayable output).
+        if (any(ch in ("a", "w") for ch in channels) or len(channels) >= 4
+                or self.assigned_bindings.get(target.object.name) == TEXType.VEC4):
             return TEXType.VEC4
-        # 4-component swizzle implies vec4
-        if len(channels) >= 4:
-            return TEXType.VEC4
-        # If already inferred as VEC4, keep it
-        if self.assigned_bindings.get(name) == TEXType.VEC4:
-            return TEXType.VEC4
-        # 3-component → vec3, 2-component → vec3 (at minimum, since we need a displayable output)
-        if self.assigned_bindings.get(name) == TEXType.VEC3:
-            return TEXType.VEC3
-        if len(channels) >= 3:
-            return TEXType.VEC3
-        # Default to VEC3 for single/2-component channel assigns (.r, .xy, etc.)
         return TEXType.VEC3
 
     def _promote_out(self, current: TEXType, new: TEXType, loc: SourceLoc) -> TEXType:

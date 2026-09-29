@@ -567,3 +567,88 @@ def test_input_analysis_still_drops_the_dead_ternary_arm():
     assert tex_lazy.lazy_required_bindings(src, {"k": 0.0}) == frozenset({"OUT", "B"})
     assert tex_lazy.lazy_required_bindings(src, {"k": 1.0}) == frozenset({"OUT", "A"})
     tex_lazy.clear_lazy_memo()
+
+
+# ── Checker: names, targets, arrays, advisories ────────────────────────────────────────────
+
+def _warn_codes(code, bindings=None):
+    bt = {"OUT": TEXType.VEC4, **(bindings or _V4)}
+    prog = parse_and_split(code, bt)
+    _errs, warns = TypeChecker(binding_types=bt, source=code).check_collect(prog)
+    return sorted(w.code for w in warns if w.code != "W7002")
+
+
+@pytest.mark.parametrize("code, want", [
+    ("f$k = 0.5; @OUT = vec4(@k);", ["E3202"]),
+    ("vec4 q = @k; f$k = 0.5; @OUT = q;", ["E3202"]),
+    ("float q = $x; f$x = 2.0; @OUT = vec4(q);", []),
+    ("f$a = 0.5; f$a = 0.7; @OUT = vec4($a);", ["E3001"]),
+    ("f$a = 0.5; i$a = 2; @OUT = vec4($a);", ["E3001"]),
+    ("f$a = 0.5; $a = 0.3; @OUT = vec4($a);", ["E3001"]),
+    ("if (@A.r > 0.5) { f$a = 0.5; } @OUT = vec4($a);", ["E3200"]),
+    ("f$a = 0.5; f$b = 0.7; @OUT = vec4($a + $b);", []),
+])
+def test_param_declarations_and_wire_names(code, want):
+    assert check_errors(code, _V4) == want
+
+
+@pytest.mark.parametrize("code", [
+    "vec3 w = vec3(0.0); w.xy.x = 1.0; @OUT = vec4(w, 1.0);",
+    "vec3 a[2] = {vec3(0.0), vec3(0.0)}; a[0].x = 1.0; @OUT = vec4(a[0], 1.0);",
+    "vec3 w = vec3(0.0); (w + 1.0).x = 1.0; @OUT = vec4(w, 1.0);",
+])
+def test_unwritable_targets_are_compile_errors(code):
+    assert check_errors(code, _V4) == ["E4000"]
+
+
+def test_a_param_cannot_be_sampled_or_indexed():
+    assert check_errors("f$a = 1.0; @OUT = vec4($a(0.5, 0.5));", _V4) == ["E3201"]
+    assert check_errors("f$a = 1.0; @OUT = vec4($a[1, 1]);", _V4) == ["E3201"]
+
+
+@pytest.mark.parametrize("code, want", [
+    ('@OUT = @A["a", 1];', ["E5003"]),
+    ("@OUT = @A(mat3(1.0), 0.5);", ["E5003"]),
+    ("@OUT = @A[@A, 1];", ["E5003"]),
+    ("@OUT = @A[ix, iy]; @OUT = @A(u, v);", []),
+    ("@OUT = @A(u, v, 0);", []),
+])
+def test_image_access_arguments_are_numbers(code, want):
+    assert check_errors(code, _V4) == want
+
+
+@pytest.mark.parametrize("code, want", [
+    ("float a[3]; vec3 b[3]; a = b; @OUT = vec4(a[0]);", ["E3101"]),
+    ('string s[2] = {"a", "b"}; float f[2]; f = s; @OUT = vec4(f[0]);', ["E3101"]),
+    ("float a[3]; float b[3]; a = b; @OUT = vec4(a[0]);", []),
+    ('float p[] = split("1,2", ",");  @OUT = vec4(p[0]);', ["E3101"]),
+    ("vec3 vv[2] = {vec3(0.0), vec3(1.0)}; float w[] = sort(vv); @OUT = vec4(w[0]);", ["E3101"]),
+    ('string t = split("a,b", ",")[0]; @OUT = vec4(len(t));', []),
+    ('float t = split("a,b", ",")[0]; @OUT = vec4(t);', ["E3200"]),
+    ("vec3 vv[2] = {vec3(0.0), vec3(1.0)}; float s = arr_sum(sort(vv)); @OUT = vec4(s);", ["E3200"]),
+    ("vec3 vv[2] = {vec3(0.0), vec3(1.0)}; vec3 s = arr_sum(reverse(vv)); @OUT = vec4(s, 1.0);", []),
+])
+def test_array_element_types_follow_sort_reverse_split(code, want):
+    assert check_errors(code, _V4) == want
+
+
+def test_fixed_arity_message_says_exactly():
+    bt = {"OUT": TEXType.VEC4}
+    prog = parse_and_split("@OUT = vec4(sin(1.0, 2.0));", bt)
+    with pytest.raises(TypeCheckError) as ei:
+        TypeChecker(binding_types=bt, source="").check(prog)
+    assert "exactly 1 argument," in str(ei.value) and "1-1" not in str(ei.value)
+
+
+def test_unused_variable_is_reported_when_only_written():
+    assert _warn_codes("float x = 1.0; x = 2.0; @OUT = @A;") == ["W7001"]
+    assert _warn_codes("vec3 c = vec3(0.0); c.x = 1.0; @OUT = @A;") == ["W7001"]
+    assert _warn_codes("float x = 1.0; x = 2.0; @OUT = vec4(x);") == []
+    assert _warn_codes("float x = 1.0; x += 1.0; @OUT = vec4(x);") == []
+    assert _warn_codes("float a[2] = {0.0, 1.0}; int i = 1; a[i] = 3.0; @OUT = vec4(a[0]);") == []
+
+
+def test_an_inner_variable_does_not_use_the_outer_one():
+    code = ("float x = 1.0; if (@A.r > 0.5) { float x = 2.0; @OUT = vec4(x); } "
+            "else { @OUT = @A; }")
+    assert _warn_codes(code) == ["W7001", "W7003"]

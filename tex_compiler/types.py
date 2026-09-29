@@ -91,7 +91,7 @@ class TEXType(Enum):
 @dataclass
 class TEXArrayType:
     """Metadata for an array type: element type + fixed size."""
-    element_type: TEXType  # FLOAT, INT, VEC3, VEC4, or STRING
+    element_type: TEXType  # any value type except VOID and ARRAY (the checker's E3101)
     size: int
 
 
