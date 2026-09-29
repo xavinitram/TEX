@@ -1622,10 +1622,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             self._emit(f"_sb.index_put_((_fb, _fy, _fx), _fv, accumulate=True)")
         elif op == "-":
             self._emit(f"_sb.index_put_((_fb, _fy, _fx), -_fv, accumulate=True)")
-        elif op == "*":
-            self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] * _fv")
-        elif op == "/":
-            self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] / _tw(_fv == 0, _SAFE_EPS, _fv)")
+        elif op == "*" or op == "/":
+            # Every colliding source applies its factor: the interpreter's own reduction.
+            self._emit(f"_MF.scatter_scale(_sb, (_fb, _fy, _fx), _fv, {op == '/'})")
 
         if masked_scatter:
             self._indent -= 1

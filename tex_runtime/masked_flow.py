@@ -238,6 +238,30 @@ def scatter_keep(live, B: int, H: int, W: int):
     return keep
 
 
+def scatter_scale(buf: torch.Tensor, idx: tuple, flat_v, divide: bool) -> None:
+    """Scatter `*=` / `/=` in place: every source that lands on a destination applies its
+    factor, as `+=` / `-=` add every source. The factors are multiplied per destination
+    first (`scatter_reduce_` "prod"), then applied once. A zero divisor takes the dtype's
+    zero guard, as `x /= 0` does. Both tiers call this, so a collision reduces one way."""
+    from .stdlib_core import SAFE_EPSILON, ZERO_GUARD_EPS
+    b, y, x = idx
+    H, W = buf.shape[1], buf.shape[2]
+    tail = tuple(buf.shape[3:])
+    lin = (b * H + y) * W + x
+    v = torch.as_tensor(flat_v, dtype=buf.dtype, device=buf.device)
+    if divide:
+        v = torch.where(v == 0, ZERO_GUARD_EPS.get(v.dtype, SAFE_EPSILON), v)
+    v = v.expand(tuple(lin.shape) + tail)
+    index = lin.view(-1, *([1] * len(tail))).expand_as(v) if tail else lin
+    fac = torch.ones((buf.shape[0] * H * W,) + tail, dtype=buf.dtype, device=buf.device)
+    fac.scatter_reduce_(0, index, v, reduce="prod")
+    fac = fac.view(buf.shape)
+    if divide:
+        buf.div_(fac)
+    else:
+        buf.mul_(fac)
+
+
 def probe_is_live(live, x, y) -> bool:
     """M7: does `debug_print`'s probe pixel lie in the live set?"""
     if live is True:
