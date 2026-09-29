@@ -17,7 +17,7 @@ not merely a "smooth, no branch, no fragile fn" one (doc 32 C1): a continuous fu
 an image value scaled by a large constant, catastrophic cancellation, or loop-accumulation
 of image lineage all amplify fp16's input-quantization error past the 8-bit quantum while
 staying finite. So the hazard test *also* declines constant magnitude amplification of
-image lineage (`_amplifies_image`, threshold `_AMP`) and `for`-loop accumulation of an
+image lineage (`_amplification_hazard`, threshold `_AMP`) and `for`-loop accumulation of an
 image-tainted variable. Runtime params are the honest residual limit — the gate cannot see
 a `@A * $huge` factor statically; the value-keyed first-cook finiteness net (tex_node) still
 catches a param-induced NaN, but a wrong-but-finite runtime blow-up is out of static reach.
@@ -211,25 +211,15 @@ def _const_eval(node, consts=None):
 
 def _const_magnitude(node, consts=None):
     """Max |constant| in a scalar or vector-of-constants node, else None."""
-    if node.__class__.__name__ == "VecConstructor":
-        vals = [_const_eval(a, consts) for a in node.args]
-        if not vals or any(v is None for v in vals):
-            return None
-        return max(abs(v) for v in vals)
-    v = _const_eval(node, consts)
-    return abs(v) if v is not None else None
+    vals = _vec_vals(node, consts)
+    return max(abs(v) for v in vals) if vals else None
 
 
 def _vec_l1(node, consts=None):
     """L1 norm (sum of |components|) of a constant vector/scalar, else None — the exact
     gain/magnitude weight for `dot(image, const_vec)` (a sum of products, not a max)."""
-    if node.__class__.__name__ == "VecConstructor":
-        vals = [_const_eval(a, consts) for a in node.args]
-        if not vals or any(v is None for v in vals):
-            return None
-        return sum(abs(v) for v in vals)
-    v = _const_eval(node, consts)
-    return abs(v) if v is not None else None
+    vals = _vec_vals(node, consts)
+    return sum(abs(v) for v in vals) if vals else None
 
 
 def _vec_vals(node, consts=None):
@@ -463,20 +453,7 @@ def _amplification_hazard(program, out_names) -> bool:
                     if g >= _AMP:             # write to an @output binding, amplified
                         return True
             elif cls == "IfElse":
-                bg, bm, bc = dict(vg), dict(vm), dict(consts)
-                if process(s.then_body):
-                    return True
-                tg, tm, tc = dict(vg), dict(vm), dict(consts)   # then-branch results
-                vg.clear(); vg.update(bg); vm.clear(); vm.update(bm)
-                consts.clear(); consts.update(bc)
-                if process(s.else_body):                        # else results land in vg/vm/consts
-                    return True
-                for k in set(tg) | set(vg):                     # gain/mag: merge by max
-                    vg[k] = max(tg.get(k, 0.0), vg.get(k, 0.0))
-                for k in set(tm) | set(vm):
-                    vm[k] = max(tm.get(k, 0.0), vm.get(k, 0.0))
-                merged = {k: v for k, v in tc.items() if consts.get(k) == v}  # const iff both agree
-                consts.clear(); consts.update(merged)
+                return True   # `_has_fp16_hazard` declines any data-dependent branch anyway
             elif cls in ("ForLoop", "WhileLoop"):
                 # The body is analysed once, but a name it assigns is carried into the next
                 # iteration: it is no longer a folded constant and its magnitude is unbounded
@@ -532,7 +509,7 @@ def _for_accumulates_image(loop, tainted) -> bool:
 # a total cycle guard), but it does not bound DEPTH: a chain of N *distinct* defs costs N
 # Python frames, and at ~995 links that is a RecursionError raised inside a cook, on a
 # program that parses and typechecks. 64 is not a guess — it is the interpreter's own
-# MAX_CALL_DEPTH (interpreter.py:40), so any chain this cap truncates is one the
+# MAX_CALL_DEPTH, so any chain this cap truncates is one the
 # interpreter would refuse to execute anyway (E6060). Truncating to True (decline -> fp32)
 # keeps the direction #10 asks for: the deepest programs are the least likely to be
 # fp16-safe, and fp32 is always correct.
@@ -596,7 +573,7 @@ def _fn_body_conditions(name, user_fns, tainted, out_names, seen=None, depth=0) 
         for n in _walk(stmt):
             cls = n.__class__.__name__
             if cls == "Identifier":
-                # Name membership, the same recognition `_gm` uses (:261). A *parameter*
+                # Name membership, the same recognition `_gm` uses for Identifier nodes. A *parameter*
                 # shadowing a builtin name reads as a magnitude here: an over-decline,
                 # which is the safe direction and the one #10 asks for.
                 if n.name in _BUILTIN_MAG or n.name in tainted:
@@ -714,9 +691,8 @@ def _masked_per_pixel_for(program, _masked_flow: "bool | None" = None) -> bool:
     (a)/(b) set, so "per-pixel" means here exactly what it means to the region gate.
 
     Asked ONLY of a flagged program (invariant 7): `masked_flow.enabled_for` decides on
-    `Program.language is None` alone for every program without a pragma, and is shut for
-    every pragma while `LANGUAGE_VERSION` is below `0.25`, so no default-path verdict
-    moves and no `_AUTO_DECISION` entry is minted differently. An INCOMPLETE plan declines
+    `Program.language is None` alone for every program without a pragma, so no default-path
+    verdict moves and no `_AUTO_DECISION` entry is minted differently. An INCOMPLETE plan declines
     (fp32 is always correct); an EMPTY one does not, so a `0.25` program with a static
     `for` keeps the fp16 it has today. *_masked_flow* is the LANG-L4/L5 test seam and NOT
     a host-facing switch: `None` asks the engine's gate; True/False name the answer."""
@@ -746,8 +722,8 @@ def resolve_auto_precision(program, spatial_px: int, device_type: str, *,
     reason) otherwise — the gate over-declines rather than risk accuracy.
 
     *_masked_flow* is LANG-L6's test seam for `_masked_per_pixel_for` (NOT host-facing):
-    `None` asks the engine's language gate, shut for every program that can exist while
-    `LANGUAGE_VERSION` is below `0.25`."""
+    `None` asks the engine's language gate, which answers False for a program without a
+    language pragma."""
     if device_type != "cuda":
         return "fp32", "auto->fp32: CPU (fp16 is slower on CPU)"
     if spatial_px < _MIN_FP16_PX:
@@ -758,7 +734,7 @@ def resolve_auto_precision(program, spatial_px: int, device_type: str, *,
         return "fp32", "auto->fp32: sampling/fetch/reduction/scatter (fp16-unsafe)"
     if _has_fp16_hazard(program, _output_names(program)):
         return "fp32", "auto->fp32: fp16-fragile fn, data branch, or image-lineage amplification"
-    # LANG-L6: asked LAST, so every program declined today keeps today's reason string.
+    # LANG-L6: asked LAST, so a program declined for another reason keeps that reason string.
     if _masked_per_pixel_for(program, _masked_flow):
         return "fp32", "auto->fp32: per-pixel `for` bound under language 0.25 (a fp16 value steers control flow)"
     return "fp16", "auto->fp16: gate-verified accurate (smooth, bounded condition number)"
