@@ -449,6 +449,8 @@ class TypeChecker:
                     code="E3200",
                     hint=f"The right-hand side produces a {init_type.value}, which doesn't fit into {node.type_name}.",
                 )
+            else:
+                node.initializer = self._widen(node.initializer, declared_type, init_type)
 
         if self._declare_var(node.name, declared_type, node.loc) and self._collect_warnings:
             self._note_local_decl(node.name, node.loc)   # LANG-2 W7001/W7003 (only if declared)
@@ -515,7 +517,8 @@ class TypeChecker:
             )
         if size is None:
             size = init_size
-        for elem in node.initializer.elements:
+        elements = node.initializer.elements
+        for i, elem in enumerate(elements):
             et = self._check_expr(elem)
             if not self._is_assignable(elem_type, et):
                 self._error(
@@ -524,6 +527,8 @@ class TypeChecker:
                     code="E3102",
                     hint=f"Each element in a {node.element_type_name}[] array must be compatible with {node.element_type_name}.",
                 )
+            else:
+                elements[i] = self._widen(elem, elem_type, et)
         self._set_type(node.initializer, TEXType.ARRAY)
         return size
 
@@ -782,6 +787,8 @@ class TypeChecker:
                     code="E3200",
                     hint=f"The target is {target_type.value}, which isn't compatible with {value_type.value}.",
                 )
+            elif not isinstance(node.target, ChannelAccess):
+                node.value = self._widen(node.value, target_type, value_type)
         else:
             self._error("This expression doesn't work as an assignment target.",
                         node.loc, code="E4000",
@@ -948,6 +955,8 @@ class TypeChecker:
                 node.loc, code="E3013",
                 hint=f"The declared return type is {expected.value}.",
             )
+        else:
+            node.value = self._widen(node.value, expected, value_type)
         self._set_type(node, TEXType.VOID)
 
     # -- Expression checking --------------------------------------------
@@ -1600,6 +1609,11 @@ class TypeChecker:
                              "and matrices aren't supported.")
 
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
+        user_fn = self._user_functions.get(node.name)
+        if (user_fn is not None and len(user_fn["params"]) == len(arg_types)
+                and _function_signatures().get(node.name) is None):
+            node.args = [self._widen(a, ptype, at) for a, (ptype, _), at
+                         in zip(node.args, user_fn["params"], arg_types)]
         self._set_type(node, result_type)
         return result_type
 
@@ -1656,6 +1670,31 @@ class TypeChecker:
         return ret
 
     # -- Assignment compatibility ---------------------------------------
+
+    def _widen(self, expr: ASTNode, target: TEXType, value: TEXType) -> ASTNode:
+        """Make an accepted widening explicit in the AST, so both tiers run it.
+
+        A scalar, or a narrower vector, bound to a wider vecN (declaration, assignment,
+        return, user-function argument) becomes `vecN(expr)` or `vecN(expr, 0.0[, 1.0])`:
+        a scalar broadcasts, vec2 -> vec3 pads 0, and a widening to vec4 pads alpha 1.
+        Anything else is returned unchanged, so a re-check never wraps twice."""
+        if not target.is_vector:
+            return expr
+        n = target.channels
+        if value.is_scalar:
+            pads = ()
+        elif value.is_vector and value.channels < n:
+            pads = (0.0,) * (n - value.channels - 1) + ((1.0,) if n == 4 else (0.0,))
+        else:
+            return expr
+        args = [expr]
+        for p in pads:
+            lit = NumberLiteral(loc=expr.loc, value=p)
+            self._set_type(lit, TEXType.FLOAT)
+            args.append(lit)
+        wide = VecConstructor(loc=expr.loc, size=n, args=args)
+        self._set_type(wide, target)
+        return wide
 
     @staticmethod
     def _is_assignable(target: TEXType, value: TEXType) -> bool:
