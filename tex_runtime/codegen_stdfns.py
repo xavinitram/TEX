@@ -76,16 +76,10 @@ class _EmitStdFnsMixin:
                 self._emit(f"{sq} = {args[0]} * {args[0]}")
                 self._emit(f"{tmp} = {sq} * {args[0]}")
                 return tmp
-            # Only x^{0,1,2,3} have a bit-exact closed form. EVERY other constant
-            # exponent must defer to the interpreter's fn_pow (the general dispatch
-            # below), never a local specialization:
-            #  - the old rsqrt(clamp)/reciprocal(+eps) forms for -0.5/-1/-2 FLIPPED
-            #    finiteness on x<=0 and diverged by up to 8e-3 (a nightly-class
-            #    interp!=codegen bug), and (x*x)*(x*x) for 4.0 lost ~8e-6;
-            #  - even a plain _torch.pow(x, <python-float exp>) diverges from fn_pow's
-            #    torch.pow(x, _to_tensor(exp)) — the scalar-exponent kernel rounds
-            #    differently (~3.7e-9 on 0.5/-0.5).
-            # (pow(x, 0.5) was already correctly deferred here; matches optimizer.py:364.)
+            # Only x^{0,1,2,3} have a bit-exact closed form; any other constant exponent
+            # defers to fn_pow, since even torch.pow with a Python-float exponent rounds
+            # differently from fn_pow's tensor exponent. Mirrors the pow folding in
+            # optimizer.py.
         # Non-{0,1,2,3} constant OR a variable exponent: fall through to the general
         # path, which calls the SAME _fns['pow'] (fn_pow) the interpreter uses — so
         # codegen stays bit-exact with the interpreter for every exponent.
@@ -370,32 +364,9 @@ class _EmitStdFnsMixin:
             py = self._tmp()
             self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).nan_to_num_(0.0).long()")
             self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).nan_to_num_(0.0).long()")
-            # B=1 fast path: direct indexing, batch dim kept explicitly.
-            #
-            # TRK-5/FIX-4: the old form indexed the batch axis with a bare `0`
-            # (basic indexing, which REMOVES that axis) and left `px`/`py` as
-            # whatever rank the caller happened to hand in. That is only safe
-            # when both coordinates have already had their own leading batch
-            # dim stripped (the old `else` sub-case's `py[0]`/`px[0]`) — the
-            # advanced-index broadcast then rebuilds exactly the plain [H,W]
-            # grid, and reinserting one dim via a `0:1` slice (instead of the
-            # dim-removing `0`) correctly restores rank-4 [1,H,W,C], bit-exact
-            # with the interpreter's `fn_fetch`.
-            #
-            # The old `if px.dim() < 3` sub-case did NOT strip a leading dim
-            # first: when only `px` is scalar/degenerate (e.g. `sx` in a
-            # `for` loop, `iy` still `[1,H,1]`), `py` still carries its OWN
-            # leading singleton, and a `0:1` slice there would stack a
-            # SECOND leading dim on top of it (rank-5), not restore rank-4.
-            # `examples/break_search.tex` is exactly this shape.
-            #
-            # `.expand(1, H, W)` — mirroring `fn_fetch`'s own scalar-coordinate
-            # sub-case (`stdlib.py`'s `px_i.expand(1, H, W)` /
-            # `img[0, py_i[0], px_i[0]].unsqueeze(0)`) — sidesteps both
-            # failure modes at once: it is a no-op broadcast view (not a
-            # copy) on an already-correct [1,H,W]-or-narrower coordinate
-            # tensor, so it changes no value, only makes both sub-cases use
-            # the identical, always-rank-correct shape before indexing.
+            # B=1: expand both coordinates to (1, H, W) first, as stdlib_sample's fn_fetch
+            # does, so a 0-dim counter beside a [1,H,1] `iy` indexes the full grid and
+            # the result is rank-4 [1,H,W,C].
             self._emit(f"if {img_var}.shape[0] == 1:")
             self._indent += 1
             px_full = self._tmp()

@@ -2357,10 +2357,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         """`rad = int(radius)`. A float counter over a fractional radius visits fractional
         offsets no integer kernel has, so that cook raises and runs on the interpreter."""
         r_expr = self._emit_expr(radius)
+        # The host reading a `$param` or literal carries, else a readback (`_host_scalar`).
+        host = (f"getattr({r_expr}, {_HOST_SCALAR_ATTR!r}, None) if _torch.is_tensor({r_expr}) "
+                f"else {r_expr}")
+        read = f"({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})"
+        self._emit(f"{rad} = {host}")
+        self._emit(f"{rad} = {'float' if stencil.float_counter else 'int'}({read} if {rad} is None else {rad})")
         if not stencil.float_counter:
-            self._emit(f"{rad} = int({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
             return
-        self._emit(f"{rad} = float({r_expr}.item() if _torch.is_tensor({r_expr}) else {r_expr})")
         self._emit(f"if not {rad}.is_integer(): raise RuntimeError("
                    "'stencil lowering: a float counter over a fractional radius')")
         self._emit(f"{rad} = int({rad})")

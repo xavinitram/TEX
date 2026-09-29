@@ -1,7 +1,8 @@
 """Masked per-pixel control flow — the interpreter's language-`0.25` rules (M1–M7).
 
-`docs/masked-control-flow.md` §1 is the specification; this module is its interpreter-side
-implementation, and the one that a later codegen tier must reproduce bit-exactly.
+`docs/masked-control-flow.md` §1 is the specification. This module holds the mask and frame
+algebra both tiers share: the interpreter's mixin runs it, and codegen's emitted source
+calls the same functions through `CgFlow` (`codegen_masked.py`).
 
 **The rule, in one sentence.** Every active region carries a per-pixel *live* mask, and a
 write to anything declared outside that region becomes a masked select, so a pixel that has
@@ -20,8 +21,8 @@ file, and the module the hot path lives in does not grow.
 §4, and the v0.36.0 review that had to be corrected before it shipped). `enabled_for` asks
 `tex_roi._language_tuple`, which is `min(what the program asks for, what the engine
 implements)` — the SAME single definition the region-dependence sunset keys on, never a
-second one. While `tex_api.LANGUAGE_VERSION` is below `0.25` that minimum is below `0.25`
-for every program that exists, so nothing reaches the masked path at all.
+second one. A program runs masked when that minimum is at least `0.25` and its flow plan is
+not empty.
 
 **Mask representation.** `True` (the Python bool) means every pixel is live and is the
 program's starting mask; anything else is a `torch.bool` tensor broadcastable to the cook
@@ -341,17 +342,6 @@ def cg_merge_branch(cond_bool, box, target, keys, then_vals, else_vals) -> None:
     Interpreter._merge_branch_vars(cond_bool, box, target, keys, then_vals, else_vals)
 
 
-def cg_debug_print(state: CgFlow, impl):
-    """M7's probe gate for the codegen tier. Unreachable today — `codegen` refuses
-    `debug_print` outright (LX-5) so the probe always records on the interpreter — and
-    present so that the gate exists the day that refusal is lifted."""
-    def _probe(label, value, x=0.0, y=0.0):
-        if not probe_is_live(state.live, x, y):
-            return value
-        return impl(label, value, x, y)
-    return _probe
-
-
 # ── the language gate ───────────────────────────────────────────────────────────
 
 def enabled_for(program, source: str) -> bool:
@@ -370,9 +360,7 @@ def enabled_for(program, source: str) -> bool:
     declares the pragma. An INCOMPLETE plan (`complete=False`) is never empty, so an
     analysis that could not finish masks rather than skips — the fail-closed direction.
 
-    Pure and total: anything unexpected answers False, which is `0.23`'s behaviour and
-    therefore the only safe direction while the engine's own `LANGUAGE_VERSION` is below
-    `0.25` anyway.
+    Pure and total: anything unexpected answers False, which is `0.23`'s behaviour.
 
     THE `Program.language is None` FAST-OUT IS LOAD-BEARING FOR INVARIANT 7, not tidiness.
     `tex_roi._language_tuple` falls back to `tex_api.language_pragma(code)` when the field

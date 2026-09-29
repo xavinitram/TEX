@@ -211,7 +211,8 @@ class MaskedEmitMixin:
         are dict mutations (free variables, no declaration needed at any nesting depth),
         and a env var hoisted to a raw Python local (`self._local_vars`) needs `nonlocal`
         to write through the closure boundary — see the docstring on
-        `_mf_emit_function_def`'s new pre-declaration for why that is always resolvable."""
+        the CODEGENT6 pre-declaration comment in `_mf_emit_function_def` for why that is always
+        resolvable."""
         self._mf_cont_counter += 1
         fn_name = f"_mfc{self._mf_cont_counter}"
         env_mods, _bind_mods = self._collect_modified_vars(stmts) if stmts else (set(), set())
