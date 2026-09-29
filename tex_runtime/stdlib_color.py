@@ -18,7 +18,6 @@ from .stdlib_core import (
     LUMA_B,
     _grid_sample_f32,
     _to_tensor,
-    _uniform_dtype,
 )
 # ZERO_GUARD_EPS is bound by attribute lookup, not folded into the `from` import above: a
 # name bound by `from X import name` compiles a later `name.method(...)` call site WITHOUT
@@ -374,7 +373,7 @@ class _StdlibColor:
         out of [0,1], e.g. a mask subtraction dipping below zero). Here a
         below-threshold denominator is replaced by ±eps carrying denom's own sign."""
         eps = ZERO_GUARD_EPS.get(denom.dtype, SAFE_EPSILON)
-        eps_t = torch.as_tensor(eps, dtype=denom.dtype, device=denom.device)
+        eps_t = denom.new_full((), eps)     # filled on denom's device: no host tensor, no copy
         below = denom.abs() < eps
         guard_trace.note(below)  # C4-ux (no-op unless armed)
         safe = torch.where(below, torch.copysign(eps_t, denom), denom)

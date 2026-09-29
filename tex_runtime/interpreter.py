@@ -863,6 +863,19 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             return base[..., indices[0]:indices[0] + len(indices)]
         return torch.stack([base[..., i] for i in indices], dim=-1)
 
+    def _string_array_index(self, index, size: int, loc) -> int:
+        """A runtime index into a string array (a Python list): one value, floored and clamped."""
+        if isinstance(index, torch.Tensor):
+            if index.numel() != 1:
+                raise InterpreterError(
+                    "A string array can only be indexed by one value for the whole image, "
+                    "but this index varies per pixel.",
+                    loc, source=self._source, code="E6005",
+                    hint="Strings are not per-pixel values. Compute the index once (from a "
+                         "$param or a constant), or select the string with an if.")
+            index = index.item()
+        return _list_index(index, size)
+
     def _eval_array_index(self, node: ArrayIndexAccess) -> torch.Tensor | str:
         """Evaluate array[index] with clamped bounds.
 
@@ -876,8 +889,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         if isinstance(array, list):
             ci = _const_index(node.index, len(array))
             if ci is None:
-                index = self._eval(node.index)
-                ci = _list_index(index.item() if isinstance(index, torch.Tensor) else index, len(array))
+                ci = self._string_array_index(self._eval(node.index), len(array), node.loc)
             return array[ci]
 
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]

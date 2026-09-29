@@ -2,14 +2,14 @@
 REG-1 — the single-source stdlib registry.
 
 One `@stdlib(...)` decorator co-located with each `fn_*` impl replaces the
-hand-maintained 143-entry `get_functions()` dict and (via TST-3) the parallel
-taxonomy sets. The rule that keeps this a *readability* win, not a clever-registry
-loss (all four audit agents flagged it): the decorator is **pure data attachment** —
+hand-maintained `get_functions()` dict and (via TST-3) the parallel taxonomy sets.
+The rule that keeps this a *readability* win, not a clever-registry loss: the decorator
+is **pure data attachment** —
 
   * the name is **explicit** (no dynamic `fn_*` discovery),
   * it attaches metadata only (no signature inference, no return-type magic),
   * `get_functions()` becomes `{name: fn for e in REGISTRY}` — one readable line
-    replacing 143 hand-listed rows that could drift from the impls.
+    replacing a hand-listed dict of rows that could drift from the impls.
 
 Layering note (Option 1): the *type contract* stays in the compiler —
 `FUNCTION_SIGNATURES` (tex_compiler) is NOT derived from this runtime registry, so
@@ -25,7 +25,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class StdlibEntry:
     """One registered stdlib function. `fn` is the raw callable (the same object
-    `TEXStdlib.<attr>` resolves to). `doc`/`ex` are populated by DOC-4."""
+    `TEXStdlib.<attr>` resolves to). `doc`/`ex` are the help text and example."""
     name: str
     fn: object
     aliases: tuple = ()
@@ -175,7 +175,7 @@ def _valid_pixel_args(pixel_args, footprint) -> bool:
 def _valid_arg_footprint(arg_footprint) -> bool:
     """REACH-48: `arg_footprint` well-formedness, the same discipline `_valid_footprint`
     already applies to the whole-function descriptor. Each item must be an `(index,
-    descriptor)` pair, `index` a non-negative-excluding-zero int (arg 0's reach is
+    descriptor)` pair, `index` an int of at least 1 (arg 0's reach is
     `footprint`'s job, not this one's — index 0 here is a contradiction, not a typo, so it
     is rejected the same way a bool radius is), no index repeated (one declaration per
     argument), and `descriptor` a valid `_valid_footprint` value."""
@@ -251,6 +251,14 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
 # O(1)-after-first-use cache rather than a stale snapshot. A plain dict (not a `None`
 # sentinel) so the cache-store census in `tests/test_v018_docs.py` sees it: see its
 # ARCHITECTURE.md row.
+def _refresh(cache: dict, fresh: dict) -> None:
+    """Bring `cache` to `fresh` without a moment where it is empty or half-built: a reader on
+    another thread sees the old entries or the new ones, never a `clear()` gap."""
+    cache.update(fresh)
+    for stale in [k for k in cache if k not in fresh]:
+        cache.pop(stale, None)
+
+
 _NON_SPATIAL_CACHE: dict = {}
 _NON_SPATIAL_CACHE_READY = False
 
@@ -268,9 +276,8 @@ def non_spatial_args_by_name() -> dict:
     `stdlib()`'s `deco`) instead."""
     global _NON_SPATIAL_CACHE_READY
     if not _NON_SPATIAL_CACHE_READY:
-        _NON_SPATIAL_CACHE.clear()
-        _NON_SPATIAL_CACHE.update(
-            (n, e.non_spatial_args) for e in REGISTRY if e.non_spatial_args for n in e.names)
+        _refresh(_NON_SPATIAL_CACHE, dict(
+            (n, e.non_spatial_args) for e in REGISTRY if e.non_spatial_args for n in e.names))
         _NON_SPATIAL_CACHE_READY = True
     return _NON_SPATIAL_CACHE
 
@@ -288,9 +295,8 @@ def pixel_args_by_name() -> dict:
     emission both read. Same cache shape and invalidation rule as `non_spatial_args_by_name()`."""
     global _PIXEL_ARGS_CACHE_READY
     if not _PIXEL_ARGS_CACHE_READY:
-        _PIXEL_ARGS_CACHE.clear()
-        _PIXEL_ARGS_CACHE.update(
-            (n, e.pixel_args) for e in REGISTRY if e.pixel_args for n in e.names)
+        _refresh(_PIXEL_ARGS_CACHE, dict(
+            (n, e.pixel_args) for e in REGISTRY if e.pixel_args for n in e.names))
         _PIXEL_ARGS_CACHE_READY = True
     return _PIXEL_ARGS_CACHE
 
@@ -308,9 +314,8 @@ def arg_footprint_by_name() -> dict:
     invalidation rule as `non_spatial_args_by_name()`/`pixel_args_by_name()`."""
     global _ARG_FOOTPRINT_CACHE_READY
     if not _ARG_FOOTPRINT_CACHE_READY:
-        _ARG_FOOTPRINT_CACHE.clear()
-        _ARG_FOOTPRINT_CACHE.update(
-            (n, dict(e.arg_footprint)) for e in REGISTRY if e.arg_footprint for n in e.names)
+        _refresh(_ARG_FOOTPRINT_CACHE, dict(
+            (n, dict(e.arg_footprint)) for e in REGISTRY if e.arg_footprint for n in e.names))
         _ARG_FOOTPRINT_CACHE_READY = True
     return _ARG_FOOTPRINT_CACHE
 
@@ -378,7 +383,7 @@ def non_local_names() -> frozenset:
     """The registry-derived set of names whose footprint != 'point' (ROI-1): the
     single source for `tex_memory._NON_LOCAL_FNS`, replacing that hand-kept literal.
     Function form (evaluated AFTER `TEXStdlib`'s class body has populated `REGISTRY`),
-    mirroring `spatial_names()` — TST-3 proves it equals the old 18-name literal."""
+    mirroring `spatial_names()`."""
     return frozenset(n for e in REGISTRY for n in e.names if e.non_local)
 
 
@@ -525,8 +530,7 @@ def _impl_looks_fragile(fn, _depth: int = 0) -> bool:
     # — its own body has no marker, but it inherits `over`'s fragility. Match the callee's
     # fn-name against the registry (no TEXStdlib import → no cycle).
     if _depth == 0:
-        import re
-        callees = set(re.findall(r"TEXStdlib\.(fn_\w+)\s*\(", body))
+        callees = set(_re.findall(r"TEXStdlib\.(fn_\w+)\s*\(", body))
         if callees:
             for e in REGISTRY:
                 if getattr(e.fn, "__name__", "") in callees and _impl_looks_fragile(e.fn, 1):

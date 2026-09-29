@@ -17,7 +17,6 @@ from .stdlib_core import (
     _build_sample_grid,
     _dtype_rounded,
     _expand_to_bhw,
-    _gauss_blur_bchw,
     _gauss_blur_auto,
     _require_finite_arg,
     _get_batch_index,
@@ -663,9 +662,10 @@ class _StdlibSample:
     # and the separable tier (O(image size * radius), not O(image size * radius^2)) takes
     # over.
     #
-    # `radius<=3` is UNCHANGED: `_bilateral_exact_bchw` (the old row-tiled path, still the
-    # only implementation of this regime) degenerates to a single untiled pass there
-    # (A5's own proof) and stays bit-identical to v0.50.0 (`test_bilat50_radius.py`).
+    # `radius<=3` is UNCHANGED: `_bilateral_exact_bchw` (the row-tiled path, still the only
+    # implementation of this regime) runs as one untiled pass while B*C*H*W is at most about
+    # 163k pixels and row-tiles above that; it stays bit-identical to v0.50.0
+    # (`test_bilat50_radius.py`).
     # A1 (v0.50 Phase C): the `spatial_sigma` value past which `fn_bilateral_filter`
     # itself switches to the detail-transfer downscale approximation (`radius =
     # ceil(3*ss) > _BILATERAL_EXACT_RADIUS_MAX` <=> `ss > _BILATERAL_EXACT_RADIUS_MAX /
@@ -738,11 +738,11 @@ class _StdlibSample:
         windowed cook and a whole-frame cook of `bilateral_filter`'s exact tier agreed
         bit-for-bit on CUDA regardless of how each one's row-tiling shaped the
         reduction. `_bilateral_exact_bchw` (the only caller that ever passed
-        `deterministic=True`) now only runs for `radius<=3`, where its row-tiling loop
-        always degenerates to a single untiled tile (A5, v0.50 Phase C) -- so there is
-        no longer any product call whose tiling can vary the shape `torch.sum` sees for
-        the same output pixels, and the flag has no caller left to protect. Dropped
-        along with the now-fully-dead `_sum_kernel_taps_fixed_order` helper it drove."""
+        `deterministic=True`) now only runs for `radius<=3`. Its row tiles are a single
+        tile only up to about 163k pixels of B*C*H*W, so above that a windowed and a
+        whole-frame cook can hand `torch.sum` differently shaped inputs for the same output
+        pixels (an ulp-level difference on CUDA). The flag and its fixed-order helper were
+        dropped as not worth their cost."""
         diff = patches - center
         inv_2sr = -0.5 / max(sr * sr, 1e-10)
         w_range = TEXStdlib._bilateral_range_weight(diff, inv_2sr)
@@ -768,25 +768,15 @@ class _StdlibSample:
         # budget (measured: 3x on a 3-channel image, unnoticed because this codebase's own
         # C=1 mask-shaped test images and B=1 assumption never exercised the gap). This
         # function's only remaining caller is radius<=3 (BILATX-51 moved 3<radius<=40 to
-        # `_bilateral_exact_taploop_bchw`), where tile_h always degenerates to a single
-        # tile anyway -- kept correct regardless, since a future caller could reintroduce
-        # a larger radius here.
+        # `_bilateral_exact_taploop_bchw`).
         tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, B * C * W * ksize * ksize))
         if tile_h >= H:
             tile_h = H
-        # A4 (v0.51 Phase C, R2#1/R3#2/B2#2/B4#4): this loop used to pick a
-        # `deterministic` flag (`radius > 3`) here, routing the kernel-window sum
-        # through a fixed-order accumulator so a windowed crop and the whole frame it
-        # is drawn from (generally different widths, hence different `tile_h`) agreed
-        # bit-for-bit on CUDA (FIX-501 F3). The only caller left that can ever reach
-        # `radius > 3` in this function is a future one -- today's dispatch
-        # (`fn_bilateral_filter`) sends every `radius > 3` call to
-        # `_bilateral_exact_taploop_bchw` instead, whose own per-tap accumulation is
-        # already shape-independent by construction (see its docstring) -- so this
-        # function's row-tiling loop only ever runs with `tile_h == H` (a single tile,
-        # A5's own proof), and `torch.sum`'s reduction never sees two different shapes
-        # for the same output pixels. Flag and helper dropped; still bit-identical to
-        # v0.50.0 at `radius<=3` (`test_bilat50_radius.py`).
+        # This loop used to route the kernel-window sum through a fixed-order accumulator when
+        # `radius > 3`, so a windowed crop and the whole frame agreed bit-for-bit on CUDA
+        # (FIX-501 F3). It only runs at `radius<=3` now, where the frame is one tile up to
+        # about 163k pixels of B*C*H*W and several row tiles above that, so the two can
+        # differ by an ulp on CUDA. Still bit-identical to v0.50.0 (`test_bilat50_radius.py`).
         outputs = []
         for y0 in range(0, H, tile_h):
             # CANCEL-44/PACE-47c idiom: a poll between tiles -- the multi-pass boundary
@@ -882,7 +872,7 @@ class _StdlibSample:
 
     @staticmethod
     def _bilateral_detail_transfer_bchw(bchw, ss, sr):
-        """BILAT-50: past `_BILATERAL_EXACT_RADIUS_MAX`, downscale until
+        """BILAT-50: past `_BILATERAL_SEPARABLE_RADIUS_MAX`, downscale until
         the REDUCED spatial_sigma lands back inside today's own exact 7x7 window (<=1.0),
         run the exact filter there (always radius<=3 by construction -- no tiling needed),
         upsample the filtered result back to full resolution, and add back the full-
@@ -952,7 +942,7 @@ class _StdlibSample:
         # Up to 193 sequential taps: accumulate in fp32 whatever the image dtype (a no-op
         # for fp32), as the tap-loop tier does, and cast the result back at the end.
         src = bchw.float()
-        ref32 = range_ref.float()
+        ref32 = src if range_ref is bchw else range_ref.float()
         acc = torch.zeros_like(src)
         wsum_shape = list(bchw.shape)
         wsum_shape[1] = 1
@@ -960,7 +950,8 @@ class _StdlibSample:
         for i, off in enumerate(range(-radius, radius + 1)):
             idx = (idx_base + off).clamp(0, n - 1)
             tap = torch.index_select(src, dim, idx)
-            tap_ref = torch.index_select(ref32, dim, idx)
+            # the row pass measures its range weight against its own input: same tap
+            tap_ref = tap if ref32 is src else torch.index_select(ref32, dim, idx)
             diff = ref32 - tap_ref
             cd2 = (diff * diff).sum(dim=1, keepdim=True)
             w_range = torch.exp(cd2 * inv_2sr)
@@ -1021,11 +1012,11 @@ class _StdlibSample:
         """Edge-preserving bilateral filter using Tensor.unfold.
 
         Weights each neighbor by spatial Gaussian x range (color similarity)
-        Gaussian. Radius is derived from sigma_s (3x sigma) -- exact (row-tiled,
-        memory-bounded) up to `_BILATERAL_EXACT_RADIUS_MAX`, then a downscale +
-        detail-transfer approximation (BILAT-50) past it. Best for small kernels
-        (3x3); for larger kernels, the loop-based approach in bilateral_approx.tex
-        may be faster due to memory traffic.
+        Gaussian. Radius is derived from sigma_s (3x sigma) and picks one of four tiers:
+        radius <= 3 the exact unfolded-window pass; up to `_BILATERAL_EXACT_RADIUS_MAX`
+        the exact tap-loop pass; up to `_BILATERAL_SEPARABLE_RADIUS_MAX` a row-then-column
+        separable approximation; past that a downscale + detail-transfer approximation
+        (flat cost, independent of sigma).
 
         Args:
             image: [B, H, W, C] tensor
@@ -1068,6 +1059,8 @@ class _StdlibSample:
                 sr = raw if rounded is None else rounded
 
         _require_finite_arg("bilateral_filter", "spatial_sigma", ss)  # A7: friendly diagnostic
+        if sr != sr:   # NaN would turn every weight, and so the whole image, to NaN; +inf is a plain blur
+            _require_finite_arg("bilateral_filter", "range_sigma", sr)
         if img.dim() < 3 or ss < 0.3:
             return img
         mask = img.dim() == 3  # [B,H,W] mask / scalar field: one channel
@@ -1078,11 +1071,9 @@ class _StdlibSample:
         radius = int(math.ceil(3.0 * ss))  # BILAT-50: no clamp -- the true window
         bchw = _get_bchw(img)
 
-        # A5 (v0.50 Phase C, R2#1): `_bilateral_exact_bchw`'s row-tiling degenerates to a
-        # single untiled pass whenever `tile_h >= H`, which is always true at a small
-        # `ksize` (small radius) -- so it is correct, and bit-identical (proven,
-        # `tests/test_bilat50_radius.py::test_bilat50_a5_exact_bchw_matches_inline_and_
-        # degenerates_to_one_tile`), for `radius<=3` too.
+        # `_bilateral_exact_bchw` runs as a single untiled pass whenever `tile_h >= H`
+        # (frames up to about 163k pixels of B*C*H*W at radius 3) and is bit-identical to the
+        # inline formula (`tests/test_bilat50_radius.py`).
         # BILATX-51: four regimes now -- `radius<=3` unchanged (bit-identical, the old
         # untiled `_bilateral_exact_bchw` path), `3<radius<=_BILATERAL_EXACT_RADIUS_MAX`
         # the new tap-loop exact pass (`_bilateral_exact_taploop_bchw`, same math restated
@@ -1104,9 +1095,9 @@ class _StdlibSample:
         return result.squeeze(-1) if mask else result
 
     # ASK-1: native convolution. `kernel` is a second IMAGE/MASK BINDING, read whole —
-    # not an ARRAY literal (an array is expanded to one full frame per tap by the
-    # interpreter, `interpreter.py:1611-1617`) and not a mat3/mat4 (capped at 4x4,
-    # `DEVELOPMENT.md:165`). footprint='image' (arg 0, the image itself), because
+    # not an ARRAY literal (the interpreter's `_eval_array_literal` expands an array to one
+    # full frame per tap) and not a mat3/mat4 (capped at 4x4; see the convolve entry in
+    # DEVELOPMENT.md's "Rejected design decisions"). footprint='image' (arg 0, the image itself), because
     # `('halo_arg', kernel)` cannot be built here: `tex_roi._call_reach` resolves a
     # halo_arg only from a folded NumberLiteral, so a kernel BINDING can only ever resolve
     # 'unbounded' — never a narrowable radius. REACH-48 (TIERS-48-design.md SS B.2 point 2)
@@ -1212,11 +1203,16 @@ class _StdlibSample:
         RuntimeError from an ambiguous `.item()`.
         """
         if not isinstance(x, torch.Tensor):
-            return int(x)
+            v = float(x)
+            _require_finite_arg("patch_dist", argname, v)
+            return int(v)
         if x.numel() == 1:
             v = _host_scalar(x)
-            return int(v if v is not None else x.reshape(()).item())
+            v = float(v if v is not None else x.reshape(()).item())
+            _require_finite_arg("patch_dist", argname, v)
+            return int(v)
         flat = x.reshape(-1)
+        _require_finite_arg("patch_dist", argname, float(flat[0].item()))
         if bool(torch.all(flat == flat[0])):
             return int(flat[0].item())
         n = int(torch.unique(flat).numel())
@@ -1251,7 +1247,7 @@ class _StdlibSample:
                 value per cook) — see `_uniform_scalar_or_raise`; a per-pixel
                 offset raises rather than silently meaning one of its values.
             radius: patch half-size; uniform-or-raise like dx/dy, then clamped to
-                [0, 32] (mirrors `_morph`'s defensive clamp — the real range is 1-3).
+                [0, 32] (the useful range is 1-3).
 
         Replicate border padding throughout (matches sample/gauss_blur/erode/dilate/
         convolve), via `_pad_replicate_chunked` for both the (dx, dy) shift and the
@@ -1308,8 +1304,8 @@ class _StdlibSample:
         """Sample with Gaussian-prefiltered mipmap (sigma=1.13 pyramid).
 
         Same interface as sample_mip but uses a Gaussian pre-blur before each
-        2x downsample, producing SIGMA_C ≈ 0.825. This gives ~5 dB better
-        accuracy for exponential blur reconstruction vs the area-downsample pyramid.
+        2x downsample. This gives ~5 dB better accuracy for exponential blur
+        reconstruction vs the area-downsample pyramid.
         """
         # FIX-PACE P4: same warm-cache entry poll as fn_sample_mip above -- see its comment.
         poll_cook_cancel(heavy=True)

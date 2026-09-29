@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 import torch
 
 from . import tier_trace as _tier_trace   # a leaf (collections/threading only): no import cycle
@@ -162,9 +163,8 @@ def _zeros_broadcast(coords: tuple) -> torch.Tensor:
 # The 8-gradient set matches the classic Perlin 2D set:
 #   h&7: 0→(1,0) 1→(-1,0) 2→(0,1) 3→(0,-1)
 #        4→(1,1) 5→(-1,1) 6→(1,-1) 7→(-1,-1)
-# (diagonal components are NOT normalized to 1/√2 — this matches the original
-#  _GRAD2 table which uses 0.7071, but the arithmetic version uses ±1 for
-#  diagonals. The visual difference is negligible and the output range is similar.)
+# (diagonal components are ±1, not normalized to 1/√2 as a classic table would have them;
+#  the visual difference is negligible and the output range is similar.)
 
 
 def _lowbias32(x: torch.Tensor) -> torch.Tensor:
@@ -427,16 +427,9 @@ def _is_kernel_load_failure(exc: BaseException) -> bool:
 class _TieredCache:
     """3-tier compilation cache: eager → jit.trace → torch.compile.
 
-    Usage:
-        cache = _TieredCache()
-        # In the noise function:
-        cached = cache.get(key)
-        if cached is not None:
-            cache.try_upgrade(key, compile_fn)
-            return cache.get(key)(*args)
-        result = eager_fn(*args)
-        cache.store(key, lambda: torch.jit.trace(eager_fn, args))
-        return result
+    Usage (the one entry point; it selects the tier and settles new signatures):
+        cache = _TieredCache("fbm")
+        return cache.call(key, args, device=device, trace_fn=..., compile_fn=..., eager_fn=...)
     """
 
     def __init__(self, name: str = "noise"):
@@ -461,25 +454,12 @@ class _TieredCache:
         traced tier stays in place, instead of caching a callable that raises
         lazily at the real call site.
 
-        KNOWN, UNCLOSED: this promotion swaps the callable mid-process, so if the
-        Inductor tier is not bit-identical to the traced tier, cook #4 onward can
-        differ from cooks #1-3 — the same shape of defect first_call() closes for
-        tier 1 vs tier 2. It is left open deliberately, on two grounds: unlike the
-        tier-1 swap (which bought nothing) this one is worth a measured 13-18x. It
-        could not be characterized on the box this was FIXED on — neither backend
-        compiles there (CUDA has no Triton; the CPU Inductor build fails with a
-        CppCompileError), so tier 3 never engaged there and a bit-equality adoption
-        gate could not be tested on that box. It has since been characterized on a
-        Triton-capable box and bounded rather than left open: the promotion moves
-        pixels by amounts the per-builtin `promotion_envelope` band pins
-        (`tests/test_v031_noise_tiers.py`), so a build that blows the band is a
-        recorded decision to re-band, never a silent drift. Gating adoption on
-        `torch.equal(compiled(*probe), incumbent(*probe))` using the dummy
-        compile_fn already warms with would close the gap for ~one 64x64 call on a
-        path that already costs ~28s — but on a Triton box that gate would silently
-        forfeit the speedup whenever the tiers disagree within the pinned band, so
-        it stays an open option, not a requirement. Nothing here is a *new*
-        regression: this path predates the cold-frame fix and is unchanged by it.
+        The promotion swaps the callable mid-process, so if the Inductor tier is not
+        bit-identical to the traced tier, cook #4 onward can differ from cooks #1-3. That is
+        accepted: the promotion is worth a measured 13-18x, and it moves pixels only by
+        amounts the per-builtin `promotion_envelope` band pins
+        (`tests/test_v031_noise_tiers.py`), so a build that blows the band is a recorded
+        decision to re-band, never a silent drift.
         """
         if key in self._compile_attempted or not _can_inductor_compile(device):
             return
@@ -492,9 +472,7 @@ class _TieredCache:
                 return
             self._compile_attempted.add(key)
         try:
-            import time as _time
-            from . import tier_trace as _tt
-            _t0 = _time.perf_counter()
+            _t0 = time.perf_counter()
             built = compile_fn()
             # Clear the settled marks BEFORE publishing the new callable, never after:
             # the reverse order leaves a window where another thread reads the new tier
@@ -502,7 +480,7 @@ class _TieredCache:
             # unsettled value from it — the exact defect _settle exists to prevent.
             self.forget_settled(key)
             self.cache[key] = built
-            _tt.record_noise_compile(self.name, (_time.perf_counter() - _t0) * 1000.0)  # P6
+            _tier_trace.record_noise_compile(self.name, (time.perf_counter() - _t0) * 1000.0)  # P6
         except Exception as e:
             # BRIEF-4: this used to vanish silently. Record it (never re-raise, never
             # log) so a doctor-style report can surface it; the jit.trace tier already
@@ -511,7 +489,7 @@ class _TieredCache:
             try:
                 dt = (device.type if isinstance(device, torch.device) else
                      ("cuda" if device == "cuda" else "cpu"))
-                _tt.record_noise_compile_failure(self.name, dt, e, key=key)
+                _tier_trace.record_noise_compile_failure(self.name, dt, e, key=key)
             except Exception:
                 pass
             # TRK-182/TRK-193: a native-kernel LOAD failure here (e.g. Windows Application/
@@ -666,7 +644,8 @@ class _TieredCache:
             for _ in range(_SETTLE_MAX_RUNS):
                 nxt = fn(*args)
                 if _bitwise_same(out, nxt):
-                    self._settled.add(sig)
+                    with self._lock:
+                        self._settled.add(sig)
                     return nxt
                 out = nxt
         except Exception as e:
@@ -687,7 +666,8 @@ class _TieredCache:
         across a tier swap would let the very first call of the new tier be served
         unsettled, which is exactly the defect this class now exists to prevent.
         """
-        self._settled = {s for s in self._settled if s[0] != key}
+        with self._lock:
+            self._settled = {s for s in self._settled if s[0] != key}
 
     def _run_or_fall_back(self, key, fn, eager_fn, args, exc=None):
         """TRK-182: call `fn` (the trace or promoted tier); on a native-kernel LOAD
@@ -882,11 +862,10 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
     Persistence=0.5, lacunarity=2.0. Octaves clamped to 1-10.
 
     Uses arithmetic hash (table-free) noise for TorchInductor-friendly execution.
-    Execution tiers:
-      1. First call: eager arithmetic hash (~100ms at 512x512)
-      2. Second call: torch.jit.trace (~94ms — modest improvement)
-      3. After 3 calls: torch.compile/Inductor (~16ms — 6x speedup, ~28s one-time compile)
-    Falls back gracefully if MSVC is unavailable (stays on jit.trace tier).
+    Execution tiers (see `_TieredCache.call`): the first call builds a jit.trace and is
+    answered from it; after `_COMPILE_AFTER_CALLS` calls it is promoted to
+    torch.compile/Inductor (~6x faster, ~28s one-time compile). Without a toolchain it stays
+    on the jit.trace tier; eager runs only when the trace fails or a signature never settles.
     """
     octaves = max(1, min(octaves, 10))
     key = (octaves, x.device)
@@ -1232,9 +1211,9 @@ def _flow2d(x: torch.Tensor, y: torch.Tensor, time: float) -> torch.Tensor:
 
 # ── Alligator noise ──────────────────────────────────────────────────────────
 #
-# Layered cell noise where each octave's Worley F1 distance is combined
-# with a smooth-min operator, creating an organic skin-like pattern with
-# connected ridges between cells.
+# Layered cell noise where each octave's Worley F1 distance is inverted into a ridge
+# (1 - clamp(2d)) and the ridges are summed with halving amplitude, creating an organic
+# skin-like pattern with connected ridges between cells.
 
 def _alligator_nd(worley_fn, coords: tuple, octaves: int) -> torch.Tensor:
     """Alligator noise — layered cell noise with ridge accumulation.

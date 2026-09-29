@@ -66,7 +66,9 @@ class _StdlibArray:
     @stdlib("median", sig='median(arr) \\u2192 float', category='Arrays', doc='Median value of array.', ex='float mid = median(arr);')
     @staticmethod
     def fn_median(arr) -> torch.Tensor:
-        """Median element of an array per channel. Returns scalar (or vec) per pixel."""
+        """Median element of an array per channel. Returns scalar (or vec) per pixel.
+        An even count answers the LOWER of the two middle values (torch.median's rule),
+        so median of [1, 3] is 1."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: torch.median(t, dim=d).values)
 
     @stdlib("arr_avg", sig='arr_avg(arr) \\u2192 float', category='Arrays', doc='Average of all array elements.', ex='float avg = arr_avg(arr);')
@@ -175,7 +177,6 @@ class _StdlibArray:
         list (folded into the ui= HUD payload) and returns `value` UNCHANGED so @OUT is
         bit-identical with or without the probe. torch-native readout, no numpy."""
         from . import tier_trace
-        import math
 
         def _json_safe(v):
             # audit: a NaN/Inf probe would serialize as a bare NaN/Infinity token — invalid

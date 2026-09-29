@@ -8,7 +8,7 @@ assignment (including the in-place-reuse fast path), and the scatter write
 (`@OUT[px, py] = value`, including the LANG-L4 masked-write compaction).
 
 `InterpreterError` (defined in `interpreter.py`) and the spatial/index helpers `_ensure_spatial` /
-`_safe_array_index` / `_const_index` / `_host_index` / `_list_index` (defined in
+`_safe_array_index` / `_const_index` / `_host_index` (defined in
 `interpreter_values.py`, re-exported by `interpreter.py`) are imported back from
 `interpreter.py` lazily, inside the methods that need them, because `interpreter.py` imports
 this module before those names exist — the same deferred-import shape `masked_flow.py` uses.
@@ -379,13 +379,13 @@ class _BindingExecMixin:
     def _exec_array_index_assign(self, target: ArrayIndexAccess, value, rhs_node=None):
         """Handle: arr[i] = expr;"""
         from .interpreter import (_ensure_spatial, _safe_array_index, _const_index,
-                                  _host_index, _list_index, InterpreterError)
+                                  _host_index, InterpreterError)
         array = self._eval(target.array)
         index = self._eval(target.index)
 
         # String array (Python list)
         if isinstance(array, list):
-            idx_int = _list_index(index.item() if isinstance(index, torch.Tensor) else index, len(array))
+            idx_int = self._string_array_index(index, len(array), target.loc)
             result = list(array)
             result[idx_int] = value if isinstance(value, str) else str(value)
             if isinstance(target.array, Identifier):

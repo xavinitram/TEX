@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 from .stdlib_registry import stdlib
 from .stdlib_core import (
+    _require_finite_arg,
     _to_float,
     _to_tensor,
 )
@@ -35,6 +36,20 @@ from .noise import (
 # `stdlib_registry._impl_looks_fragile` reads the literal `TEXStdlib.fn_*(` from the source
 # to follow one level of delegation, so it must not be rewritten to the mixin's name.
 TEXStdlib = None
+
+
+def _octaves(fn_name: str, v) -> int:
+    """The octave count `v` as an int; NaN or infinity is a friendly diagnostic, not a raw
+    int() crash. The kernels clamp the count to their own range."""
+    f = _to_float(v)
+    _require_finite_arg(fn_name, "octaves", f)
+    return int(f)
+
+
+def _finite_time(fn_name: str, v) -> float:
+    f = _to_float(v)
+    _require_finite_arg(fn_name, "time", f)
+    return f
 
 
 class _StdlibNoise:
@@ -67,8 +82,8 @@ class _StdlibNoise:
         """FBM noise. fbm(x,y,octaves) for 2D, fbm(x,y,z,octaves) for 3D."""
         if octaves is not None:
             return _fbm3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
-                          int(_to_float(octaves)))
-        return _fbm2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+                          _octaves("fbm", octaves))
+        return _fbm2d(_to_tensor(x), _to_tensor(y), _octaves("fbm", z_or_oct))
 
     @stdlib("worley_f1", sig='worley_f1(x, y) \\u2192 float', category='Noise', heavy=True, doc='Worley (cellular) noise — distance to nearest cell center.', ex='float n = worley_f1(u * 5.0, v * 5.0);')
     @staticmethod
@@ -89,8 +104,7 @@ class _StdlibNoise:
     @stdlib("voronoi", sig='voronoi(x, y) \\u2192 float', category='Noise', heavy=True, doc='Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id.', ex='float d = voronoi(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_voronoi(x, y, z=None) -> torch.Tensor:
-        """Voronoi noise (alias for worley_f1). Unchanged output — only the help
-        text above was wrong (it claimed a per-cell id; this is a distance)."""
+        """Voronoi noise: an alias for worley_f1 (a distance; worley_id gives a per-cell id)."""
         return TEXStdlib.fn_worley_f1(x, y, z)
 
     # ASK-5: a per-cell id, distinct from worley_f1/f2's distances above. Footprint
@@ -127,8 +141,8 @@ class _StdlibNoise:
         """Ridged FBM. ridged(x,y,octaves) for 2D, ridged(x,y,z,octaves) for 3D."""
         if octaves is not None:
             return _ridged3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
-                             int(_to_float(octaves)))
-        return _ridged2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+                             _octaves("ridged", octaves))
+        return _ridged2d(_to_tensor(x), _to_tensor(y), _octaves("ridged", z_or_oct))
 
     @stdlib("billow", sig='billow(x, y, octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Billowy noise — abs(fbm). Puffy cloud shapes.', ex='float n = billow(u * 4.0, v * 4.0, 6);')
     @staticmethod
@@ -136,8 +150,8 @@ class _StdlibNoise:
         """Billow FBM. billow(x,y,octaves) for 2D, billow(x,y,z,octaves) for 3D."""
         if octaves is not None:
             return _billow3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
-                             int(_to_float(octaves)))
-        return _billow2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+                             _octaves("billow", octaves))
+        return _billow2d(_to_tensor(x), _to_tensor(y), _octaves("billow", z_or_oct))
 
     @stdlib("turbulence", sig='turbulence(x, y, octaves) \\u2192 float', category='Noise', sync=True, heavy=True, doc='Turbulence — sum of abs(noise) per octave. Veiny patterns.', ex='float n = turbulence(u * 4.0, v * 4.0, 6);')
     @staticmethod
@@ -145,8 +159,8 @@ class _StdlibNoise:
         """Turbulence. turbulence(x,y,octaves) for 2D, turbulence(x,y,z,octaves) for 3D."""
         if octaves is not None:
             return _turbulence3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
-                                 int(_to_float(octaves)))
-        return _turbulence2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+                                 _octaves("turbulence", octaves))
+        return _turbulence2d(_to_tensor(x), _to_tensor(y), _octaves("turbulence", z_or_oct))
 
     @stdlib("flow", sig='flow(x, y, angle) \\u2192 float', category='Noise', sync=True, doc='Flow noise — Perlin rotated by angle per octave. Avoids static patterns.', ex='float n = flow(u * 6.0, v * 6.0, fi * 0.1);')
     @staticmethod
@@ -154,8 +168,8 @@ class _StdlibNoise:
         """Flow noise. flow(x,y,time) for 2D, flow(x,y,z,time) for 3D."""
         if time is not None:
             return _flow3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_time),
-                           _to_float(time))
-        return _flow2d(_to_tensor(x), _to_tensor(y), _to_float(z_or_time))
+                           _finite_time("flow", time))
+        return _flow2d(_to_tensor(x), _to_tensor(y), _finite_time("flow", z_or_time))
 
     @stdlib("alligator", sig='alligator(x, y) \\u2192 float', category='Noise', sync=True, doc='Alligator noise — cellular crack patterns.', ex='float n = alligator(u * 5.0, v * 5.0);')
     @staticmethod
@@ -163,7 +177,7 @@ class _StdlibNoise:
         """Alligator noise. 2 args: 2D default octaves; 3 args: 2D custom octaves; 4 args: 3D."""
         if octaves is not None:
             return _alligator3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
-                                int(_to_float(octaves)))
+                                _octaves("alligator", octaves))
         if z_or_oct is not None:
-            return _alligator2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+            return _alligator2d(_to_tensor(x), _to_tensor(y), _octaves("alligator", z_or_oct))
         return _alligator2d(_to_tensor(x), _to_tensor(y), 4)
