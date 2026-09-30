@@ -21,7 +21,6 @@ import math
 import torch
 
 from ..tex_compiler.ast_nodes import Program
-from .lru_util import lru_get, lru_put
 # PHASEC-OBSROUTE follow-up: `_BUILTINS_LRU_MAX`/`_COORD_RAMP_LRU_MAX`/
 # `_SCALAR_BUILTIN_DEFAULTS` used to sit in a top-level `from .interpreter import ...`
 # here, contradicting this docstring's own claim (above) that the names this module does
@@ -83,6 +82,7 @@ class _SpatialContextMixin:
         `ramp / max(size-1,1)` division `_create_builtins` already applied to `ix`,
         computed once over the full extent instead of once per window."""
         from .interpreter import _COORD_RAMP_LRU_MAX
+        from .lru_util import lru_get, lru_put   # lazy: keeps the cold-import closure unchanged
         key = (self._device_str, size)
         hit = lru_get(self._coord_ramp_lru, key)
         if hit is not None:
@@ -110,6 +110,7 @@ class _SpatialContextMixin:
         """
         from .interpreter import (_collect_identifiers, _CACHEABLE_BUILTIN_NAMES,
                                   _SCALAR_BUILTIN_DEFAULTS, _BUILTINS_LRU_MAX)
+        from .lru_util import lru_get, lru_put   # lazy: keeps the cold-import closure unchanged
         used = used_builtins if used_builtins is not None else _collect_identifiers(program)
 
         # Cache builtins: reuse tensors when spatial config hasn't changed (LAT-4: small LRU,

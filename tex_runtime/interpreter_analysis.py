@@ -38,8 +38,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import fields as _dc_fields
 
-from .lru_util import lru_get, lru_put
-
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
@@ -137,6 +135,7 @@ def _reads_and_non_spatial_cached(program: Program) -> tuple[frozenset[str], fro
     program pays for one walk regardless of which (or how many) accessor a caller uses.
     Internal: callers outside this module use one of those two, each of which preserves
     its OWN pre-existing return type (a bare `frozenset[str]`, never this tuple)."""
+    from .lru_util import lru_get, lru_put   # lazy: keeps the engine's cold-import closure unchanged
     key = id(program)
     hit = lru_get(_READS_MEMO, key)
     if hit is not None and hit[0] is program:
