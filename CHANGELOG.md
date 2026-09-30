@@ -5,6 +5,123 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.1] - 2026-09-30 — "Not while it compiles"
+
+A patch release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no node default moved and no name is
+newly reserved. It fixes a process crash on the opt-in `torch_compile` tier and closes the items
+`0.52.0` deferred, three of which change results for existing programs (listed below).
+
+### Fixed
+
+- **A process crash on the opt-in `torch_compile` tier.** Resetting torch's compiler state
+  (`torch._dynamo.reset()`) could run on one thread while a compile, or compiled code, was in
+  flight on another. The reset frees the cache entries, guards and resume functions that work is
+  still using, so it was a use-after-free in native code: the process died with no Python error,
+  seen as a native floating-point-exception crash (SIGFPE) on Linux and an access violation on
+  Windows. The compiled tier's failure paths (the first cook's fallback, the warm-cook crash, the
+  promotion trial and the engine's tier fallback) all reset this way. Every reset now goes through
+  one gate that waits for in-flight compiles: it skips the reset while any compile-pool job, probe
+  job or promoted noise call is running, and holds its lock across the reset, so no job can start
+  halfway through it. A skipped reset only keeps memory until the next idle one. Compile mode
+  `"none"`, the default, was never affected.
+- **An int or bool `$param` no longer adds a graph break.** The `$param` preamble read an int64 or
+  bool parameter back through a 0-dim tensor's `.item()`, which the compiler cannot trace, so every
+  compiled program with such a parameter paid one more resume function, and each resume function
+  is a copy of the program's code. An int or bool reads back exactly, so its value is used as is.
+  `examples/merge.tex` (a ten-way else-if chain) compiled in 178 s on a CPU box at `0.52.0` (92 s
+  at `0.50.1`); it now compiles in 109 s.
+
+### Results change for existing programs
+
+- **Codegen scalar loops round like the interpreter (fp32).** A scalar-only loop body ran on
+  Python doubles on the codegen tier while the interpreter runs it in fp32, so the tiers drifted
+  and a comparison could take the other branch: after ten `f += 0.1`, `if (!(f <= 1.0)) break`
+  ran 10 passes on the interpreter and 11 on codegen. Codegen now rounds every arithmetic result,
+  every literal and the zero-divisor guard to fp32, so loop results match across the tiers bit for
+  bit, and a value past fp32's range becomes inf on both. The cost, for a 1000-iteration scalar
+  loop with five operations per pass (median per cook, interleaved runs): CPU 426-435 -> 646-686 us
+  (about +52%), CUDA 613-636 -> 837-879 us (about +38%). The interpreter takes 11.4 ms (CPU) and
+  70.9 ms (CUDA) for the same program.
+- **A `[B,H,W,1]` binding is normalised to a plain `[B,H,W]` mask at ingest**, on both tiers.
+  Before this, codegen broadcast `u * @M` against the rank-4 tensor: an error and an interpreter
+  fallback when H != W, and a silently wrong `[B,H,W,W]` result on square frames, while the
+  interpreter returned `[B,H,W,1]`. A program that passes such a binding through
+  (`@OUT = @M;`) now cooks to `[B,H,W]`. Every egress (MASK, IMAGE, LATENT) maps both ranks to the
+  same wire value, so a node output does not change; the raw `cook()` output rank does.
+- **The explicit-fp16 stencil route honours the cook's precision.** With no resolution scale, the
+  stencil route ran an explicit fp16 cook at the fp32 default while the tiling and interpreter
+  paths of the same cook used fp16. An fp32 cook passes the default unchanged, and auto precision
+  never reaches this route. Measured on CUDA and CPU (5x5 box, 5x5 max and 7x7 box over a 96x128
+  image), the fp16 route stays within 2.3e-3 of the interpreter's fp16 cook, under the 8-bit
+  quantum (3.9e-3) of the fp16 contract.
+
+No other change in this release alters a cooked result.
+
+### Performance
+
+Measured on one CUDA box, interleaved runs, median.
+
+- **A static-range loop counter carries its host reading** on a GPU, so an array index, kernel
+  radius or sigma built from it no longer reads back from the device on every pass (loops of
+  eight passes or fewer were already unrolled). At 256x256 on the interpreter: a 32-pass array
+  read 5.4-5.6 -> 3.6-3.7 ms; a 10-pass `gauss_blur(@A, i)` 1.70-1.77 -> 1.34-1.42 ms; device
+  `.item()` calls for a 24-pass array loop plus a 10-pass blur loop 58 -> 0. A comparison built
+  from the counter (`if (i % 2 == 0)`) still reads back.
+- **`sample_mip` and `sample_mip_gauss` skip the identity-grid probe for the untouched `u`/`v`
+  builtins** when their window is the whole image, removing one device sync per call. At
+  1024x1024: `sample_mip(@A, u, v, 1.0)` interpreter 0.32-0.35 -> 0.164 ms, codegen 0.52-0.53 ->
+  0.34 ms; a 12-pass loop with a per-pass LOD, interpreter 6.8-7.0 -> 5.5 ms, codegen 7.3-7.6 ->
+  6.0 ms. Any other coordinate is still probed. On the CPU the gain is within noise.
+
+### Editor
+
+- The editor bundle was rebuilt from its current sources (the committed bundle predated the
+  multi-line diagnostic span), and the build is reproducible: two consecutive builds are
+  byte-identical, and a test compares a fresh build with the committed bundle when the build
+  tools are installed.
+- The highlighter, completion and hover word lists are generated from the language (lexer
+  keywords and binding prefixes, built-in variables, the stdlib registry) into one file,
+  `editor_build/src/tex_lexicon.mjs`, by `tools/gen_editor_lexicon.py`; a test fails on a stale
+  copy. They gain `vec2`, `return`, `const`, `frame`, `fps`, `time`, the `a` and `p` binding
+  prefixes and 54 missing functions, and no longer offer `rand`.
+- Completion and hover are context-aware: no word completion inside numbers, comments or
+  strings, and no hover docs on `@`/`$` bindings, typed prefixes, members, comments or strings.
+- Diagnostic columns are converted from code points to UTF-16, so a non-BMP character earlier on
+  the line no longer shifts the squiggle. The error banner's fix link converts its column the
+  same way.
+- Dead code, a duplicate export block and stale comments are removed from the bundle sources; the
+  diagnostic font stack gains JetBrains Mono as a fallback.
+
+### Tests
+
+- The cross-device envelope rows and the scatter determinism pin cook a real 128x128 grid instead
+  of a single pixel. The pin's collision variant deposits a value per writer, so a reorder can
+  show: on CUDA it reads 0.0 run to run (60 runs), and its CPU sanity bound moves from 1e-5 to
+  1e-4 after a measured worst of 1.05e-5. No envelope band moved.
+- Two rows that printed a pass without measuring anything now report a named skip: the
+  compile-route arming row when the route is gated out, and the soak memory row when `psutil` is
+  missing. The skip budget moves 135 -> 137 for exactly those two sites.
+- Thirteen per-pixel twins of the 1x1 adversarial compatibility-corpus rows are appended to the
+  `0.25` golden (141 -> 154 hashes) through a new append-only `freeze(add=...)`. The existing
+  goldens are unchanged.
+- The auto-calibration benchmark's unused threshold suggestions (`TEX_PF1_AUTOCAL`) are removed:
+  nothing read them, and four corners cannot place a threshold. The canary still reports the fit.
+
+### Audit closure
+
+All 1164 findings from the two whole-codebase audits are now closed: 1033 fixed, 93 already
+fixed, 23 duplicates, 13 declined with a reason and 2 not bugs. The 30 items `0.52.0` deferred
+are among the fixed.
+
+### Known issues
+
+- **A stencil program with a float `$param` falls back to the interpreter on every GPU cook.** The
+  picture is correct; the cook is slower.
+- **Codegen at `precision="fp16"` computes in fp32.** It does not cast image bindings or constants
+  to fp16, so it differs from the interpreter's fp16 cook by fp16 quantization.
+- **`torch_compile` on a deep chain of blurs can run for hours without finishing** (carried from
+  `0.51.0`; cause not found). Compile mode `"none"`, the default, is unaffected.
+
 ## [0.52.0] - 2026-09-30 — "As written"
 
 A minor release, and the first published one since `0.50.1`. **`0.51.0` was never published on
