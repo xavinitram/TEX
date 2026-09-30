@@ -67,7 +67,6 @@ codegen rows are not measurable and the affected rows SKIP rather than pass.
 """
 import os
 import sys
-import time
 
 from helpers import *
 # By name, not by star: `helpers.__all__` is pinned to its v0.35.0 set (HOOK-4), because
@@ -338,8 +337,9 @@ def _cook(prepared, count: bool):
         # `clear_compiled_cache` forgets the fn-calls verdict, so this cook records it again
         # and `warm_state.persist` runs once its 5 s throttle has lapsed: a snapshot write
         # and reload sized by whatever the cache dir holds (about 140 extra frames). That is
-        # neither the cold path nor deterministic, so the throttle is held shut for the cook.
-        _ws._last_persist = time.time()
+        # neither the cold path nor deterministic, so the throttle is held shut for the cook
+        # (an infinite last-persist stamp keeps `now - _last_persist` under any throttle).
+        _ws._last_persist = float("inf")
         f = _Frames()
         with f:
             execute_compiled(program, dict(bindings), type_map, "cpu", fp,
