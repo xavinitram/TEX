@@ -661,7 +661,9 @@ def test_root_channel_and_swizzle_fixes(r: SubTestResult):
         for c, ttype in ((1, TEXType.FLOAT), (2, TEXType.VEC2)):
             res = tex_engine.cook("@OUT = @A;", {"A": make_img(1, 8, 8, c, seed=20 + c)},
                                   device_mode="cpu")
-            okc = okc and res.outputs["OUT"].shape[-1] == c and res.assigned["OUT"] == ttype
+            # A one-channel image enters as the [B,H,W] mask it is typed as.
+            want = (1, 8, 8) if c == 1 else (1, 8, 8, c)
+            okc = okc and tuple(res.outputs["OUT"].shape) == want and res.assigned["OUT"] == ttype
         for wide in (make_img(1, 8, 8, 5),                                    # a 5-ch IMAGE/EXR
                      unwrap_latent({"samples": torch.randn(1, 16, 8, 8)})[0]):  # a 16-ch LATENT (unwrapped)
             try:

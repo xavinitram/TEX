@@ -1,4 +1,5 @@
-"""Tier-parity rows: scalar-loop arithmetic rounds like the interpreter's fp32.
+"""Tier-parity rows: scalar-loop arithmetic rounds like the interpreter's fp32, and a
+one-channel image binding `[B,H,W,1]` enters both tiers as the mask `[B,H,W]`.
 
 Each row runs the interpreter (the oracle) and the codegen-only route on copies of the same
 bindings; codegen must serve the program. Loop rows compare BIT-exactly: a scalar loop runs
@@ -9,7 +10,7 @@ import pytest
 import torch
 
 from TEX_Wrangle.tex_cache import get_cache, parse_and_split
-from TEX_Wrangle.tex_marshalling import infer_binding_type
+from TEX_Wrangle.tex_marshalling import infer_binding_type, to_fp32_if_int_image
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 from TEX_Wrangle.tex_runtime.codegen import try_compile
 from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
@@ -74,3 +75,45 @@ def test_scalar_loop_break_count_is_the_fp32_one():
     ref, got = both_tiers(code, _out())
     assert ref["OUT"].flatten()[0].item() == 9.0
     assert got["OUT"].flatten()[0].item() == 9.0
+
+
+# ── A one-channel image binding enters as a plain mask ──────────────────────────────────
+
+def _mask_bindings(H, W, rank4):
+    g = torch.Generator().manual_seed(958)
+    m = torch.rand(1, H, W, generator=g)
+    a = torch.rand(1, H, W, 4, generator=g)
+    return {"M": m.unsqueeze(-1) if rank4 else m, "A": a}
+
+
+@pytest.mark.parametrize("H,W", [(4, 5), (4, 4)], ids=["H!=W", "H==W"])
+@pytest.mark.parametrize("code", [
+    "float f = u * @M; @OUT = f;",
+    "@OUT = @M;",
+    "@OUT = vec4(@A.rgb, @M);",
+    "@OUT = @M * @A;",
+    "float f = @M; if (f > 0.5) { f = 1.0 - f; } @OUT = f;",
+], ids=["u*M", "passthrough", "vec-constructor", "mask*image", "per-pixel-if"])
+def test_rank4_single_channel_binding_is_a_mask(code, H, W):
+    """A `[B,H,W,1]` binding cooks exactly as the `[B,H,W]` mask does, on both tiers:
+    same rank, same values. Before, codegen broadcast `u * @M` to `[B,H,W,W]` when H==W."""
+    ref3, got3 = both_tiers(code, _mask_bindings(H, W, rank4=False))
+    ref4, got4 = both_tiers(code, _mask_bindings(H, W, rank4=True))
+    for name, want in ref3.items():
+        for tier, res in (("interpreter", ref4), ("codegen", got4)):
+            assert tuple(res[name].shape) == tuple(want.shape), (
+                f"{tier}: {tuple(res[name].shape)} != {tuple(want.shape)}")
+            assert torch.equal(res[name], want), f"{tier}: values differ"
+        assert torch.equal(got3[name], want)
+
+
+def test_ingest_squeezes_only_a_single_channel_image():
+    m4 = torch.rand(1, 3, 3, 1)
+    assert tuple(to_fp32_if_int_image(m4).shape) == (1, 3, 3)
+    assert torch.equal(to_fp32_if_int_image(m4), m4[..., 0])
+    for keep in (torch.rand(1, 3, 3, 3), torch.rand(1, 3, 3), torch.rand(3, 1)):
+        assert to_fp32_if_int_image(keep) is keep
+    # An integer one-channel image is cast and squeezed in the same step.
+    i4 = torch.ones(1, 2, 2, 1, dtype=torch.int64)
+    out = to_fp32_if_int_image(i4)
+    assert out.dtype is torch.float32 and tuple(out.shape) == (1, 2, 2)

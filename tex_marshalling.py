@@ -137,11 +137,17 @@ def to_fp32_if_int_image(t, device=None):
     a single direct hop on every tier, instead of an exception + interpreter
     retry on the codegen tiers.
 
+    A one-channel image `[B,H,W,1]` enters as the plain mask `[B,H,W]` it is typed as
+    (FLOAT), so every operation sees one rank for a scalar field, whichever shape the
+    host sent it in.
+
     Single source for both ingestion paths (the interpreter binding loop and
     codegen's `_contiguous_bindings`); guarded by the M5-INT bit-exactness test."""
     torch = _torch_mod()
     if not isinstance(t, torch.Tensor):
         return t
+    if t.dim() == 4 and t.shape[-1] == 1:
+        t = t.squeeze(-1)
     needs_cast = (t.dim() >= 3 and not t.is_floating_point()
                   and t.dtype != torch.bool)
     needs_move = device is not None and t.device != device
