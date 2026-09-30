@@ -21,6 +21,9 @@ from TEX_Wrangle.tex_cache import parse_and_split
 # (label, code, band, structural) — structural=True compares total energy (img_sum
 # rel-tol) instead of pointwise, because scatter coordinate-rounding legally relocates
 # quanta between neighbouring pixels (a large pointwise diff, conserved in the sum).
+# Re-measured on the 128x128 grid (fp32, one CUDA box): grade/mat3 1.2e-7, gauss 0,
+# fbm 7.1e-7, lens_warp 1.0e-5, scatter and worley_id 0 (structural). Every band is at
+# least ~10x its reading, or the zero-reading floor, so none moved.
 _PROBES = [
     ("grade_pointwise",
      "vec3 c = @A.rgb; c = pow(c, vec3(1.0/2.2));"
@@ -67,11 +70,11 @@ _PROBES = [
 
 
 def _run_on(code, device, img):
-    binds = {}
-    bt = {}
-    if "@A" in code:
-        binds["A"] = img.to(device)
-        bt["A"] = TEXType.VEC3
+    # Every probe binds @A, read or not: a bound image sizes the cook grid, so the probes
+    # that never read it (fbm, scatter, worley_id) still cook 128x128. With no binding they
+    # cooked one pixel at the origin, and the band compared one number.
+    binds = {"A": img.to(device)}
+    bt = {"A": TEXType.VEC3}
     prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     out = Interpreter().execute(prog, binds, tm, device=device,

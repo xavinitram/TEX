@@ -9,25 +9,24 @@ deterministic-in-practice path.
 
 The one genuine exposure is that torch does not *promise* atomic-add ordering, so a
 future torch upgrade could break run-to-run scatter determinism. This test pins that:
-- CUDA scatter (plain + a collision variant, both cooked on the interpreter's no-binding
-  default grid; see the note above `_SCATTER`) must be bitwise identical across 5 runs. **GATED on a band by default** (A1-4, v0.19: was WARN-first in v0.18): measured
+- CUDA scatter (plain + a collision variant, both cooked on a 128x128 grid) must be
+  bitwise identical across 5 runs. **GATED on a band by default** (A1-4, v0.19: was WARN-first in v0.18): measured
   bitwise-0.0, and a torch atomic-add reorder is a discrete jump well above the 1e-9 band,
   so gating catches a real regression without flapping. Set `TEX_DETERMINISM_SOFT=1` to
   DOWNGRADE to a warning (the old behavior) if a future torch upgrade forces a re-band.
 - The CPU is the honest caveat: threaded float accumulation is run-to-run
-  nondeterministic at ~5.5e-6. We assert it stays within a loose 1e-5 sanity bound
+  nondeterministic: the collision variant's cells (~12.0) vary by ~5e-6 run to run, and
+  by up to 1.05e-5 in 60 runs on 24 threads. We assert it stays within a loose 1e-4 sanity bound
   (a real red if it blows up), documenting rather than fixing it (pin, don't chase).
 
 CUDA-gated: the CUDA half skips clean on a CPU-only box.
 """
 from helpers import *
 
-# plain displacement scatter, and a collision-stress variant. `_run()` below cooks with NO
-# bindings, so the grid is the interpreter's no-binding default rather than a bound 128^2
-# image folded into a 4x4 target — the "~1024-way atomic-add collisions per cell" this
-# comment used to describe. The pin still catches the same atomic-add-reorder class of
-# regression within that smaller default shape; widening the grid to match (TRK-11) is a
-# separate, unmeasured change and is not made here.
+# Plain displacement scatter, and a collision-stress variant: the 128^2 grid folded into a
+# 4x4 target, ~1024 writers per cell. Each writer deposits its own value, so the fp32 sum of
+# a cell depends on the order of its atomic adds; equal deposits would sum the same in any
+# order and the pin could not see a reorder.
 _SCATTER = (
     "@OUT[ix, iy] = vec3(0.0);"
     "float dx = simplex(u * 3.0, v * 3.0) * 8.0;"
@@ -38,14 +37,16 @@ _SCATTER = (
 _COLLIDE = (
     "@OUT[ix, iy] = vec3(0.0);"
     "int tx = int(u * 4.0); int ty = int(v * 4.0);"
-    "@OUT[tx, ty] += vec3(0.01);"
+    "@OUT[tx, ty] += vec3(0.01 + u * 0.003 + v * 0.0007);"
 )
+# A bound image sizes the cook grid, read or not; with no binding the grid is one pixel.
+_GRID = make_img(1, 128, 128, 3, seed=5)
 
 
 def _run(code, device):
     prog = Parser(Lexer(code).tokenize(), source=code).parse()
-    tm = TypeChecker(binding_types={}, source=code).check(prog)
-    return Interpreter().execute(prog, {}, tm, device=device,
+    tm = TypeChecker(binding_types={"A": TEXType.VEC3}, source=code).check(prog)
+    return Interpreter().execute(prog, {"A": _GRID.to(device)}, tm, device=device,
                                  output_names=["OUT"], precision="fp32")["OUT"]
 
 
@@ -84,6 +85,7 @@ def _max_run_to_run(code, device, runs=5):
 # to WARN (inverse of the old HARD flag) if an environment ever flaps in practice. The
 # release gate (TST-8) also reads LAST_CUDA_DET_VAR to fail a publish on out-of-band drift.
 _CUDA_DET_BAND = 1e-9
+_CPU_CAVEAT_BOUND = 1e-4   # ~10x the worst CPU collision-cell drift measured (1.05e-5)
 LAST_CUDA_DET_VAR = None   # worst CUDA run-to-run measured; None = not measured (CPU box)
 
 
@@ -94,12 +96,13 @@ def test_prlp5_determinism_pin(r: SubTestResult):
 
     # CPU caveat: threaded accumulation is nondeterministic — pin the loose bound.
     try:
-        cpu_var = _max_run_to_run(_SCATTER, "cpu")
-        if cpu_var > 1e-5:
-            r.fail("PR-LP5 CPU variance", f"CPU scatter run-to-run {cpu_var:.2e} > 1e-5 "
-                   "sanity bound (expected ~5.5e-6)")
+        cpu_var = _max_run_to_run(_COLLIDE, "cpu")
+        if cpu_var > _CPU_CAVEAT_BOUND:
+            r.fail("PR-LP5 CPU variance", f"CPU scatter run-to-run {cpu_var:.2e} > "
+                   f"{_CPU_CAVEAT_BOUND:.0e} sanity bound (expected ~5e-6)")
         else:
-            r.ok(f"CPU scatter run-to-run within caveat bound ({cpu_var:.1e} <= 1e-5)")
+            r.ok(f"CPU scatter run-to-run within caveat bound "
+                 f"({cpu_var:.1e} <= {_CPU_CAVEAT_BOUND:.0e})")
     except Exception as e:
         r.fail("PR-LP5 CPU variance", f"{type(e).__name__}: {e}")
 
@@ -137,7 +140,7 @@ def test_prlp5_the_determinism_comparator_is_not_inert(r: SubTestResult):
     a bitwise-identical pair reads 0.0 and passes, a pair that differs by a discrete jump reads
     that jump and REDS, and `TEX_DETERMINISM_SOFT` downgrades exactly the out-of-band case and
     nothing else. They also pin the CPU caveat's own bound, which is the half that does run
-    here: 1e-5 has to be a number the comparator can exceed.
+    here: its bound has to be a number the comparator can exceed.
     """
     print("\n--- PR-LP5: the determinism comparator fires (no GPU needed) ---")
     ref = torch.zeros(1, 8, 8, 3)
@@ -158,7 +161,8 @@ def test_prlp5_the_determinism_comparator_is_not_inert(r: SubTestResult):
         # enough that a single-ulp drift is a decision, which is the claim the pin makes.
         ("one fp32 ulp is already out of band", [a_ulp], _CUDA_DET_BAND, False, False, "out"),
         # The CPU caveat's loose bound is the half that runs on every box.
-        ("the CPU caveat bound can be exceeded", [reordered], 1e-5, False, False, "out"),
+        ("the CPU caveat bound can be exceeded", [reordered], _CPU_CAVEAT_BOUND, False, False,
+         "out"),
     ]
     bad = []
     for label, repeats, band, soft, want_zero, want in checks:
