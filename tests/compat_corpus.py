@@ -46,6 +46,9 @@ Freeze a NEW language version (only ever after the surface change that earned th
     python -X utf8 -c "import texboot, compat_corpus; compat_corpus.freeze()"
 (run from tests/, with the scratchpad on sys.path for texboot). It writes
 `compat_corpus_goldens/<tex_api.LANGUAGE_VERSION>.json` and refuses if that file exists.
+
+New rows appended to the corpus while the language has not moved join the current version with
+`compat_corpus.freeze(add={name, ...})`: it only appends, and every frozen row stays as it was.
 """
 import hashlib
 import json
@@ -183,6 +186,48 @@ _ADVERSARIAL = {
         "float x = @A.r; float c = 0.0;\n"
         "while (x < 0.8) { x = x + 0.25; c = c + 1.0; }\n"
         "@OUT = vec4(c, c, c, 1.0);",
+
+    # The per-pixel twins of the thirteen `adv_*` rows at the top of this table. Those read
+    # only `u`/`v` with no `@` wire, so they cook at a 1x1 grid where `u = v = 0` and their
+    # goldens pin ONE pixel (the note above `adv025_break` says the same of `adv_while_loop`).
+    # Each row here is the same corner with an `@A.r` read, so it cooks at `B=2,H=16,W=16` and
+    # the untaken branches, the non-zero coordinates and the per-pixel data are all hashed.
+    # Appended, never edited: the originals stay as frozen. No loop bound or `return` varies
+    # per pixel, so none of these draws W7007 or opens the masked-flow gate at any level.
+    "adv_px_ternary_ops":
+        "@OUT = vec4((u > 0.5 ? 1.0 : (v > 0.5 ? 0.5 : 0.0)), u*v, u+v-1.0,\n"
+        "            (@A.r > 0.5 ? @A.r : 1.0 - @A.r));",
+    "adv_px_for_accumulate":
+        "float s = 0.0; for (int i=0;i<4;i=i+1){ s = s + float(i)*0.1*(u + @A.r); }\n"
+        "@OUT = vec4(s, s*0.5, s*0.25, 1.0);",
+    "adv_px_while_loop":
+        "float x = @A.r * 0.1; int n = 0; while (n < 8){ x = x + 0.1*u; n = n + 1; }\n"
+        "@OUT = vec4(x, float(n)*0.1, v, 1.0);",
+    "adv_px_array_index":
+        "float arr[4]; for(int i=0;i<4;i=i+1){ arr[i] = float(i)*u + @A.r; }\n"
+        "@OUT = vec4(arr[0], arr[1], arr[2], arr[3]*0.25);",
+    "adv_px_swizzle_vecops":
+        "vec4 c = vec4(u, v, u*v, @A.r);\nvec2 p = c.xy;\n"
+        "@OUT = vec4(c.z, p.y, c.x * 2.0 - c.z, c.w);",
+    "adv_px_user_function":
+        "float sq(float x){ return x*x; }\n@OUT = vec4(sq(u), sq(v), sq(u*v), sq(@A.r));",
+    "adv_px_math_builtins":
+        "@OUT = vec4(sin(u*PI), cos(v*TAU), sqrt(abs(u-v)), @A.r);",
+    "adv_px_mix_clamp_smoothstep":
+        "@OUT = vec4(mix(0.2, 0.8, u), clamp(v*2.0-0.5, 0.0, 1.0), smoothstep(0.2, 0.8, u),\n"
+        "            smoothstep(0.2, 0.8, @A.r));",
+    "adv_px_param_metadata":
+        "f$gain = 1.5 [min: 0, max: 2, label: \"Gain\"];\n"
+        "@OUT = vec4(u*$gain, v*$gain, @A.r*$gain, 1.0);",
+    "adv_px_matrix_mul":
+        "mat3 m = mat3(1,0,0, 0,1,0, 0,0,1);\nvec3 r = m * vec3(u, v, @A.r);\n@OUT = vec4(r, 1.0);",
+    "adv_px_mod_floor_fract":
+        "@OUT = vec4(mod(u*10.0, 1.0), floor(v*4.0)/4.0, fract(u+v), @A.r);",
+    "adv_px_const_compound":
+        "const float k = 0.3; float a = u + @A.r; a += k; a *= 2.0;\n"
+        "@OUT = vec4(a, a-k, a*0.5, 1.0);",
+    "adv_px_pragma_current":
+        "//!tex 0.23\n@OUT = vec4(u, v, u*v, @A.r);",
 }
 
 
@@ -328,7 +373,7 @@ def _compute_selected(names) -> dict:
     return found
 
 
-def freeze(version: str | None = None, only=None) -> dict:
+def freeze(version: str | None = None, only=None, add=None) -> dict:
     """Freeze current behavior as a NEW archived version. Defaults to `LANGUAGE_VERSION`.
 
     **May only ADD** a version that is not frozen yet — re-freezing one from scratch
@@ -348,10 +393,46 @@ def freeze(version: str | None = None, only=None) -> dict:
     current archive, so a one-row fix cannot pull in unrelated corpus growth. Use it in
     a commit whose message argues the pixel change, on any archived version — not only
     the newest — the same way the old procedure was always meant to be used.
+
+    `add` is `only`'s append-only counterpart, for rows APPENDED to the corpus after their
+    language version was frozen while the language itself has not moved. Every name must be
+    absent from the existing file (an existing row is corrected with `only=`, never
+    re-minted here) and present in the current corpus; every existing row is carried over
+    byte-for-byte and only the named ones are computed. It exists so new coverage never has
+    to wait for the next language bump, and it can never change what a frozen row says.
     """
     from TEX_Wrangle.tex_api import LANGUAGE_VERSION
     version = str(version or LANGUAGE_VERSION)
     path = archive_path(version)
+
+    if add:
+        if only:
+            raise ValueError("freeze(): pass only= (correct existing rows) or add= "
+                             "(append new rows), not both")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"add={sorted(set(add))} appends to an EXISTING archived version, but "
+                f"{path} does not exist yet -- freeze a version for the first time with "
+                f"only=None and add=None.")
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+        existing_hashes = existing.get("hashes", {})
+        add = set(add)
+        already = add & set(existing_hashes)
+        if already:
+            raise KeyError(
+                f"add={sorted(already)} row(s) already frozen in {path} -- add= appends "
+                f"new rows only; correct an existing one with freeze(only=...).")
+        new_hashes = dict(existing_hashes)
+        new_hashes.update(_compute_selected(add))
+        data = {"language_version": existing.get("language_version", version),
+                "hashes": new_hashes}
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"added {len(add)} golden(s) {sorted(add)} to language version {version} "
+              f"-> {path}; {len(existing_hashes)} existing row(s) untouched")
+        return data
 
     if only:
         if not os.path.exists(path):
