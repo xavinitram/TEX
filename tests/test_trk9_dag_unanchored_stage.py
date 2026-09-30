@@ -25,8 +25,10 @@ STANDALONE (`interpreter._consensus_extent` sees zero bindings and returns
 terminal alongside a real image — which is exactly what a stage-by-stage
 reconstruction oracle does (`test_tool_roundtrip_unfused`'s technique), and
 exactly the shape a future single-stage preview/debug tool would need. That
-raises a plain torch broadcast `RuntimeError` — not a named TEX check — three
-layers away from the manifest that caused it. A manifest of this shape works
+used to raise a plain torch broadcast `RuntimeError` three layers away from the
+manifest that caused it; now that a bare uniform vec broadcasts against a
+field it runs, and splices a constant generator where the fused cook has the
+`u`/`v` ramps — a quietly different picture. A manifest of this shape works
 today ONLY by the accident of always being fused; refusing it at validation
 catches the fragility before anything downstream depends on it.
 
@@ -87,12 +89,16 @@ def _anchored_dag_manifest() -> dict:
     return m
 
 
-def test_trk9_premise_fused_works_standalone_crashes(r: SubTestResult):
+def test_trk9_premise_fused_works_standalone_diverges(r: SubTestResult):
     """Re-verify the row's own premise fresh (never carried): the manifest's
-    generator stage cooks fine FUSED but crashes when reconstructed
-    stage-by-stage — the asymmetry that makes this worth refusing at
-    validation rather than leaving it to work by accident."""
-    print("\n--- TRK-9 premise: fused cook works, stage-by-stage reconstruction raises ---")
+    generator stage cooks fine FUSED but cannot be reconstructed stage by
+    stage. Standalone, its `u`/`v` have no grid and collapse to 0, so it cooks
+    to a bare vector; spliced into the terminal that vector used to raise a
+    torch broadcast error, and since a bare uniform vec broadcasts against a
+    field in binary operators it runs instead, giving a constant generator
+    where the fused cook has the `u`/`v` ramps. Either way the asymmetry is
+    what makes the shape worth refusing at validation."""
+    print("\n--- TRK-9 premise: fused cook works, stage-by-stage reconstruction diverges ---")
     gen_code = "@OUT = vec3(u, 0.25, v);"
     term_code = "@OUT = @src * 0.5 + @gen * 0.5;"
     img = torch.rand(1, 5, 9, 3)
@@ -107,14 +113,24 @@ def test_trk9_premise_fused_works_standalone_crashes(r: SubTestResult):
     else:
         r.ok(f"standalone generator cooked to a bare vector {gen_out.tolist()} (no shared grid)")
     try:
-        tex_engine.cook(term_code, {"src": img.clone(), "gen": gen_out.clone()}, device_mode="cpu")
-        r.fail("splicing the standalone generator's output into the terminal raises",
-              "no exception raised")
+        out = tex_engine.cook(term_code, {"src": img.clone(), "gen": gen_out.clone()},
+                              device_mode="cpu").outputs["OUT"]
     except RuntimeError as e:
-        r.ok(f"stage-by-stage reconstruction raises as expected: {e}")
+        r.ok(f"stage-by-stage reconstruction raises: {e}")
+        return
     except Exception as e:
-        r.fail("the crash is a plain RuntimeError (a torch broadcast, not a named TEX check)",
+        r.fail("the reconstruction raises a plain RuntimeError or runs",
               f"{type(e).__name__}: {e}")
+        return
+    gen_part = out - img * 0.5
+    spread = (gen_part.amax(dim=(1, 2)) - gen_part.amin(dim=(1, 2))).abs().max().item()
+    if spread > 1e-6:
+        r.fail("the reconstruction loses the generator's u/v ramps",
+              f"the spliced generator varies across the frame (spread {spread}); the "
+              f"standalone stage is no longer grid-less and the premise needs re-deriving")
+    else:
+        r.ok("stage-by-stage reconstruction runs but splices a constant generator where "
+             "the fused cook has the u/v ramps")
 
 
 def test_trk9_unanchored_dag_stage_is_refused_at_validation(r: SubTestResult):
