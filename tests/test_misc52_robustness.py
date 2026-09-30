@@ -111,8 +111,8 @@ def test_touched_selection_reads_from_package_import_module(r: SubTestResult):
 def test_msvc_env_dump_upcases_names(r: SubTestResult):
     print("\n--- compiled: MSVC env dump keys are upper-cased ---")
     from TEX_Wrangle.tex_runtime import compiled
-    env = compiled._parse_env_dump("Path=C:\cl\nINCLUDE=I\nweird=a=b\nnoequals\n")
-    if env.get("PATH") == "C:\cl" and env.get("INCLUDE") == "I" and env.get("WEIRD") == "a=b":
+    env = compiled._parse_env_dump("Path=C:\\cl\nINCLUDE=I\nweird=a=b\nnoequals\n")
+    if env.get("PATH") == "C:\\cl" and env.get("INCLUDE") == "I" and env.get("WEIRD") == "a=b":
         r.ok("Path -> PATH")
     else:
         r.fail("env parse", repr(env))
