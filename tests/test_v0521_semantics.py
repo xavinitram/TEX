@@ -117,3 +117,56 @@ def test_ingest_squeezes_only_a_single_channel_image():
     i4 = torch.ones(1, 2, 2, 1, dtype=torch.int64)
     out = to_fp32_if_int_image(i4)
     assert out.dtype is torch.float32 and tuple(out.shape) == (1, 2, 2)
+
+
+# ── The default-tier stencil route runs at the cook's precision ─────────────────────────
+
+_BOX = ("vec3 acc = vec3(0.0); float cnt = 0.0;"
+        "for (int dy = -2; dy <= 2; dy = dy + 1) { for (int dx = -2; dx <= 2; dx = dx + 1) {"
+        "acc = acc + fetch(@A, ix + dx, iy + dy).rgb; cnt = cnt + 1.0; } }"
+        "@OUT = vec4(acc / cnt, 1.0);")
+
+
+def _stencil_cook(precision, device, monkeypatch):
+    from TEX_Wrangle import tex_engine
+    seen = []
+    real = tex_engine._codegen_only_execute
+
+    def spy(*a, **kw):
+        seen.append(kw.get("precision", "fp32"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(tex_engine, "_codegen_only_execute", spy)
+    g = torch.Generator().manual_seed(112)
+    img = torch.rand(1, 40, 48, 3, generator=g).to(device)
+    tier_trace.reset()
+    res = tex_engine.cook(_BOX, {"A": img}, device_mode=device,
+                          compile_mode="none", precision=precision)
+    rec = tier_trace.last()
+    assert rec is not None and rec.tier == "codegen", "the stencil route did not serve"
+    return res.outputs["OUT"], seen
+
+
+@pytest.mark.parametrize("precision", ["fp32", "fp16"])
+def test_stencil_route_gets_the_cook_precision(precision, monkeypatch):
+    _out, seen = _stencil_cook(precision, "cpu", monkeypatch)
+    assert seen == [precision], f"stencil route ran at {seen}, the cook at {precision}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fp16_stencil_route_parity_on_cuda(monkeypatch):
+    """The fp16 stencil route on the GPU agrees with the interpreter's fp16 cook within the
+    8-bit quantum (the fp16 contract), and with the fp32 cook within fp16's own rounding."""
+    from TEX_Wrangle import tex_engine
+    got, seen = _stencil_cook("fp16", "cuda", monkeypatch)
+    assert seen == ["fp16"]
+    g = torch.Generator().manual_seed(112)
+    img = torch.rand(1, 40, 48, 3, generator=g).cuda()
+    prep = tex_engine.prepare(_BOX, {"A": img}, device_mode="cuda",
+                              compile_mode="none", precision="fp16")
+    ref16 = Interpreter().execute(prep.ctx.program, dict(prep.ctx.bindings), prep.ctx.type_map,
+                                  device="cuda", output_names=["OUT"], precision="fp16")["OUT"]
+    ref32, _ = _stencil_cook("fp32", "cuda", monkeypatch)
+    assert torch.isfinite(got).all()
+    assert (got.float() - ref16.float()).abs().max().item() < 1.0 / 255.0
+    assert (got.float() - ref32.float()).abs().max().item() < 1e-3

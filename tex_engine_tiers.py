@@ -313,29 +313,18 @@ def _run_default(ctx):
     # guard covers env-build edge cases so this can never hard-fail the node.
     #
     # FIX-TIER T3 (R4#3): this is the ONE call site for "does this default-tier cook use
-    # the UC-2 stencil route" — scale-active or not. Before this fix `_run_tier` carried a
-    # SECOND, independently-maintained copy of this exact decision (same
-    # `_should_stencil_route` + `_codegen_only_execute` pair) reached only when
-    # `ctx.scale is not None`, unwrapped in any try/except of its own. `ctx.scale` is
-    # `None` on every ordinary ComfyUI cook, so `scale=ctx.scale` below is a no-op there
-    # (`_codegen_only_execute`'s own default), and `precision` is passed only when scale
-    # is active — matching the two call sites' PRE-EXISTING behavior exactly (the
-    # scale=None route has never pinned a precision here, relying on
-    # `_codegen_only_execute`'s own `"fp32"` default; only the scale-active route ever
-    # passed `ctx.eff_precision`), so merging them changes no byte on either path.
+    # the UC-2 stencil route", scale-active or not. It runs at the cook's precision, as the
+    # tiling and interpreter paths below do (an fp32 cook passes the default unchanged).
     if not ctx.fused_chain:
         try:
             if _tex_engine._should_stencil_route(ctx.fp, ctx.program):
-                _cg_kwargs = dict(
+                return _tex_engine._codegen_only_execute(
+                    ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                     latent_channel_count=ctx.latent_channel_count,
                     output_names=ctx.output_names,
                     used_builtins=ctx.used_builtins, fingerprint=ctx.fp,
-                    time_context=ctx.time_context,
+                    time_context=ctx.time_context, precision=ctx.eff_precision,
                     cancel=ctx.cancel, scale=ctx.scale)  # CANCEL-44 (Gap 2): had no yield point
-                if ctx.scale is not None:
-                    _cg_kwargs["precision"] = ctx.eff_precision
-                return _tex_engine._codegen_only_execute(
-                    ctx.program, ctx.bindings, ctx.type_map, ctx.device, **_cg_kwargs)
         except _tex_engine.CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to interp
         except Exception as _stencil_exc:
