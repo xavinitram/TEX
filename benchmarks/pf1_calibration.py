@@ -7,15 +7,11 @@ encoded in four hardcoded constants (graphed.py: _GRAPH_MIN_OPS / _GRAPH_HIGH_OP
 _GRAPH_BASE_PX_CEIL / _GRAPH_HIGH_PX_CEIL). This script re-measures the 4-corner matrix
 (low/high op-count x low/high resolution) on THIS box and REPORTS whether the gate's
 win/lose prediction still matches measured reality — a drift canary for a torch/driver
-bump. **The constants stay the contract**: the script reports (and, under opt-in
-TEX_PF1_AUTOCAL=1, writes SUGGESTED capped overrides to results/pf1_autocal.json for a
-human to apply) — it never silently changes the gate.
+bump. **The constants stay the contract**: the script only reports the fit; it never
+changes the gate, and four corners at two resolutions cannot place a threshold anyway.
 
     python benchmarks/pf1_calibration.py            # report fit (CUDA-only)
-    TEX_PF1_AUTOCAL=1 python benchmarks/pf1_calibration.py   # + write suggested overrides
 """
-import json
-import os
 import statistics
 import sys
 import time
@@ -35,8 +31,6 @@ from TEX_Wrangle.tex_runtime import graphed as G
 _LOW = "@OUT = vec4(sin(@A.rgb) * 0.5 + 0.5, 1.0);"
 _HIGH = "vec3 c = @A.rgb;" + "".join(f"c = c * 1.01 + sin(c) * 0.001;" for _ in range(20)) + \
         "@OUT = vec4(c, 1.0);"
-_CAP_PX = (256 * 256, 2048 * 2048)   # autocal clamp on resolution ceilings
-_CAP_OPS = (2, 64)                   # autocal clamp on op thresholds
 
 
 def _compile(code):
@@ -108,18 +102,6 @@ def main():
           + ("" if not drift else f"  (DRIFT at: {[r['corner'] for r in drift]})"))
     print("Constants stay the contract; a DRIFT is a signal to re-measure + decide, "
           "not an auto-change.")
-    if os.environ.get("TEX_PF1_AUTOCAL") == "1":
-        # suggest capped overrides for a human to apply (never auto-applied)
-        sug = {"note": "SUGGESTED only — apply by hand; constants are the contract",
-               "_GRAPH_BASE_PX_CEIL": max(_CAP_PX[0], min(_CAP_PX[1], G._GRAPH_BASE_PX_CEIL)),
-               "_GRAPH_HIGH_PX_CEIL": max(_CAP_PX[0], min(_CAP_PX[1], G._GRAPH_HIGH_PX_CEIL)),
-               "_GRAPH_MIN_OPS": max(_CAP_OPS[0], min(_CAP_OPS[1], G._GRAPH_MIN_OPS)),
-               "_GRAPH_HIGH_OPS": max(_CAP_OPS[0], min(_CAP_OPS[1], G._GRAPH_HIGH_OPS)),
-               "corners": rows}
-        p = _b / "results" / "pf1_autocal.json"
-        p.parent.mkdir(exist_ok=True)
-        p.write_text(json.dumps(sug, indent=2), encoding="utf-8")
-        print(f"TEX_PF1_AUTOCAL: wrote suggested (capped) overrides to {p}")
 
 
 if __name__ == "__main__":

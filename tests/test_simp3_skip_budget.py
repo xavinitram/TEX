@@ -270,7 +270,13 @@ _SKIP_VOCAB = re.compile(
 #: box has no CUDA device -- the same named environment every CUDA-only row in this pin
 #: already needs; both run for real on the box this ask's own GPU readings were taken on
 #: (CUDA present there).
-_SKIP_BUDGET = 135
+#: Re-pinned from 135 to 137: honest named skips instead of silent passes. Two rows used to
+#: report a pass having measured nothing. `test_v020_phase1.py::test_g2_verify_arming` printed
+#: an `r.ok` note when the compile route is gated out on the box (no toolchain), so the arming
+#: path was never reached; `test_v028_phase1.py::test_data4_session_soak` reported a
+#: flat RSS of +0.0 MB when psutil is missing (CI installs only torch and pytest). Each now
+#: says `r.skip(...)` for that environment, which is what these two sites are counted for.
+_SKIP_BUDGET = 137
 
 
 def _literal(node) -> str:

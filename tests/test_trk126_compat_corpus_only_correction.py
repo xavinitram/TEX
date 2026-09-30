@@ -186,3 +186,79 @@ def test_trk126_plain_freeze_without_only_is_still_append_only(r):
     finally:
         compat_corpus._ARCHIVE, compat_corpus.compute_all = real_archive, real_compute
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_fu2pol_add_appends_new_rows_and_never_touches_an_existing_one(r):
+    """`add=` is `only=`'s append-only counterpart: new rows join a frozen version, every
+    existing row is carried over byte-for-byte, and it refuses to re-mint a frozen row,
+    to create a version, or to be combined with `only=`."""
+    tmp = _isolated_archive()
+    real_archive, real_compute, real_selected = (
+        compat_corpus._ARCHIVE, compat_corpus.compute_all, compat_corpus._compute_selected)
+    try:
+        compat_corpus._ARCHIVE = tmp
+        compat_corpus._compute_selected = lambda names: {n: f"NEW-{n}" for n in names}
+
+        try:
+            compat_corpus.freeze("0.99", add={"q0"})
+            r.fail("FU2-POL add= needs a version", "add= created a version that was never frozen")
+            return
+        except FileNotFoundError:
+            pass
+        assert not os.path.exists(os.path.join(tmp, "0.99.json"))
+
+        compat_corpus.compute_all = lambda: {f"p{i}": f"h{i}" for i in range(5)}
+        compat_corpus.freeze("0.99")
+        before = _read_json(os.path.join(tmp, "0.99.json"))
+
+        for bad, exc in (({"p2"}, KeyError), ({"q0", "p2"}, KeyError)):
+            try:
+                compat_corpus.freeze("0.99", add=bad)
+                r.fail("FU2-POL add= refuses a frozen row", f"add={sorted(bad)} SUCCEEDED")
+                return
+            except exc:
+                pass
+        try:
+            compat_corpus.freeze("0.99", add={"q0"}, only={"p1"})
+            r.fail("FU2-POL add= excludes only=", "add= with only= SUCCEEDED")
+            return
+        except ValueError:
+            pass
+        assert _read_json(os.path.join(tmp, "0.99.json")) == before, \
+            "a refused add= must not have written anything"
+
+        data = compat_corpus.freeze("0.99", add={"q0", "q1"})
+        assert data["hashes"]["q0"] == "NEW-q0" and data["hashes"]["q1"] == "NEW-q1"
+        for name, h in before["hashes"].items():
+            assert data["hashes"][name] == h, f"{name} moved but add= may only append"
+        assert len(data["hashes"]) == len(before["hashes"]) + 2
+        assert _read_json(os.path.join(tmp, "0.99.json")) == data
+        r.ok("FU2-POL: add= appends new rows, carries every frozen row over unchanged, and "
+             "refuses a frozen row, a missing version, and add= together with only=")
+    except Exception as e:
+        r.fail("FU2-POL add= append-only", f"{type(e).__name__}: {e}")
+    finally:
+        (compat_corpus._ARCHIVE, compat_corpus.compute_all,
+         compat_corpus._compute_selected) = real_archive, real_compute, real_selected
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_fu2pol_per_pixel_rows_read_a_wire_and_are_frozen_in_the_newest_version(r):
+    """Every `adv_px_*` row reads an `@` wire (so it cooks at B=2,H=16,W=16 rather than 1x1,
+    where u = v = 0) and has a hash in the newest archived version."""
+    try:
+        px = {n: src for n, src in compat_corpus._ADVERSARIAL.items() if n.startswith("adv_px_")}
+        assert len(px) == 13, sorted(px)
+        base = {n[len("adv_px_"):] for n in px}
+        have = {n[len("adv_"):] for n in compat_corpus._ADVERSARIAL if n.startswith("adv_")
+                and not n.startswith(("adv_px_", "adv025_"))}
+        assert base == have, f"each base adv_* row has one per-pixel twin: {sorted(base ^ have)}"
+        blind = sorted(n for n, src in px.items() if "@A" not in src)
+        assert not blind, f"rows that read no @ wire cook at 1x1: {blind}"
+        newest = compat_corpus.load_goldens()["hashes"]
+        unfrozen = sorted(set(px) - set(newest))
+        assert not unfrozen, f"adv_px rows missing from the newest archived version: {unfrozen}"
+        r.ok("FU2-POL: 13 per-pixel twins of the adv_* rows read @A and are frozen at "
+             f"{compat_corpus.archived_versions()[-1]}")
+    except Exception as e:
+        r.fail("FU2-POL per-pixel corpus rows", f"{type(e).__name__}: {e}")
