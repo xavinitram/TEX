@@ -25,6 +25,7 @@ import time
 import types
 import torch
 
+from .dynamo_gate import dynamo_job
 from . import tier_trace as _tier_trace   # a leaf (collections/threading only): no import cycle
 
 
@@ -762,7 +763,12 @@ def _compile_noise(fn):
     `fbm_fn` code, so they all shared one budget of 8 and the next new signature raised."""
     own = types.FunctionType(fn.__code__.replace(), fn.__globals__, fn.__name__,
                              fn.__defaults__, fn.__closure__)
-    return torch.compile(own, backend=_NOISE_COMPILE_BACKEND, fullgraph=True, dynamic=True)
+    compiled = torch.compile(own, backend=_NOISE_COMPILE_BACKEND, fullgraph=True, dynamic=True)
+
+    def run(*args):
+        with dynamo_job():   # TEX skips any Dynamo reset while this runs (dynamo_gate)
+            return compiled(*args)
+    return run
 
 
 def _warm_coords(device):

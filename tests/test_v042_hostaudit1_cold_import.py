@@ -87,9 +87,12 @@ from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV he
 # 57 -> 58: `compiled.py` reached its 2000-line budget again; the dynamo precompile-scoping
 # helpers moved into their own eagerly-imported leaf module (`compiled_precompile.py`),
 # imported at `compiled.py` module scope. +1 for this one new module, nothing else moved.
+#
+# 58 -> 59: `dynamo_gate.py`, the leaf every Dynamo reset and every pool job goes through
+# (a reset under a running compile kills the process). +1 for this one new module.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 58
+_TEX_ENGINE_TEX_MODULES_MAX = 59
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

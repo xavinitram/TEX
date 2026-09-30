@@ -53,6 +53,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .tex_runtime.dynamo_gate import reset_if_idle
+
 logger = logging.getLogger("TEX")
 
 # ROUTE-45: `tex_engine` is reached through a lazy proxy, NOT a direct `from .tex_chain import
@@ -103,7 +105,7 @@ def _interp_fallback(ctx, *, reset_dynamo: bool, pass_precision: bool):
                                             # back into a stale cook
     if reset_dynamo:
         try:
-            torch._dynamo.reset()
+            reset_if_idle()
         except Exception:
             pass
     interp = _tex_engine._get_interpreter()

@@ -33,6 +33,7 @@ import time as _time
 import torch
 
 from .compiled_exec_support import _contiguous_bindings, _is_transient_failure, _timed
+from .dynamo_gate import reset_if_idle
 from .host import _cancel_check  # SCHED-3 seam
 
 # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation of a freshly-promoted
@@ -184,7 +185,7 @@ def _await_trial(cache_key, cancel=None):
             from .compiled import _compiled_cache
             _compiled_cache.pop(cache_key, None)
             try:
-                torch._dynamo.reset()
+                reset_if_idle()
             except Exception:
                 pass
             return "failed", None

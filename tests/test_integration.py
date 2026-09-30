@@ -1,6 +1,7 @@
 """Integration tests — examples, cache, device, inference, batching, latent, matrices."""
 from helpers import *
 from TEX_Wrangle.tex_cache import parse_and_split
+from TEX_Wrangle.tex_runtime.dynamo_gate import reset_if_idle
 
 
 def _scratch_dir():
@@ -453,10 +454,7 @@ def test_example_files_compiled(r: SubTestResult):
 
     # Clear compiled cache and dynamo state to start clean
     clear_compiled_cache()
-    try:
-        torch._dynamo.reset()
-    except Exception:
-        pass
+    reset_if_idle()
 
     # ONE worker for every program: a fresh pool per program started a thread per program,
     # and each thread that runs a parallel CPU op keeps a torch thread team alive after it
@@ -540,11 +538,10 @@ def test_example_files_compiled(r: SubTestResult):
         finally:
             # Release compiled kernels and dynamo state between programs
             # to prevent memory accumulation (~25 MB per compiled program).
+            # After a timeout the abandoned compile is still running, and resetting
+            # Dynamo under it kills the process in native code: reset only when idle.
             gc.collect()
-            try:
-                torch._dynamo.reset()
-            except Exception:
-                pass
+            reset_if_idle()
 
     pool.shutdown(wait=True)
     example_failed = r.failed - start_failed

@@ -40,6 +40,7 @@ from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
                                       VecConstructor, MatConstructor, CastExpr,
                                       ForLoop, WhileLoop, IfElse, FunctionDef)
 from .codegen import _iter_child_nodes
+from .dynamo_gate import dynamo_job
 
 _OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
              VecConstructor, MatConstructor, CastExpr)
@@ -277,7 +278,9 @@ class _DaemonProbePool:
             fut, fn = self._q.get()
             if fut.set_running_or_notify_cancel():
                 try:
-                    fut.set_result(fn())
+                    with dynamo_job():
+                        result = fn()
+                    fut.set_result(result)
                 except BaseException as exc:   # propagate to the future, never crash the worker
                     fut.set_exception(exc)
             del fut, fn   # do not keep the finished job (and what it captured) alive while idle
@@ -311,7 +314,9 @@ class _CompilePool:
             fut, fn = self._q.get()
             if fut.set_running_or_notify_cancel():
                 try:
-                    fut.set_result(fn())
+                    with dynamo_job():
+                        result = fn()
+                    fut.set_result(result)
                 except BaseException as exc:   # propagate to the future, never crash the worker
                     fut.set_exception(exc)
             del fut, fn

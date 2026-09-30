@@ -46,6 +46,7 @@ from .pacing_heavy import program_has_any_heavy_stmt as _program_has_any_heavy_s
 # module imports `compiled.py` at its own module scope (see each one's docstring); each
 # reaches back to `compiled._backend_status` / `compiled._setup_msvc_env` — which stay HERE
 # — lazily, inside the one function that needs it.
+from .dynamo_gate import reset_if_idle
 from .compiled_capability import (_count_tensor_ops, _max_loop_depth, _select_backend,
                                   compile_capability, compile_capability_async,
                                   _reset_capability_cache_for_test,
@@ -783,15 +784,11 @@ def execute_compiled(
             # BackendCompilerFailed can also be program-specific — those (and
             # all other runtime failures) blacklist the fingerprint only.
             _blacklist_add(fingerprint)
-        # IMPORTANT: torch.compile / dynamo state is PROCESS-GLOBAL, not
-        # thread-local.  Resetting it on a *disposable worker thread* corrupts
-        # the calling thread's dynamo / code-cache state and garbles the
-        # interpreter fallback that runs immediately after — surfacing as bogus
-        # "Variable not defined" / "dictionary changed size during iteration"
-        # errors (or a segfault) on perfectly valid TEX code.  Reset on THIS
-        # (the calling) thread instead.
+        # Dynamo state is process-global: a reset while any other thread compiles or
+        # runs compiled code frees what that thread is using and kills the process in
+        # native code. `reset_if_idle` skips the reset while any pool job runs.
         try:
-            torch._dynamo.reset()
+            reset_if_idle()
         except Exception:
             pass
         # Fall back on the PRISTINE bindings, not contiguous_bindings: the
@@ -1114,7 +1111,7 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
         _note_failure(cache_key, _exc)
         _compiled_cache.pop(cache_key, None)
         try:
-            torch._dynamo.reset()
+            reset_if_idle()
         except Exception:
             pass
         return None, None
