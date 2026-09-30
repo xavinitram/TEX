@@ -1044,15 +1044,23 @@ def test_brief9_t5_uniform_output_param_query_never_recompiles_moves_lineage(r):
 
     Spies patch the same three choke points `test_v031_anim_contract.py` does
     (`TEXCache.compile_ast`, `compiled._try_codegen`, `graphed.GraphedProgram.capture`) so a
-    counter that could never move is not mistaken for a guarantee that holds."""
+    counter that could never move is not mistaken for a guarantee that holds.
+
+    The cook runs against a fresh, empty program cache in a temp dir: a program another run
+    left in the shared cache dir is a disk hit, and the cold cook would never compile."""
+    import shutil
+    import tempfile
     import torch
     from TEX_Wrangle import tex_engine
-    from TEX_Wrangle.tex_cache import TEXCache, get_cache
+    from TEX_Wrangle import tex_cache as _tex_cache
+    from TEX_Wrangle.tex_cache import TEXCache
+    tmp = tempfile.mkdtemp(prefix="brief9_t5_")
+    prev_cache = _tex_cache._cache_instance
     try:
         from TEX_Wrangle.tex_runtime import compiled as _C, graphed as _G
         A = torch.rand(1, 6, 8, 4)
         code = "@OUT = @A * 0.5 + vec4($dw_x, $dw_y, $dw_w, $dw_h);"
-        cache = get_cache()
+        cache = _tex_cache._cache_instance = TEXCache(cache_dir=pathlib.Path(tmp))
         counts = {"compiles": 0, "emissions": 0, "captures": 0}
         orig = (TEXCache.compile_ast, _C._try_codegen, _G.GraphedProgram.capture)
 
@@ -1103,6 +1111,9 @@ def test_brief9_t5_uniform_output_param_query_never_recompiles_moves_lineage(r):
              "the output's lineage key")
     except Exception as e:
         r.fail("BRIEF-9 T5 query sweep", f"{type(e).__name__}: {e}")
+    finally:
+        _tex_cache._cache_instance = prev_cache
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_brief9_t6_uniform_output_fp32_exact_at_3841(r):
