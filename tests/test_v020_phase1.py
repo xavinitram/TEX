@@ -345,7 +345,7 @@ def test_g2_verify_arming(r: SubTestResult):
                     "codegen-eager entry (backend None) must NOT arm verification"
                 r.ok("codegen-eager entry did not arm verification (nothing to churn)")
         else:
-            r.ok("[note] compile route gated out on this box — arming path not reachable")
+            r.skip("G-2 verify arming", "compile route gated out on this box")
         C.clear_compiled_cache()
     except Exception as e:
         r.fail("G-2 verify arming", f"{type(e).__name__}: {e}")

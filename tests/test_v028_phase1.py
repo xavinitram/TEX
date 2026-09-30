@@ -376,9 +376,12 @@ def test_data4_session_soak(r: SubTestResult):
         batch(40, "cpu")
         s.reset()
     gc.collect()
-    rss_grow = (proc.memory_info().rss / (1 << 20) - rss0) if proc else 0.0
-    r.ok(f"soak: RSS flat over ~230 cooks + 5 resets (+{rss_grow:.1f} MB)") if rss_grow < 60.0 \
-        else r.fail("DATA-4 soak-rss", f"RSS grew {rss_grow:.1f} MB")
+    if proc is None:
+        r.skip("soak RSS", "psutil not installed")
+    else:
+        rss_grow = proc.memory_info().rss / (1 << 20) - rss0
+        r.ok(f"soak: RSS flat over ~230 cooks + 5 resets (+{rss_grow:.1f} MB)") if rss_grow < 60.0 \
+            else r.fail("DATA-4 soak-rss", f"RSS grew {rss_grow:.1f} MB")
     if _CUDA:
         torch.cuda.empty_cache(); batch(20, "cuda"); torch.cuda.synchronize()
         v0 = torch.cuda.memory_allocated() / (1 << 20)
