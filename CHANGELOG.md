@@ -5,7 +5,377 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] - 2026-09-30 — "As written"
+
+A minor release, and the first published one since `0.50.1`. **`0.51.0` was never published on
+its own: every change in the `[0.51.0]` section below ships in `0.52.0`**, so a user upgrading
+from `0.50.1` should read that section too. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no name is
+newly reserved and no node default moved.
+
+This release is a correctness release. A whole-codebase review raised 1164 findings; 1003 are
+fixed here, 93 were already fixed, 38 were duplicates, not bugs, or declined with a reason, and 30
+are deferred (listed under "Known issues"). Many of the fixes make a program do what its text
+says where it used to crash, fall back silently or compute something else, so **results change
+for existing programs**. That list comes first and is meant to be complete. The full test tier at the release's parent reads 2927 passed on the
+CPU-only shape and 2926 passed, 1 skipped with CUDA and ComfyUI present.
+
+### Results change for existing programs
+
+**Values and output shapes**
+
+- **A scalar assigned to a multi-channel swizzle broadcasts.** `c.rgb = 0.5` or
+  `c.rgb = <scalar field>` fills every named channel on both tiers. It used to raise on a
+  non-square frame and write column slices on a square one.
+- **Vectors widen at declaration, assignment, return and user-function argument** (and in an
+  array-literal element). A scalar broadcasts; a narrower vector gets 0 in a missing channel and
+  alpha 1 when widened to `vec4`. `vec3 c = 0.5;` is a vec3 (it stayed a scalar at run time).
+  `vec4 c = @A.rgb; @OUT = c;` now gives a 4-channel output with alpha 1 (it gave 3 channels).
+  `vec3 f(..) { return luma(c); }` returns gray (it returned neighbouring pixels' luma).
+  `vec4 c = screen(@A.rgb, @B)` yields the vec3 result widened with alpha 1.
+- **`int / int` is typed float, as every tier divides.** `int c = n / 3;`, an int function
+  returning `a / 2` and `i /= 2` on an int now fail at check (E3200 / E3013) instead of holding a
+  fraction. `@OUT = a / b` over two ints infers a FLOAT (MASK) output, not INT. Write
+  `int(a / b)` for the floored quotient (`int()` floors); the diagnostic's hint says so.
+- **A fractional runtime index into a string array floors, on read and on write, on both
+  tiers.** It rounded half up, so `s[1.5]` read element 2. The index is clamped, and NaN reads
+  element 0.
+- **`pow(x, -1)` at `x == 0` is inf on both tiers.** An optimizer rewrite turned it into a
+  guarded division that gave about 1e8.
+- **Array arithmetic is a compile error.** `arr + 1.0`, `-arr`, `!arr`, `arr < 2.0` report E3401
+  and `float(arr)` E3700 with a hint to index first; they produced wrong-width results.
+- **A `for` step that does not count up under a `<` / `<=` bound runs the general loop.**
+  `for (int i = 0; i < 5; i = i - 1)` runs to its `break` (or reaches the iteration-cap error)
+  where it was an empty loop; `for (int i = 10; i < 5; i = i - 1)` runs no passes where it ran
+  five.
+- **A loop whose body writes its own counter** runs the number of passes C gives, on both tiers
+  (it ran the header's count).
+- **A general `while` / `for` that needs exactly 1024 passes runs** (it failed with the loop
+  limit).
+- **Names resolve lexically.** A declaration inside a block, loop or function no longer leaks
+  past its scope: `float g = 1; if (1.0) { float g = 5; } @OUT = vec4(g);` gives 1 (it gave 5).
+  A user function reads the value visible where it is defined, not a caller's shadow of that
+  name. Programs without shadowing are unchanged.
+- **A per-pixel `if` around a `for` whose header assigns an outer variable** keeps that
+  variable's old value on the pixels that did not take the branch.
+- **Scatter `*=` and `/=` apply every colliding writer's factor** (it was last-write-wins), and
+  `@T[x, y]++` / `--` count every writer like `+= 1` / `-= 1`. On a multi-channel target `++`
+  raises the same E6006 as `+= 1.0` instead of silently storing 1.
+- **`pow(x, 2)` and `pow(x, 3)` stay one call when `x` is expensive or impure.** The rewrite to
+  `x * x` ran `pow(gauss_blur(@A, 12.0), 2.0)`'s blur twice and `pow(f(x), 2.0)`'s user function,
+  scatter writes included, twice. Pure operands agree with the old result to 3e-8.
+- **Common-subexpression elimination** no longer merges duplicates across nested blocks, misses a
+  `for` header's writes, or breaks on a duplicate inside a binding's index or sample argument; the
+  programs affected were wrong or failed.
+- **Constant folding matches the fp32 runtime:** rounding, an inverted `clamp`, and `%` / `mod`
+  (no longer folded).
+- **`-0.0` written as a literal keeps its sign** on both tiers (visible through `atan2`, a
+  reciprocal or a sign test).
+- **Math builtins take a vector with a per-pixel scalar field** (`min`, `max`, `pow`, `mod`,
+  `atan2`, `hypot`, `spow`, `sdiv`, `step`, `clamp`, `smoothstep`, `fit`, `lerp`) and broadcast;
+  they raised a size mismatch. `sincos` of a uniform multiplied by a field runs. `length`,
+  `distance` and `normalize` no longer reduce over the width of a rank-3 scalar field.
+- **Text:** `str()` of a non-integer prints at most 6 significant digits (`0.1`, not
+  `0.10000000149011612`); `substr()` clamps a negative start or length to 0 (it counted from the
+  end); NaN and Inf format as `nan` / `inf` in `str`, `format`, casts and STRING outputs (they
+  raised); an INT output of NaN/Inf raises a clear error. **The codegen tier's string cast now
+  prints the interpreter's text** (`string(1.0 / 3.0)` was 18 characters on codegen and 8 on the
+  interpreter).
+- **`gauss_blur` and `bilateral_filter` blur a mask or scalar field.** They returned it
+  untouched.
+- **A NaN pixel coordinate reads pixel 0** in `fetch`, `@A[x, y]`, `sample_frame` and
+  `sample_time` (it raised or poisoned the context; NaN in a bilinear weight still propagates).
+- **`sample_mip` / `sample_mip_gauss` warp as written** when `u`/`v` match the identity only at
+  the corners (the probe now checks every texel); mixed-rank `u`/`v` broadcast; a NaN level of
+  detail reads level 0.
+- **`hash_int` without a usable `max`** folds the hash (it returned the constant 16777215).
+- **Colour:** `hsv2rgb` wraps a hue below -1/6, `rgb2hsv` is finite on gray under fp16, and
+  `dodge` / `burn` / `vivid_light` stay in range for blend values outside [0, 1]. In-range inputs
+  are bit-identical.
+- **`sdf_polygon`** takes a per-pixel radius (it raised); a non-finite side count is a diagnostic.
+- **`examples/pixelate.tex`:** blocks sit on the pixel grid (64 px at block 16 gave runs of
+  16, 16, 16, 15, 1; now four runs of 16).
+
+**Precision**
+
+- `precision="auto"` resolves fp32 for more programs: the fp16 gate now follows long taint
+  chains, swizzle and element stores, and loop-carried values (the safe direction).
+- `bilateral_filter` radius 41-96 accumulates in fp32 under fp16/bf16; fp32 is bit-identical.
+- Explicit fp16 only: `sdiv`, `spow`, `normalize`, the `log` family, `fit` and `smoothstep` use
+  an fp16-representable epsilon on both tiers (finite at 0/0 and `log(0)`); an in-place
+  `x = x OP e` promotes with an fp32 operand like the out-of-place form; `float()` of an fp16 value
+  converts to fp32 on codegen. fp32 is unchanged.
+- fp16/bf16 cooks on the codegen and compiled tiers build the coordinate builtins (`ix`, `iy`,
+  `u`, `v`, `iw`, `ih`, `px`, `py`, `fi`, `fn`) in fp32, as the interpreter does.
+
+**The codegen tier now gives the interpreter's answer** (default path) for: static `for` loops
+the optimizer does not unroll whose step does not divide the span or whose range is empty;
+general `for` loops with a fractional counter or literal bound; channel writes inside `if`/`else`
+to a variable that aliases another variable or an input; a sample through a variable a loop
+advances; a binding scatter-written and sampled in one loop; a user function whose local shadows
+a sampled outer variable; box, min/max, median and array-collect nests the stencil lowering could
+not compute exactly (including a float counter over a fractional runtime radius); a `for` header
+inside a masked `if` arm that assigns an outer local; a string assigned under a per-pixel `if`
+(the majority branch); `min`/`max` signed-zero ties; a hoisted fetch at batch > 1; the 65th
+nested user call (the call-depth error).
+
+**New compile-time errors** (each program ran with a wrong value or crashed at cook): a fractional
+builtin of ints stored in an int, and mismatched vector widths or argument kinds to the
+element-wise, colour, noise, SDF, compositing and `arr_*` builtins (E3200 / E5003);
+`float t = !<vector>`, `float x = float(<vector>)`; string, vector or matrix conditions (E3500);
+matrix ternary arms (E3400); float literals beyond 3.4028235e38 (E2000); arrays of matrices
+(E3101); non-literal `$param` defaults, a `$param` declared twice, with another type or inside a
+block (E3001 / E3200); a name used as both `@wire` and `$param` (E3202); writes to built-ins or to
+outer variables inside a function (E3204); `w.xy.x = 1`, `a[0].x = 1`, `(expr).x = 1` (E4000);
+`$p(u, v)` / `$p[x, y]` (E3201); non-numeric image-access arguments (E5003); array assignment
+across element types (E3101); a call after an untaken `if` that defined the function (E5001);
+deep nesting (E2000); `float a[] = {};` (E2004). `split(..)[i]` is typed string and
+`arr_sum(sort(<vec3 array>))` a vec3, so programs that relied on a FLOAT typing there get E3200.
+
+**Programs that failed and now run:** `.r` / `.x` on a uniform scalar (read is the scalar, write
+assigns it); `.5e3` (one float literal); a program file with a leading BOM; a variable named
+`out`, `in`, `var`, `case` and similar foreign keywords; `float a[0x4]`; a vec or mat local
+initialised from a scalar literal (it failed after optimization); a loop-defined user function;
+a noise call that hit the compile tier's recompile limit or a C++ build error (see
+"Long-running processes").
+
+**Diagnostics:** parse errors quote the token as written and a missing `;` `)` `}` `]` points
+just after the previous token; an `if`/`else` with one bad statement reports one error, not up
+to four; `W7001` (advisory) also fires for a variable that is only written or whose name an inner
+scope reuses.
+
+**Caches, keys and tiers** (no pixel changes unless stated)
+
+- **One-time re-cook and recompile after upgrading.** The compiled-program (`.pkl`) cache is
+  rebuilt once: its payload now carries the first check's binding sets, and its epoch lists cover
+  the type, fusion and stdlib-registry files. The codegen (`.cg`) cache re-emits once. Spilled
+  result frames are keyed by the full torch version tag and the cook pipeline's files, so frames
+  spilled by an earlier build are recooked once. ComfyUI re-executes cached TEX nodes once: the
+  `IS_CHANGED` key is an exact tensor fingerprint, so edits the old key could not see now
+  re-execute.
+- **`tex_results_keys.env_epoch(device=None)` follows the frame's device.** On a CUDA host a
+  CPU-device frame's lineage key and spill stamp no longer carry the GPU's identity, so a spill
+  written before this is a one-time miss.
+- **Opt-in `"auto"` tier:** persisted verdicts carry the GPU name, so an existing `autotier.json`
+  is read as foreign and re-measured once; a convergence-bound rejection is no longer persisted; a
+  compile that finished during an idle pause is trialled instead of pinned to codegen; each cook
+  is served its own output (a trial's output could reach a later cook of another size); an
+  out-of-memory, dead-pool or cancelled trial is not remembered; a committed verdict whose
+  artifact was lost measures again.
+- An out-of-memory, loop-limit or missing-toolchain failure on a program's first compiled call no
+  longer records a permanent "does not compile" verdict; an out-of-memory graph capture no longer
+  blacklists its program for the session.
+- **Resolution scale:** programs that read `iw`, `ih`, `px` or `py` are refused at a scale other
+  than 1.0 unless marked `//!tex scale: safe` (as `ix`/`iy` programs already were); a scale-active
+  cook that runs out of memory raises instead of returning an unscaled picture.
+- A fused chain whose auto-fp16 result is non-finite is pinned to fp32 after the first frame (it
+  cooked twice every frame); a fused terminal can read-modify-write an external input that is not
+  on the chain (it failed).
+- `cook_stage_dag` with a result cache but fewer upstream keys than tensor bindings no longer
+  reads or writes boundaries.
+- `set_media_budget_mb(0)` and `MediaCache(budget_mb=0)` cache nothing (they were unbounded after
+  the first eviction); a
+  frame larger than the whole budget is refused.
+- **`tex_provider.declare_window` raises `ValueError` on unknown spacing** (a provider with no
+  rate and no `step=`) where it stepped one second; `step=` is a new keyword. A prefetch cancelled
+  while its read is in flight no longer installs its frame.
+- `tex_recovery.sweep_temps(directory, *, min_age_s=600.0)` spares temps younger than ten minutes
+  (a live writer may own one); `min_age_s <= 0` takes every temp.
+- Scheduler plans keep a node with an unmeasured candidate device on the greedy device, and the
+  hysteresis band is measured against the fresh plan.
+- The peak-memory estimate counts inferred-size arrays, so a memory-pressured cook may be planned
+  into strips sooner (pixels unchanged).
+- `POST /tex_wrangle/free_caches` answers 409 while ComfyUI reports a prompt running; its `ok` is
+  true only when all three steps succeed, and the reply adds `steps`.
+- With the debug NaN highlight on and a compiled or captured tier serving the cook,
+  `near_singularities` is `None` (was 0) and no partial cyan is painted; the debug payload's tier
+  reads `torch_compile` / `codegen` for cooks those tiers served (it read `interpreter`).
+- Noise promotion no longer advances the global torch RNG.
+- `ResultCache.patch_region` returns `None` for a window outside the frame (it raised or wrote in
+  the wrong place); `ResultCache.requalify` returns `False` for a non-tensor and keeps the preview.
+
+**I/O and tools**
+
+- **EXR:** a UINT sample at or above 2^31 reads as its unsigned value (it was negative). Files
+  with uninitialised rows, duplicate channel names, a wrong version byte, an inverted or oversized
+  data window or an over-long ZIP payload raise `EXRError` instead of returning garbage.
+- **LUT:** `.cube` / `.spi1d` files with a NaN, Inf or overflowing sample, a ragged spi1d row, a
+  repeated `LUT_3D_SIZE` or an over-long `DOMAIN` line raise `LutError` instead of loading a wrong
+  table; a file with a BOM loads.
+- A tool whose name has no ASCII letters is stored under a hashed file name (it was
+  `tool.textool`), so re-publishing one leaves the old file beside the new. A manifest whose
+  `tex_language` or `min_engine` has trailing `.0` components no longer warns as newer than the
+  equal version.
+- `tex run`: `--device` accepts only `cpu`, `cuda` and `auto`; a gray+alpha input loads as RGB;
+  an output name that is neither `.png` nor `.exr` prints a note (PNG data is written).
+- The `v` parameter hint is an alias of `v3` in parameter conversion.
+- **Editor:** system inputs (`precision`, `debug_nan_highlight`, the chain, preview, slot-map and
+  time inputs) no longer create sockets or parameter widgets; scatter, `+=` and `++` writers get
+  an output socket instead of an input; string and hex `$param` defaults reach the widget; wired
+  `$param`s are no longer taken for images after a reload; live lint uses the wired
+  MASK/INT/FLOAT/STRING types.
+
+### Fixed
+
+**Language and front end**
+
+- Under the language-0.25 masked control flow, a `return` or `break` taken by every pixel left the
+  live mask a Python bool that the next statement crashed on.
+- A call argument that raised left the call depth one level too deep; the depth is also reset per
+  cook.
+- Literal propagation turned a vec local initialised by a scalar into a bare float, so the
+  re-check after optimization rejected a program that checks as written. A hex array size parses.
+- Parser recovery resumes inside the block that failed; a finite float beyond fp32 in the
+  lazy-analysis memo key or the fold no longer raises `OverflowError`.
+
+**Codegen and interpreter parity**
+
+- A non-finite literal was emitted as a bare name (`inf`), so the cook raised `NameError` and ran
+  on the interpreter; function-body locals shared a prefix with user function names; a scalar-mode
+  loop left an enclosing local it only read converted to a Python float. Each fell back to the
+  interpreter; each now serves on codegen.
+- Array access by a literal or a static-loop counter resolves on the host instead of reading a
+  device value per access.
+- A ternary on a uniform condition runs only the taken arm, so a recursive base case such as
+  `n <= 1.0 ? 1.0 : n * f(n - 1.0)` no longer hits the call-depth guard and falls back.
+- Vector constructors broadcast a whole-image reduction of a vector, so `img_sum`, `img_mean`,
+  `img_min`, `img_max` and `img_median` on a 3-channel image run on codegen instead of falling
+  back.
+- The cancel-polling build has its own source name, so a traceback resolves against the right
+  lines.
+
+**Stdlib**
+
+- NaN range sigma in `bilateral_filter`, NaN/Inf `patch_dist` arguments, NaN/Inf noise octaves and
+  flow time, and a per-pixel string-array or matrix-array index give a diagnostic instead of a raw
+  error or an all-NaN image.
+
+**Cache and host**
+
+- The compile cache's memory LRUs take a lock, so a lookup racing an eviction cannot raise out of
+  a cook; a failing access-time touch on a read-only cache directory no longer discards a verified
+  disk hit; `clear_all` also removes the persisted warm state.
+- A late compile job can no longer clear the replacement pool's busy marker, which hid a second
+  stuck compile.
+- The precompile lock is skipped where the compiler's config patch is per-thread.
+- The out-of-memory ladder now also covers the fp32 re-cook.
+- Cook queue: shed ties evict the newest non-resumed job, a job with an already-failed input fails
+  through the waiting path, an orphaned submit is cancelled, and cancelling a job withdraws its
+  granted preemption.
+- Journal compaction keeps appends made during it; the disk total is reconciled under the lock.
+- The out-of-process prewarm child starts under the host's own package name. Under ComfyUI every
+  out-of-process prewarm used to fail and fall back to the in-process warm.
+- The pacing wait no longer recycles its own timing anchor; a frame handle whose event query
+  raises blocks on the fence instead of reporting ready.
+
+**I/O and security**
+
+- A negative EXR attribute size no longer spins the header parser, and a data window claiming more
+  pixels than the file holds is refused before any plane is allocated. EXR and 16-bit PNG writes
+  replace the destination atomically.
+- Tool store: an over-long name is cut with a hash, a Windows device name is prefixed, the
+  overwrite guard refuses to replace a file it could not read, and a path that is not a regular
+  file is refused before it is opened. One undecodable, deeply nested or vanished `.textool` no
+  longer aborts the tool palette; a lone surrogate in a snippet no longer fails every save.
+- The package routes that compile or validate (`chain_preflight`, `list_tools`) and `free_caches`
+  run off the event loop.
+- The doctor dialog escapes server-supplied text; the snippet tree treats `__proto__` as an
+  ordinary key.
+- The Inductor cache sweep leaves a sibling version directory alone while another install may
+  still be writing to it. `SECURITY.md` gains the route inventory and the Inductor cache tree.
+- The language server answers pull diagnostics and counts positions in UTF-16 code units.
+- The toolchain probe finds `PATH` whatever case the environment dump spells it, and the vcvarsall
+  search covers 64-bit Professional and Enterprise installs.
+
+**Editor**
+
+- Output wires survive an output-set change; a stale `[Fix]` action is refused; renaming a
+  snippet onto an existing name is refused instead of overwriting it; a composite subgraph node id
+  is no longer read as its parent's id; publishing a tool keeps string, colour, vector and boolean
+  defaults; `v4$` parameters get a vector widget.
+
+**Long-running processes**
+
+- **The noise tiers no longer fail a cook on the compiler's recompile limit.** Every promoted
+  noise function shared one code object and so one recompile budget, and each promotion's warm-up
+  spent two slots; after about four octave counts a new signature (a batch-size change late in a
+  session, for one) raised out of the cook. Each promotion now has its own code object, the
+  warm-up uses distinct tensors, and a compile-tier failure falls back per key (to the trace, or
+  to eager) when eager answers; an error eager also raises is the program's and still surfaces.
+- **An abandoned compile pool no longer blocks interpreter exit.** The compile and warm pools
+  joined every worker ever started at exit, including one abandoned while stuck, so a process
+  that had abandoned a pool could never exit. The pools are now single daemon workers whose exit
+  hook drains only the live pools, up to the stuck bound.
+- The product does not leak threads per cook: 200 cooks in one process keep the Python thread
+  count at 1-2 and the OS thread count flat. Test rows no longer leave per-thread CPU worker teams
+  behind, and a test session still alive 600 s after it ends dumps every thread's stack and exits.
+
+### Performance
+
+Measured on an Intel Core Ultra 9 275HX (CPU), before and after on the same box in the same
+session. None of these is a GPU figure.
+
+- `pow(gauss_blur(@A, 12.0), 2.0)` at 1024x1024 RGBA: 51.2 -> 42.8 ms median (one blur alone
+  24.5 ms), because the blur runs once.
+- In-place `x = x OP e` no longer evaluates the other operand twice when it cannot run in place:
+  an 8-step vec accumulate against a scalar-field expression at 1024x1024, about 88 -> 63 ms
+  median.
+- The optimizer's literal propagation, 60 literal locals: 9.5 -> 3.4 ms.
+- Codegen array access by a literal or static counter: device reads per cook 128 -> 0 on a
+  64-element fill-and-read at 64x64 (CPU time 4.72-5.18 -> 4.37-4.89 ms; the GPU gain is the
+  removed stream syncs, not measured).
+- `min(max(expr, 0.0), 1.0)` in a 12-pass loop at 1536x1536: 14.8 / 15.3 / 18.9 ->
+  14.3 / 13.5 / 15.5 ms (three interleaved runs).
+- Scheduler planning of a 12-node graph with the default providers: 97-112 -> 25-28 ms.
+- A non-contiguous frame export takes one copy: 1080p, 4.2 -> 2.6 ms median.
+- A second compile pool entering its precompile scope while the first compiles for 500 ms: 500.4
+  -> 0.0 ms median of 5.
+- `examples/host_demo.py`'s RGBA byte conversion at 512x512: 9.2 -> 0.77 ms, identical bytes.
+- The cold compiled cook of a blur chain runs 327 TEX Python frames (364 before the fix inside
+  this release; 317 at `0.51.0`).
+- Costs, stated: the exact `IS_CHANGED` fingerprint is 0.10 -> 0.12 ms at 1024x1024x3 and 1.3 ms
+  either way at 4x1920x1080x3; a vector constructor that broadcasts a reduced vector costs about
+  1 us more (1024x1024: 1350 -> 1356 us).
+
+### Known issues
+
+- **`torch_compile` on a deep chain of blurs can run for hours without finishing** (carried from
+  `0.51.0`; cause not found). Compile mode `"none"`, the default, is unaffected.
+- **Codegen's scalar-mode loops accumulate in double precision while the interpreter uses fp32.**
+  A long loop can leave the 1e-5 tier contract and even flip control flow: ten additions of 0.1
+  followed by a `<= 1.0` test run 10 passes on the interpreter and 11 on codegen. The fix rounds
+  every scalar-mode operation to the working dtype and costs the scalar path speed; it waits on
+  that decision.
+- **A host-supplied `[B,H,W,1]` scalar binding** in a scalar operation gives a rank-5 result, of a
+  different shape on each tier (and `vec3(@M)` raises on the interpreter). Normalising such bindings at ingest needs a ruling on the
+  shape. ComfyUI never sends that shape.
+- **Editor bundle:** 19 fixes to the bundled editor wait on a bundle rebuild: highlighting and
+  completion miss `vec2`, `return`, `const`, `frame`, `fps`, `time` and 54 registered functions,
+  `rand()` is offered but does not exist, `a` and `p` typed-binding prefixes are missing, hover
+  matches words inside bindings, diagnostic columns count code points where the editor counts
+  UTF-16 units, plus stale comments and dead code in the bundle sources.
+- **Items that need a CUDA measurement:** under explicit fp16 the stencil route ignores the
+  precision and computes in fp32; a runtime array index or scalar `if` on a static-range loop
+  variable reads back from the device every iteration; `sample_mip`'s identity probe reads back
+  once per call; a cross-device envelope row and the scatter determinism pin cook a single pixel,
+  so they cannot see reordering on a real grid.
+- **Two test rows can pass without running their check:** the compile-route arming row when the
+  route is gated out, and the soak memory row when `psutil` is missing (as in CI). Turning them
+  into skips needs the skip budget to move.
+- **The auto-calibration benchmark's "suggested overrides"** are the current constants clamped,
+  not derived from its measurements.
+- **Thirteen adversarial compatibility-corpus rows cook a 1x1 grid**, so their golden hashes pin
+  one pixel. Fixing them needs new append-only rows and a new language-version golden freeze.
+
+### Not in this release
+
+Moved to `v0.53.0`: a compiled-tier speedup on builtin chains (and `scale=` on the compiled tiers,
+which waits on it), and a `bilateral_filter` that holds the display-8 bar past radius 40,
+including past 96.
+
 ## [0.51.0] - 2026-09-28 — "What the artist sees"
+
+**Never published on its own:** `0.51.0` was cut but not pushed, and every change below ships in
+`0.52.0`.
 
 A minor release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
 name. **Two builtins' output changes for programs that were already using them past a threshold**
