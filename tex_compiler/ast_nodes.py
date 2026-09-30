@@ -399,7 +399,10 @@ def _field_names(cls) -> tuple:
 
 def iter_child_nodes(node):
     """Yield the direct AST children of `node` (descending into list fields)."""
-    for name in _field_names(type(node)):
+    cls = type(node)
+    # The cache is read inline and `_field_names` only fills a miss: a call per visited
+    # node would be one more Python frame per node on every walk.
+    for name in _CHILD_FIELDS.get(cls) or _field_names(cls):
         v = getattr(node, name)
         if isinstance(v, ASTNode):
             yield v
@@ -441,7 +444,7 @@ def _clone_node(node, memo: dict):
     cls = type(node)
     new = cls.__new__(cls)
     memo[id(node)] = new
-    for name in _field_names(cls):
+    for name in _CHILD_FIELDS.get(cls) or _field_names(cls):     # inline hit, as above
         v = getattr(node, name)
         vc = v.__class__
         if isinstance(v, ASTNode):
