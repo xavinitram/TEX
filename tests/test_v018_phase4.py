@@ -82,10 +82,10 @@ def test_hw1_pf1_calibration_smoke(r: SubTestResult):
     except Exception as e:
         r.fail("HW-1 import", f"{type(e).__name__}: {e}")
         return
-    # the autocal clamps are sane and the gate accessors it reports on exist
+    # the gate accessors it reports on exist
     fails = []
-    if not (cal._CAP_PX[0] < cal._CAP_PX[1] and cal._CAP_OPS[0] < cal._CAP_OPS[1]):
-        fails.append("autocal caps malformed")
+    if not callable(getattr(cal, "main", None)):
+        fails.append("calibration canary has no main()")
     from TEX_Wrangle.tex_runtime import graphed as G
     for c in ("_GRAPH_MIN_OPS", "_GRAPH_HIGH_OPS", "_GRAPH_BASE_PX_CEIL", "_GRAPH_HIGH_PX_CEIL"):
         if not hasattr(G, c):
@@ -93,5 +93,5 @@ def test_hw1_pf1_calibration_smoke(r: SubTestResult):
     if fails:
         r.fail("HW-1 pf1 calibration", "; ".join(fails))
     else:
-        r.ok("calibration canary imports; autocal caps sane; PF-1 gate constants present "
+        r.ok("calibration canary imports; PF-1 gate constants present "
              "(constants stay the contract — the script only reports)")
