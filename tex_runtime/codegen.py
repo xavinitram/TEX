@@ -46,6 +46,7 @@ from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
 from . import masked_flow as _masked_flow_mod
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
+                     _f32_round,  # seeded as `_F32`, `build()` below
                      _stage_codegen_param,  # TRK-236: seeded as `_THS`, `build()` below
                      _scale_pixel_arg,   # SCALE-CG-48: seeded as `_SCM`, `build()` below
                      _is_vec_param_list as is_vec_param_list,  # v0.51:
@@ -560,6 +561,13 @@ _SCALAR_MATH_2ARG: dict[str, str] = {
     "atan2": "atan2", "hypot": "hypot",
 }
 
+# Scalar-mode results that are already fp32 when their operands are: no `_F32` rounding.
+_SCALAR_EXACT_FNS: frozenset[str] = frozenset({
+    "floor", "ceil", "trunc", "abs", "sign", "max", "min", "step", "clamp", "round", "mod"})
+
+# Scalar-mode loops: the zero-divisor guard as the fp32 value the interpreter's guard holds.
+_F32_EPS_SRC = repr(_f32_round(SAFE_EPSILON))
+
 # The stdlib fns that `_emit_scalar_fn_call` can lower to pure Python/`_math` (so they are
 # safe inside a scalar-mode loop). A stdlib call NOT in this set falls through to the TENSOR
 # emission, which crashes on Python-scalar args (`spow(3.0, 0.5)` -> `_torch.abs(3.0)`) — the
@@ -986,9 +994,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         In scalar loop mode, returns a bare Python float literal instead.
         """
-        src = _num_src(value)
         if self._scalar_loop:
-            return src
+            # The fp32 value the interpreter's literal tensor holds, not the double.
+            return _num_src(_f32_round(float(value)))
+        src = _num_src(value)
         # Keyed by the spelling: -0.0 == 0.0 as a dict key, and a signed zero keeps its sign.
         cached = self._const_cache.get(src)
         if cached is not None:
@@ -1173,7 +1182,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         _register_codegen_linecache(filename, func_src)
         namespace = _codegen_exec_namespace(
             filename, {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel,
-                      "_SCM": _scale_pixel_arg, "_THS": _stage_codegen_param})
+                      "_SCM": _scale_pixel_arg, "_THS": _stage_codegen_param,
+                      "_F32": _f32_round})
         exec(code_obj, namespace)
         fn = namespace["_tex_fn"]
         # Stash the module code object + source for PC-3 marshal persistence.
@@ -3140,14 +3150,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if self._scalar_loop:
             op = node.op
             tmp = self._tmp()
+            # Arithmetic rounds to fp32 per op (`_F32`), as the interpreter's 0-dim fp32
+            # tensors do; the zero guard is the fp32 epsilon the interpreter's `where` holds.
             if op in _INFIX_OPS:
-                self._emit(f"{tmp} = ({left} {op} {right})")
+                self._emit(f"{tmp} = _F32({left} {op} {right})")
             elif op == "/":
-                self._emit(f"{tmp} = ({left} / ({right} if {right} != 0 else _SAFE_EPS))")
+                self._emit(f"{tmp} = _F32({left} / ({right} if {right} != 0 else {_F32_EPS_SRC}))")
             elif op == "%":
                 # Guard a zero divisor with a tiny epsilon (matching the '/' case
-                # and the interpreter), NOT 1.0 — which gave 0.5 % 0 -> 0.5.
-                self._emit(f"{tmp} = _math.fmod(float({left}), float({right}) if {right} != 0 else _SAFE_EPS)")
+                # and the interpreter), NOT 1.0 — which gave 0.5 % 0 -> 0.5. fmod is exact.
+                self._emit(f"{tmp} = _math.fmod(float({left}), float({right}) if {right} != 0 else {_F32_EPS_SRC})")
             elif op in _CMP_OPS:
                 py_op = _CMP_OPS[op]
                 self._emit(f"{tmp} = (1.0 if {left} {py_op} {right} else 0.0)")
@@ -3461,6 +3473,8 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         if self._scalar_loop:
             result = self._emit_scalar_fn_call(node, name, args, tmp)
             if result is not None:
+                if result == tmp and name not in _SCALAR_EXACT_FNS:
+                    self._emit(f"{tmp} = _F32({tmp})")  # math's double result -> fp32
                 return result
 
         # Dispatch table for specialized tensor-path handlers
@@ -3563,7 +3577,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 self._emit(f"{tmp} = 1.0 if float({args[1]}) >= float({args[0]}) else 0.0")
                 return tmp
             if name == "mod":
-                self._emit(f"{tmp} = _math.fmod(float({args[0]}), float({args[1]}) if float({args[1]}) != 0 else _SAFE_EPS)")
+                self._emit(f"{tmp} = _math.fmod(float({args[0]}), float({args[1]}) if float({args[1]}) != 0 else {_F32_EPS_SRC})")
                 return tmp
         elif len(args) == 3:
             if name == "lerp":
@@ -3578,8 +3592,10 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             if name == "smoothstep":
                 edge0, edge1, x = args
                 t = self._tmp()
-                self._emit(f"{t} = max(0.0, min(1.0, (float({x}) - float({edge0})) / (float({edge1}) - float({edge0}) + _SAFE_EPS)))")
-                self._emit(f"{tmp} = {t} * {t} * (3.0 - 2.0 * {t})")
+                # Each step rounded to fp32, in the interpreter's order (fn_smoothstep).
+                self._emit(f"{t} = max(0.0, min(1.0, _F32(_F32(float({x}) - float({edge0})) / "
+                           f"_F32(_F32(float({edge1}) - float({edge0})) + {_F32_EPS_SRC}))))")
+                self._emit(f"{tmp} = _F32({t} * {t}) * _F32(3.0 - 2.0 * {t})")
                 return tmp
         # Fall through to tensor path for unhandled scalar functions
         return None

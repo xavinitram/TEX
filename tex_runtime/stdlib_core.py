@@ -110,6 +110,23 @@ def _dtype_rounded(value, dtype):
         return None
 
 
+_F32_STRUCT = _struct.Struct("<f")
+
+
+def _f32_round(x, _pack=_F32_STRUCT.pack, _unpack=_F32_STRUCT.unpack):
+    """`x` rounded to fp32, as a Python float: the value a 0-dim fp32 tensor would hold.
+
+    Codegen's scalar-mode loop body runs on Python floats (doubles); it rounds every
+    arithmetic result through this, so its loop arithmetic is the interpreter's fp32
+    arithmetic. For + - * / and sqrt, a double result rounded once to fp32 IS the
+    correctly rounded fp32 result. A magnitude past fp32's range becomes a signed inf,
+    as the tensor would."""
+    try:
+        return _unpack(_pack(x))[0]
+    except OverflowError:
+        return math.copysign(math.inf, x)
+
+
 def _tag_host_scalar(t: torch.Tensor, value, dtype=None) -> torch.Tensor:
     """Record `value`'s host reading on a freshly minted 0-dim tensor; returns `t`.
 
