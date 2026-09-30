@@ -20,8 +20,9 @@ would be a value change. (The separate interp-vs-codegen row uses the repo's own
 contract instead: invariant #2's 1e-5, because the two tiers mint their constants differently.)
 
 BOTH DIRECTIONS. `test_perf2_a_host_scalar_costs_no_readback` counts every `Tensor.item()`
-the builtin makes, split by where the tensor lived, and requires ZERO from the device — it
-fails on the base sha, where each of those shapes reads one.
+the builtin makes, split by where the tensor lived, and requires ZERO from the device beyond
+the builtin's own pinned `_OTHER_DEVICE_READS` — it fails on the base sha, where each of
+those shapes reads one more.
 `test_perf2_a_computed_scalar_still_reads_back` requires the same probe to count a readback
 for a sigma computed in-program, so "no readback" cannot be passed by a builtin that stopped
 needing the number, or by a probe that stopped counting. And
@@ -59,6 +60,13 @@ _PROGRAMS = (
     # that clamp on a host-origin LOD.
     ("sample_mip",         "@OUT = sample_mip(@A, u, v, {s});", {}),
 )
+
+#: Device readbacks a builtin makes for a reason other than its host-resolved argument, which
+#: the zero-readback row allows and pins exactly (one more is the host argument read back).
+#: `sample_mip`: the identity-UV probe reads one reduction back to choose a plain resample
+#: over `grid_sample`. It predates PERF-2, when it was a `.tolist()` of four corners that this
+#: `.item()` counter could not see; the full-texel probe reads it with `.item()`.
+_OTHER_DEVICE_READS = {"sample_mip": 1}
 
 #: (label, the text substituted for `{s}`, the bindings it needs, has_host_value).
 #: `has_host_value` is False for exactly one row — a sigma computed on the device from a
@@ -303,9 +311,11 @@ def test_perf2_a_host_scalar_costs_no_readback(r: SubTestResult):
                 try:
                     with _count_readbacks_inside(fname) as probe:
                         run_tier(code, _bindings(extra, "cuda"), tier, device="cuda")
-                    if probe.device_reads:
+                    floor = _OTHER_DEVICE_READS.get(fname, 0)
+                    if probe.device_reads != floor:
                         r.fail("PERF-2 readback",
-                               f"{name}: {probe.device_reads} device readback(s)")
+                               f"{name}: {probe.device_reads} device readback(s), want "
+                               f"{floor} (see _OTHER_DEVICE_READS)")
                     else:
                         r.ok(name)
                 except Exception as e:
