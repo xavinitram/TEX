@@ -100,7 +100,7 @@ reason: **everything that matters is keyed on token value, not on AST shape.**
   the dot has already produced a `ChannelAccess`, which is not callable — and `@src.N[x,y]`
   parses as `ArrayIndexAccess` and dies in the TypeChecker. Both are unreachable as plane
   sugar under (b), and both fall out for free under (a).
-* `identity_binding_types` (`tex_marshalling.py:906`) and `TEXCache.fingerprint`
+* `identity_binding_types` (`tex_marshalling.py:912`) and `TEXCache.fingerprint`
   (`tex_cache.py:431`) hash `(name, type)` pairs. `("beauty.diffuse", "vec3")` is just another
   tuple; no identity machinery changes.
 
@@ -216,7 +216,7 @@ assigned binding `OUT.diffuse` on a `PLANES` output.
   both would make the output type depend on statement order, which is the class of bug phase 0
   spent its whole budget removing.
 * Egress grows the inverse repack into a `PlanesValue`, and `map_inferred_type`
-  (`tex_marshalling.py:917`) gains the PLANES arm.
+  (`tex_marshalling.py:923`) gains the PLANES arm.
 
 ---
 

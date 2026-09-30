@@ -16,11 +16,11 @@ that are not:
 `prepare()` builds `binding_types` by calling `infer_binding_type` on every value
 (`tex_engine.py:642`). At the time this was written, `infer_binding_type`'s own channel-count
 branch ended in a silent `return TEXType.FLOAT` catch-all; that branch is now
-`_spatial_channels_to_type` (`tex_marshalling.py:686`), whose out-of-range case is a
+`_spatial_channels_to_type` (`tex_marshalling.py:692`), whose out-of-range case is a
 DELIBERATE refusal (`raise ValueError`), not a silent FLOAT collapse — the specific premise
 below is historical, kept for the Promise-identity point it makes, not as a live claim about
 today's fallback. **The point stands regardless**: a value-less `Promise` still types via its
-own `declared_type` (`infer_binding_type`, `tex_marshalling.py:709`), not by inspecting pixels
+own `declared_type` (`infer_binding_type`, `tex_marshalling.py:715`), not by inspecting pixels
 that do not exist yet. A promise wired today does not fail; it mints a fingerprint for a
 program whose real value is still pending, and compiles something wrong if the promise's
 declared type disagrees with what eventually lands. Identity corruption, not an error.
