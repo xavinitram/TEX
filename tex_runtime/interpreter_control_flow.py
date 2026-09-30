@@ -271,6 +271,12 @@ class _ControlFlowMixin:
                                         dtype=dtype, device=device)
             # unbind(0) returns a tuple of 0-d tensors — no per-iteration allocation
             loop_values = loop_tensors.unbind(0)
+            if device.type != "cpu":
+                # Each counter carries its host reading, so an array index, a scalar `if`
+                # or a kernel radius built from it reads nothing back from the device.
+                from .stdlib import _tag_host_scalar
+                for val, hv in zip(loop_values, range(start, start + n * step, step)):
+                    _tag_host_scalar(val, hv, dtype)
             env = self.env
             inplace_discard = self._inplace_ready.discard
 

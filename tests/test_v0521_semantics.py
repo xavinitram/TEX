@@ -170,3 +170,38 @@ def test_fp16_stencil_route_parity_on_cuda(monkeypatch):
     assert torch.isfinite(got).all()
     assert (got.float() - ref16.float()).abs().max().item() < 1.0 / 255.0
     assert (got.float() - ref32.float()).abs().max().item() < 1e-3
+
+
+# ── A static-range loop counter reads back nothing on the device ───────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_loop_counter_carries_its_host_reading_on_cuda():
+    """An array index and a kernel radius built from the counter of a loop too long to
+    unroll read the counter's host value, not the device: no `.item()` per pass."""
+    code = ("float w[24]; for (int i = 0; i < 24; i++) { w[i] = i * 0.01; } vec3 s = vec3(0.0);"
+            "for (int i = 0; i < 24; i++) { s += @A.rgb * w[i]; }"
+            "for (int i = 1; i < 11; i++) { s += gauss_blur(@A, i).rgb * 0.01; }"
+            "@OUT = vec4(s, 1.0);")
+    g = torch.Generator().manual_seed(928)
+    img = torch.rand(1, 16, 16, 4, generator=g)
+    bt = {"A": infer_binding_type(img)}
+    program = parse_and_split(code, bt)
+    program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+    interp = Interpreter()
+    ref = interp.execute(program, {"A": img}, tm, device="cpu", output_names=["OUT"])["OUT"]
+    interp.execute(program, {"A": img.cuda()}, tm, device="cuda", output_names=["OUT"])
+    real, reads = torch.Tensor.item, []
+
+    def item(self):
+        if self.device.type != "cpu":
+            reads.append(tuple(self.shape))
+        return real(self)
+
+    torch.Tensor.item = item
+    try:
+        got = interp.execute(program, {"A": img.cuda()}, tm, device="cuda",
+                             output_names=["OUT"])["OUT"]
+    finally:
+        torch.Tensor.item = real
+    assert reads == [], f"{len(reads)} device reads in the cook"
+    assert torch.allclose(got.cpu(), ref, atol=1e-4)
