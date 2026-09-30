@@ -264,7 +264,7 @@ def test_brief10_unsigned_frame_is_a_silent_miss(r: SubTestResult):
         f = _frame()
         # A fully valid v2 record, written UNSIGNED — a HIT on the base tree, a miss on the fix.
         rec = {"t": f[0].clone(), "fmt": tex_results._FRAME_FORMAT, "device": "cpu",
-               "canvas": None, "epoch": tex_results.env_epoch(), "orig": None,
+               "canvas": None, "epoch": tex_results.env_epoch("cpu"), "orig": None,
                "viewed": None, "quality": None}
         with open(c._disk_path("legacy"), "wb") as fh:
             _pickle.dump(rec, fh, protocol=_pickle.HIGHEST_PROTOCOL)

@@ -350,7 +350,7 @@ def test_v0332_a5_a_future_frame_format_is_refused(r):
         c = tex_results.ResultCache(cache_dir=d)
         rec = {"t": torch.randint(-32768, 32767, (1, 16, 16, 4), dtype=torch.int16),
                "fmt": tex_results._FRAME_FORMAT + 1, "device": "cpu", "canvas": None,
-               "epoch": tex_results.env_epoch(), "orig": "float32", "viewed": "uint16"}
+               "epoch": tex_results.env_epoch("cpu"), "orig": "float32", "viewed": "uint16"}
         # SIGNED, so the MAC passes and the forward-compat fmt check is what refuses it (BRIEF-10
         # authenticates before the fmt decode; an unsigned future record would miss for the
         # wrong reason, hiding the fmt pin).
@@ -360,7 +360,7 @@ def test_v0332_a5_a_future_frame_format_is_refused(r):
     with tempfile.TemporaryDirectory() as d:
         c2 = tex_results.ResultCache(cache_dir=d)
         v0 = {"t": _frame(res=16), "device": "cpu", "canvas": None,
-              "epoch": tex_results.env_epoch()}
+              "epoch": tex_results.env_epoch("cpu")}
         tex_results._atomic_pickle(c2._disk_path("v0"), v0)      # SIGNED: reads (backward dir)
         back = c2.get("v0")
         # An UNSIGNED v0 is a silent miss — authentication precedes the fmt decode (BRIEF-10).

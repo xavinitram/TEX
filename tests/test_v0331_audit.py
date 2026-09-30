@@ -294,7 +294,7 @@ def test_v0331_a4_frame_records_carry_a_format_version(r):
         # restore — BRIEF-10's authentication gate is in front of the fmt decode, so the
         # backward-decodable direction is unchanged for an authentic file.
         v0 = {"t": f[0].clone(), "device": "cpu", "canvas": None,
-              "epoch": tex_results.env_epoch()}
+              "epoch": tex_results.env_epoch("cpu")}
         tex_results._atomic_pickle(c._disk_path("legacy"), v0)
         with c._lock:
             c._spilled = None
