@@ -1272,7 +1272,7 @@ function showDOMErrorBanner(node, errMsg) {
                 fixLink.addEventListener("click", ((sug, diag) => (e) => {
                     e.stopPropagation();
                     if (!diag.source_line || !diag.col) return;
-                    const wrongStart = diag.col - 1;
+                    const wrongStart = [...diag.source_line].slice(0, diag.col - 1).join("").length;  // code points -> UTF-16
                     let wrongEnd = wrongStart;
                     while (wrongEnd < diag.source_line.length && /[\w]/.test(diag.source_line[wrongEnd])) wrongEnd++;
                     const wrongText = diag.source_line.substring(wrongStart, wrongEnd);
