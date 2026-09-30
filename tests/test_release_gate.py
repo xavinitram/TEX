@@ -69,15 +69,15 @@ def _emit_under_seed(seed: str, script_path: str) -> str:
 def test_codegen_determinism(r: SubTestResult):
     print("\n--- TST-8: codegen-emission determinism (PYTHONHASHSEED) ---")
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
-                                         encoding="utf-8") as tf:
-            tf.write(_PROBE)
-            script = tf.name
-        try:
+        # A private directory, not the shared temp dir: the script's directory is first on
+        # the child's sys.path, so any stray `<stdlib name>.py` left in the temp dir would
+        # shadow the standard library there (it has: `enum.py`, then `grp.py`).
+        with tempfile.TemporaryDirectory(prefix="tst8_probe_") as probe_dir:
+            script = os.path.join(probe_dir, "probe.py")
+            with open(script, "w", encoding="utf-8") as tf:
+                tf.write(_PROBE)
             src0 = _emit_under_seed("0", script)
             src1 = _emit_under_seed("1", script)
-        finally:
-            os.unlink(script)
         assert src0 and src0 != "NONE", f"probe produced no source: {src0!r}"
         assert src0 == src1, ("codegen emission is NOT hash-seed-stable — a set/dict "
                               "is iterated without sorted(). First diff:\n"
