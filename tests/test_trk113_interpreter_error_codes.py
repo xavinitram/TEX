@@ -107,6 +107,16 @@ def test_trk113_e6004_channel_assign_target_not_a_variable_or_binding(r: SubTest
         r.fail("a channel write whose target is a function call", "no error raised")
 
 
+def test_trk113_e6004_channel_write_past_the_value_width(r: SubTestResult):
+    """`.a = value` on a binding declared vec4 but handed a 3-channel tensor: the checker
+    passes it (the declared type has an alpha), so the interpreter's width check is what
+    refuses the write."""
+    def go():
+        _run("float m = @A.r; @A.a = m; @OUT = @A;",
+             {"A": TEXType.VEC4}, {"A": torch.rand(1, 4, 4, 3)})
+    _expect_code(r, "E6004", "a channel write past the value's channel count", go)
+
+
 def test_trk113_e6005_array_index_assign_target_not_a_variable_or_binding(r: SubTestResult):
     """`[0] = value` on a call result: an array-index assignment whose base is neither a
     variable nor an `@binding` — `sort()` returns an array, but not a named one."""
