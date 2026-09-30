@@ -90,6 +90,17 @@ def _align_field_rank(*ts):
 #     missing tag is slower, never wrong.
 _HOST_SCALAR_ATTR = "_tex_host_scalar"
 
+# Set on the `u`/`v` builtins when they are the untouched pixel ramp over the full image
+# (no ROI or strip offset), so a sampler can skip proving it with a device readback.
+_IDENTITY_RAMP_ATTR = "_tex_identity_ramp"
+
+
+def _mark_identity_ramp(t: torch.Tensor, full_extent: bool) -> torch.Tensor:
+    """`t`, marked as the identity ramp when its window is the whole image."""
+    if full_extent:
+        setattr(t, _IDENTITY_RAMP_ATTR, True)
+    return t
+
 
 def _dtype_rounded(value, dtype):
     """`value` as the Python double a 0-dim `dtype` tensor holding it would yield from
@@ -1412,7 +1423,10 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     # read). A corner probe is not enough -- a warp that fixes the corners is still a warp.
     # One max-abs reduction and ONE GPU->CPU sync (this runs inside sampling loops).
     identity_uv = False
-    if u.dim() == 3 and u.shape == (B, H, W) and H > 1 and W > 1:
+    if (u.dim() == 3 and u.shape == (B, H, W) and getattr(u, _IDENTITY_RAMP_ATTR, False)
+            and getattr(v, _IDENTITY_RAMP_ATTR, False)):
+        identity_uv = True   # the untouched `u`/`v` builtins: the ramp by construction
+    elif u.dim() == 3 and u.shape == (B, H, W) and H > 1 and W > 1:
         ramp_u = torch.arange(W, dtype=torch.float32, device=u.device).div_(W - 1).view(1, 1, W)
         ramp_v = torch.arange(H, dtype=torch.float32, device=v.device).div_(H - 1).view(1, H, 1)
         dev = torch.maximum((u - ramp_u).abs().amax(), (v - ramp_v).abs().amax())

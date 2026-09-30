@@ -63,10 +63,9 @@ _PROGRAMS = (
 
 #: Device readbacks a builtin makes for a reason other than its host-resolved argument, which
 #: the zero-readback row allows and pins exactly (one more is the host argument read back).
-#: `sample_mip`: the identity-UV probe reads one reduction back to choose a plain resample
-#: over `grid_sample`. It predates PERF-2, when it was a `.tolist()` of four corners that this
-#: `.item()` counter could not see; the full-texel probe reads it with `.item()`.
-_OTHER_DEVICE_READS = {"sample_mip": 1}
+#: None today: `sample_mip`'s identity-UV probe used to read one reduction back, and the
+#: untouched `u`/`v` builtins these programs pass are now marked as the identity grid.
+_OTHER_DEVICE_READS: dict = {}
 
 #: (label, the text substituted for `{s}`, the bindings it needs, has_host_value).
 #: `has_host_value` is False for exactly one row — a sigma computed on the device from a

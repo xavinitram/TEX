@@ -205,3 +205,76 @@ def test_loop_counter_carries_its_host_reading_on_cuda():
         torch.Tensor.item = real
     assert reads == [], f"{len(reads)} device reads in the cook"
     assert torch.allclose(got.cpu(), ref, atol=1e-4)
+
+
+# ── sample_mip takes the untouched u/v builtins as the identity grid without a readback ─
+
+def _mip(code, img, device):
+    bt = {"A": infer_binding_type(img)}
+    program = parse_and_split(code, bt)
+    program, tm, _r, _assigned, _p, used = get_cache().compile_ast(program, bt, source=code)
+    b = {"A": img.to(device)}
+    ref = Interpreter().execute(program, dict(b), tm, device=device, output_names=["OUT"])["OUT"]
+    tier_trace.reset()
+    got = _codegen_only_execute(program, dict(b), tm, device, output_names=["OUT"],
+                                used_builtins=used, fingerprint=None, time_context=None)["OUT"]
+    assert tier_trace.last().tier == "codegen"
+    return ref, got
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs CUDA"))])
+def test_sample_mip_identity_builtins_match_the_probed_grid(device):
+    """The marked builtins take the identity route; `u + 0.0` (unmarked, same values) is
+    proved identity by the probe. Both tiers give the same picture either way."""
+    img = torch.rand(1, 32, 40, 4, generator=torch.Generator().manual_seed(931))
+    direct = _mip("@OUT = sample_mip(@A, u, v, 1.5);", img, device)
+    probed = _mip("float uu = u + 0.0; float vv = v + 0.0; @OUT = sample_mip(@A, uu, vv, 1.5);",
+                  img, device)
+    for a, b in zip(direct, probed):
+        assert torch.equal(a, b)
+    assert torch.equal(direct[0], direct[1])
+
+
+def test_identity_mark_is_only_on_the_full_extent_ramp():
+    """Both tiers mark `u`/`v` over the whole image, and neither marks a window's ramp."""
+    from TEX_Wrangle.tex_runtime.stdlib_core import _IDENTITY_RAMP_ATTR
+    from TEX_Wrangle.tex_runtime.compiled import _build_codegen_env
+    code = "@OUT = u; @V = v;"
+    img = torch.rand(1, 6, 8, 4)
+    bt = {"A": infer_binding_type(img)}
+    program = parse_and_split(code, bt)
+    program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+    for roi, want_u in ((None, True), ((2, 0, 4, 6, 8, 6), False)):
+        env, _sp, _ = _build_codegen_env(program, {"A": img}, torch.device("cpu"), 0,
+                                         used_builtins={"u", "v"}, roi=roi)
+        out = Interpreter().execute(program, {"A": img if roi is None else img[:, :, 2:6]}, tm,
+                                    device="cpu", output_names=["OUT", "V"], roi=roi)
+        for tier, uu, vv in (("codegen", env["u"], env["v"]),
+                             ("interpreter", out["OUT"], out["V"])):
+            assert getattr(uu, _IDENTITY_RAMP_ATTR, False) is want_u, (tier, roi)
+            assert getattr(vv, _IDENTITY_RAMP_ATTR, False) is True, (tier, roi)  # full height
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_sample_mip_on_the_builtin_grid_reads_nothing_back():
+    code = "@OUT = sample_mip(@A, u, v, 1.0);"
+    img = torch.rand(1, 32, 40, 4).cuda()
+    bt = {"A": infer_binding_type(img)}
+    program = parse_and_split(code, bt)
+    program, tm, *_ = get_cache().compile_ast(program, bt, source=code)
+    interp = Interpreter()
+    interp.execute(program, {"A": img}, tm, device="cuda", output_names=["OUT"])
+    real, reads = torch.Tensor.item, []
+
+    def item(self):
+        if self.device.type != "cpu":
+            reads.append(tuple(self.shape))
+        return real(self)
+
+    torch.Tensor.item = item
+    try:
+        interp.execute(program, {"A": img}, tm, device="cuda", output_names=["OUT"])
+    finally:
+        torch.Tensor.item = real
+    assert reads == [], f"{len(reads)} device reads"

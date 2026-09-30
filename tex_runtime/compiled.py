@@ -34,7 +34,7 @@ from .interpreter import MAX_LOOP_ITERATIONS as _MAX_LOOP_ITERATIONS  # kept for
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
 from .host import CookCancelled, _cancel_check  # SCHED-3 seam (no cycle: host imports torch only)
-from .stdlib import TEXStdlib, _tag_host_scalar
+from .stdlib import TEXStdlib, _tag_host_scalar, _mark_identity_ramp
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 from . import fncalls_compile  # COMPILETRY-50: leaf module (lazy-imports warm_state) — no cycle
 from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts in
@@ -1519,7 +1519,8 @@ def _build_codegen_env(
                 env["ix"] = ix
             if "u" in used:
                 env["u"] = _env_cached(("u", B, H, W, x0, W_full, dev_key, cdt),
-                                       lambda: (ix / max(W_full - 1, 1)).expand(B, H, W))
+                                       lambda: _mark_identity_ramp((ix / max(W_full - 1, 1))
+                                                                   .expand(B, H, W), x0 == 0 and W == W_full))
         if "iy" in used or "v" in used:
             iy = _env_cached(("iy", H, y0, dev_key, cdt),
                              lambda: torch.arange(y0, y0 + H, dtype=cdt, device=device).view(1, H, 1))
@@ -1527,7 +1528,8 @@ def _build_codegen_env(
                 env["iy"] = iy
             if "v" in used:
                 env["v"] = _env_cached(("v", B, H, W, y0, H_full, dev_key, cdt),
-                                       lambda: (iy / max(H_full - 1, 1)).expand(B, H, W))
+                                       lambda: _mark_identity_ramp((iy / max(H_full - 1, 1))
+                                                                   .expand(B, H, W), y0 == 0 and H == H_full))
         if "iw" in used:
             env["iw"] = _env_cached(("iw", W_full, dev_key, cdt),
                                     lambda: torch.tensor(float(W_full), dtype=cdt, device=device))

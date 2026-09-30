@@ -61,6 +61,7 @@ from .stdlib_core import (  # noqa: F401
     _cook_ctx,
     _has_channel_axis,
     _dtype_rounded,
+    _mark_identity_ramp,
     _f32_round,
     _tag_host_scalar,
     _host_scalar,

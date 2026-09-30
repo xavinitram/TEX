@@ -21,6 +21,7 @@ import math
 import torch
 
 from ..tex_compiler.ast_nodes import Program
+from .stdlib_core import _mark_identity_ramp
 # PHASEC-OBSROUTE follow-up: `_BUILTINS_LRU_MAX`/`_COORD_RAMP_LRU_MAX`/
 # `_SCALAR_BUILTIN_DEFAULTS` used to sit in a top-level `from .interpreter import ...`
 # here, contradicting this docstring's own claim (above) that the names this module does
@@ -159,7 +160,8 @@ class _SpatialContextMixin:
                 if "ix" in used:
                     self.env["ix"] = ix
                 if "u" in used:
-                    self.env["u"] = u_flat.view(1, 1, W).expand(B, H, W)
+                    self.env["u"] = _mark_identity_ramp(u_flat.view(1, 1, W).expand(B, H, W),
+                                                        x0 == 0 and W == W_full)
 
             # iy: pixel y-coordinate (offset by the ROI's top row)
             if "iy" in used or "v" in used:
@@ -173,7 +175,8 @@ class _SpatialContextMixin:
                 if "iy" in used:
                     self.env["iy"] = iy
                 if "v" in used:
-                    self.env["v"] = v_flat.view(1, H, 1).expand(B, H, W)
+                    self.env["v"] = _mark_identity_ramp(v_flat.view(1, H, 1).expand(B, H, W),
+                                                        y0 == 0 and H == H_full)
 
             # iw, ih: image dimensions (the FULL image under an ROI/strip)
             if "iw" in used:
