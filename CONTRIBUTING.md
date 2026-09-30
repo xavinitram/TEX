@@ -70,6 +70,8 @@ npm install
 npm run build
 ```
 
+`npm run build` writes `js/tex_cm6_bundle.js`; commit it with the source change. The editor's keyword, built-in variable and stdlib function lists are generated: after adding a stdlib function or a keyword, run `python tools/gen_editor_lexicon.py` before building.
+
 For all other contributions, the editor build is not required.
 
 ## Pull Request Expectations

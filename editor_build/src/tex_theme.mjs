@@ -10,12 +10,14 @@ import { tags } from "@lezer/highlight";
 
 // ─── Editor theme (layout, chrome, colors) ───────────────────────────
 
+const MONO = "'Monaspace Neon', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace";
+
 export const texEditorTheme = EditorView.theme({
     "&": {
         backgroundColor: "#1a1a1a",
         color: "#d4d4d4",
         fontSize: "13px",
-        fontFamily: "'Monaspace Neon', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace",
+        fontFamily: MONO,
         fontFeatureSettings: '"calt" 1, "liga" 1, "ss01" 1, "ss02" 1, "ss03" 1, "ss06" 1, "cv01" 2',
         fontVariationSettings: '"wght" 380',
         WebkitFontSmoothing: "antialiased",
@@ -85,12 +87,6 @@ export const texEditorTheme = EditorView.theme({
         outline: "1px solid rgba(255, 50, 50, 0.5)",
     },
 
-    // Fold gutter — hidden by default, too narrow to be useful inline
-    ".cm-foldGutter": {
-        width: "0px",
-        display: "none",
-    },
-
     // ── Autocomplete popup ──
     ".cm-tooltip": {
         backgroundColor: "#1e1e1e",
@@ -100,7 +96,7 @@ export const texEditorTheme = EditorView.theme({
     },
     ".cm-tooltip.cm-tooltip-autocomplete": {
         "& > ul": {
-            fontFamily: "'Monaspace Neon', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace",
+            fontFamily: MONO,
             fontSize: "12px",
             maxHeight: "200px",
         },
@@ -138,7 +134,7 @@ export const texEditorTheme = EditorView.theme({
         padding: "4px 8px",
         borderRadius: "4px",
         fontSize: "12px",
-        fontFamily: "'Monaspace Neon', 'Cascadia Code', 'Fira Code', 'Consolas', monospace",
+        fontFamily: MONO,
     },
     ".cm-diagnostic-error": {
         backgroundColor: "rgba(180, 40, 40, 0.3)",
@@ -158,9 +154,6 @@ export const texEditorTheme = EditorView.theme({
     ".cm-lint-marker": {
         width: "5px",
         height: "5px",
-    },
-    ".cm-lint-marker-error": {
-        content: "''",
     },
 
     // Lint tooltip
@@ -202,23 +195,23 @@ export const texEditorTheme = EditorView.theme({
 // Maps CodeMirror tags to the existing TEX color scheme.
 
 export const texHighlightStyle = syntaxHighlighting(HighlightStyle.define([
-    // Keywords: purple bold — float, int, vec3, vec4, mat3, mat4, string, if, else, for
+    // Keywords: purple bold — the types (float, int, vec2 … mat4, string), the control words (if, else, for, while, break, continue, return) and const
     { tag: tags.keyword, color: "#c792ea", fontWeight: "bold" },
 
     // Built-in functions: blue — sin, cos, lerp, sample, luma, etc.
     // "builtin" token → default table → tags.standard(tags.variableName)
     { tag: tags.standard(tags.variableName), color: "#82aaff" },
 
-    // @ bindings: orange bold — @A, @OUT, @base_image
+    // Bindings: orange bold — @A, @OUT, @base_image, the $param form and the typed forms (f@x, i$n)
     { tag: tags.special(tags.variableName), color: "#f78c6c", fontWeight: "bold" },
 
     // Numbers: amber — 0.5, 42, 0xFF
     { tag: tags.number, color: "#f9ae58" },
 
-    // Constants: red — PI, E
+    // Constants: red — PI, TAU, E
     { tag: tags.atom, color: "#ff5370" },
 
-    // Coord variables: cyan — u, v, ix, iy, iw, ih, ic, fi, fn
+    // Built-in variables: cyan — u, v, ix, iy, iw, ih, px, py, ic, fi, fn, frame, fps, time
     { tag: tags.definition(tags.variableName), color: "#89ddff" },
 
     // String literals: green — "hello"

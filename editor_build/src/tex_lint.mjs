@@ -4,9 +4,9 @@
  * Converts TEX compilation errors (from the WebSocket execution_error event)
  * into CodeMirror 6 Diagnostic objects for inline error display.
  *
- * v0.8.0: Supports structured TEX_DIAG: JSON payloads with multi-error,
- * suggestions, hints, and error codes. Falls back to legacy regex parsing
- * for backward compatibility.
+ * A message carrying a structured `TEX_DIAG:` JSON payload (multi-error, suggestions,
+ * hints, error codes) is read from that. Any other message (a runtime error, or a compile
+ * error without the payload) is parsed for a "line N, column M" or "[N:M]" location.
  */
 import { setDiagnostics } from "@codemirror/lint";
 
@@ -24,19 +24,36 @@ export function texErrorToDiagnostics(view, errorData) {
 
     const msg = errorData.message;
 
-    // ── Structured diagnostics (v0.8.0+) ──
+    // ── Structured diagnostics ──
     const diagPos = msg.indexOf("TEX_DIAG:");
     if (diagPos >= 0) {
         try {
             const diagnostics = JSON.parse(msg.slice(diagPos + 9));
             return diagnostics.map(d => structuredToCM6(view, d)).filter(Boolean);
         } catch {
-            // JSON parse failed — fall through to legacy
+            // JSON parse failed: fall through to the message-text parser
         }
     }
 
-    // ── Legacy: regex-based line:col extraction ──
+    // ── Message text: regex-based line:col extraction ──
     return legacyToCM6(view, msg, errorData);
+}
+
+// The server counts columns in code points (a Python string); CodeMirror offsets are
+// UTF-16 code units, so a non-BMP character (an emoji in a string or comment) earlier on the
+// line is two units wide. Returns the offset in `lineText` of the 1-based code-point column
+// `col`, clamped to the end of the line.
+function colToOffset(lineText, col) {
+    let off = 0;
+    for (let n = col - 1; n > 0 && off < lineText.length; n--) {
+        off += lineText.codePointAt(off) > 0xFFFF ? 2 : 1;
+    }
+    return off;
+}
+
+// A diagnostic for a message with no usable line: mark the first line.
+function firstLineDiagnostic(doc, message, severity, source) {
+    return { from: 0, to: doc.lines > 0 ? doc.line(1).to : 0, severity, message, source };
 }
 
 /**
@@ -48,27 +65,19 @@ function structuredToCM6(view, d) {
     const col = d.col || 1;
 
     if (!line || line < 1 || line > doc.lines) {
-        // No valid line — mark first line
-        return {
-            from: 0,
-            to: doc.lines > 0 ? doc.line(1).to : 0,
-            severity: d.severity || "error",
-            message: formatStructuredMessage(d),
-            source: d.code || "TEX",
-        };
+        return firstLineDiagnostic(doc, formatStructuredMessage(d), d.severity || "error", d.code || "TEX");
     }
 
     const lineInfo = doc.line(line);
-    const from = lineInfo.from + Math.min(col - 1, lineInfo.length);
+    const from = lineInfo.from + colToOffset(lineInfo.text, col);
     let to;
     // LANG-2: a multi-line span (end_line > line) underlines through to end_col on the
     // last line; otherwise fall back to end_col on the same line, else to end-of-line.
     if (d.end_line && d.end_line > line && d.end_line <= doc.lines) {
         const endInfo = doc.line(d.end_line);
-        to = d.end_col ? endInfo.from + Math.min(d.end_col - 1, endInfo.length)
-                       : endInfo.to;
+        to = d.end_col ? endInfo.from + colToOffset(endInfo.text, d.end_col) : endInfo.to;
     } else if (d.end_col && d.end_col > col) {
-        to = lineInfo.from + Math.min(d.end_col - 1, lineInfo.length);
+        to = lineInfo.from + colToOffset(lineInfo.text, d.end_col);
     } else {
         to = lineInfo.to;
     }
@@ -101,7 +110,7 @@ function formatStructuredMessage(d) {
 }
 
 /**
- * Legacy regex-based error parsing (pre-v0.8.0 compatibility).
+ * Regex-based parsing of a message that has no TEX_DIAG payload.
  */
 function legacyToCM6(view, msg, errorData) {
     let line = null;
@@ -120,15 +129,6 @@ function legacyToCM6(view, msg, errorData) {
         if (match2) {
             line = parseInt(match2[1]);
             col = parseInt(match2[2]);
-        }
-    }
-
-    // Fallback: try just "line N"
-    if (line === null) {
-        const match3 = msg.match(/line\s+(\d+)/i);
-        if (match3) {
-            line = parseInt(match3[1]);
-            col = 1;
         }
     }
 
@@ -151,7 +151,7 @@ function legacyToCM6(view, msg, errorData) {
         }
 
         const lineInfo = doc.line(line);
-        const from = lineInfo.from + Math.min((col || 1) - 1, lineInfo.length);
+        const from = lineInfo.from + colToOffset(lineInfo.text, col || 1);
         const to = lineInfo.to;
         return [{
             from,
@@ -162,21 +162,15 @@ function legacyToCM6(view, msg, errorData) {
         }];
     }
 
-    // No line info — mark the first line
-    return [{
-        from: 0,
-        to: doc.lines > 0 ? doc.line(1).to : 0,
-        severity: "error",
-        message: msg,
-        source: errorData.type || "TEX",
-    }];
+    // No line info: mark the first line
+    return [firstLineDiagnostic(doc, msg, "error", errorData.type || "TEX")];
 }
 
 /**
  * Remove redundant location prefix from error message for inline display.
  */
 function cleanErrorMessage(msg) {
-    let clean = msg
+    const clean = msg
         .replace(/^(?:Lex|Parse|Type|Interpret)(?:er)?Error:\s*/i, "")
         .replace(/(?:at |)line\s+\d+(?:,\s*col(?:umn)?\s+\d+)?:?\s*/i, "")
         .replace(/^\[?\d+:\d+\]?\s*/, "")

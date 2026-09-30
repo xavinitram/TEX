@@ -5,48 +5,21 @@
  * to map TEX token types to proper CM6 highlight tags.
  */
 import { StreamLanguage } from "@codemirror/language";
+import { LEX_KEYWORDS, LEX_CONSTANTS, LEX_COORD_VARS, LEX_BINDING_PREFIXES,
+         LEX_FUNCTIONS, LEX_ALIASES } from "./tex_lexicon.mjs";
 
-// ─── Token sets (must match tex_extension.js exactly) ────────────────
+// ─── Token sets ──────────────────────────────────────────────────────
+// Generated into tex_lexicon.mjs by tools/gen_editor_lexicon.py from the lexer's
+// KEYWORDS and BINDING_TYPE_PREFIXES, the type checker's built-in variable names and
+// the stdlib registry. Regenerate it instead of editing a list here.
 
-const TEX_KEYWORDS = new Set([
-    "float", "int", "vec3", "vec4", "mat3", "mat4", "string",
-    "if", "else", "for", "while", "break", "continue",
-]);
-
-const TEX_BUILTINS = new Set([
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sincos",
-    "sinh", "cosh", "tanh",
-    "pow", "sqrt", "exp", "log", "log2", "log10", "abs", "sign",
-    "pow2", "pow10", "hypot",
-    "floor", "ceil", "round", "fract", "mod",
-    "isnan", "isinf", "degrees", "radians",
-    "spow", "sdiv",
-    "min", "max", "clamp", "lerp", "mix", "step", "smoothstep",
-    "length", "normalize", "dot", "cross", "reflect",
-    "luma", "rgb2hsv", "hsv2rgb", "fit", "rand",
-    "sample", "fetch", "sample_cubic", "sample_lanczos",
-    "fetch_frame", "sample_frame",
-    "distance",
-    "perlin", "simplex", "fbm",
-    "str", "len", "replace", "strip", "lstrip", "rstrip", "lower", "upper",
-    "contains", "startswith", "endswith", "find", "substr",
-    "to_int", "to_float", "sanitize_filename",
-    "split", "pad_left", "pad_right", "format", "repeat", "str_reverse",
-    "count", "matches", "hash", "hash_float", "hash_int", "char_at",
-    "sort", "reverse", "arr_sum", "arr_min", "arr_max", "median", "arr_avg",
-    "join",
-    "img_sum", "img_mean", "img_min", "img_max", "img_median",
-    "transpose", "determinant", "inverse",
-]);
-
-const TEX_CONSTANTS = new Set(["PI", "TAU", "E"]);
-
-const TEX_COORD_VARS = new Set([
-    "u", "v", "ix", "iy", "iw", "ih", "px", "py", "ic", "fi", "fn",
-]);
+const TEX_KEYWORDS = new Set(LEX_KEYWORDS);
+const TEX_BUILTINS = new Set([...LEX_FUNCTIONS.map(f => f[0]), ...LEX_ALIASES.map(a => a[0])]);
+const TEX_CONSTANTS = new Set(LEX_CONSTANTS);
+const TEX_COORD_VARS = new Set(LEX_COORD_VARS);
 
 // Type prefixes for typed bindings: f@threshold, i$count, etc.
-const BINDING_TYPE_PREFIXES = new Set(["f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b"]);
+const BINDING_TYPE_PREFIXES = new Set(LEX_BINDING_PREFIXES);
 
 // ─── Token name strategy ─────────────────────────────────────────────
 // StreamLanguage.define() accepts ONE argument (the spec); there is NO
@@ -61,6 +34,19 @@ const BINDING_TYPE_PREFIXES = new Set(["f", "i", "v", "v2", "v3", "v4", "s", "im
 
 // ─── StreamLanguage parser ───────────────────────────────────────────
 
+// Consume up to and including the closing `*/` on this line, or to the end of the line
+// when the comment continues on the next one.
+function blockCommentBody(stream, state) {
+    if (stream.skipTo("*/")) {
+        stream.next(); // *
+        stream.next(); // /
+        state.inBlockComment = false;
+    } else {
+        stream.skipToEnd();
+    }
+    return "blockComment";
+}
+
 const texStreamParser = {
     name: "tex-wrangle",
 
@@ -74,16 +60,7 @@ const texStreamParser = {
 
     token(stream, state) {
         // ── Block comment continuation ──
-        if (state.inBlockComment) {
-            if (stream.skipTo("*/")) {
-                stream.next(); // *
-                stream.next(); // /
-                state.inBlockComment = false;
-            } else {
-                stream.skipToEnd();
-            }
-            return "blockComment";
-        }
+        if (state.inBlockComment) return blockCommentBody(stream, state);
 
         // ── Whitespace ──
         if (stream.eatSpace()) return null;
@@ -97,15 +74,7 @@ const texStreamParser = {
         // ── Block comment start: /* ──
         if (stream.match("/*")) {
             state.inBlockComment = true;
-            // Consume rest of this line within the comment
-            if (stream.skipTo("*/")) {
-                stream.next();
-                stream.next();
-                state.inBlockComment = false;
-            } else {
-                stream.skipToEnd();
-            }
-            return "blockComment";
+            return blockCommentBody(stream, state);
         }
 
         // ── String literal: "..." with escape sequences ──
@@ -127,16 +96,10 @@ const texStreamParser = {
             return "string";
         }
 
-        // ── @ bindings: @A, @OUT, @base_image ──
-        if (stream.eat("@")) {
+        // ── @ wire bindings (@A, @OUT, @base_image) and $ parameter bindings ($strength) ──
+        if (stream.eat(/[@$]/)) {
             stream.eatWhile(/[A-Za-z0-9_]/);
             return "variable-2";   // → default table → tags.special(tags.variableName)
-        }
-
-        // ── $ parameter bindings: $strength, $count ──
-        if (stream.eat("$")) {
-            stream.eatWhile(/[A-Za-z0-9_]/);
-            return "variable-2";   // same highlight as @ bindings
         }
 
         // ── Numbers: hex, float, int, scientific ──
@@ -151,7 +114,7 @@ const texStreamParser = {
             const word = stream.current();
 
             // Typed binding prefix: f@threshold, i$count, img@result, etc.
-            if (BINDING_TYPE_PREFIXES.has(word) && !stream.eol()) {
+            if (BINDING_TYPE_PREFIXES.has(word)) {
                 const next = stream.peek();
                 if (next === "@" || next === "$") {
                     stream.next();                // consume @ or $
@@ -193,5 +156,5 @@ const texStreamParser = {
 
 export const texLanguageDef = StreamLanguage.define(texStreamParser);
 
-// Re-export sets for use in completions
+// Exported through the TEX_CM6 bundle API (tex_cm6.mjs).
 export { TEX_KEYWORDS, TEX_BUILTINS, TEX_CONSTANTS, TEX_COORD_VARS };
