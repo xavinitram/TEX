@@ -84,7 +84,9 @@ def sweep_temps(directory: str, *, min_age_s: float = 600.0) -> int:
             for entry in it:
                 if entry.name.startswith(TMP_PREFIX) and entry.name.endswith(".tmp"):
                     try:
-                        if now - entry.stat().st_mtime < min_age_s:
+                        # `min_age_s <= 0` takes every temp: a timestamp can sit a tick past
+                        # `time.time()`, which would spare a file the caller asked to sweep.
+                        if min_age_s > 0.0 and now - entry.stat().st_mtime < min_age_s:
                             continue
                         os.remove(entry.path)
                         n += 1

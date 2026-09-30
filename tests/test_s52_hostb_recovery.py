@@ -44,3 +44,13 @@ def test_sweep_temps_leaves_a_fresh_temp_alone(tmp_path):
     assert R.sweep_temps(str(tmp_path)) == 1
     assert fresh.exists() and not old.exists() and other.exists()
     assert R.sweep_temps(str(tmp_path), min_age_s=0.0) == 1 and not fresh.exists()
+
+
+def test_sweep_temps_with_no_age_floor_takes_a_temp_stamped_ahead_of_the_clock(tmp_path):
+    # A just-written file's mtime can read a tick past time.time() on Windows; with no age
+    # floor it must still go.
+    ahead = tmp_path / (R.TMP_PREFIX + "ahead.tmp")
+    ahead.write_bytes(b"x")
+    soon = time.time() + 5.0
+    os.utime(ahead, (soon, soon))
+    assert R.sweep_temps(str(tmp_path), min_age_s=0.0) == 1 and not ahead.exists()
