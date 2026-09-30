@@ -1,141 +1,35 @@
 /**
  * TEX Autocomplete Provider for CodeMirror 6
  *
- * Four completion sources:
- *   A. Stdlib functions — with signatures and descriptions
- *   B. Built-in variables — with type and description
- *   C. @ binding completions — triggered by "@" character
- *   D. $ parameter completions — triggered by "$" character
+ * One completion source with three branches, chosen by what precedes the cursor:
+ *   - `$`: parameter names
+ *   - `@`: wire binding names
+ *   - a word: the stdlib functions (with signatures and descriptions), keywords and
+ *     built-in variables in ALL_COMPLETIONS
  * Plus (LX-6) a hover-tooltip provider reusing the same completion data.
  */
 import { hoverTooltip } from "@codemirror/view";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import { LEX_FUNCTIONS, LEX_ALIASES } from "./tex_lexicon.mjs";
 
 // ─── Stdlib function completions ─────────────────────────────────────
+// Generated with the rest of the lexicon (tools/gen_editor_lexicon.py) from the stdlib
+// registry, so the list is every registered function and alias and cannot drift.
 
 const STDLIB_COMPLETIONS = [
-    // Math
-    { label: "sin", detail: "(x)", info: "Sine" },
-    { label: "cos", detail: "(x)", info: "Cosine" },
-    { label: "tan", detail: "(x)", info: "Tangent" },
-    { label: "asin", detail: "(x)", info: "Arcsine" },
-    { label: "acos", detail: "(x)", info: "Arccosine" },
-    { label: "atan", detail: "(x)", info: "Arctangent" },
-    { label: "atan2", detail: "(y, x)", info: "Two-argument arctangent" },
-    { label: "sincos", detail: "(x)", info: "Returns vec2(sin(x), cos(x))" },
-    { label: "sinh", detail: "(x)", info: "Hyperbolic sine" },
-    { label: "cosh", detail: "(x)", info: "Hyperbolic cosine" },
-    { label: "tanh", detail: "(x)", info: "Hyperbolic tangent" },
-    { label: "pow", detail: "(x, y)", info: "x raised to power y" },
-    { label: "pow2", detail: "(x)", info: "2 raised to power x" },
-    { label: "pow10", detail: "(x)", info: "10 raised to power x" },
-    { label: "sqrt", detail: "(x)", info: "Square root" },
-    { label: "exp", detail: "(x)", info: "e raised to power x" },
-    { label: "log", detail: "(x)", info: "Natural logarithm" },
-    { label: "log2", detail: "(x)", info: "Base-2 logarithm" },
-    { label: "log10", detail: "(x)", info: "Base-10 logarithm" },
-    { label: "abs", detail: "(x)", info: "Absolute value" },
-    { label: "sign", detail: "(x)", info: "Sign (-1, 0, or 1)" },
-    { label: "floor", detail: "(x)", info: "Round down to integer" },
-    { label: "ceil", detail: "(x)", info: "Round up to integer" },
-    { label: "round", detail: "(x)", info: "Round to nearest integer" },
-    { label: "fract", detail: "(x)", info: "Fractional part" },
-    { label: "mod", detail: "(x, y)", info: "Modulo (remainder)" },
-    { label: "hypot", detail: "(x, y)", info: "Hypotenuse: sqrt(x*x + y*y)" },
-    { label: "degrees", detail: "(x)", info: "Radians to degrees" },
-    { label: "radians", detail: "(x)", info: "Degrees to radians" },
-    // Safe ops
-    { label: "spow", detail: "(x, y)", info: "Sign-safe power (no NaN on negatives)" },
-    { label: "sdiv", detail: "(a, b)", info: "Safe division (0 when b near 0)" },
-    // Classification
-    { label: "isnan", detail: "(x)", info: "1.0 if NaN, else 0.0" },
-    { label: "isinf", detail: "(x)", info: "1.0 if Inf, else 0.0" },
-    // Interpolation
-    { label: "min", detail: "(a, b)", info: "Minimum of two values" },
-    { label: "max", detail: "(a, b)", info: "Maximum of two values" },
-    { label: "clamp", detail: "(x, lo, hi)", info: "Clamp x to [lo, hi]" },
-    { label: "lerp", detail: "(a, b, t)", info: "Linear interpolation" },
-    { label: "mix", detail: "(a, b, t)", info: "Linear interpolation (alias)" },
-    { label: "fit", detail: "(x, omin, omax, nmin, nmax)", info: "Remap range" },
-    { label: "step", detail: "(edge, x)", info: "0.0 if x < edge, else 1.0" },
-    { label: "smoothstep", detail: "(lo, hi, x)", info: "Smooth Hermite step" },
-    // Vector
-    { label: "dot", detail: "(a, b)", info: "Dot product" },
-    { label: "length", detail: "(v)", info: "Vector length" },
-    { label: "distance", detail: "(a, b)", info: "Distance between vectors" },
-    { label: "normalize", detail: "(v)", info: "Normalize to unit length" },
-    { label: "cross", detail: "(a, b)", info: "Cross product (vec3)" },
-    { label: "reflect", detail: "(v, n)", info: "Reflect vector around normal" },
-    // Matrix
-    { label: "transpose", detail: "(m)", info: "Transpose matrix" },
-    { label: "determinant", detail: "(m)", info: "Matrix determinant" },
-    { label: "inverse", detail: "(m)", info: "Matrix inverse" },
-    // Color
-    { label: "luma", detail: "(v)", info: "Luminance (Rec.709 weights)" },
-    { label: "rgb2hsv", detail: "(rgb)", info: "RGB to HSV conversion" },
-    { label: "hsv2rgb", detail: "(hsv)", info: "HSV to RGB conversion" },
-    // Noise
-    { label: "perlin", detail: "(x, y)", info: "2D Perlin noise [-1, 1]" },
-    { label: "simplex", detail: "(x, y)", info: "2D Simplex noise [-1, 1]" },
-    { label: "fbm", detail: "(x, y, octaves)", info: "Fractal Brownian Motion" },
-    { label: "rand", detail: "()", info: "Random value [0, 1)" },
-    // Sampling
-    { label: "sample", detail: "(@in, u, v)", info: "Bilinear sample at UV coords" },
-    { label: "fetch", detail: "(@in, px, py)", info: "Nearest pixel at integer coords" },
-    { label: "sample_cubic", detail: "(@in, u, v)", info: "Bicubic (Catmull-Rom) sample" },
-    { label: "sample_lanczos", detail: "(@in, u, v)", info: "Lanczos-3 sample" },
-    { label: "fetch_frame", detail: "(@in, frame, px, py)", info: "Fetch from specific frame" },
-    { label: "sample_frame", detail: "(@in, frame, u, v)", info: "Bilinear from specific frame" },
-    // String
-    { label: "str", detail: "(x)", info: "Number to string" },
-    { label: "len", detail: "(s)", info: "String/array length" },
-    { label: "replace", detail: "(s, old, new, max?)", info: "Replace occurrences (optional max count)" },
-    { label: "strip", detail: "(s)", info: "Trim whitespace" },
-    { label: "lower", detail: "(s)", info: "To lowercase" },
-    { label: "upper", detail: "(s)", info: "To uppercase" },
-    { label: "contains", detail: "(s, sub)", info: "1.0 if sub found, else 0.0" },
-    { label: "startswith", detail: "(s, pre)", info: "1.0 if starts with prefix" },
-    { label: "endswith", detail: "(s, suf)", info: "1.0 if ends with suffix" },
-    { label: "find", detail: "(s, sub)", info: "Index of substring, or -1" },
-    { label: "substr", detail: "(s, start, len?)", info: "Extract substring" },
-    { label: "to_int", detail: "(s)", info: "Parse integer from string" },
-    { label: "to_float", detail: "(s)", info: "Parse float from string" },
-    { label: "sanitize_filename", detail: "(s)", info: "Clean illegal filename chars" },
-    { label: "split", detail: "(s, delim, max?)", info: "Split string into array" },
-    { label: "lstrip", detail: "(s)", info: "Trim leading whitespace" },
-    { label: "rstrip", detail: "(s)", info: "Trim trailing whitespace" },
-    { label: "pad_left", detail: "(s, width, char?)", info: "Left-pad to width" },
-    { label: "pad_right", detail: "(s, width, char?)", info: "Right-pad to width" },
-    { label: "format", detail: "(template, ...args)", info: "String interpolation with {} placeholders" },
-    { label: "repeat", detail: "(s, count)", info: "Repeat string N times" },
-    { label: "str_reverse", detail: "(s)", info: "Reverse a string" },
-    { label: "count", detail: "(s, sub)", info: "Count substring occurrences" },
-    { label: "matches", detail: "(s, pattern)", info: "Regex full match (1.0/0.0)" },
-    { label: "hash", detail: "(s)", info: "Deterministic SHA-256 hex prefix" },
-    { label: "hash_float", detail: "(s)", info: "Deterministic hash to float [0,1)" },
-    { label: "hash_int", detail: "(s, max?)", info: "Deterministic hash to integer" },
-    { label: "char_at", detail: "(s, i)", info: "Character at index" },
-    // Array
-    { label: "sort", detail: "(arr)", info: "Sort ascending" },
-    { label: "reverse", detail: "(arr)", info: "Reverse order" },
-    { label: "arr_sum", detail: "(arr)", info: "Sum of elements" },
-    { label: "arr_min", detail: "(arr)", info: "Minimum element" },
-    { label: "arr_max", detail: "(arr)", info: "Maximum element" },
-    { label: "median", detail: "(arr)", info: "Median element" },
-    { label: "arr_avg", detail: "(arr)", info: "Mean of elements" },
-    { label: "join", detail: "(arr, sep)", info: "Join string array" },
-    // Image reductions
-    { label: "img_sum", detail: "(@in)", info: "Per-channel sum of all pixels" },
-    { label: "img_mean", detail: "(@in)", info: "Per-channel mean of all pixels" },
-    { label: "img_min", detail: "(@in)", info: "Per-channel minimum" },
-    { label: "img_max", detail: "(@in)", info: "Per-channel maximum" },
-    { label: "img_median", detail: "(@in)", info: "Per-channel median" },
+    ...LEX_FUNCTIONS.map(([label, detail, info]) => ({ label, detail, info })),
+    ...LEX_ALIASES.map(([label, target]) => {
+        const [, detail, info] = LEX_FUNCTIONS.find(f => f[0] === target);
+        return { label, detail, info: `${info} (alias of ${target})` };
+    }),
 ].map(c => ({ ...c, type: "function" }));
 
-// ─── Type keyword completions ────────────────────────────────────────
+// ─── Keyword completions (types and control flow) ────────────────────
 
-const TYPE_COMPLETIONS = [
+const KEYWORD_COMPLETIONS = [
     { label: "float", type: "keyword", info: "Scalar floating-point" },
     { label: "int", type: "keyword", info: "Integer value" },
+    { label: "vec2", type: "keyword", detail: "(x, y)", info: "2-component vector" },
     { label: "vec3", type: "keyword", detail: "(r, g, b)", info: "3-component vector (RGB)" },
     { label: "vec4", type: "keyword", detail: "(r, g, b, a)", info: "4-component vector (RGBA)" },
     { label: "mat3", type: "keyword", detail: "(...)", info: "3x3 matrix (internal only)" },
@@ -147,6 +41,8 @@ const TYPE_COMPLETIONS = [
     { label: "while", type: "keyword", detail: "(condition)", info: "Conditional loop" },
     { label: "break", type: "keyword", info: "Exit innermost loop" },
     { label: "continue", type: "keyword", info: "Skip to next iteration" },
+    { label: "return", type: "keyword", info: "Return a value from a user function" },
+    { label: "const", type: "keyword", info: "Declare a value that cannot be reassigned" },
 ];
 
 // ─── Built-in variable completions ───────────────────────────────────
@@ -163,6 +59,9 @@ const VARIABLE_COMPLETIONS = [
     { label: "fn", type: "variable", info: "Total frame/batch count" },
     { label: "px", type: "variable", info: "Pixel step in x: 1.0 / iw" },
     { label: "py", type: "variable", info: "Pixel step in y: 1.0 / ih" },
+    { label: "frame", type: "variable", info: "Host timeline frame number (0 in ComfyUI, which has no playhead)" },
+    { label: "fps", type: "variable", info: "Host timeline frames per second" },
+    { label: "time", type: "variable", info: "Host timeline time in seconds" },
     { label: "PI", type: "constant", info: "3.14159..." },
     { label: "TAU", type: "constant", info: "6.28318... (2 * PI)" },
     { label: "E", type: "constant", info: "2.71828..." },
@@ -170,11 +69,40 @@ const VARIABLE_COMPLETIONS = [
 
 // ─── All non-binding completions ─────────────────────────────────────
 
-const ALL_COMPLETIONS = [...STDLIB_COMPLETIONS, ...TYPE_COMPLETIONS, ...VARIABLE_COMPLETIONS];
+const ALL_COMPLETIONS = [...STDLIB_COMPLETIONS, ...KEYWORD_COMPLETIONS, ...VARIABLE_COMPLETIONS];
 
 // ─── LX-6: hover tooltips (reuse the completion data) ─────────────────
 
 const _HOVER_INDEX = new Map(ALL_COMPLETIONS.map(c => [c.label, c]));
+
+// True when `pos` sits inside a comment or a string literal, where a word is prose and
+// neither completion nor hover documentation applies. `side` picks which token to read
+// when `pos` is a token boundary (-1: the one ending there, 1: the one starting there).
+function inCommentOrString(state, pos, side) {
+    const tree = ensureSyntaxTree(state, pos, 20) || syntaxTree(state);
+    const name = tree.resolveInner(pos, side).name;
+    return name === "lineComment" || name === "blockComment" || name === "string";
+}
+
+/**
+ * The documentation entry under document position `pos`, as `{ from, to, entry }`, or null.
+ * A word that is a binding or parameter name (`@length`, `$mix`, `f@u`), a member (`.x`) or
+ * part of a comment or string is not the built-in of the same name and has no entry.
+ */
+export function texHoverAt(state, pos) {
+    const line = state.doc.lineAt(pos);
+    const text = line.text, base = line.from;
+    const isWord = c => c && /[A-Za-z0-9_]/.test(c);
+    let start = pos, end = pos;
+    while (start > base && isWord(text[start - base - 1])) start--;
+    while (end < line.to && isWord(text[end - base])) end++;
+    if (start >= end) return null;
+    const before = text[start - base - 1], after = text[end - base];
+    if (before === "@" || before === "$" || before === "." || after === "@" || after === "$") return null;
+    if (inCommentOrString(state, start, 1)) return null;
+    const entry = _HOVER_INDEX.get(text.slice(start - base, end - base));
+    return entry ? { from: start, to: end, entry } : null;
+}
 
 /**
  * Create a hover-tooltip provider: hovering a known TEX token shows its signature
@@ -183,15 +111,9 @@ const _HOVER_INDEX = new Map(ALL_COMPLETIONS.map(c => [c.label, c]));
  */
 export function createTexHover() {
     return hoverTooltip((view, pos) => {
-        const line = view.state.doc.lineAt(pos);
-        const text = line.text, base = line.from;
-        const isWord = c => c && /[A-Za-z0-9_]/.test(c);
-        let start = pos, end = pos;
-        while (start > base && isWord(text[start - base - 1])) start--;
-        while (end < line.to && isWord(text[end - base])) end++;
-        if (start >= end) return null;
-        const entry = _HOVER_INDEX.get(text.slice(start - base, end - base));
-        if (!entry) return null;
+        const hit = texHoverAt(view.state, pos);
+        if (!hit) return null;
+        const { from: start, to: end, entry } = hit;
         return {
             pos: start, end, above: true,
             create() {
@@ -224,6 +146,8 @@ export function createTexHover() {
  */
 export function createTexCompletions(getBindings, getParams) {
     return function texCompletionSource(context) {
+        if (inCommentOrString(context.state, context.pos, -1)) return null;
+
         // ── $ parameter trigger ──
         const dollarMatch = context.matchBefore(/\$\w*/);
         if (dollarMatch) {
@@ -273,12 +197,10 @@ export function createTexCompletions(getBindings, getParams) {
         }
 
         // ── General word completions ──
-        // Activate on 1+ typed characters
+        // Activate on 1+ typed characters; a token that starts with a digit is a number
+        // (`1.5`, `1e3`, `0xFF`), not a name.
         const word = context.matchBefore(/\w+/);
-        if (!word) return null;
-
-        // Require at least 1 character typed (word.text.length >= 1)
-        if (word.text.length < 1) return null;
+        if (!word || /^\d/.test(word.text)) return null;
 
         return {
             from: word.from,

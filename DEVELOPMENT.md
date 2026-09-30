@@ -288,6 +288,8 @@ if node.name == "saturate":
 { name: "saturate", sig: "saturate(x) → float", desc: "Clamp value to [0,1].", example: "@OUT = vec4(saturate(@A.rgb), 1.0);" },
 ```
 
+4a. **The editor's word lists** -- run `python tools/gen_editor_lexicon.py` (it regenerates `editor_build/src/tex_lexicon.mjs` from the registry, the lexer and the type checker), then `npm run build` in `editor_build/` and commit `js/tex_cm6_bundle.js` with it. Without the rebuild the editor does not highlight, complete or hover the new function; `tests/test_editor_bundle.py` fails on a stale lexicon file, and on a stale bundle where `editor_build/node_modules` is installed.
+
 **⚠️ 4b. If your function reads NEIGHBOURING pixels or the whole image**
 (sample/fetch/blur/morphology/reduction), you MUST classify it **in the `@stdlib(...)`
 decorator** — the taxonomy sets DERIVE from the tags (TST-3 fails a mismatch); do NOT
@@ -331,7 +333,7 @@ Also add a default to `_SCALAR_BUILTIN_DEFAULTS` in `tex_runtime/interpreter.py`
 
 3. **`tex_compiler/type_checker.py`** -- add the name to `_BUILTIN_VAR_NAMES`. That frozenset seeds the top scope (every built-in is `FLOAT`) and feeds the W7003 shadow warning. Optionally add a one-line explanation to `_BUILTIN_VAR_HINTS` in `tex_compiler/diagnostics.py`, so declaring the name gets a specific message.
 
-4. **`js/tex_extension.js`** -- add the name to the "Built-in Variables" entry of `TEX_HELP_DATA` (its `sig` and `desc`), then run `python tools/gen_help_data.py` to regenerate `tex_help.json`. Add a row to `LANGUAGE.md` §6.
+4. **`js/tex_extension.js`** -- add the name to the "Built-in Variables" entry of `TEX_HELP_DATA` (its `sig` and `desc`), then run `python tools/gen_help_data.py` to regenerate `tex_help.json`. Add a row to `LANGUAGE.md` §6. Then run `python tools/gen_editor_lexicon.py`, add the name's one-line description to `VARIABLE_COMPLETIONS` in `editor_build/src/tex_completions.mjs` (the editor tests fail until it has one), and rebuild the bundle with `npm run build` in `editor_build/`.
 
 A new built-in name is reserved, so a program that declared its own variable of that name stops compiling: that is a minor, breaking change, and the CHANGELOG has to say so (see "API stability tiers").
 

@@ -2,7 +2,10 @@
  * TEX CodeMirror 6 Bundle Entry Point
  *
  * This file is the Rollup input. It imports all CM6 modules and TEX-specific
- * extensions, then registers them as globalThis.TEX_CM6 for cross-module access.
+ * extensions, then registers them as globalThis.TEX_CM6 for cross-module access. The
+ * bundle has no exports: the global is the whole interface, and it carries a few members
+ * (keymap, closeCompletion, the TEX_* word sets) that js/tex_extension.js does not use
+ * because the bundle is also redistributed to a second embedding host.
  *
  * Build: cd editor_build && npm run build
  * Output: ../js/tex_cm6_bundle.js
@@ -17,8 +20,7 @@ import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 
 // ── Language support ──
-import { syntaxHighlighting, defaultHighlightStyle, indentOnInput,
-         bracketMatching, foldGutter, foldKeymap, StreamLanguage } from "@codemirror/language";
+import { indentOnInput, bracketMatching } from "@codemirror/language";
 
 // ── Autocomplete ──
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap,
@@ -32,7 +34,7 @@ import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 
 // ── TEX-specific modules ──
 import { texLanguageDef, TEX_KEYWORDS, TEX_BUILTINS, TEX_CONSTANTS, TEX_COORD_VARS } from "./tex_language.mjs";
-import { createTexCompletions, createTexHover } from "./tex_completions.mjs";
+import { createTexCompletions, createTexHover, texHoverAt } from "./tex_completions.mjs";
 import { texEditorTheme, texHighlightStyle } from "./tex_theme.mjs";
 import { texErrorToDiagnostics, setDiagnostics } from "./tex_lint.mjs";
 
@@ -44,8 +46,6 @@ function texSetup() {
         highlightActiveLineGutter(),
         highlightSpecialChars(),
         history(),
-        // Fold gutter omitted — takes horizontal space; code folding still works
-        // via keyboard shortcuts but no gutter markers shown.
         drawSelection(),
         dropCursor(),
         EditorState.allowMultipleSelections.of(true),
@@ -61,7 +61,6 @@ function texSetup() {
             ...defaultKeymap,
             ...searchKeymap,
             ...historyKeymap,
-            ...foldKeymap,
             ...completionKeymap,
             ...lintKeymap,
             indentWithTab,
@@ -92,6 +91,7 @@ const TEX_CM6_API = {
     autocompletion,
     createTexCompletions,
     createTexHover,
+    texHoverAt,   // the tooltip lookup on its own; tests/js_editor_bundle_checks.cjs calls it
     startCompletion,
     closeCompletion,
     completionStatus,
@@ -115,29 +115,3 @@ const TEX_CM6_API = {
 globalThis.TEX_CM6 = TEX_CM6_API;
 
 console.log("[TEX] CodeMirror 6 bundle registered (globalThis.TEX_CM6)");
-
-// Also keep the named exports for Rollup's IIFE return value (belt + suspenders)
-export {
-    EditorView,
-    EditorState,
-    Compartment,
-    keymap,
-    texSetup,
-    texLanguageDef,
-    TEX_KEYWORDS,
-    TEX_BUILTINS,
-    TEX_CONSTANTS,
-    TEX_COORD_VARS,
-    autocompletion,
-    createTexCompletions,
-    createTexHover,
-    startCompletion,
-    closeCompletion,
-    completionStatus,
-    texEditorTheme,
-    texHighlightStyle,
-    tooltips,
-    lintGutter,
-    setDiagnostics,
-    texErrorToDiagnostics,
-};
