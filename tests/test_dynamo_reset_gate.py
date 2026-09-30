@@ -11,8 +11,13 @@ be running a job.
 The gate (`tex_runtime/dynamo_gate.py`) counts every pool job, and every reset TEX does goes
 through `reset_if_idle()`, which skips while any job runs.
 
-PORTABILITY: CPU only. No compiler toolchain needed: the compile is a stub, and the gate
-needs no backend at all.
+The int `$param` preamble used to round its host reading through a 0-dim tensor's `.item()`,
+which is a graph break under torch.compile in every program with an int `$param`. It made
+each such program pay one more resume function, which doubled the compile time of a long
+else-if chain and pushed that example past the harness timeout.
+
+PORTABILITY: CPU only. No compiler toolchain needed: the compile is a stub, and the one trace
+uses Dynamo's "eager" backend.
 """
 import threading
 
@@ -24,6 +29,8 @@ from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import compiled as C
 from TEX_Wrangle.tex_runtime import compiled_capability as CC
 from TEX_Wrangle.tex_runtime import dynamo_gate as G
+from TEX_Wrangle.tex_runtime.stdlib_core import (_HOST_SCALAR_ATTR, _dtype_rounded,
+                                                 _stage_codegen_param)
 
 
 def _program():
@@ -100,3 +107,30 @@ def test_reset_if_idle_is_atomic_with_job_entry(r, resets):
     assert resets == [1]
     r.ok("reset skipped inside a job, run once outside")
 
+
+@pytest.mark.parametrize("value,dtype", [
+    (1, torch.int64), (0, torch.int64), (-7, torch.int64),
+    (2 ** 63 - 1, torch.int64), (-2 ** 63, torch.int64),
+    (True, torch.bool), (False, torch.bool),
+])
+def test_int_and_bool_host_reading_matches_the_tensor(r, value, dtype):
+    want = torch.scalar_tensor(value, dtype=dtype).item()
+    got = _dtype_rounded(value, dtype)
+    assert got == want and type(got) is type(want), (got, want)
+    r.ok(f"{value!r} as {dtype}")
+
+
+def test_int_param_preamble_is_not_a_graph_break(r):
+    def preamble(x):
+        t = _stage_codegen_param(1, torch.as_tensor(1))
+        return x + t
+
+    torch._dynamo.reset()
+    try:
+        ex = torch._dynamo.explain(preamble)(torch.ones(2))
+    finally:
+        torch._dynamo.reset()
+    assert ex.graph_break_count == 0, [str(b.reason) for b in ex.break_reasons]
+    t = _stage_codegen_param(3, torch.as_tensor(3))
+    assert getattr(t, _HOST_SCALAR_ATTR) == 3   # the tag is still carried
+    r.ok("an int $param stages with no graph break and keeps its host reading")

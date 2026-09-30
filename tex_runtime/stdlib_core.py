@@ -89,6 +89,7 @@ def _align_field_rank(*ts):
 #     never written in place. Every reader falls back to the readback it replaced, so a
 #     missing tag is slower, never wrong.
 _HOST_SCALAR_ATTR = "_tex_host_scalar"
+_I64 = 2 ** 63
 
 # Set on the `u`/`v` builtins when they are the untouched pixel ramp over the full image
 # (no ROI or strip offset), so a sampler can skip proving it with a device readback.
@@ -115,6 +116,13 @@ def _dtype_rounded(value, dtype):
             return _struct.unpack("<f", _struct.pack("<f", value))[0]
         except (OverflowError, ValueError, TypeError):
             return None
+    # An int or bool `$param` is held exactly, so its reading needs no tensor. The tensor
+    # route's `.item()` is a graph break under torch.compile, paid by every program with
+    # an int `$param`.
+    if dtype is torch.int64 and type(value) is int and -_I64 <= value < _I64:
+        return value
+    if dtype is torch.bool and type(value) is bool:
+        return value
     try:
         return torch.scalar_tensor(value, dtype=dtype).item()
     except Exception:
